@@ -4,7 +4,7 @@
 import os
 import re
 from collections.abc import Awaitable, Callable, Sequence
-from typing import Annotated, Literal, NotRequired
+from typing import Annotated, Any, Literal, NotRequired, cast
 
 from langchain.agents.middleware.types import (
     AgentMiddleware,
@@ -471,11 +471,11 @@ class FilesystemMiddleware(AgentMiddleware):
             self._create_execute_tool(),
         ]
 
-    def _get_backend(self, runtime: ToolRuntime) -> BackendProtocol:
+    def _get_backend(self, runtime: Any) -> BackendProtocol:
         """Get the resolved backend instance from backend or factory.
 
         Args:
-            runtime: The tool runtime context.
+            runtime: The tool runtime context (can be ToolRuntime or Runtime).
 
         Returns:
             Resolved backend instance.
@@ -839,7 +839,8 @@ class FilesystemMiddleware(AgentMiddleware):
                 )
 
             try:
-                result = resolved_backend.execute(command)
+                sandbox_backend = cast(SandboxBackendProtocol, resolved_backend)
+                result = sandbox_backend.execute(command)
             except NotImplementedError as e:
                 # Handle case where execute() exists but raises NotImplementedError
                 return f"Error: Execution not available. {e}"
@@ -872,7 +873,8 @@ class FilesystemMiddleware(AgentMiddleware):
                 )
 
             try:
-                result = await resolved_backend.aexecute(command)
+                sandbox_backend = cast(SandboxBackendProtocol, resolved_backend)
+                result = await sandbox_backend.aexecute(command)
             except NotImplementedError as e:
                 # Handle case where execute() exists but raises NotImplementedError
                 return f"Error: Execution not available. {e}"

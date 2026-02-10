@@ -62,8 +62,9 @@ dependencies = [
 vertexai = ["langchain-google-vertexai>=3.0.0,<4.0.0"]
 
 [project.scripts]
-deep-worker = "deep_worker_cli:cli_main"
-deep-worker-cli = "deep_worker_cli:cli_main"
+deep-worker = "deep_worker_cli.cli.router:deep_worker_main"
+deep-worker-cli = "deep_worker_cli.cli.router:deep_worker_cli_main"
+dwcli = "deep_worker_cli.cli.router:deep_worker_cli_main"
 
 [project.urls]
 Homepage = "https://docs.langchain.com/oss/python/deepagents/overview"
@@ -311,7 +312,7 @@ ignore-var-parameters = true
 omit = ["tests/*"]
 
 [tool.pytest.ini_options]
-timeout = 30  # Default timeout for all tests (can be overridden per-test)
+# timeout = 30  # Default timeout for all tests (requires pytest-timeout plugin)
 
 addopts = "--strict-markers --strict-config --durations=5"
 asyncio_mode = "auto"

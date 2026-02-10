@@ -144,8 +144,9 @@ class StoreBackend(BackendProtocol):
         Otherwise, uses legacy assistant_id detection from metadata (deprecated).
         """
         if self._namespace is not None:
+            from typing import Any, cast
             state = getattr(self.runtime, "state", None)
-            ctx = BackendContext(state=state, runtime=self.runtime)
+            ctx = BackendContext(state=cast(Any, state), runtime=cast(Any, self.runtime))
             return _validate_namespace(self._namespace(ctx))
 
         return self._get_namespace_legacy()
@@ -187,7 +188,7 @@ class StoreBackend(BackendProtocol):
             return (namespace,)
 
         try:
-            assistant_id = cfg.get("metadata", {}).get("assistant_id")  # type: ignore[assignment]
+            assistant_id = cfg.get("metadata", {}).get("assistant_id")
         except Exception:
             assistant_id = None
 
@@ -529,7 +530,7 @@ class StoreBackend(BackendProtocol):
     def grep_raw(
         self,
         pattern: str,
-        path: str = "/",
+        path: str | None = None,
         glob: str | None = None,
     ) -> list[GrepMatch] | str:
         store = self._get_store()

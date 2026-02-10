@@ -167,7 +167,7 @@ class StateBackend(BackendProtocol):
     def grep_raw(
         self,
         pattern: str,
-        path: str = "/",
+        path: str | None = None,
         glob: str | None = None,
     ) -> list[GrepMatch] | str:
         files = self.runtime.state.get("files", {})

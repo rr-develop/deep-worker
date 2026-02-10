@@ -1,0 +1,257 @@
+================================================================================
+Deep Agents CLI - Quick Reference
+================================================================================
+
+STATUS: ✅ Installation Complete & Production Ready
+DATE: 2026-02-08
+VERSION: deepagents-cli 0.0.19
+
+================================================================================
+QUICK START (30 SECONDS)
+================================================================================
+
+Run:
+    deepagents-deepseek
+
+Or after venv activation:
+    source ./venv/bin/activate
+    deepagents-deepseek
+
+Then:
+    user > Your question or request here
+    agent > [AI response]
+    user > quit
+
+================================================================================
+MAIN COMMANDS
+================================================================================
+
+Startup:
+    deepagents-deepseek              # Main (Recommended)
+    deepagents --model deepseek-coder # Code generation
+    deepagents --model deepseek-reasoner # Complex tasks
+    deepagents -r                    # Resume last session
+
+Management:
+    deepagents list                  # List agents
+    deepagents threads list          # List sessions
+    deepagents threads delete <ID>   # Delete session
+
+================================================================================
+DOCUMENTATION (READ IN THIS ORDER)
+================================================================================
+
+1. README_DEEPAGENTS.md
+   → Overview of the installation
+
+2. DEEPAGENTS_INSTALLATION_SUMMARY.md
+   → What was installed and how
+
+3. DEEPAGENTS_QUICKSTART.md
+   → Quick start guide with examples
+
+4. DEEPAGENTS_REFERENCE.md
+   → Cheat sheet with all commands
+
+5. DEEPAGENTS_SETUP.md
+   → Detailed architecture and configuration
+
+6. DEEPAGENTS_INDEX.md
+   → Navigation and index of all docs
+
+================================================================================
+DOCUMENTATION FILES
+================================================================================
+
+In the project root:
+
+    ├── README_DEEPAGENTS.md
+    ├── DEEPAGENTS_INSTALLATION_SUMMARY.md
+    ├── DEEPAGENTS_QUICKSTART.md
+    ├── DEEPAGENTS_REFERENCE.md
+    ├── DEEPAGENTS_SETUP.md
+    ├── DEEPAGENTS_INDEX.md
+    ├── setup_deepagents_deepseek.sh
+    └── .env (API keys, not in git)
+
+================================================================================
+KEY FEATURES
+================================================================================
+
+✅ Interactive AI Assistant with Deepseek
+✅ Multiple models: chat, coder, reasoner
+✅ Session management (save & resume conversations)
+✅ File operations (create, read, edit)
+✅ Code execution
+✅ Custom agents support
+✅ Cost-effective (1000x cheaper than GPT-4)
+✅ Very fast responses
+✅ Secure (API keys protected)
+
+================================================================================
+API CONFIGURATION
+================================================================================
+
+Location: ./.env
+Content:
+    DEEPSEEK_API_KEY=<your-deepseek-api-key>
+    GOOGLE_API_KEY=<your-google-api-key>
+    AI_PROVIDER=deepseek
+
+User config: ~/.deepagents/.env
+    OPENAI_API_KEY=${DEEPSEEK_API_KEY}
+    OPENAI_BASE_URL=https://api.deepseek.com
+    OPENAI_MODEL=deepseek-chat
+
+================================================================================
+EXAMPLES
+================================================================================
+
+Example 1: Basic Q&A
+    $ deepagents-deepseek
+    user > What is Python?
+    agent > [Detailed explanation]
+
+Example 2: Code Generation
+    $ deepagents --model deepseek-coder
+    user > Write a factorial function
+    agent > [Complete code]
+
+Example 3: Complex Reasoning
+    $ deepagents --model deepseek-reasoner
+    user > Solve this algorithm optimization problem
+    user > [Paste problem]
+    agent > [Step-by-step solution]
+
+================================================================================
+TROUBLESHOOTING
+================================================================================
+
+Q: Command not found?
+A: Use full path or activate venv:
+   source ./venv/bin/activate
+
+Q: API key not working?
+A: Check .env file and permissions:
+   cat ./.env
+   echo $DEEPSEEK_API_KEY
+
+Q: Connection timeout?
+A: Check internet and API status:
+   ping api.deepseek.com
+
+More help: See DEEPAGENTS_QUICKSTART.md
+
+================================================================================
+MODELS & PRICING
+================================================================================
+
+deepseek-chat (default)
+├── Speed: ⚡⚡⚡ (Very fast)
+├── Quality: ⭐⭐⭐ (Good)
+├── Price: $0.27 / 1M input tokens
+
+deepseek-coder (for code)
+├── Speed: ⚡⚡⚡ (Very fast)
+├── Quality: ⭐⭐⭐⭐ (Excellent for code)
+├── Price: Same as deepseek-chat
+
+deepseek-reasoner (complex tasks)
+├── Speed: ⚡⚡ (Medium)
+├── Quality: ⭐⭐⭐⭐⭐ (Excellent)
+├── Price: ~2-3x deepseek-chat
+
+Compare: OpenAI GPT-4 costs ~1000x more!
+
+================================================================================
+SECURITY
+================================================================================
+
+✅ .env files protected by .gitignore
+✅ API keys NOT committed to git
+✅ Keys stored locally only
+✅ Proper file permissions (600)
+✅ Wrapper script doesn't expose keys
+✅ Environment variables used for runtime config
+
+Never:
+    ❌ Commit .env files
+    ❌ Share API keys
+    ❌ Log credentials
+    ❌ Store keys in code
+
+================================================================================
+INTEGRATION
+================================================================================
+
+Works with:
+    ✅ LangChain (via langchain_openai)
+    ✅ Shared configuration (same Deepseek key)
+    ✅ Shared AI library (compatible configuration)
+    ✅ Python scripts (subprocess)
+    ✅ Bash (direct CLI call)
+
+================================================================================
+INSTALLED PACKAGES
+================================================================================
+
+deepagents-cli:     0.0.19 ✅
+deepagents:         0.3.10 ✅
+langchain-core:     1.2.9 ✅
+langchain-openai:   latest ✅
+langchain-anthropic: 1.3.2 ✅
+Other tools:        modal, runloop, daytona, etc.
+
+================================================================================
+NEXT STEPS
+================================================================================
+
+1. Read DEEPAGENTS_QUICKSTART.md (5 min)
+2. Run deepagents-deepseek (2 min)
+3. Try some examples (10 min)
+4. Read DEEPAGENTS_SETUP.md if interested (optional)
+
+START HERE:
+    deepagents-deepseek
+
+================================================================================
+QUICK LINKS
+================================================================================
+
+Quick Start:     DEEPAGENTS_QUICKSTART.md
+Reference Card:  DEEPAGENTS_REFERENCE.md
+Setup Details:   DEEPAGENTS_SETUP.md
+Navigation:      DEEPAGENTS_INDEX.md
+Installation:    DEEPAGENTS_INSTALLATION_SUMMARY.md
+Overview:        README_DEEPAGENTS.md (this file)
+
+Deepseek API:    https://api-docs.deepseek.com/
+LangChain:       https://python.langchain.com/docs/
+Deep Agents:     https://docs.langchain.com/oss/python/deepagents/
+
+================================================================================
+SUPPORT
+================================================================================
+
+For questions, see:
+    - DEEPAGENTS_REFERENCE.md (quick answers)
+    - DEEPAGENTS_QUICKSTART.md (examples)
+    - DEEPAGENTS_SETUP.md (technical details)
+
+================================================================================
+SUMMARY
+================================================================================
+
+✅ Deep Agents CLI installed and configured
+✅ Deepseek AI integrated as primary provider
+✅ Multiple models available (chat, coder, reasoner)
+✅ Documentation complete
+✅ API keys secured
+✅ Production ready
+
+Status: 🎉 READY TO USE!
+
+Run:    deepagents-deepseek
+Learn:  DEEPAGENTS_QUICKSTART.md
+
+================================================================================

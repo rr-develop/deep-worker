@@ -1,7 +1,7 @@
 """Deep Agents come with planning, filesystem, and subagents."""
 
 from collections.abc import Callable, Sequence
-from typing import Any
+from typing import Any, cast
 
 from langchain.agents import create_agent
 from langchain.agents.middleware import HumanInTheLoopMiddleware, InterruptOnConfig, TodoListMiddleware
@@ -43,7 +43,7 @@ def get_default_model() -> ChatAnthropic:
     """
     return ChatAnthropic(
         model_name="claude-sonnet-4-5-20250929",
-        max_tokens=20000,  # type: ignore[call-arg]
+        max_tokens=20000,
     )
 
 
@@ -171,12 +171,12 @@ def create_deep_agent(
     if interrupt_on is not None:
         gp_middleware.append(HumanInTheLoopMiddleware(interrupt_on=interrupt_on))
 
-    general_purpose_spec: SubAgent = {
+    general_purpose_spec: SubAgent = cast(SubAgent, {
         **GENERAL_PURPOSE_SUBAGENT,
         "model": model,
         "tools": tools or [],
         "middleware": gp_middleware,
-    }
+    })
 
     # Process user-provided subagents to fill in defaults for model, tools, and middleware
     processed_subagents: list[SubAgent | CompiledSubAgent] = []
@@ -211,12 +211,12 @@ def create_deep_agent(
                 subagent_middleware.append(SkillsMiddleware(backend=backend, sources=subagent_skills))
             subagent_middleware.extend(spec.get("middleware", []))
 
-            processed_spec: SubAgent = {
+            processed_spec: SubAgent = cast(SubAgent, {
                 **spec,
                 "model": subagent_model,
                 "tools": spec.get("tools", tools or []),
                 "middleware": subagent_middleware,
-            }
+            })
             processed_subagents.append(processed_spec)
 
     # Combine GP with processed user-provided subagents
@@ -263,7 +263,7 @@ def create_deep_agent(
             *system_prompt.content_blocks,
             {"type": "text", "text": f"\n\n{BASE_AGENT_PROMPT}"},
         ]
-        final_system_prompt = SystemMessage(content=new_content)
+        final_system_prompt = SystemMessage(content_blocks=cast(Any, new_content))
     else:
         # String: simple concatenation
         final_system_prompt = system_prompt + "\n\n" + BASE_AGENT_PROMPT

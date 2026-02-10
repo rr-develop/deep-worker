@@ -1,10 +1,10 @@
 # LangChain Integration with Security
 
-Complete LangChain agent integration for a web application with Claude Code-compatible security model and `skip_permissions` support.
+Complete LangChain agent integration for the web application with a Claude Code-compatible security model and `skip_permissions` support.
 
 ## Overview
 
-This project provides a comprehensive LangChain agent framework integrated with a web application, featuring:
+This project provides a comprehensive LangChain agent framework integrated with the web application, featuring:
 
 - **Security Framework**: STRICT (default) and PERMISSIVE (--skip-permissions) modes matching Claude Code behavior
 - **16 Tools**: Shell, File, Python, Git, and Web tools for agent interaction
@@ -107,7 +107,7 @@ python examples/comparison.py
 ## Architecture
 
 ```
-repository-root/
+.
 ├── docs/              # Documentation
 ├── examples/          # Code examples
 ├── scripts/           # Setup scripts
@@ -152,4 +152,4 @@ MIT
 
 ## Contributing
 
-See the main repository for contribution guidelines.
+This is part of the main web application project. See the main repository for contribution guidelines.

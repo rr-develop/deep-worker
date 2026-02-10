@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+
+# deep-worker launcher - a minimal wrapper around the Python module
+# Runs the agent process directly, without installation via pip
+
+# Get the script directory
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+
+# Parent directory containing deepagents
+PARENT_DIR="$(dirname "$SCRIPT_DIR")"
+
+# Save the user's current working directory
+ORIGINAL_CWD="$(pwd)"
+
+# Add the module paths to PYTHONPATH
+export PYTHONPATH="$SCRIPT_DIR:$PARENT_DIR/deepagents:${PYTHONPATH:-}"
+
+# Change to the script directory so Python modules import correctly,
+# and pass the user's original directory through the environment
+cd "$SCRIPT_DIR" && DEEP_WORKER_ORIGINAL_CWD="$ORIGINAL_CWD" exec python3 -m deep_worker_cli.cli.agent_command "$@"

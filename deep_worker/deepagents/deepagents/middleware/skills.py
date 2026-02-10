@@ -93,7 +93,7 @@ from __future__ import annotations
 import logging
 import re
 from pathlib import PurePosixPath
-from typing import TYPE_CHECKING, Annotated
+from typing import TYPE_CHECKING, Annotated, Any, cast
 
 import yaml
 from langchain.agents.middleware.types import PrivateStateAttr
@@ -637,20 +637,21 @@ class SkillsMiddleware(AgentMiddleware):
         self.sources = sources
         self.system_prompt_template = SKILLS_SYSTEM_PROMPT
 
-    def _get_backend(self, state: SkillsState, runtime: Runtime, config: RunnableConfig) -> BackendProtocol:
+    def _get_backend(self, state: SkillsState, runtime: Any) -> BackendProtocol:
         """Resolve backend from instance or factory.
 
         Args:
             state: Current agent state.
             runtime: Runtime context for factory functions.
-            config: Runnable config to pass to backend factory.
 
         Returns:
             Resolved backend instance
         """
         if callable(self._backend):
             # Construct an artificial tool runtime to resolve backend factory
-            tool_runtime = ToolRuntime(
+            # Use runtime.config if available, otherwise create empty config
+            config = getattr(runtime, "config", RunnableConfig())
+            tool_runtime: Any = ToolRuntime(
                 state=state,
                 context=runtime.context,
                 stream_writer=runtime.stream_writer,
@@ -658,7 +659,7 @@ class SkillsMiddleware(AgentMiddleware):
                 config=config,
                 tool_call_id=None,
             )
-            backend = self._backend(tool_runtime)
+            backend = self._backend(cast(Any, tool_runtime))
             if backend is None:
                 raise AssertionError("SkillsMiddleware requires a valid backend instance")
             return backend
@@ -717,7 +718,7 @@ class SkillsMiddleware(AgentMiddleware):
 
         return request.override(system_message=new_system_message)
 
-    def before_agent(self, state: SkillsState, runtime: Runtime, config: RunnableConfig) -> SkillsStateUpdate | None:
+    def before_agent(self, state: SkillsState, runtime: Any) -> SkillsStateUpdate | None:  # type: ignore[override]
         """Load skills metadata before agent execution (synchronous).
 
         Runs before each agent interaction to discover available skills from all
@@ -729,7 +730,6 @@ class SkillsMiddleware(AgentMiddleware):
         Args:
             state: Current agent state.
             runtime: Runtime context.
-            config: Runnable config.
 
         Returns:
             State update with `skills_metadata` populated, or `None` if already present
@@ -739,7 +739,7 @@ class SkillsMiddleware(AgentMiddleware):
             return None
 
         # Resolve backend (supports both direct instances and factory functions)
-        backend = self._get_backend(state, runtime, config)
+        backend = self._get_backend(state, runtime)
         all_skills: dict[str, SkillMetadata] = {}
 
         # Load skills from each source in order
@@ -752,7 +752,7 @@ class SkillsMiddleware(AgentMiddleware):
         skills = list(all_skills.values())
         return SkillsStateUpdate(skills_metadata=skills)
 
-    async def abefore_agent(self, state: SkillsState, runtime: Runtime, config: RunnableConfig) -> SkillsStateUpdate | None:
+    async def abefore_agent(self, state: SkillsState, runtime: Any) -> SkillsStateUpdate | None:  # type: ignore[override]
         """Load skills metadata before agent execution (async).
 
         Runs before each agent interaction to discover available skills from all
@@ -774,7 +774,7 @@ class SkillsMiddleware(AgentMiddleware):
             return None
 
         # Resolve backend (supports both direct instances and factory functions)
-        backend = self._get_backend(state, runtime, config)
+        backend = self._get_backend(state, runtime)
         all_skills: dict[str, SkillMetadata] = {}
 
         # Load skills from each source in order
