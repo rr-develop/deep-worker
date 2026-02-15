@@ -1,5 +1,6 @@
 """Session manager for deep_worker agents."""
 
+import asyncio
 import json
 from datetime import datetime
 from pathlib import Path
@@ -11,7 +12,7 @@ class SessionManager:
     """Manages session state and metadata for a deep_worker agent.
 
     Responsibilities:
-    - Track agent status (idle, running, waiting_approval, error)
+    - Track agent status (idle, running, waiting_input, error)
     - Count completed tasks
     - Count messages
     - Persist metadata to disk
@@ -39,9 +40,9 @@ class SessionManager:
             self.message_count = 0
             self.error_message: str | None = None
             self.last_activity = datetime.now()
-            self._persist()
+            self._persist_sync()
 
-    def set_status(self, status: AgentStatus) -> None:
+    async def set_status(self, status: AgentStatus) -> None:
         """Set the agent status.
 
         Args:
@@ -49,9 +50,9 @@ class SessionManager:
         """
         self.status = status
         self.last_activity = datetime.now()
-        self._persist()
+        await self._persist()
 
-    def set_error(self, error_message: str) -> None:
+    async def set_error(self, error_message: str) -> None:
         """Set error status with message.
 
         Args:
@@ -60,27 +61,27 @@ class SessionManager:
         self.status = AgentStatus.ERROR
         self.error_message = error_message
         self.last_activity = datetime.now()
-        self._persist()
+        await self._persist()
 
-    def clear_error(self) -> None:
+    async def clear_error(self) -> None:
         """Clear error message."""
         self.error_message = None
-        self._persist()
+        await self._persist()
 
-    def increment_tasks_completed(self) -> None:
+    async def increment_tasks_completed(self) -> None:
         """Increment the tasks completed counter."""
         self.tasks_completed += 1
         self.last_activity = datetime.now()
-        self._persist()
+        await self._persist()
 
-    def increment_message_count(self) -> None:
+    async def increment_message_count(self) -> None:
         """Increment the message count."""
         self.message_count += 1
         self.last_activity = datetime.now()
-        self._persist()
+        await self._persist()
 
-    def _persist(self) -> None:
-        """Persist metadata to disk."""
+    def _persist_sync(self) -> None:
+        """Persist metadata to disk synchronously (for initialization only)."""
         metadata = {
             "status": self.status.value,
             "tasks_completed": self.tasks_completed,
@@ -98,6 +99,31 @@ class SessionManager:
             if temp_file.exists():
                 temp_file.unlink()
             raise
+
+    async def _persist(self) -> None:
+        """Persist metadata to disk asynchronously to avoid blocking event loop."""
+        metadata = {
+            "status": self.status.value,
+            "tasks_completed": self.tasks_completed,
+            "message_count": self.message_count,
+            "error_message": self.error_message,
+            "last_activity": self.last_activity.isoformat(),
+        }
+
+        # Write atomically using temp file (run in thread pool to avoid blocking)
+        temp_file = self.metadata_file.with_suffix(".tmp")
+
+        def _write_to_disk():
+            try:
+                temp_file.write_text(json.dumps(metadata, indent=2))
+                temp_file.replace(self.metadata_file)
+            except OSError:
+                if temp_file.exists():
+                    temp_file.unlink()
+                raise
+
+        # Run blocking I/O in thread pool
+        await asyncio.to_thread(_write_to_disk)
 
     def _load_metadata(self) -> None:
         """Load metadata from disk."""
@@ -118,4 +144,4 @@ class SessionManager:
             self.message_count = 0
             self.error_message = None
             self.last_activity = datetime.now()
-            self._persist()
+            self._persist_sync()

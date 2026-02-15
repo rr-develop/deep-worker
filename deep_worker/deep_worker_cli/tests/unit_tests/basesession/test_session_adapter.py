@@ -29,10 +29,10 @@ class TestMapAgentStatus:
         """Test mapping RUNNING to WORKING."""
         assert map_agent_status(AgentStatus.RUNNING) == SessionStatus.WORKING
 
-    def test_waiting_approval_to_waiting_input(self):
-        """Test mapping WAITING_APPROVAL to WAITING_INPUT."""
+    def test_waiting_input_to_waiting_input(self):
+        """Test mapping WAITING_INPUT to WAITING_INPUT."""
         assert (
-            map_agent_status(AgentStatus.WAITING_APPROVAL)
+            map_agent_status(AgentStatus.WAITING_INPUT)
             == SessionStatus.WAITING_INPUT
         )
 
@@ -60,7 +60,6 @@ class TestGetSessionInfo:
         agent = AgentProcess(
             name="test-agent",
             config=config,
-            socket_path=tmp_path / "test.sock",
             pid_file=tmp_path / "test.pid",
             data_dir=tmp_path / "data",
         )
@@ -69,7 +68,7 @@ class TestGetSessionInfo:
         agent.session_manager = SessionManager(data_dir=tmp_path / "data")
 
         # Set some test values
-        agent.session_manager.set_status(AgentStatus.IDLE)
+        agent.session_manager.status = AgentStatus.IDLE
         agent.session_manager.tasks_completed = 5
         agent.session_manager.message_count = 42
 
@@ -96,7 +95,6 @@ class TestGetSessionInfo:
         assert session_info.data is not None
         assert session_info.data.message_count == 42
         assert session_info.data.process_id == os.getpid()
-        assert "test.sock" in session_info.data.socket_path
 
     def test_get_session_info_with_metadata(self, mock_agent_process):
         """Test session info includes metadata."""
@@ -109,34 +107,20 @@ class TestGetSessionInfo:
             session_info.metadata.properties["model"]
             == "claude-sonnet-4-5-20250929"
         )
-        assert session_info.metadata.properties["clients_count"] == 0
 
     def test_get_session_info_with_error(self, mock_agent_process):
         """Test session info with error status."""
-        mock_agent_process.session_manager.set_status(AgentStatus.ERROR)
-        mock_agent_process.session_manager.set_error("Test error message")
+        mock_agent_process.session_manager.status = AgentStatus.ERROR
+        mock_agent_process.session_manager.error_message = "Test error message"
 
         session_info = get_session_info(mock_agent_process)
 
         assert session_info.status == SessionStatus.ERROR
         assert session_info.error_message == "Test error message"
 
-    def test_get_session_info_with_clients(self, mock_agent_process):
-        """Test session info with connected clients."""
-        # Mock some clients
-        mock_agent_process.clients = {
-            "client1": MagicMock(),
-            "client2": MagicMock(),
-        }
-
-        session_info = get_session_info(mock_agent_process)
-
-        assert session_info.metadata is not None
-        assert session_info.metadata.properties["clients_count"] == 2
-
     def test_get_session_info_running_status(self, mock_agent_process):
         """Test session info with RUNNING status."""
-        mock_agent_process.session_manager.set_status(AgentStatus.RUNNING)
+        mock_agent_process.session_manager.status = AgentStatus.RUNNING
 
         session_info = get_session_info(mock_agent_process)
 

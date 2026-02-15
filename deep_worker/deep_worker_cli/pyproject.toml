@@ -50,6 +50,10 @@ dependencies = [
   # Clipboard
   "pyperclip>=1.11.0,<2.0.0",
 
+  # IPC/RPC
+  "rpyc>=6.0.0,<7.0.0",
+  "arpyc",  # in-repo package at ../../arpyc; see [tool.uv.sources] below
+
   # Utilities
   "python-dotenv>=1.0.0,<2.0.0",
   "requests>=2.0.0,<3.0.0",
@@ -89,7 +93,11 @@ test = [
     "pytest-xdist>=3.8.0,<4.0.0",
     "responses>=0.25.0,<1.0.0",
     "twine>=6.0.0,<7.0.0",
+    "pyte>=0.8.2,<1.0.0",  # Terminal emulator for UI testing
 ]
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["deep_worker_cli"]
@@ -100,12 +108,16 @@ packages = ["deep_worker_cli"]
 
 [tool.uv.sources]
 deepagents = { path = "../deepagents", editable = true }
+arpyc = { path = "../../arpyc", editable = true }
 
 [tool.ty.environment]
 extra-paths = ["../deepagents"]
 
 [tool.ty.rules]
 # https://docs.astral.sh/ty/rules/
+# Type checking is performed via pyright (configured in pyrightconfig.json)
+# Pre-commit hook uses: uv run --all-groups ty check deep_worker_cli
+# This includes tests/integration_ai/ as specified in pyrightconfig.json
 
 [tool.ruff.format]
 docstring-code-format = true

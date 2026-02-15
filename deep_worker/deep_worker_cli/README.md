@@ -21,6 +21,18 @@ uv tool install deepagents-cli
 deepagents
 ```
 
+## 🔒 Security Notice
+
+**⚠️ IMPORTANT: deep-worker-cli is designed for LOCAL TRUSTED ENVIRONMENTS ONLY**
+
+- All network services bind to **localhost (127.0.0.1) only**
+- **NO external network access** - ports are not exposed outside your machine
+- No authentication/authorization - relies on localhost isolation
+- Suitable for personal development, NOT for production servers
+- See [SECURITY.md](SECURITY.md) for detailed security requirements
+
+**Never expose deep-worker ports to external networks!**
+
 ## 🤔 What is this?
 
 Using an LLM to call tools in a loop is the simplest form of an agent. This architecture, however, can yield agents that are "shallow" and fail to plan and act over longer, more complex tasks.

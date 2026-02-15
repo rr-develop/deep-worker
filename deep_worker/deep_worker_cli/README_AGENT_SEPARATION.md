@@ -1,5 +1,15 @@
 # Deep Worker - Agent Separation Architecture
 
+**⚠️ DEPRECATION NOTICE: This document describes the old Unix socket IPC architecture which has been completely removed.**
+
+**Current Architecture**: Deep-worker now uses **RPyC (Remote Python Call)** for all inter-process communication. Unix sockets are NO LONGER USED.
+
+**For current architecture details**, see the source code in `deep_worker_cli/rpyc_service/` and `deep_worker_cli/client/agent_client.py`.
+
+---
+
+## OUTDATED CONTENT BELOW (Historical reference only)
+
 **Production-ready** agent separation system for running multiple isolated deep-worker agents with IPC communication and BaseSession protocol compatibility.
 
 ## 🎯 Architecture Overview
@@ -64,7 +74,7 @@ The deep-worker system uses a **process separation architecture** where each age
 
 ## 📦 Installation
 
-**No installation required!** Commands work directly via bash wrappers (like the `cco`-style launcher in comparable CLI tools):
+**No installation required!** Commands work directly via bash wrappers:
 
 ```bash
 # Check commands are available

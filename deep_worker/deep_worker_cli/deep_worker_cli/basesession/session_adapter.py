@@ -31,7 +31,7 @@ def map_agent_status(agent_status: AgentStatus) -> SessionStatus:
     mapping = {
         AgentStatus.IDLE: SessionStatus.READY,
         AgentStatus.RUNNING: SessionStatus.WORKING,
-        AgentStatus.WAITING_APPROVAL: SessionStatus.WAITING_INPUT,
+        AgentStatus.WAITING_INPUT: SessionStatus.WAITING_INPUT,
         AgentStatus.ERROR: SessionStatus.ERROR,
         AgentStatus.SHUTDOWN: SessionStatus.UNKNOWN,
     }
@@ -73,14 +73,12 @@ def get_session_info(agent_process: "AgentProcess") -> SessionInfo:
         data=SessionData(
             message_count=agent_process.session_manager.message_count,
             process_id=os.getpid(),
-            socket_path=str(agent_process.socket_path),
         ),
         metadata=SessionMetadata(
             environment=dict(os.environ),
             properties={
                 "agent_type": "deep_worker",
                 "model": agent_process.config.model,
-                "clients_count": len(agent_process.clients),
             },
         ),
     )

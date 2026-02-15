@@ -139,3 +139,42 @@ class TestClientCommand:
         assert not args.list
         assert args.status is None
         assert args.stop is None
+
+    def test_parse_prompt_flag(self):
+        """Test parsing -p/--prompt flag for headless mode."""
+        parser = create_client_parser()
+        args = parser.parse_args(["-p", "What does this code do?", "my-agent"])
+
+        assert args.prompt == "What does this code do?"
+        assert args.agent_name == "my-agent"
+        assert args.output_format == "text"
+
+    def test_parse_prompt_with_output_format(self):
+        """Test parsing prompt with --output-format."""
+        parser = create_client_parser()
+        args = parser.parse_args([
+            "-p", "List all functions",
+            "--output-format", "json",
+            "my-agent"
+        ])
+
+        assert args.prompt == "List all functions"
+        assert args.agent_name == "my-agent"
+        assert args.output_format == "json"
+
+    def test_parse_prompt_requires_agent_name(self):
+        """Test that -p flag requires agent name."""
+        parser = create_client_parser()
+        args = parser.parse_args(["-p", "Test prompt"])
+
+        # agent_name should be None (will be caught by validation in main())
+        assert args.prompt == "Test prompt"
+        assert args.agent_name is None
+
+    def test_parse_long_form_prompt(self):
+        """Test parsing --prompt (long form)."""
+        parser = create_client_parser()
+        args = parser.parse_args(["--prompt", "Analyze code", "test-agent"])
+
+        assert args.prompt == "Analyze code"
+        assert args.agent_name == "test-agent"

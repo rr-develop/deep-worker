@@ -1,0 +1,90 @@
+================================================================================
+DEEPAGENTS QUERY AND RESPONSE VISIBILITY TEST - SUCCESSFUL RESULT
+================================================================================
+Test: test_deepagents_query_does_not_disappear
+Status: ✅ PASSED
+Timestamp: 2026-02-11
+
+================================================================================
+FINAL SCREEN WITH QUERY AND RESPONSE
+================================================================================
+
+   ███████║ ██║  ███╗ █████╗   ██╔██╗ ██║    ██║    ███████╗
+   ██╔══██║ ██║   ██║ ██╔══╝   ██║╚██╗██║    ██║    ╚════██║
+   ██║  ██║ ╚██████╔╝ ███████╗ ██║ ╚████║    ██║    ███████║
+   ╚═╝  ╚═╝  ╚═════╝  ╚══════╝ ╚═╝  ╚═══╝    ╚═╝    ╚══════╝
+                                                     v0.0.19
+
+   Thread: f8d30e38
+   Ready to code! What would you like to build?
+   Enter send • Ctrl+J newline • @ files • / commands
+
+
+  ▎ > What is 2+2?
+
+   2+2 = 4
+
+
+   ┌──────────────────────────────────────────────────────────────────────┐
+   │ >                                                                    │
+   └──────────────────────────────────────────────────────────────────────┘
+
+  manual | shift+tab to cycle                       9.8K tokens  deepseek-chat
+
+================================================================================
+QUERY AND RESPONSE DETAILS
+================================================================================
+Query sent:           "What is 2+2?"
+Response received:    "2+2 = 4"
+Response time:        ~1-1.5 seconds
+Model used:           deepseek-chat
+Tokens used:          9.8K
+
+================================================================================
+AI VALIDATION RESULTS
+================================================================================
+Validation method:    verify_screenshot_contains()
+AI model:             haiku (Claude 3.5 Haiku)
+Validation status:    ✓ Valid
+Cost:                 $0.0003 USD
+Time:                 4-5 seconds
+
+Validation confirmed:
+  ✅ Query "What is 2+2?" is clearly visible on screen
+  ✅ Response containing "4" is visible on screen
+  ✅ Both query and response present simultaneously
+
+================================================================================
+TEST EXECUTION SUMMARY
+================================================================================
+1. Started deepagents terminal session (120x40)
+2. Waited for prompt appearance (UI ready)
+3. Sent query: "What is 2+2?"
+4. Waited for AI processing with "Thinking..." indicator
+5. Detected response in ~1.5 seconds
+6. Captured final screenshot
+7. AI validation confirmed both query and response visible
+8. Test marked as PASSED ✅
+
+================================================================================
+SIGNIFICANCE
+================================================================================
+This test demonstrates the CORRECT TUI behavior where:
+  - User input (query) remains visible on screen
+  - AI response appears below the query
+  - Both elements are present simultaneously
+  - This is the GOLD STANDARD for interactive agents
+
+This contrasts with dwcli bug where queries would disappear after submission.
+
+================================================================================
+HOW TO RUN THIS TEST
+================================================================================
+  $ cd <repository root>
+  $ pytest tests/integration_ai/test_terminal_emulator.py::test_deepagents_query_does_not_disappear -v -s
+
+Expected result: PASSED
+Typical duration: 13-15 seconds
+Requires: deepagents command available in PATH
+
+================================================================================

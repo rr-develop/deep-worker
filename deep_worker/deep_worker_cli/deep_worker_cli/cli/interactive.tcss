@@ -1,0 +1,33 @@
+/* Textual CSS for InteractiveApp */
+
+/* Main chat area */
+#chat {
+    width: 100%;
+    height: 1fr;
+    scrollbar-gutter: stable;
+}
+
+/* Messages container */
+#messages {
+    width: 100%;
+    height: auto;
+    padding: 0 1;
+}
+
+/* Bottom container for input */
+#bottom-app-container {
+    width: 100%;
+    height: auto;
+}
+
+/* Spacer to fill remaining space */
+#chat-spacer {
+    width: 100%;
+    height: auto;
+}
+
+/* Status bar */
+#status-bar {
+    dock: bottom;
+    height: 1;
+}

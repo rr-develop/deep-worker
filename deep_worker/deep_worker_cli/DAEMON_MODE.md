@@ -1,6 +1,6 @@
 # Deep Worker Daemon Mode
 
-## 🎯 Background operation mode
+## 🎯 Background mode
 
 Deep-worker **always** starts in background (daemon) mode:
 - ✅ The terminal is not blocked
@@ -11,7 +11,7 @@ Deep-worker **always** starts in background (daemon) mode:
 ## 📝 How it works
 
 ```bash
-# Starting an agent
+# Start the agent
 $ cd /my/project
 $ deep-worker my-agent
 Agent 'my-agent' starting in background (PID will be written to /tmp/deep_worker_my-agent.pid)
@@ -64,7 +64,7 @@ dwcli --stop my-agent
 dwcli --status my-agent
 ```
 
-## 🛠️ Command-line options
+## 🛠️ Command line options
 
 ### --dir: Working directory
 
@@ -88,7 +88,7 @@ deep-worker my-agent --dir /other/path
 
 ### -sp: Skip Permissions
 
-**Purpose**: automatically confirm dangerous operations without prompting
+**Purpose**: Automatically confirm dangerous operations without prompting
 
 ```bash
 # With permission checks (default)
@@ -99,7 +99,7 @@ deep-worker my-agent -sp
 deep-worker my-agent --skip-permissions  # the same thing
 ```
 
-**When to use**:
+**When to use it**:
 - ✅ In CI/CD pipelines (automation)
 - ✅ In trusted environments
 - ✅ For rapid prototyping
@@ -116,14 +116,14 @@ Deep-worker uses the Unix double-fork pattern:
    - The child process continues
 
 2. **Detaching from the terminal**:
-   - `os.setsid()` — create a new session
-   - `os.chdir("/")` — change to the root directory
-   - `os.umask(0)` — reset the permissions mask
+   - `os.setsid()` - create a new session
+   - `os.chdir("/")` - change to the root directory
+   - `os.umask(0)` - reset the permission mask
 
 3. **Second fork()**:
    - Guarantees that the process cannot acquire a controlling terminal
 
-4. **Redirecting file descriptors**:
+4. **Redirecting descriptors**:
    - `stdin` → `/dev/null`
    - `stdout` → `~/.deep_worker/logs/<name>.out.log`
    - `stderr` → `~/.deep_worker/logs/<name>.err.log`
@@ -141,16 +141,18 @@ $ ps -p 123456
 123456 ?        00:00:01 python3
 ```
 
-### Unix socket
+### RPyC Port
 
-Created at `/tmp/deep_worker_<name>.sock`:
+Agent listens on an RPyC port (automatically assigned):
 
 ```bash
-$ ls -l /tmp/deep_worker_my-agent.sock
-srwxrwxrwx 1 user user 0 Feb 10 17:00 /tmp/deep_worker_my-agent.sock
-
-# The client connects through this socket
-$ dwcli my-agent  # will use this socket
+# Check agent's RPyC port
+$ dwcli --status my-agent
+Agent Status: my-agent
+============================================================
+...
+  RPyC port: 18861
+...
 ```
 
 ## 📊 Usage examples
@@ -158,24 +160,24 @@ $ dwcli my-agent  # will use this socket
 ### Example 1: Project development
 
 ```bash
-# Terminal 1: start the agent in the project directory
-cd /my-project
+# Terminal 1: Start the agent in the project directory
+cd /my/project
 deep-worker dev-agent -sp
 # The agent started in the background
 
-# Terminal 1: keep working in the same terminal
+# Terminal 1: Keep working in the same terminal
 git status
 vim src/main.py
 
-# Terminal 2: monitor the logs
+# Terminal 2: Monitor the logs
 tail -f ~/.deep_worker/logs/dev-agent.out.log
 
-# Terminal 3: manage the agent
+# Terminal 3: Manage the agent
 dwcli --status dev-agent
 dwcli --stop dev-agent
 ```
 
-### Example 2: Several agents at the same time
+### Example 2: Several agents at once
 
 ```bash
 # Start an agent for each project
@@ -218,20 +220,20 @@ cat ~/.deep_worker/logs/ci-agent.err.log
 ### Process isolation
 
 - ✅ Each agent is a separate process
-- ✅ Separate PID, socket and log files
+- ✅ Separate PID, RPyC port, log files
 - ✅ Independent working directories
 - ✅ Not dependent on the terminal session
 
-### Limitations of -sp
+### -sp limitations
 
 When using `-sp`:
-- ⚠️ The agent may perform dangerous operations without confirmation
-- ⚠️ It may modify the file system
-- ⚠️ It may execute system commands
+- ⚠️ The agent can perform dangerous operations without confirmation
+- ⚠️ It can modify the file system
+- ⚠️ It can run system commands
 
 **Recommendations**:
 - Use only in trusted environments
-- Set up proper sandboxing in production
+- In production, set up proper sandboxing
 - Check the logs for suspicious activity
 
 ## 💡 Troubleshooting
@@ -239,14 +241,14 @@ When using `-sp`:
 ### The agent does not start
 
 ```bash
-# Check the error log
+# Check the error logs
 cat ~/.deep_worker/logs/<name>.err.log
 
 # Check whether the PID file exists
 ls -la /tmp/deep_worker_<name>.pid
 
-# Check whether the socket is in use
-ls -la /tmp/deep_worker_<name>.sock
+# Check the RPyC port
+dwcli --status <name>
 ```
 
 ### The agent is "stuck"
@@ -255,14 +257,14 @@ ls -la /tmp/deep_worker_<name>.sock
 # Check the status
 dwcli --status <name>
 
-# If it does not respond, kill it manually
+# If it does not respond - kill it manually
 cat /tmp/deep_worker_<name>.pid | xargs kill -9
 
 # Clean up the files
 rm /tmp/deep_worker_<name>.*
 ```
 
-### Log output is lost
+### Log output was lost
 
 ```bash
 # All logs are in this directory

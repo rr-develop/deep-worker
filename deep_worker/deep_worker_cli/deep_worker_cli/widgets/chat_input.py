@@ -507,15 +507,35 @@ class ChatInput(Vertical):
 
     def on_chat_text_area_submitted(self, event: ChatTextArea.Submitted) -> None:
         """Handle text submission."""
+        import os
+        debug = os.environ.get("DWCLI_DEBUG") == "1"
+
+        if debug:
+            import sys
+            print(f"[DWCLI_DEBUG] on_chat_text_area_submitted called: enabled={self._submit_enabled}", file=sys.stderr)
+
         if not self._submit_enabled:
+            if debug:
+                import sys
+                print(f"[DWCLI_DEBUG] submission disabled, returning", file=sys.stderr)
             return  # Submission disabled while agent is working
+
         value = event.value
+        if debug:
+            import sys
+            print(f"[DWCLI_DEBUG] submission value: '{value}' (len={len(value)})", file=sys.stderr)
+
         if value:
             if self._completion_manager:
                 self._completion_manager.reset()
 
             self._history.add(value)
+            if debug:
+                import sys
+                print(f"[DWCLI_DEBUG] posting Submitted message with mode={self.mode}", file=sys.stderr)
+
             self.post_message(self.Submitted(value, self.mode))
+            # Clear input immediately after submission (standard chat UX)
             if self._text_area:
                 self._text_area.clear_text()
             self.mode = "normal"
@@ -559,7 +579,9 @@ class ChatInput(Vertical):
                     self._completion_manager.reset()
                     self._history.add(value)
                     self.post_message(self.Submitted(value, self.mode))
-                    self._text_area.clear_text()
+                    # Clear input immediately after submission (standard chat UX)
+                    if self._text_area:
+                        self._text_area.clear_text()
                     self.mode = "normal"
             case CompletionResult.IGNORED if event.key == "enter":
                 # Handle Enter when completion is not active (bash/normal modes)
@@ -569,7 +591,9 @@ class ChatInput(Vertical):
                     event.stop()
                     self._history.add(value)
                     self.post_message(self.Submitted(value, self.mode))
-                    self._text_area.clear_text()
+                    # Clear input immediately after submission (standard chat UX)
+                    if self._text_area:
+                        self._text_area.clear_text()
                     self.mode = "normal"
 
     def _get_cursor_offset(self) -> int:
@@ -650,6 +674,15 @@ class ChatInput(Vertical):
         """
         if self._text_area:
             self._text_area.set_app_focus(has_focus=active)
+
+    def clear_input(self) -> None:
+        """Clear the input field.
+
+        This should be called after receiving a response from the agent,
+        not immediately after submission (to keep query visible).
+        """
+        if self._text_area:
+            self._text_area.clear_text()
 
     # =========================================================================
     # CompletionView protocol implementation

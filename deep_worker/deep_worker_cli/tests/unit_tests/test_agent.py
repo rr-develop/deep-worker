@@ -489,9 +489,9 @@ class TestCreateCliAgentSkillsSources:
 
         with (
             patch("deep_worker_cli.agent.settings", mock_settings),
-            patch("deep_worker_cli.agent.SkillsMiddleware", FakeSkillsMiddleware),
-            patch("deep_worker_cli.agent.MemoryMiddleware"),
-            patch("deep_worker_cli.agent.create_deep_agent", return_value=mock_agent),
+            patch("deepagents.middleware.SkillsMiddleware", FakeSkillsMiddleware),
+            patch("deepagents.middleware.MemoryMiddleware"),
+            patch("deepagents.create_deep_agent", return_value=mock_agent),
         ):
             create_cli_agent(
                 model="fake-model",

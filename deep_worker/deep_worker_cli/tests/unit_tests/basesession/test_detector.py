@@ -1,5 +1,6 @@
 """Tests for DeepWorkerDetector - cco daemon integration."""
 
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -37,10 +38,10 @@ class TestDeepWorkerDetector:
         agent_info = AgentProcessInfo(
             name="test-agent",
             pid=12345,
-            socket_path=Path("/tmp/test.sock"),
             pid_file=Path("/tmp/test.pid"),
             working_dir="/tmp/work",
-            started_at="2025-01-01T12:00:00",
+            started_at=datetime.fromisoformat("2025-01-01T12:00:00"),
+            rpyc_port=18861,
         )
 
         # Mock registry to return agent
@@ -73,10 +74,10 @@ class TestDeepWorkerDetector:
             AgentProcessInfo(
                 name=f"agent-{i}",
                 pid=12345 + i,
-                socket_path=Path(f"/tmp/agent-{i}.sock"),
                 pid_file=Path(f"/tmp/agent-{i}.pid"),
                 working_dir="/tmp/work",
-                started_at="2025-01-01T12:00:00",
+                started_at=datetime.fromisoformat("2025-01-01T12:00:00"),
+                rpyc_port=18861 + i,
             )
             for i in range(3)
         ]
@@ -114,18 +115,18 @@ class TestDeepWorkerDetector:
             AgentProcessInfo(
                 name="agent-1",
                 pid=12345,
-                socket_path=Path("/tmp/agent-1.sock"),
                 pid_file=Path("/tmp/agent-1.pid"),
                 working_dir="/tmp/work",
-                started_at="2025-01-01T12:00:00",
+                started_at=datetime.fromisoformat("2025-01-01T12:00:00"),
+            rpyc_port=18861,
             ),
             AgentProcessInfo(
                 name="agent-2",
                 pid=12346,
-                socket_path=Path("/tmp/agent-2.sock"),
                 pid_file=Path("/tmp/agent-2.pid"),
                 working_dir="/tmp/work",
-                started_at="2025-01-01T12:00:00",
+                started_at=datetime.fromisoformat("2025-01-01T12:00:00"),
+            rpyc_port=18861,
             ),
         ]
 
@@ -172,10 +173,10 @@ class TestDeepWorkerDetector:
         agent_info = AgentProcessInfo(
             name="test-agent",
             pid=12345,
-            socket_path=Path("/tmp/test.sock"),
             pid_file=Path("/tmp/test.pid"),
             working_dir="/tmp/work",
-            started_at="2025-01-01T12:00:00",
+            started_at=datetime.fromisoformat("2025-01-01T12:00:00"),
+            rpyc_port=18861,
         )
 
         with patch.object(

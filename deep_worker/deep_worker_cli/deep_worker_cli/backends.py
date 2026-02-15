@@ -32,15 +32,13 @@ from deepagents.middleware.filesystem import (
 from langchain.tools import ToolRuntime  # noqa: TC002
 from langchain_core.tools import BaseTool, StructuredTool
 
+from deep_worker_cli.constants import DEFAULT_EXECUTE_TIMEOUT
+
 logger = logging.getLogger(__name__)
 
 _TIMEOUT_DESC = (
     "Optional timeout in seconds. Overrides the default. Use for long-running commands."
 )
-
-# Must match LocalShellBackend's default timeout parameter.
-DEFAULT_EXECUTE_TIMEOUT = 120
-"""Default timeout in seconds for shell command execution."""
 
 
 class CLIShellBackend(LocalShellBackend):

@@ -12,7 +12,7 @@ class AgentStatus(str, Enum):
 
     IDLE = "idle"
     RUNNING = "running"
-    WAITING_APPROVAL = "waiting_approval"
+    WAITING_INPUT = "waiting_input"
     ERROR = "error"
     SHUTDOWN = "shutdown"
 
@@ -39,24 +39,18 @@ class EventType(str, Enum):
 
 @dataclass
 class AgentProcessInfo:
-    """Information about a running agent process."""
+    """Information about a running agent process.
+
+    RPyC is the ONLY communication method - no Unix sockets.
+    """
 
     name: str
     pid: int
-    socket_path: Path
     pid_file: Path
     working_dir: str
     started_at: datetime
+    rpyc_port: int  # RPyC server port (REQUIRED)
     last_activity: datetime | None = None
-
-
-@dataclass
-class IPCMessage:
-    """IPC protocol message."""
-
-    command: str
-    data: dict[str, Any]
-    client_id: str | None = None
 
 
 @dataclass

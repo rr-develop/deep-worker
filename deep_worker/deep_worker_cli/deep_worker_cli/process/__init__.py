@@ -3,7 +3,7 @@
 This module provides process lifecycle management and registry for deep-worker agents.
 
 Key Components:
-    - AgentProcess: Main agent process with lifecycle management, IPC server,
+    - AgentProcess: Main agent process with lifecycle management, RPyC server,
       and signal handling
     - ProcessRegistry: JSON-based registry for agent discovery and tracking
       with file locking and process liveness verification
@@ -11,7 +11,7 @@ Key Components:
 Architecture:
     Each agent runs as a separate OS process with:
     - Unique name and PID file
-    - Unix domain socket for IPC
+    - RPyC for inter-process communication
     - Registration in shared ProcessRegistry
     - SessionManager for state tracking
 

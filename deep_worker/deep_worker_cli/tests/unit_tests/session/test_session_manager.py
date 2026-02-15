@@ -64,9 +64,10 @@ class TestSessionManagerInitialization:
 class TestSessionManagerStatusManagement:
     """Tests for session status management."""
 
-    def test_set_status(self, session_manager):
+    @pytest.mark.asyncio
+    async def test_set_status(self, session_manager):
         """Test setting session status."""
-        session_manager.set_status(AgentStatus.RUNNING)
+        await session_manager.set_status(AgentStatus.RUNNING)
         assert session_manager.status == AgentStatus.RUNNING
 
         # Verify persisted
@@ -74,27 +75,29 @@ class TestSessionManagerStatusManagement:
         data = json.loads(metadata_file.read_text())
         assert data["status"] == "running"
 
-    def test_status_transitions(self, session_manager):
+    @pytest.mark.asyncio
+    async def test_status_transitions(self, session_manager):
         """Test various status transitions."""
         # IDLE -> RUNNING
-        session_manager.set_status(AgentStatus.RUNNING)
+        await session_manager.set_status(AgentStatus.RUNNING)
         assert session_manager.status == AgentStatus.RUNNING
 
-        # RUNNING -> WAITING_APPROVAL
-        session_manager.set_status(AgentStatus.WAITING_APPROVAL)
-        assert session_manager.status == AgentStatus.WAITING_APPROVAL
+        # RUNNING -> WAITING_INPUT
+        await session_manager.set_status(AgentStatus.WAITING_INPUT)
+        assert session_manager.status == AgentStatus.WAITING_INPUT
 
-        # WAITING_APPROVAL -> RUNNING
-        session_manager.set_status(AgentStatus.RUNNING)
+        # WAITING_INPUT -> RUNNING
+        await session_manager.set_status(AgentStatus.RUNNING)
         assert session_manager.status == AgentStatus.RUNNING
 
         # RUNNING -> IDLE
-        session_manager.set_status(AgentStatus.IDLE)
+        await session_manager.set_status(AgentStatus.IDLE)
         assert session_manager.status == AgentStatus.IDLE
 
-    def test_set_error_status(self, session_manager):
+    @pytest.mark.asyncio
+    async def test_set_error_status(self, session_manager):
         """Test setting error status with message."""
-        session_manager.set_error("Something went wrong")
+        await session_manager.set_error("Something went wrong")
 
         assert session_manager.status == AgentStatus.ERROR
         assert session_manager.error_message == "Something went wrong"
@@ -105,15 +108,16 @@ class TestSessionManagerStatusManagement:
         assert data["status"] == "error"
         assert data["error_message"] == "Something went wrong"
 
-    def test_clear_error(self, session_manager):
+    @pytest.mark.asyncio
+    async def test_clear_error(self, session_manager):
         """Test clearing error status."""
         # Set error
-        session_manager.set_error("Test error")
+        await session_manager.set_error("Test error")
         assert session_manager.error_message is not None
 
         # Clear error
-        session_manager.set_status(AgentStatus.IDLE)
-        session_manager.clear_error()
+        await session_manager.set_status(AgentStatus.IDLE)
+        await session_manager.clear_error()
 
         assert session_manager.error_message is None
 
@@ -130,12 +134,13 @@ class TestSessionManagerTaskTracking:
         """Test initial tasks completed count."""
         assert session_manager.tasks_completed == 0
 
-    def test_increment_tasks_completed(self, session_manager):
+    @pytest.mark.asyncio
+    async def test_increment_tasks_completed(self, session_manager):
         """Test incrementing tasks completed counter."""
-        session_manager.increment_tasks_completed()
+        await session_manager.increment_tasks_completed()
         assert session_manager.tasks_completed == 1
 
-        session_manager.increment_tasks_completed()
+        await session_manager.increment_tasks_completed()
         assert session_manager.tasks_completed == 2
 
         # Verify persisted
@@ -143,10 +148,11 @@ class TestSessionManagerTaskTracking:
         data = json.loads(metadata_file.read_text())
         assert data["tasks_completed"] == 2
 
-    def test_multiple_increments(self, session_manager):
+    @pytest.mark.asyncio
+    async def test_multiple_increments(self, session_manager):
         """Test multiple task completions."""
         for _ in range(10):
-            session_manager.increment_tasks_completed()
+            await session_manager.increment_tasks_completed()
 
         assert session_manager.tasks_completed == 10
 
@@ -154,9 +160,10 @@ class TestSessionManagerTaskTracking:
 class TestSessionManagerPersistence:
     """Tests for metadata persistence."""
 
-    def test_persist_on_status_change(self, session_manager):
+    @pytest.mark.asyncio
+    async def test_persist_on_status_change(self, session_manager):
         """Test that metadata is persisted on status change."""
-        session_manager.set_status(AgentStatus.RUNNING)
+        await session_manager.set_status(AgentStatus.RUNNING)
 
         # Load metadata file
         metadata_file = session_manager.data_dir / "session_metadata.json"
@@ -164,9 +171,10 @@ class TestSessionManagerPersistence:
 
         assert data["status"] == "running"
 
-    def test_persist_on_task_completion(self, session_manager):
+    @pytest.mark.asyncio
+    async def test_persist_on_task_completion(self, session_manager):
         """Test that metadata is persisted on task completion."""
-        session_manager.increment_tasks_completed()
+        await session_manager.increment_tasks_completed()
 
         # Load metadata file
         metadata_file = session_manager.data_dir / "session_metadata.json"
@@ -174,10 +182,11 @@ class TestSessionManagerPersistence:
 
         assert data["tasks_completed"] == 1
 
-    def test_last_activity_updated(self, session_manager):
+    @pytest.mark.asyncio
+    async def test_last_activity_updated(self, session_manager):
         """Test that last_activity timestamp is updated."""
         before = datetime.now()
-        session_manager.set_status(AgentStatus.RUNNING)
+        await session_manager.set_status(AgentStatus.RUNNING)
         after = datetime.now()
 
         # Load metadata
@@ -187,13 +196,14 @@ class TestSessionManagerPersistence:
         last_activity = datetime.fromisoformat(data["last_activity"])
         assert before <= last_activity <= after
 
-    def test_metadata_survives_reload(self, temp_data_dir):
+    @pytest.mark.asyncio
+    async def test_metadata_survives_reload(self, temp_data_dir):
         """Test that metadata persists across manager instances."""
         # Create first manager
         manager1 = SessionManager(data_dir=temp_data_dir)
-        manager1.set_status(AgentStatus.RUNNING)
-        manager1.increment_tasks_completed()
-        manager1.increment_tasks_completed()
+        await manager1.set_status(AgentStatus.RUNNING)
+        await manager1.increment_tasks_completed()
+        await manager1.increment_tasks_completed()
 
         # Create second manager (should load existing metadata)
         manager2 = SessionManager(data_dir=temp_data_dir)
@@ -209,19 +219,21 @@ class TestSessionManagerMessageCount:
         """Test initial message count."""
         assert session_manager.message_count == 0
 
-    def test_increment_message_count(self, session_manager):
+    @pytest.mark.asyncio
+    async def test_increment_message_count(self, session_manager):
         """Test incrementing message count."""
-        session_manager.increment_message_count()
+        await session_manager.increment_message_count()
         assert session_manager.message_count == 1
 
-        session_manager.increment_message_count()
+        await session_manager.increment_message_count()
         assert session_manager.message_count == 2
 
-    def test_message_count_persisted(self, session_manager):
+    @pytest.mark.asyncio
+    async def test_message_count_persisted(self, session_manager):
         """Test that message count is persisted."""
-        session_manager.increment_message_count()
-        session_manager.increment_message_count()
-        session_manager.increment_message_count()
+        await session_manager.increment_message_count()
+        await session_manager.increment_message_count()
+        await session_manager.increment_message_count()
 
         # Load metadata
         metadata_file = session_manager.data_dir / "session_metadata.json"

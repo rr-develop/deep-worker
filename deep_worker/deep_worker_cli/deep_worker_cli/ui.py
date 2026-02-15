@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from deep_worker_cli._version import __version__
-from deep_worker_cli.backends import DEFAULT_EXECUTE_TIMEOUT
+from deep_worker_cli.constants import DEFAULT_EXECUTE_TIMEOUT
 from deep_worker_cli.config import (
     COLORS,
     MAX_ARG_LENGTH,

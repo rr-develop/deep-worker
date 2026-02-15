@@ -33,7 +33,6 @@ class SessionData(BaseModel):
 
     message_count: int
     process_id: int
-    socket_path: str
 
     model_config = {"extra": "allow"}  # Allow additional fields
 

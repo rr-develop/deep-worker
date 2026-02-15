@@ -55,6 +55,14 @@ def create_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
+        "-tm",
+        "--task-manager",
+        action="store_true",
+        dest="task_manager",
+        help="Enable TaskManager for AI-powered task evaluation and correction",
+    )
+
+    parser.add_argument(
         "--config",
         type=Path,
         help="Path to YAML configuration file",
@@ -99,6 +107,7 @@ async def run_agent(args: argparse.Namespace) -> int:
             name=args.name,
             config=config,
             skip_permissions=args.skip_permissions,
+            enable_task_manager=args.task_manager,
         )
 
         await agent.start()
@@ -190,6 +199,14 @@ def main() -> int:
     """
     parser = create_parser()
     args = parser.parse_args()
+
+    # Save current working directory BEFORE daemonize changes it to /
+    # This allows run_agent() to use the original directory after daemonization
+    # Priority: --dir arg > current directory
+    if args.dir:
+        os.environ["DEEP_WORKER_ORIGINAL_CWD"] = str(args.dir.resolve())
+    else:
+        os.environ["DEEP_WORKER_ORIGINAL_CWD"] = os.getcwd()
 
     # Daemonize before starting agent
     daemonize(args.name)

@@ -1,5 +1,7 @@
 """Agent management and creation for the CLI."""
 
+from __future__ import annotations
+
 import os
 import shutil
 import tempfile
@@ -7,16 +9,16 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from deepagents import create_deep_agent
-from deepagents.backends import CompositeBackend
-from deepagents.backends.filesystem import FilesystemBackend
-from deepagents.backends.sandbox import SandboxBackendProtocol
-from deepagents.middleware import MemoryMiddleware, SkillsMiddleware
+# Lazy import of deepagents to avoid import errors when not needed
+if TYPE_CHECKING:
+    from deepagents import create_deep_agent
+    from deepagents.backends import CompositeBackend
+    from deepagents.backends.filesystem import FilesystemBackend
+    from deepagents.backends.sandbox import SandboxBackendProtocol
+    from deepagents.middleware import MemoryMiddleware, SkillsMiddleware
+    from deepagents.middleware.subagents import CompiledSubAgent, SubAgent
 
 from deep_worker_cli.backends import CLIShellBackend, patch_filesystem_middleware
-
-if TYPE_CHECKING:
-    from deepagents.middleware.subagents import CompiledSubAgent, SubAgent
 from langchain.agents.middleware import (
     InterruptOnConfig,
 )
@@ -464,6 +466,13 @@ def create_cli_agent(
                 for execution
             - `composite_backend`: `CompositeBackend` for file operations
     """
+    # Import deepagents here to avoid import errors when not needed
+    from deepagents import create_deep_agent
+    from deepagents.backends import CompositeBackend
+    from deepagents.backends.filesystem import FilesystemBackend
+    from deepagents.middleware import MemoryMiddleware, SkillsMiddleware
+    from deepagents.middleware.subagents import CompiledSubAgent, SubAgent
+
     tools = tools or []
 
     # Setup agent directory for persistent memory (if enabled)

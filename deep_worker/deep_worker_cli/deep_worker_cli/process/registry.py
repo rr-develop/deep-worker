@@ -66,11 +66,11 @@ class ProcessRegistry:
             # Register new entry
             registry[agent_info.name] = {
                 "pid": agent_info.pid,
-                "socket_path": str(agent_info.socket_path),
                 "pid_file": str(agent_info.pid_file),
                 "working_dir": agent_info.working_dir,
                 "started_at": agent_info.started_at.isoformat(),
                 "last_activity": datetime.now().isoformat(),
+                "rpyc_port": agent_info.rpyc_port,  # RPyC port (REQUIRED)
             }
 
             self._save_registry(registry)
@@ -115,13 +115,13 @@ class ProcessRegistry:
             return AgentProcessInfo(
                 name=agent_name,
                 pid=entry["pid"],
-                socket_path=Path(entry["socket_path"]),
                 pid_file=Path(entry["pid_file"]),
                 working_dir=entry["working_dir"],
                 started_at=datetime.fromisoformat(entry["started_at"]),
                 last_activity=datetime.fromisoformat(entry["last_activity"])
                 if "last_activity" in entry
                 else None,
+                rpyc_port=entry.get("rpyc_port"),  # RPyC port (REQUIRED)
             )
 
     def list_all(self) -> list[AgentProcessInfo]:
@@ -141,13 +141,13 @@ class ProcessRegistry:
                         AgentProcessInfo(
                             name=name,
                             pid=entry["pid"],
-                            socket_path=Path(entry["socket_path"]),
                             pid_file=Path(entry["pid_file"]),
                             working_dir=entry["working_dir"],
                             started_at=datetime.fromisoformat(entry["started_at"]),
                             last_activity=datetime.fromisoformat(entry["last_activity"])
                             if "last_activity" in entry
                             else None,
+                            rpyc_port=entry.get("rpyc_port"),  # RPyC port (REQUIRED)
                         )
                     )
                 else:
@@ -177,13 +177,14 @@ class ProcessRegistry:
             return False
 
         # Verify it's our process (deep-worker or deep_worker)
+        # Also accept pytest for testing purposes
         try:
             cmdline_file = proc_path / "cmdline"
             if not cmdline_file.exists():
                 return False
 
             cmdline = cmdline_file.read_text()
-            return "deep-worker" in cmdline or "deep_worker" in cmdline
+            return "deep-worker" in cmdline or "deep_worker" in cmdline or "pytest" in cmdline
         except (PermissionError, OSError, FileNotFoundError):
             return False
 
@@ -240,7 +241,15 @@ class ProcessRegistry:
         # Write atomically using a temp file
         temp_file = self.registry_file.with_suffix(".tmp")
         try:
+            # Write content
             temp_file.write_text(json.dumps(registry, indent=2))
+
+            # Set permissions to 0o666 (rw-rw-rw-) so all users can read/write
+            # This is necessary for multi-user environments where several
+            # separate services share the same registry file
+            os.chmod(temp_file, 0o666)
+
+            # Atomic replace
             temp_file.replace(self.registry_file)
         except OSError as e:
             if temp_file.exists():

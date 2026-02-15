@@ -25,7 +25,6 @@ def temp_dirs():
             "lock_file": tmpdir_path / "registry.lock",
             "working_dir": tmpdir_path / "working",
             "data_dir": tmpdir_path / "data",
-            "socket_path": tmpdir_path / "test.sock",
             "pid_file": tmpdir_path / "test.pid",
         }
 
@@ -56,14 +55,12 @@ class TestAgentProcessInitialization:
             name="test-agent",
             config=agent_config,
             registry=mock_registry,
-            socket_path=temp_dirs["socket_path"],
             pid_file=temp_dirs["pid_file"],
             data_dir=temp_dirs["data_dir"],
         )
 
         assert process.name == "test-agent"
         assert process.config == agent_config
-        assert process.socket_path == temp_dirs["socket_path"]
         assert process.pid_file == temp_dirs["pid_file"]
         assert process.data_dir == temp_dirs["data_dir"]
 
@@ -76,7 +73,6 @@ class TestAgentProcessInitialization:
             name="test-agent",
             config=agent_config,
             registry=mock_registry,
-            socket_path=temp_dirs["socket_path"],
             pid_file=temp_dirs["pid_file"],
             data_dir=data_dir,
         )
@@ -94,7 +90,6 @@ class TestAgentProcessRegistration:
             name="test-agent",
             config=agent_config,
             registry=mock_registry,
-            socket_path=temp_dirs["socket_path"],
             pid_file=temp_dirs["pid_file"],
             data_dir=temp_dirs["data_dir"],
         )
@@ -116,7 +111,6 @@ class TestAgentProcessRegistration:
             name="test-agent",
             config=agent_config,
             registry=mock_registry,
-            socket_path=temp_dirs["socket_path"],
             pid_file=temp_dirs["pid_file"],
             data_dir=temp_dirs["data_dir"],
         )
@@ -127,7 +121,6 @@ class TestAgentProcessRegistration:
             name="test-agent",
             config=agent_config,
             registry=mock_registry,
-            socket_path=temp_dirs["tmpdir"] / "other.sock",
             pid_file=temp_dirs["tmpdir"] / "other.pid",
             data_dir=temp_dirs["tmpdir"] / "other_data",
         )
@@ -146,7 +139,6 @@ class TestAgentProcessPIDFile:
             name="test-agent",
             config=agent_config,
             registry=mock_registry,
-            socket_path=temp_dirs["socket_path"],
             pid_file=temp_dirs["pid_file"],
             data_dir=temp_dirs["data_dir"],
         )
@@ -164,7 +156,6 @@ class TestAgentProcessPIDFile:
             name="test-agent",
             config=agent_config,
             registry=mock_registry,
-            socket_path=temp_dirs["socket_path"],
             pid_file=temp_dirs["pid_file"],
             data_dir=temp_dirs["data_dir"],
         )
@@ -185,7 +176,6 @@ class TestAgentProcessSignalHandling:
             name="test-agent",
             config=agent_config,
             registry=mock_registry,
-            socket_path=temp_dirs["socket_path"],
             pid_file=temp_dirs["pid_file"],
             data_dir=temp_dirs["data_dir"],
         )
@@ -207,7 +197,6 @@ class TestAgentProcessSignalHandling:
             name="test-agent",
             config=agent_config,
             registry=mock_registry,
-            socket_path=temp_dirs["socket_path"],
             pid_file=temp_dirs["pid_file"],
             data_dir=temp_dirs["data_dir"],
         )
@@ -228,7 +217,6 @@ class TestAgentProcessLifecycle:
             name="test-agent",
             config=agent_config,
             registry=mock_registry,
-            socket_path=temp_dirs["socket_path"],
             pid_file=temp_dirs["pid_file"],
             data_dir=temp_dirs["data_dir"],
         )

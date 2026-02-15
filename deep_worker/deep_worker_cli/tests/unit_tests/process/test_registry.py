@@ -34,10 +34,10 @@ def sample_agent_info(temp_registry_dir):
     return AgentProcessInfo(
         name="test-agent",
         pid=os.getpid(),  # Use current process PID (we know it's alive)
-        socket_path=temp_registry_dir / "test.sock",
         pid_file=temp_registry_dir / "test.pid",
         working_dir="/tmp/test",
         started_at=datetime.now(),
+        rpyc_port=18861,
     )
 
 
@@ -66,10 +66,10 @@ class TestProcessRegistryRegister:
         duplicate_info = AgentProcessInfo(
             name="test-agent",
             pid=os.getpid(),  # Same PID (alive)
-            socket_path=Path("/tmp/other.sock"),
             pid_file=Path("/tmp/other.pid"),
             working_dir="/tmp/other",
             started_at=datetime.now(),
+            rpyc_port=18862,
         )
 
         with pytest.raises(AgentAlreadyExistsError, match="already running"):
@@ -81,10 +81,10 @@ class TestProcessRegistryRegister:
         dead_info = AgentProcessInfo(
             name="test-agent",
             pid=999999,  # Unlikely to exist
-            socket_path=temp_registry_dir / "dead.sock",
             pid_file=temp_registry_dir / "dead.pid",
             working_dir="/tmp/dead",
             started_at=datetime.now(),
+            rpyc_port=18863,
         )
         registry.register(dead_info)
 
@@ -92,10 +92,10 @@ class TestProcessRegistryRegister:
         alive_info = AgentProcessInfo(
             name="test-agent",
             pid=os.getpid(),  # Current process (alive)
-            socket_path=temp_registry_dir / "alive.sock",
             pid_file=temp_registry_dir / "alive.pid",
             working_dir="/tmp/alive",
             started_at=datetime.now(),
+            rpyc_port=18864,
         )
 
         # Should succeed (dead process cleaned up)
@@ -129,10 +129,10 @@ class TestProcessRegistryLookup:
         dead_info = AgentProcessInfo(
             name="dead-agent",
             pid=999999,
-            socket_path=temp_registry_dir / "dead.sock",
             pid_file=temp_registry_dir / "dead.pid",
             working_dir="/tmp/dead",
             started_at=datetime.now(),
+            rpyc_port=18865,
         )
         registry.register(dead_info)
 
@@ -182,10 +182,10 @@ class TestProcessRegistryListAll:
             info = AgentProcessInfo(
                 name=f"agent-{i}",
                 pid=os.getpid(),  # All use current PID (alive)
-                socket_path=temp_registry_dir / f"agent{i}.sock",
                 pid_file=temp_registry_dir / f"agent{i}.pid",
                 working_dir=f"/tmp/agent{i}",
                 started_at=datetime.now(),
+                rpyc_port=18870 + i,
             )
             registry.register(info)
 
@@ -200,10 +200,10 @@ class TestProcessRegistryListAll:
         alive_info = AgentProcessInfo(
             name="alive-agent",
             pid=os.getpid(),
-            socket_path=temp_registry_dir / "alive.sock",
             pid_file=temp_registry_dir / "alive.pid",
             working_dir="/tmp/alive",
             started_at=datetime.now(),
+            rpyc_port=18880,
         )
         registry.register(alive_info)
 
@@ -211,10 +211,10 @@ class TestProcessRegistryListAll:
         dead_info = AgentProcessInfo(
             name="dead-agent",
             pid=999999,
-            socket_path=temp_registry_dir / "dead.sock",
             pid_file=temp_registry_dir / "dead.pid",
             working_dir="/tmp/dead",
             started_at=datetime.now(),
+            rpyc_port=18881,
         )
         registry.register(dead_info)
 
@@ -235,13 +235,15 @@ class TestProcessRegistryFileLocking:
 
         def register_agent(name):
             try:
+                # Extract agent number for unique port
+                agent_num = int(name.split('-')[1])
                 info = AgentProcessInfo(
                     name=name,
                     pid=os.getpid(),
-                    socket_path=temp_registry_dir / f"{name}.sock",
                     pid_file=temp_registry_dir / f"{name}.pid",
                     working_dir=f"/tmp/{name}",
                     started_at=datetime.now(),
+                    rpyc_port=18890 + agent_num,
                 )
                 registry.register(info)
                 results.append((name, True))

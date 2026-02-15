@@ -53,19 +53,16 @@ class TestSessionData:
         data = SessionData(
             message_count=10,
             process_id=12345,
-            socket_path="/tmp/test.sock",
         )
 
         assert data.message_count == 10
         assert data.process_id == 12345
-        assert data.socket_path == "/tmp/test.sock"
 
     def test_create_with_optional_fields(self):
         """Test creating SessionData with optional fields."""
         data = SessionData(
             message_count=5,
             process_id=99999,
-            socket_path="/tmp/agent.sock",
             custom_field="test",  # type: ignore[call-arg]
         )
 
@@ -129,7 +126,6 @@ class TestSessionInfo:
         data = SessionData(
             message_count=42,
             process_id=12345,
-            socket_path="/tmp/test.sock",
         )
         metadata = SessionMetadata(
             environment={"PATH": "/usr/bin"},
