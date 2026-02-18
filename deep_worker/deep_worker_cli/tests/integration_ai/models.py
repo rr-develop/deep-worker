@@ -43,9 +43,9 @@ class AgentFixtureInfo(BaseModel):
         description="Working directory for the agent",
     )
 
-    socket_path: Path = Field(
+    rpyc_port: int = Field(
         ...,
-        description="Path to Unix socket for IPC",
+        description="RPyC port for inter-process communication",
     )
 
     pid: Optional[int] = Field(
@@ -80,7 +80,7 @@ class AgentFixtureInfo(BaseModel):
             )
         return v
 
-    @field_validator("working_dir", "socket_path", mode="before")
+    @field_validator("working_dir", mode="before")
     @classmethod
     def convert_to_path(cls, v: Any) -> Path:
         """Convert string paths to Path objects."""
@@ -296,7 +296,7 @@ class AgentProcessInfo(BaseModel):
     agent_name: str = Field(..., description="Agent name")
     pid: int = Field(..., description="Process ID")
     status: AgentStatus = Field(..., description="Current status")
-    socket_path: Path = Field(..., description="IPC socket path")
+    rpyc_port: int = Field(..., description="RPyC port for communication")
     working_dir: Path = Field(..., description="Working directory")
     uptime_seconds: Optional[float] = Field(
         None, description="Time since agent started"

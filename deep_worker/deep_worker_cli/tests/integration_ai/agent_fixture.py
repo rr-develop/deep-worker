@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import multiprocessing
 import os
 import signal
 import sys
@@ -84,19 +85,11 @@ def _terminate_agent(agent_info: AgentFixtureInfo, force: bool = False) -> None:
 
 
 def _cleanup_agent_files(agent_info: AgentFixtureInfo) -> None:
-    """Clean up agent socket and PID files.
+    """Clean up agent PID files.
 
     Args:
         agent_info: Agent information
     """
-    # Remove socket file
-    if agent_info.socket_path.exists():
-        try:
-            agent_info.socket_path.unlink()
-            logger.debug(f"Removed socket: {agent_info.socket_path}")
-        except OSError as e:
-            logger.warning(f"Failed to remove socket {agent_info.socket_path}: {e}")
-
     # Remove PID file if we know where it is
     pid_file = Path(f"/tmp/deep_worker_{agent_info.agent_name}.pid")
     if pid_file.exists():
@@ -126,128 +119,196 @@ def _get_existing_agent(agent_name: str, registry: ProcessRegistry) -> Optional[
     return AgentFixtureInfo(
         agent_name=agent_name,
         working_dir=Path(agent_info.working_dir),
-        socket_path=agent_info.socket_path,
+        rpyc_port=agent_info.rpyc_port,
         pid=agent_info.pid,
         status=AgentStatus.RUNNING,
         created_by_fixture=False,  # Pre-existing agent
     )
 
 
-async def _start_agent_process(
+def _agent_process_entry_point(
     agent_name: str,
     working_dir: Path,
-    model: str = "deepseek-chat",
-    provider: str = "deepseek",
-    skip_permissions: bool = True,
-) -> AgentFixtureInfo:
-    """Start a new agent process.
+    model: str,
+    provider: str,
+    skip_permissions: bool,
+    api_key: Optional[str],
+) -> None:
+    """Entry point for agent subprocess - runs agent.start() in its own event loop."""
+    import asyncio
+    import os
 
-    Args:
-        agent_name: Name for the agent
-        working_dir: Working directory
-        model: AI model to use
-        provider: AI provider
-        skip_permissions: Whether to skip permission checks
-
-    Returns:
-        AgentFixtureInfo for the new agent
-
-    Raises:
-        AgentAlreadyExistsError: If agent already exists
-        RuntimeError: If agent fails to start
-    """
-    logger.info(f"Starting agent {agent_name} in {working_dir}")
+    # Set API key in environment if provided
+    if api_key:
+        if provider == "deepseek":
+            os.environ["OPENAI_API_KEY"] = api_key
+            os.environ["OPENAI_BASE_URL"] = "https://api.deepseek.com"
+            os.environ["OPENAI_MODEL"] = model
+        elif provider == "openai":
+            os.environ["OPENAI_API_KEY"] = api_key
+            os.environ["OPENAI_MODEL"] = model
+        elif provider == "gemini":
+            os.environ["GOOGLE_API_KEY"] = api_key
+            os.environ["GOOGLE_MODEL"] = model
 
     # Create config
     config = AgentConfig(
         model=model,
         working_dir=working_dir,
         provider=provider,
+        api_key=api_key,
     )
-
-    # Create socket path
-    socket_path = Path(f"/tmp/deep_worker_{agent_name}.sock")
-
-    # Ensure socket doesn't exist
-    if socket_path.exists():
-        logger.warning(f"Removing existing socket: {socket_path}")
-        socket_path.unlink()
 
     # Create agent process
     agent = AgentProcess(
         name=agent_name,
         config=config,
-        socket_path=socket_path,
         skip_permissions=skip_permissions,
+        rpyc_port=True,  # Auto-assign port
     )
 
-    # Start agent in background task
-    task = asyncio.create_task(agent.start())
+    # Run agent.start() in a new event loop (this is the correct way!)
+    asyncio.run(agent.start())
 
-    # Wait for agent to start (socket file appears)
+
+def _start_agent_process(
+    agent_name: str,
+    working_dir: Path,
+    model: str = "deepseek-chat",
+    provider: str = "deepseek",
+    skip_permissions: bool = True,
+    api_key: Optional[str] = None,
+) -> AgentFixtureInfo:
+    """Start a new agent process using multiprocessing.
+
+    CRITICAL REQUIREMENT:
+    ====================
+    This function MUST return a FULLY INITIALIZED agent that is ready to accept
+    RPyC connections. The returned AgentFixtureInfo MUST represent an agent that:
+    - Has RPyC server running and accepting connections
+    - Is registered in ProcessRegistry with correct port
+    - Can successfully handle client.connect() calls immediately
+
+    If the agent cannot be fully initialized, this function MUST raise RuntimeError
+    with a clear explanation. Returning a partially initialized agent is FORBIDDEN.
+
+    Args:
+        agent_name: Name for the agent (must be unique)
+        working_dir: Working directory
+        model: AI model to use
+        provider: AI provider
+        skip_permissions: Whether to skip permission checks
+        api_key: API key for the provider
+
+    Returns:
+        AgentFixtureInfo for the FULLY INITIALIZED agent (ready to accept connections)
+
+    Raises:
+        AgentAlreadyExistsError: If agent already exists
+        RuntimeError: If agent fails to start or cannot be fully initialized
+    """
+    logger.info(f"Starting agent {agent_name} in {working_dir}")
+
+    # Start agent in a separate process using multiprocessing
+    # This allows agent.start() to run asyncio.run() in its own event loop
+    process = multiprocessing.Process(
+        target=_agent_process_entry_point,
+        args=(agent_name, working_dir, model, provider, skip_permissions, api_key),
+        name=f"agent-{agent_name}",
+        daemon=True,
+    )
+    process.start()
+
+    # Wait for agent to start (RPyC becomes available)
     start_time = time.time()
     timeout = 60.0  # Increased from 10 to 60 seconds for better reliability
     agent_pid: Optional[int] = None
-    socket_appeared = False
+    agent_rpyc_port: Optional[int] = None
+    registry_appeared = False
     connection_attempts = 0
 
     while time.time() - start_time < timeout:
         elapsed = time.time() - start_time
 
-        if socket_path.exists():
-            if not socket_appeared:
-                socket_appeared = True
-                logger.info(f"Agent {agent_name}: Socket appeared after {elapsed:.1f}s")
+        # Check registry for agent registration
+        registry = ProcessRegistry()
+        agent_info_reg = registry.lookup(agent_name)
+
+        if agent_info_reg:
+            if not registry_appeared:
+                registry_appeared = True
+                logger.info(f"Agent {agent_name}: Registered in registry after {elapsed:.1f}s")
 
             # Give it a moment to be ready
-            await asyncio.sleep(0.2)
+            time.sleep(0.2)
 
-            # Verify we can connect and get PID from registry
+            # Verify we can connect via RPyC
             try:
                 connection_attempts += 1
-                logger.debug(f"Agent {agent_name}: Connection attempt {connection_attempts} at {elapsed:.1f}s")
+                logger.info(f"Agent {agent_name}: Connection attempt {connection_attempts} at {elapsed:.1f}s, RPyC port={agent_info_reg.rpyc_port}")
+                print(f"[FIXTURE] Connection attempt {connection_attempts} to {agent_name} on port {agent_info_reg.rpyc_port}", flush=True)
 
-                client = AgentClient(agent_name)
-                await client.connect()
-                await client.disconnect()
+                # Create a temporary event loop for the async client operations
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    client = AgentClient(agent_name)
+                    logger.info(f"Agent {agent_name}: Created AgentClient, calling connect()...")
+                    print(f"[FIXTURE] Created AgentClient, calling connect()...", flush=True)
 
-                # Get PID from registry
-                registry = ProcessRegistry()
-                agent_info = registry.lookup(agent_name)
-                if agent_info:
-                    agent_pid = agent_info.pid
-                    logger.info(f"Agent {agent_name} started successfully (PID {agent_pid}) after {elapsed:.1f}s")
+                    # Add timeout to prevent hanging forever
+                    try:
+                        loop.run_until_complete(asyncio.wait_for(client.connect(), timeout=5.0))
+                    except asyncio.TimeoutError:
+                        print(f"[FIXTURE] Connection timeout after 5s!", flush=True)
+                        raise
 
-                    return AgentFixtureInfo(
-                        agent_name=agent_name,
-                        working_dir=working_dir,
-                        socket_path=socket_path,
-                        pid=agent_pid,
-                        status=AgentStatus.RUNNING,
-                        created_by_fixture=True,
-                    )
+                    logger.info(f"Agent {agent_name}: Connected successfully, calling disconnect()...")
+                    print(f"[FIXTURE] Connected successfully!", flush=True)
+                    loop.run_until_complete(client.disconnect())
+                    logger.info(f"Agent {agent_name}: Disconnected successfully")
+                    print(f"[FIXTURE] Disconnected successfully", flush=True)
+                finally:
+                    loop.close()
+
+                # Success - agent is ready
+                print(f"[FIXTURE] Getting PID and port from registry info...", flush=True)
+                agent_pid = agent_info_reg.pid
+                agent_rpyc_port = agent_info_reg.rpyc_port
+                print(f"[FIXTURE] Got PID={agent_pid}, port={agent_rpyc_port}", flush=True)
+                logger.info(f"Agent {agent_name} started successfully (PID {agent_pid}, RPyC port {agent_rpyc_port}) after {elapsed:.1f}s")
+                print(f"[FIXTURE] About to return AgentFixtureInfo...", flush=True)
+
+                return AgentFixtureInfo(
+                    agent_name=agent_name,
+                    working_dir=working_dir,
+                    rpyc_port=agent_rpyc_port,
+                    pid=agent_pid,
+                    status=AgentStatus.RUNNING,
+                    created_by_fixture=True,
+                )
 
             except Exception as e:
                 logger.debug(f"Agent {agent_name}: Connection failed at {elapsed:.1f}s, attempt {connection_attempts}: {type(e).__name__}: {e}")
         else:
             elapsed = time.time() - start_time
             if int(elapsed) % 5 == 0 and int(elapsed) > 0:  # Log every 5 seconds
-                logger.info(f"Agent {agent_name}: Waiting for socket (elapsed: {elapsed:.1f}s)")
+                logger.info(f"Agent {agent_name}: Waiting for registry (elapsed: {elapsed:.1f}s)")
 
-        await asyncio.sleep(0.1)
+        time.sleep(0.1)
 
     # Timeout waiting for agent to start
-    task.cancel()
+    # Note: agent is running in a background thread, so no task to cancel
     elapsed = time.time() - start_time
     logger.error(f"Agent {agent_name} initialization timeline:")
     logger.error(f"  - Total elapsed: {elapsed:.1f}s")
-    logger.error(f"  - Socket appeared: {socket_appeared} (after socket creation)")
+    logger.error(f"  - Registry appeared: {registry_appeared}")
     logger.error(f"  - Connection attempts: {connection_attempts}")
-    logger.error(f"  - Socket exists at timeout: {socket_path.exists()}")
+    logger.error(f"  - RPyC port: {agent_rpyc_port}")
 
     raise RuntimeError(
         f"Agent {agent_name} failed to start within {timeout}s. "
-        f"Socket: {socket_path}, exists: {socket_path.exists()}, "
+        f"Registry appeared: {registry_appeared}, "
         f"connection_attempts: {connection_attempts}"
     )
 
@@ -259,6 +320,7 @@ def agent_fixture(
     model: str = "deepseek-chat",
     provider: str = "deepseek",
     skip_permissions: bool = True,
+    api_key: Optional[str] = None,
 ) -> Generator[AgentFixtureInfo, None, None]:
     """Context manager for test agent lifecycle management.
 
@@ -323,21 +385,14 @@ def agent_fixture(
             # Start new agent
             logger.info(f"Creating new test agent {agent_name}")
 
-            # Need to run async code
-            try:
-                loop = asyncio.get_event_loop()
-            except RuntimeError:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-
-            agent_info = loop.run_until_complete(
-                _start_agent_process(
-                    agent_name=agent_name,
-                    working_dir=working_dir,
-                    model=model,
-                    provider=provider,
-                    skip_permissions=skip_permissions,
-                )
+            # Call sync version (_start_agent_process is now sync and uses multiprocessing)
+            agent_info = _start_agent_process(
+                agent_name=agent_name,
+                working_dir=working_dir,
+                model=model,
+                provider=provider,
+                skip_permissions=skip_permissions,
+                api_key=api_key,
             )
 
         # Yield to test

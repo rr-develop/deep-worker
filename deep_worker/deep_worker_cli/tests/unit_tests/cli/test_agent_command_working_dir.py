@@ -25,6 +25,8 @@ class TestAgentCommandWorkingDirectory:
         # Create a temporary directory to simulate launching from
         with tempfile.TemporaryDirectory() as tmpdir:
             original_cwd = os.getcwd()
+            # Save and remove DEEP_WORKER_ORIGINAL_CWD if it exists
+            saved_cwd_env = os.environ.pop("DEEP_WORKER_ORIGINAL_CWD", None)
             try:
                 # Change to temp directory (simulating user running command from there)
                 os.chdir(tmpdir)
@@ -64,6 +66,9 @@ class TestAgentCommandWorkingDirectory:
 
             finally:
                 os.chdir(original_cwd)
+                # Restore DEEP_WORKER_ORIGINAL_CWD if it was originally set
+                if saved_cwd_env is not None:
+                    os.environ["DEEP_WORKER_ORIGINAL_CWD"] = saved_cwd_env
 
     @pytest.mark.asyncio
     async def test_uses_env_var_when_cwd_is_root(self):

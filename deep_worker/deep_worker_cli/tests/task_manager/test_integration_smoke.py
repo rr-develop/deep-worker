@@ -30,7 +30,6 @@ async def test_agent_process_with_task_manager_initializes():
         agent_process = AgentProcess(
             name="test_tm_agent",
             config=config,
-            socket_path=tmpdir_path / "test_tm.sock",
             pid_file=tmpdir_path / "test_tm.pid",
             data_dir=tmpdir_path / "data",
             skip_permissions=True,
@@ -66,7 +65,6 @@ async def test_agent_process_without_task_manager():
         agent_process = AgentProcess(
             name="test_no_tm_agent",
             config=config,
-            socket_path=tmpdir_path / "test_no_tm.sock",
             pid_file=tmpdir_path / "test_no_tm.pid",
             data_dir=tmpdir_path / "data",
             skip_permissions=True

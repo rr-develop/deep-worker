@@ -12,7 +12,14 @@ from typing import TYPE_CHECKING, Any
 from deep_worker_cli.exceptions import AgentNotFoundError, IPCConnectionError
 from deep_worker_cli.process.registry import ProcessRegistry
 
-# Add arpyc to path - workaround for import from source
+# ============================================================================
+# CRITICAL: ARPYC MUST BE IMPORTED FROM SOURCE CODE, NOT FROM PIP/VENV!
+# ============================================================================
+# DO NOT use 'pip install arpyc' or ANY virtual environment (.venv)!
+# ALWAYS import arpyc from the arpyc source directory in this checkout.
+# Using installed packages causes version conflicts and compatibility issues.
+# This project MUST run globally without venv to ensure correct arpyc version.
+# ============================================================================
 _arpyc_path = Path(__file__).parent.parent.parent.parent.parent / "arpyc"
 if _arpyc_path.exists() and str(_arpyc_path) not in sys.path:
     sys.path.insert(0, str(_arpyc_path))
@@ -125,10 +132,15 @@ class AgentClient:
 
             # Map commands to RPyC service methods
             if command_type == "status":
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.info("[CLIENT] About to call rpyc_session.async_call(get_status)...")
                 response = await self.rpyc_session.async_call(
                     self.rpyc_session.root.get_status
                 )
-                return {"success": True, "session_info": response}
+                logger.info(f"[CLIENT] async_call returned: {response}")
+                # Server already returns {"success": True, "session_info": {...}}, no need to wrap again
+                return response
 
             elif command_type == "invoke":
                 message = command.get("message", "")
@@ -187,7 +199,12 @@ class AgentClient:
         if not session_data:
             raise IPCConnectionError("No session_info in status response")
 
-        return SessionInfo.model_validate(session_data)
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"[CLIENT] About to call SessionInfo.model_validate()...")
+        result = SessionInfo.model_validate(session_data)
+        logger.info(f"[CLIENT] model_validate() completed, returning SessionInfo")
+        return result
 
     async def invoke_agent(
         self, message: str, stream: bool = False

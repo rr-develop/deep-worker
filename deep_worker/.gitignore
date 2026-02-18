@@ -1,0 +1,68 @@
+# ============================================================================
+# CRITICAL: VIRTUAL ENVIRONMENTS ARE STRICTLY FORBIDDEN!
+# ============================================================================
+# This project MUST run globally without venv.
+# See README.md and CLAUDE.md for detailed explanation.
+# Using .venv causes arpyc version conflicts and RPyC proxy errors.
+# ============================================================================
+
+# Virtual environments (FORBIDDEN - DO NOT CREATE)
+.venv/
+venv/
+env/
+ENV/
+virtualenv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Distribution / packaging
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# PyCharm
+.idea/
+
+# VS Code
+.vscode/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Ruff
+.ruff_cache/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.swp
+*.swo
+*~
+.tmp/
+tmp/

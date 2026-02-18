@@ -21,7 +21,6 @@ class TestAgentServiceMetadata:
         service = AgentService()
         mock_agent = Mock()
         mock_agent.started_at = datetime(2024, 1, 15, 10, 30, 0)
-        mock_agent.socket_path = Path("/tmp/test.sock")
         mock_agent.rpyc_port = 18861
 
         mock_config = Mock()
@@ -44,7 +43,6 @@ class TestAgentServiceMetadata:
         assert "pid" in metadata
         assert isinstance(metadata["pid"], int)
         assert metadata["started"] == "2024-01-15T10:30:00"
-        assert metadata["socket_path"] == "/tmp/test.sock"
         assert metadata["rpyc_port"] == 18861
         assert metadata["agent_type"] == "deep-worker"
         assert metadata["model"] == "deepseek-chat"
@@ -65,7 +63,6 @@ class TestAgentServiceMetadata:
         service = AgentService()
         mock_agent = Mock()
         mock_agent.started_at = datetime(2024, 1, 15, 10, 30, 0)
-        mock_agent.socket_path = None
         mock_agent.rpyc_port = 18861
         mock_agent.config = None
 
@@ -76,7 +73,7 @@ class TestAgentServiceMetadata:
         assert result["success"] is True
         assert result["metadata"]["model"] is None
         assert result["metadata"]["directory"] is None
-        assert result["metadata"]["socket_path"] is None
+        assert result["metadata"]["rpyc_port"] == 18861
 
 
 class TestAgentServiceShutdown:

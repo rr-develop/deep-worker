@@ -29,22 +29,28 @@ from deep_worker_cli.process.registry import ProcessRegistry
 @pytest.fixture
 async def agent_with_rpyc():
     """Start agent process with RPyC server."""
+    import os
+    # Use API key from environment or a dummy key for testing
+    api_key = os.getenv("DEEPSEEK_API_KEY", "test-api-key-for-integration-tests")
+
     # Create config
     config = AgentConfig(
         model="deepseek-chat",
         working_dir=Path("/tmp"),
+        provider="deepseek",
+        api_key=api_key,
     )
 
     # Create registry
     registry = ProcessRegistry()
 
-    # Create agent process with RPyC enabled
+    # Create agent process with RPyC enabled (auto-assign port)
     agent = AgentProcess(
         name="test_rpyc_agent",
         config=config,
         registry=registry,
         skip_permissions=True,
-        rpyc_port=18863,  # Use different port for testing
+        rpyc_port=True,  # Auto-assign free port to avoid conflicts
     )
 
     # Start agent in background
@@ -55,25 +61,26 @@ async def agent_with_rpyc():
 
     yield agent
 
-    # Cleanup
-    agent.running = False
-
-    # Stop RPyC server gracefully
-    if agent.rpyc_server:
-        try:
-            agent.rpyc_server.close()
-        except Exception:
-            pass
-
-    # Wait for task to finish (with timeout)
+    # Cleanup: call shutdown() which handles everything properly
     try:
-        await asyncio.wait_for(task, timeout=2.0)
-    except asyncio.TimeoutError:
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+        await agent.shutdown()
+    except Exception as e:
+        print(f"Error during agent shutdown: {e}")
+
+    # Cancel the background task
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        print(f"Error canceling task: {e}")
+
+    # Unregister agent from registry
+    try:
+        registry.unregister("test_rpyc_agent")
+    except Exception:
+        pass  # Ignore errors if agent wasn't registered
 
 
 @pytest.mark.asyncio
@@ -82,7 +89,9 @@ async def test_rpyc_server_starts(agent_with_rpyc):
     agent = agent_with_rpyc
 
     assert agent.rpyc_server is not None
-    assert agent.rpyc_port == 18863
+    assert agent.rpyc_port is not None
+    assert isinstance(agent.rpyc_port, int)
+    assert agent.rpyc_port > 0
 
 
 @pytest.mark.asyncio

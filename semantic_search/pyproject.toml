@@ -1,0 +1,52 @@
+[project]
+name = "semantic-search"
+version = "0.1.0"
+description = "Semantic search for code repositories using LlamaIndex + LanceDB"
+requires-python = ">=3.11"
+dependencies = [
+    "llama-index-core>=0.10.0",
+    "llama-index-vector-stores-lancedb>=0.4.0",
+    "llama-index-embeddings-huggingface>=0.4.0",
+    "lancedb>=0.20.0",
+    "tree-sitter-language-pack>=0.13.0",
+]
+
+[dependency-groups]
+test = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "pytest-mock>=3.12",
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["semantic_search*"]
+
+[tool.setuptools.package-data]
+"semantic_search" = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-v --tb=short"
+
+[tool.coverage.run]
+source = ["semantic_search"]
+omit = ["tests/*"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "@abstractmethod",
+    "raise NotImplementedError",
+]
+
+[tool.pyright]
+include = ["semantic_search"]
+pythonVersion = "3.11"
+strict = true

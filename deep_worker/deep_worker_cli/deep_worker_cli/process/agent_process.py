@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import rpyc  # type: ignore[import-untyped]
+from rpyc.core.protocol import DEFAULT_CONFIG  # type: ignore[import-untyped]
 from rpyc.utils.server import ThreadedServer  # type: ignore[import-untyped]
 
 from deep_worker_cli.agent_config_pkg.agent_config import AgentConfig
@@ -117,6 +118,7 @@ class AgentProcess:
         # RPyC components
         self.rpyc_server: ThreadedServer | None = None
         self.rpyc_service_instance: Any = None
+        self._agent_event_loop: Any = None  # Event loop for RPyC callbacks
 
         # State
         self.running = False
@@ -184,6 +186,12 @@ class AgentProcess:
                 sys.stdout.flush()
                 print(msg, file=sys.stderr)
 
+                # DEBUG: Log immediately after successful initialization
+                msg = f"[AGENT_INIT] DEBUG: After agent init, checking task_manager (enabled={self.enable_task_manager})...\n"
+                sys.stdout.write(msg)
+                sys.stdout.flush()
+                print(msg, file=sys.stderr)
+
                 # Initialize TaskManager if enabled and agent is available
                 if self.enable_task_manager and self.agent:
                     from deep_worker_cli.task_manager import TaskManager
@@ -214,15 +222,41 @@ class AgentProcess:
                 # Agent remains None, fallback to echo mode
                 self.agent = None
 
+            # DEBUG: Log before RPyC server start
+            msg = f"[AGENT_INIT] Reached line before RPyC server start...\n"
+            sys.stdout.write(msg)
+            sys.stdout.flush()
+            print(msg, file=sys.stderr)
+
             # 5. Start RPyC server if port is configured
+            msg = f"[AGENT_INIT] About to start RPyC server (port={self.rpyc_port})...\n"
+            sys.stdout.write(msg)
+            sys.stdout.flush()
+            print(msg, file=sys.stderr)
+
             if self.rpyc_port:
                 self._start_rpyc_server()
             else:
                 raise RuntimeError("RPyC port must be configured - IPC server has been removed")
 
+            msg = f"[AGENT_INIT] RPyC server started successfully\n"
+            sys.stdout.write(msg)
+            sys.stdout.flush()
+            print(msg, file=sys.stderr)
+
             # 6. Register in registry (ONLY after RPyC server is ready!)
             # This ensures clients can connect immediately after seeing the agent in registry
+            msg = f"[AGENT_INIT] About to register in registry...\n"
+            sys.stdout.write(msg)
+            sys.stdout.flush()
+            print(msg, file=sys.stderr)
+
             await self._register()
+
+            msg = f"[AGENT_INIT] Registered successfully\n"
+            sys.stdout.write(msg)
+            sys.stdout.flush()
+            print(msg, file=sys.stderr)
 
             # 7. Enter event loop
             self.running = True
@@ -325,6 +359,10 @@ class AgentProcess:
         This method initializes the RPyC service and starts a ThreadedServer
         that listens on the configured rpyc_port.
 
+        CRITICAL: This function MUST NOT return until the server is fully initialized
+        and ready to accept connections. Returning prematurely will cause connection
+        failures and race conditions in tests and client code.
+
         SECURITY REQUIREMENTS:
         ====================
         1. Server MUST listen ONLY on localhost (127.0.0.1), NEVER on 0.0.0.0
@@ -342,6 +380,7 @@ class AgentProcess:
             return
 
         from deep_worker_cli.rpyc_service.agent_service import AgentService
+        import time
 
         # SECURITY VALIDATION: Ensure we're binding to localhost only
         SAFE_HOSTNAME = "127.0.0.1"
@@ -350,7 +389,10 @@ class AgentProcess:
 
         # Create service class factory that captures agent_process reference
         agent_process = self
-        event_loop = asyncio.get_running_loop()
+        # Store the event loop for RPyC callbacks
+        # Use get_event_loop() instead of get_running_loop() to ensure compatibility
+        # with sync code that may run in different contexts
+        self._agent_event_loop = asyncio.get_running_loop()
 
         class BoundAgentService(AgentService):
             """AgentService bound to specific AgentProcess instance."""
@@ -360,7 +402,51 @@ class AgentProcess:
                 super().on_connect(conn)
                 # Set agent_process and event_loop references for this connection
                 self.set_agent_process(agent_process)
-                self.set_event_loop(event_loop)
+                self.set_event_loop(agent_process._agent_event_loop)
+
+        # Extend safe_attrs with standard Python magic methods for transparent proxies
+        # These methods are used by built-in Python operations (len(), reversed(), bytes(), etc.)
+        # and must work transparently through RPyC NetRef proxies for dwcli interactive mode
+        extended_safe_attrs = set(DEFAULT_CONFIG["safe_attrs"])
+        extended_safe_attrs.update([
+            # Iteration & sequence operations
+            "__reversed__",      # reversed(obj) - used in interactive.py:_load_more_history()
+            "__missing__",       # dict[key] when key not found (defaultdict)
+
+            # Type conversion & representation
+            "__bytes__",         # bytes(obj)
+            "__fspath__",        # os.fspath(obj) for path-like objects
+            "__complex__",       # complex(obj)
+
+            # Introspection (safe, read-only)
+            "__dir__",           # dir(obj)
+            "__sizeof__",        # sys.getsizeof(obj)
+
+            # Context managers (already have __enter__/__exit__)
+            "__aenter__",        # async with obj
+            "__aexit__",         # async with obj
+
+            # Async iteration
+            "__aiter__",         # async for
+            "__anext__",         # async for
+
+            # Descriptors (safe for data access)
+            "__get__",           # descriptor protocol
+            "__set__",           # descriptor protocol
+            "__delete__",        # descriptor protocol
+
+            # Copy operations
+            "__copy__",          # copy.copy(obj)
+            "__deepcopy__",      # copy.deepcopy(obj)
+
+            # Pickling (already allow_pickle=True, so expose these)
+            "__reduce__",        # pickle support
+            "__reduce_ex__",     # pickle support
+            "__getnewargs__",    # pickle support
+            "__getnewargs_ex__", # pickle support
+            "__getstate__",      # pickle support
+            "__setstate__",      # pickle support
+        ])
 
         # Create ThreadedServer with bound service
         # SECURITY: Listen ONLY on localhost (127.0.0.1), NEVER on external interfaces!
@@ -373,9 +459,11 @@ class AgentProcess:
                 # SECURITY WARNING: These settings are ONLY safe because we bind to localhost!
                 # allow_public_attrs: Allows access to public attributes without authentication
                 # allow_pickle: Enables pickle serialization (unsafe if exposed externally)
+                # safe_attrs: Extended list of safe magic methods for transparent proxy operations
                 # DO NOT use these settings if the server is accessible from untrusted networks!
                 "allow_public_attrs": True,
                 "allow_pickle": True,
+                "safe_attrs": extended_safe_attrs,
             }
         )
 
@@ -387,6 +475,22 @@ class AgentProcess:
             name=f"{self.name}-rpyc-server"
         )
         server_thread.start()
+
+        # CRITICAL: Wait for ThreadedServer to be fully initialized
+        # The server_thread.start() returns immediately and starts the server
+        # in a background daemon thread. However, ThreadedServer.start() needs
+        # time to bind() and listen() on the socket before accepting connections.
+        #
+        # ThreadedServer.start() is a BLOCKING call that runs the accept() loop,
+        # but we're running it in a daemon thread, so we need to give it time to
+        # actually reach the point where it's accepting connections.
+        #
+        # Simple approach: small fixed delay for thread to start accepting.
+        # This is MORE RELIABLE than trying to connect, because connecting might
+        # interfere with the server's ability to handle the first real client.
+        print(f"[RPyC] Waiting for server thread to initialize on port {self.rpyc_port}...")
+        time.sleep(0.2)  # 200ms should be more than enough for bind() + listen()
+        print(f"[RPyC] Server thread initialized")
 
         print(f"[RPyC] RPyC server started on {SAFE_HOSTNAME}:{self.rpyc_port} (localhost only)")
 
@@ -428,14 +532,22 @@ class AgentProcess:
                 "has_more": bool indicating if more messages exist
             }
         """
+        import logging
+        logger = logging.getLogger(__name__)
+
         limit = command.get("limit", 50)
         offset = command.get("offset", 0)
 
+        logger.info(f"[GET_HISTORY] Starting get_history (limit={limit}, offset={offset})")
+
         if not self.agent:
+            logger.error("[GET_HISTORY] Agent not initialized")
             return {
                 "success": False,
                 "error": "Agent not initialized",
             }
+
+        logger.info(f"[GET_HISTORY] Agent is initialized: {self.agent}")
 
         try:
             from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
@@ -443,9 +555,12 @@ class AgentProcess:
 
             # Use agent name as thread_id (same as invoke)
             config: RunnableConfig = {"configurable": {"thread_id": self.name}}
+            logger.info(f"[GET_HISTORY] Config created: {config}")
 
             # Get state from agent checkpoint
+            logger.info(f"[GET_HISTORY] About to call agent.aget_state()...")
             state = await self.agent.aget_state(config)
+            logger.info(f"[GET_HISTORY] Successfully got state: {state}")
             if not state or not state.values:
                 return {
                     "success": True,
@@ -530,13 +645,23 @@ class AgentProcess:
             }
 
     async def _handle_invoke(
-        self, command: dict[str, Any], connection: Any = None
+        self,
+        command: dict[str, Any],
+        connection: Any = None,
+        notify_callback: Any = None,
     ) -> dict[str, Any]:
         """Handle agent invocation command.
 
         Args:
             command: Command dictionary with 'message' and optional 'stream' keys
             connection: IPC connection for streaming responses
+            notify_callback: Optional callable(msg: dict) that broadcasts a message
+                to all subscribers (e.g., AgentService._notify_subscribers).
+                When provided, the TaskManager evaluation loop calls this for each
+                intermediate assistant response and each corrective prompt so that
+                ALL connected dwcli instances see the full conversation in real time.
+                This upholds the "agent is single source of truth" architecture
+                principle (see ARCHITECTURE.md).
 
         Returns:
             Response dictionary with assistant message
@@ -648,6 +773,20 @@ class AgentProcess:
                             last_msg = messages[-1]
                             content = last_msg.content if hasattr(last_msg, "content") else last_msg.get("content", "")
 
+                            # ============================================================
+                            # ARCHITECTURE PRINCIPLE: AGENT IS THE SINGLE SOURCE OF TRUTH
+                            # ============================================================
+                            # Broadcast this intermediate assistant response to ALL
+                            # subscribers (including dwcli TUI instances) so the full
+                            # conversation is visible in real time.
+                            # This is the fix for the TaskManager loop bypassing
+                            # _notify_subscribers() for intermediate messages.
+                            # ============================================================
+                            if notify_callback is not None:
+                                notify_callback(
+                                    {"type": "assistant", "content": content, "role": "assistant"}
+                                )
+
                             # Send to TaskManager for evaluation
                             corrective_prompt = await self.task_manager.on_subordinate_response(
                                 response=content,
@@ -658,6 +797,18 @@ class AgentProcess:
                             if not corrective_prompt:
                                 print(f"[INVOKE] TaskManager evaluation complete (done/unable)", file=sys.stderr)
                                 break
+
+                            # Broadcast TaskManager corrective prompt to ALL subscribers
+                            # before sending it back to the agent. This ensures dwcli TUI
+                            # shows the "TaskManager:> ..." message in real time.
+                            if notify_callback is not None:
+                                notify_callback(
+                                    {
+                                        "type": "user",
+                                        "content": corrective_prompt,
+                                        "role": "user",
+                                    }
+                                )
 
                             # Continue with corrective prompt
                             print(f"[INVOKE] TaskManager requesting corrections: {corrective_prompt[:100]}...", file=sys.stderr)

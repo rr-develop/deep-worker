@@ -3,6 +3,21 @@
 This module provides AgentService - an RPyC service that exposes agent
 functionality via RPC calls and supports real-time message streaming via callbacks.
 
+ARCHITECTURE PRINCIPLE: AGENT IS THE SINGLE SOURCE OF TRUTH
+============================================================
+The agent deep-worker is the ONLY source of truth for ALL messages, including
+user messages. ALL messages MUST be broadcast to ALL subscribers via callbacks.
+
+User messages can originate from:
+- dwcli instances
+- Task manager
+- Other clients
+
+Regardless of origin, ALL messages go through agent and are broadcast to ALL
+subscribers. This ensures every client sees the complete conversation state.
+
+CRITICAL: Always notify subscribers about BOTH user and assistant messages!
+
 SECURITY WARNING:
 ================
 This service is designed for LOCAL TRUSTED ENVIRONMENT ONLY!
@@ -107,7 +122,20 @@ class AgentService(rpyc.Service):
             return {"success": False, "error": "Event loop not initialized"}
 
         try:
-            # Notify subscribers about user message
+            # ====================================================================
+            # ARCHITECTURE PRINCIPLE: AGENT IS THE SINGLE SOURCE OF TRUTH
+            # ====================================================================
+            # Notify ALL subscribers (including dwcli) about user message.
+            #
+            # This ensures that:
+            # 1. Agent is the single source of truth for ALL messages
+            # 2. ALL clients see ALL messages, regardless of origin
+            # 3. User messages from task manager/other clients appear in dwcli
+            # 4. dwcli displays complete conversation state from agent
+            #
+            # DO NOT skip this notification! It's critical for maintaining
+            # single source of truth architecture.
+            # ====================================================================
             self._notify_subscribers(
                 {"type": "user", "content": message, "role": "user"}
             )
@@ -116,10 +144,16 @@ class AgentService(rpyc.Service):
             import asyncio
             import concurrent.futures
 
+            # Pass _notify_subscribers as callback so the TaskManager evaluation
+            # loop can broadcast intermediate messages (assistant responses and
+            # corrective prompts) to all connected dwcli subscribers in real time.
+            # This upholds the "agent is single source of truth" principle:
+            # ALL messages must flow through agent and be broadcast to ALL clients.
             future = asyncio.run_coroutine_threadsafe(
                 self._agent_process._handle_invoke(
                     {"command": "invoke", "message": message, "stream": stream},
                     connection=None,  # type: ignore[arg-type]
+                    notify_callback=self._notify_subscribers,
                 ),
                 self._event_loop
             )
@@ -303,8 +337,25 @@ class AgentService(rpyc.Service):
         Args:
             message: Message dict to send to subscribers
         """
+        # DEBUG: Log notification
+        import os
+        debug_enabled = os.environ.get("DWCLI_DEBUG_CALLBACKS") == "1"
+        if debug_enabled:
+            import traceback
+            content = message.get("content", "")[:50]
+            with open("/tmp/dwcli_callback_debug.log", "a") as f:
+                f.write(f"\n[AGENT_DEBUG] _notify_subscribers called:\n")
+                f.write(f"  message: role={message.get('role')}, content={content}...\n")
+                f.write(f"  Stack trace:\n")
+                for line in traceback.format_stack()[:-1]:
+                    f.write(f"    {line.strip()}\n")
+
         with self._subscribers_lock:
             subscribers = list(self._message_subscribers)
+
+        if debug_enabled:
+            with open("/tmp/dwcli_callback_debug.log", "a") as f:
+                f.write(f"  subscribers count: {len(subscribers)}\n")
 
         for subscriber in subscribers:
             try:

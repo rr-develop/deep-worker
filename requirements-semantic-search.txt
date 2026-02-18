@@ -1,0 +1,8 @@
+llama-index-core>=0.10.0
+llama-index-vector-stores-lancedb>=0.4.0
+llama-index-embeddings-huggingface>=0.4.0
+lancedb>=0.20.0
+tree-sitter-language-pack>=0.13.0
+pandas>=2.0.0
+pytest>=7.0
+pytest-mock>=3.12

@@ -23,6 +23,7 @@ from pathlib import Path
 import pyte
 import pytest
 
+from .clean_agent_fixture import clean_agent  # noqa: F401
 from .terminal_emulator import (
     DeepAgentsTerminalSession,
     DwcliTerminalSession,
@@ -716,7 +717,7 @@ async def test_deepagents_query_does_not_disappear():
     not _check_dwcli_available(),
     reason="dwcli command not available in PATH",
 )
-def test_dwcli_query_visibility():
+def test_dwcli_query_visibility(clean_agent):
     """Test that queries and responses are visible in dwcli terminal.
 
     🔒 SYNCHRONIZED WITH: test_deepagents_query_does_not_disappear
@@ -732,207 +733,388 @@ def test_dwcli_query_visibility():
     4. This is the CORRECT behavior - both should remain visible
 
     This matches the GOLD STANDARD behavior from test_deepagents_query_does_not_disappear.
+
+    ARCHITECTURE PRINCIPLE: AGENT IS THE SINGLE SOURCE OF TRUTH
+    ============================================================
+    This test uses clean_agent fixture to ensure agent starts with NO history.
+    All messages (user + assistant) displayed in dwcli come from agent via RPyC callbacks.
+    This ensures no duplicate messages and maintains single source of truth architecture.
     """
     logger.info("=" * 80)
     logger.info("TEST: dwcli Query and Response Visibility (Gold Standard)")
     logger.info("=" * 80)
 
-    # Start test agent via subprocess using deep-worker command
-    import subprocess
-    import time as time_module
-
     agent_name = "test_dwcli_query_visibility"
-    logger.info(f"Starting test agent: {agent_name}")
+    logger.info(f"Starting clean test agent: {agent_name}")
 
-    # Start agent in background
-    # Note: deep-worker daemonizes immediately, so parent process exits
-    # The actual agent runs in background child process
-    agent_process = subprocess.Popen(
-        ["deep-worker", agent_name, "--dir", "/tmp", "--skip-permissions"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        preexec_fn=lambda: None,
+    # Use clean_agent fixture to start agent with NO history
+    # This prevents message duplication from accumulated InMemorySaver state
+    agent_process = clean_agent(agent_name, working_dir="/tmp")
+    logger.info(f"✓ Clean agent started (PID: {agent_process.pid})")
+
+    # Import async validation inside sync context
+    from .check_reply import verify_screenshot_contains_sync
+
+    # Use DwcliTerminalSession (which extends TerminalSession with proper PTY support)
+    # TerminalSession uses pty.fork() for real PTY, unlike PexpectTerminalSession
+    session = DwcliTerminalSession(
+        agent_name=agent_name,
+        columns=120,
+        lines=40,
+        working_dir=Path("/tmp"),
     )
-    logger.info(f"Agent launcher started (PID: {agent_process.pid})")
-
-    # Wait for daemon process to complete registration
-    # The parent process daemonizes and forks, then exits
-    # The child process needs time to register in ProcessRegistry
-    time_module.sleep(1.0)  # Brief wait for daemonization and initialization
-
-    # Now wait for agent to be actually ready and registered
-    logger.info("Waiting for agent to register with ProcessRegistry...")
-    from deep_worker_cli.process.registry import ProcessRegistry
-    registry = ProcessRegistry()
-
-    start_wait = time_module.time()
-    timeout = 30.0  # Increased timeout for agent registration (up from 10s)
-    agent_registered = False
-
-    while time_module.time() - start_wait < timeout:
-        agent_info = registry.lookup(agent_name)
-        if agent_info:
-            agent_registered = True
-            elapsed = time_module.time() - start_wait
-            logger.info(f"✓ Agent registered after {elapsed:.1f}s (PID: {agent_info.pid})")
-            break
-        if int(time_module.time() - start_wait) % 5 == 0:
-            logger.info(f"  Still waiting for agent registration... ({int(time_module.time() - start_wait)}s)")
-        time_module.sleep(0.2)  # Check more frequently
-
-    if not agent_registered:
-        logger.error(f"Agent did not register within {timeout}s timeout")
-        raise RuntimeError(f"Agent '{agent_name}' failed to register")
 
     try:
-        # Import async validation inside sync context
-        from .check_reply import verify_screenshot_contains_sync
+        # Start dwcli
+        logger.info(f"Starting dwcli for agent: {agent_name}")
+        session.start(timeout=15.0)
+        logger.info(f"✓ dwcli started (PID: {session.pid if session.pid else 'unknown'})")
 
-        # Use DwcliTerminalSession (which extends TerminalSession with proper PTY support)
-        # TerminalSession uses pty.fork() for real PTY, unlike PexpectTerminalSession
-        session = DwcliTerminalSession(
-            agent_name=agent_name,
-            columns=120,
-            lines=40,
-            working_dir=Path("/tmp"),
-        )
+        # Wait briefly for UI to render
+        time.sleep(1.0)
+        logger.info("✓ Prompt appeared")
 
+        # Capture initial screen
+        time.sleep(1.0)
+        screen_before = session.get_screen_text()
+        logger.info(f"Initial screen captured ({len(screen_before)} chars)")
+
+        # Send query
+        query = "What is 2+2?"
+        logger.info(f"Sending query: '{query}'")
+        # TerminalSession (via pty.fork) properly handles text and special key input
+        session.send_input(query, press_enter=False)  # Don't press enter yet
+        time.sleep(0.3)  # Brief pause before sending Enter
+        session.send_key("enter")  # Send with Enter key
+        logger.info("✓ Query sent to dwcli")
+
+        # Debug: capture screen right after sending query
+        time.sleep(0.5)
+        screen_right_after_query = session.get_screen_text()
+        logger.info("\n" + create_terminal_snapshot(
+            screen_right_after_query,
+            title="SCREEN RIGHT AFTER QUERY (should show query being processed)",
+        ))
+
+        # Wait for AI response (up to 120 seconds = 2 minutes)
+        logger.info("Waiting for AI response...")
+        response_received = False
+        last_screen_with_thinking = None
+
+        for i in range(240):  # 240 * 0.5s = 120 seconds max
+            time.sleep(0.5)  # Check every 0.5 seconds
+            screen_current = session.get_screen_text()
+
+            # Check if still thinking
+            if "Thinking" in screen_current or "thinking" in screen_current or "⠴" in screen_current:
+                if i % 20 == 0:
+                    logger.info(f"  Still processing... ({i * 0.5:.0f}s)")
+                last_screen_with_thinking = screen_current
+                continue
+
+            # If we get here, thinking has stopped - check for answer
+            # The AI may respond with "4", "four", "2+2=4", "The answer is 4", etc.
+            if "4" in screen_current or "four" in screen_current.lower():
+                response_received = True
+                logger.info(f"✓ AI response received after {i * 0.5:.1f} seconds")
+                break
+
+            if i % 40 == 0 and i > 0:
+                logger.info(f"  Waiting for response... ({i * 0.5:.0f}s)")
+
+        if not response_received:
+            logger.warning("⚠ AI did not respond with clear answer within 120 seconds")
+            # Get final screen and try validation anyway
+            screen_final = session.get_screen_text()
+        else:
+            # AI responded with what looks like "4"
+            logger.info("✓ Processing complete, waiting for screen to stabilize...")
+            # Wait a bit more to ensure screen is fully rendered
+            time.sleep(2.0)
+            screen_final = session.get_screen_text()
+
+        logger.info("\n" + create_terminal_snapshot(
+            screen_final,
+            title="FINAL SCREEN (query and response should be visible)",
+        ))
+
+        # Now use AI validation to verify that the screenshot contains both query and response
+        logger.info("\nValidating screenshot using AI analysis...")
+        logger.info(f"Checking for query: '{query}'")
+        logger.info("Checking for response containing: '4' (or variations)")
+
+        # Use the validation function (sync version)
         try:
-            # Start dwcli
-            logger.info(f"Starting dwcli for agent: {agent_name}")
-            session.start(timeout=15.0)
-            logger.info(f"✓ dwcli started (PID: {session.pid if session.pid else 'unknown'})")
+            validation_result = verify_screenshot_contains_sync(
+                screenshot_text=screen_final,
+                original_query=query,
+                expected_response_contains="4",
+                model="haiku",  # Use cheapest model
+            )
 
-            # Wait briefly for UI to render
-            time.sleep(1.0)
-            logger.info("✓ Prompt appeared")
+            logger.info(f"Validation result: {validation_result}")
 
-            # Capture initial screen
-            time.sleep(1.0)
-            screen_before = session.get_screen_text()
-            logger.info(f"Initial screen captured ({len(screen_before)} chars)")
-
-            # Send query
-            query = "What is 2+2?"
-            logger.info(f"Sending query: '{query}'")
-            # TerminalSession (via pty.fork) properly handles text and special key input
-            session.send_input(query, press_enter=False)  # Don't press enter yet
-            time.sleep(0.3)  # Brief pause before sending Enter
-            session.send_key("enter")  # Send with Enter key
-            logger.info("✓ Query sent to dwcli")
-
-            # Debug: capture screen right after sending query
-            time.sleep(0.5)
-            screen_right_after_query = session.get_screen_text()
-            logger.info("\n" + create_terminal_snapshot(
-                screen_right_after_query,
-                title="SCREEN RIGHT AFTER QUERY (should show query being processed)",
-            ))
-
-            # Wait for AI response (up to 120 seconds = 2 minutes)
-            logger.info("Waiting for AI response...")
-            response_received = False
-            last_screen_with_thinking = None
-
-            for i in range(240):  # 240 * 0.5s = 120 seconds max
-                time.sleep(0.5)  # Check every 0.5 seconds
-                screen_current = session.get_screen_text()
-
-                # Check if still thinking
-                if "Thinking" in screen_current or "thinking" in screen_current or "⠴" in screen_current:
-                    if i % 20 == 0:
-                        logger.info(f"  Still processing... ({i * 0.5:.0f}s)")
-                    last_screen_with_thinking = screen_current
-                    continue
-
-                # If we get here, thinking has stopped - check for answer
-                # The AI may respond with "4", "four", "2+2=4", "The answer is 4", etc.
-                if "4" in screen_current or "four" in screen_current.lower():
-                    response_received = True
-                    logger.info(f"✓ AI response received after {i * 0.5:.1f} seconds")
-                    break
-
-                if i % 40 == 0 and i > 0:
-                    logger.info(f"  Waiting for response... ({i * 0.5:.0f}s)")
-
-            if not response_received:
-                logger.warning("⚠ AI did not respond with clear answer within 120 seconds")
-                # Get final screen and try validation anyway
-                screen_final = session.get_screen_text()
-            else:
-                # AI responded with what looks like "4"
-                logger.info("✓ Processing complete, waiting for screen to stabilize...")
-                # Wait a bit more to ensure screen is fully rendered
-                time.sleep(2.0)
-                screen_final = session.get_screen_text()
-
-            logger.info("\n" + create_terminal_snapshot(
-                screen_final,
-                title="FINAL SCREEN (query and response should be visible)",
-            ))
-
-            # Now use AI validation to verify that the screenshot contains both query and response
-            logger.info("\nValidating screenshot using AI analysis...")
-            logger.info(f"Checking for query: '{query}'")
-            logger.info("Checking for response containing: '4' (or variations)")
-
-            # Use the validation function (sync version)
-            try:
-                validation_result = verify_screenshot_contains_sync(
-                    screenshot_text=screen_final,
-                    original_query=query,
-                    expected_response_contains="4",
-                    model="haiku",  # Use cheapest model
+            if not validation_result.is_valid:
+                logger.error(f"❌ Screenshot validation FAILED: {validation_result.comment}")
+                logger.error("\n" + create_terminal_snapshot(
+                    screen_final,
+                    title="FAILED VALIDATION - Check this screenshot",
+                ))
+                pytest.fail(
+                    f"Screenshot validation failed: {validation_result.comment}\n"
+                    f"Query should be: '{query}'\n"
+                    f"Response should contain: '4'"
                 )
 
-                logger.info(f"Validation result: {validation_result}")
+            logger.info("✓ AI validation confirmed both query and response are visible")
 
-                if not validation_result.is_valid:
-                    logger.error(f"❌ Screenshot validation FAILED: {validation_result.comment}")
-                    logger.error("\n" + create_terminal_snapshot(
-                        screen_final,
-                        title="FAILED VALIDATION - Check this screenshot",
-                    ))
-                    pytest.fail(
-                        f"Screenshot validation failed: {validation_result.comment}\n"
-                        f"Query should be: '{query}'\n"
-                        f"Response should contain: '4'"
-                    )
+        except ImportError as e:
+            logger.warning(f"Could not import verify_screenshot_contains_sync: {e}")
+            logger.warning("Falling back to simple text search (less robust)")
 
-                logger.info("✓ AI validation confirmed both query and response are visible")
+            # Fallback: simple text search with normalization
+            screen_normalized = " ".join(screen_final.split())
 
-            except ImportError as e:
-                logger.warning(f"Could not import verify_screenshot_contains_sync: {e}")
-                logger.warning("Falling back to simple text search (less robust)")
+            if query not in screen_normalized:
+                pytest.fail(f"Query '{query}' not found in screenshot")
 
-                # Fallback: simple text search with normalization
-                screen_normalized = " ".join(screen_final.split())
+            logger.info(f"✓ Query '{query}' found in screenshot")
 
-                if query not in screen_normalized:
-                    pytest.fail(f"Query '{query}' not found in screenshot")
-
-                logger.info(f"✓ Query '{query}' found in screenshot")
-
-            logger.info("=" * 80)
-            logger.info("✅ TEST PASSED: Query and response both visible on screen")
-            logger.info("=" * 80)
-            logger.info("✅ This demonstrates correct TUI behavior in dwcli")
-            logger.info("=" * 80)
-
-        finally:
-            session.close()
+        logger.info("=" * 80)
+        logger.info("✅ TEST PASSED: Query and response both visible on screen")
+        logger.info("=" * 80)
+        logger.info("✅ This demonstrates correct TUI behavior in dwcli")
+        logger.info("=" * 80)
 
     finally:
-        # Clean up: terminate agent process
-        logger.info("Terminating test agent...")
-        agent_process.terminate()
-        try:
-            agent_process.wait(timeout=5)
-            logger.info("Agent process terminated")
-        except subprocess.TimeoutExpired:
-            logger.warning("Agent process did not terminate, killing...")
-            agent_process.kill()
-            agent_process.wait()
+        session.close()
+    # Note: Agent cleanup is handled by clean_agent fixture
+
+
+@pytest.mark.skipif(
+    not _check_dwcli_available(),
+    reason="dwcli command not available in PATH",
+)
+def test_dwcli_query_visibility2(clean_agent):
+    """Test that queries appear ONCE and input area is visible at bottom.
+
+    This test verifies TWO CRITICAL behaviors:
+    1. Query "What is 2+2?" appears ONLY ONCE on screen (no duplication)
+    2. Input area (box with '>' prompt) is visible at bottom WITHOUT scrolling
+
+    ARCHITECTURE PRINCIPLE: AGENT IS THE SINGLE SOURCE OF TRUTH
+    ============================================================
+    This test uses clean_agent fixture to ensure agent starts with NO history.
+    All messages (user + assistant) displayed in dwcli come from agent via RPyC callbacks.
+    This ensures no duplicate messages and maintains single source of truth architecture.
+    """
+    logger.info("=" * 80)
+    logger.info("TEST: Query visibility + Input area at bottom")
+    logger.info("=" * 80)
+
+    agent_name = "test_dwcli_query_visibility2"
+    logger.info(f"Starting clean test agent: {agent_name}")
+
+    # Use clean_agent fixture to start agent with NO history
+    agent_process = clean_agent(agent_name, working_dir="/tmp")
+    logger.info(f"✓ Clean agent started (PID: {agent_process.pid})")
+
+    # Import async validation inside sync context
+    from .check_reply import verify_screenshot_contains_sync
+
+    session = DwcliTerminalSession(
+        agent_name=agent_name,
+        columns=120,
+        lines=40,
+        working_dir=Path("/tmp"),
+    )
+
+    try:
+        # Start dwcli
+        logger.info(f"Starting dwcli for agent: {agent_name}")
+        session.start(timeout=15.0)
+        logger.info(f"✓ dwcli started (PID: {session.pid if session.pid else 'unknown'})")
+
+        # Wait briefly for UI to render
+        time.sleep(1.0)
+        logger.info("✓ Prompt appeared")
+
+        # Capture initial screen
+        time.sleep(1.0)
+        screen_before = session.get_screen_text()
+        logger.info(f"Initial screen captured ({len(screen_before)} chars)")
+
+        # ===== CHECK 0: Input area border visible AT STARTUP (before any input) =====
+        logger.info("CHECK 0: Input area border visible at startup (no user input yet)")
+        initial_lines = screen_before.split("\n")
+        initial_non_empty = [l for l in initial_lines if l.strip()]
+        initial_bottom = initial_non_empty[-10:] if len(initial_non_empty) >= 10 else initial_non_empty
+        startup_input_markers = ["│ >", "│>", "┌─", "└─"]
+        startup_found = [m for m in startup_input_markers if any(m in l for l in initial_bottom)]
+        startup_has_border = any(m in startup_found for m in ["┌─", "└─"])
+        startup_has_prompt = any(m in startup_found for m in ["│ >", "│>"])
+        startup_input_visible = startup_has_border and startup_has_prompt
+        if not startup_input_visible:
+            pytest.fail(
+                f"Input area border NOT visible at startup (before any user input).\n"
+                f"Found markers: {startup_found}\n"
+                f"Likely cause: watch_scroll_y override missing super() call, "
+                f"so _refresh_scroll() is never invoked and the display stays "
+                f"at the old scroll position.\n"
+                f"Bottom lines of screen:\n" + "\n".join(initial_bottom)
+            )
+        else:
+            logger.info("✓ Input area border visible at startup")
+
+        # Send query
+        query = "What is 2+2?"
+        logger.info(f"Sending query: '{query}'")
+        session.send_input(query, press_enter=False)
+        time.sleep(0.3)
+        session.send_key("enter")
+        logger.info("✓ Query sent to dwcli")
+
+        # Wait for AI response
+        logger.info("Waiting for AI response...")
+        response_received = False
+
+        for i in range(240):  # 240 * 0.5s = 120 seconds max
+            time.sleep(0.5)
+            screen_current = session.get_screen_text()
+
+            # Check if still thinking
+            if "Thinking" in screen_current or "thinking" in screen_current or "⠴" in screen_current:
+                if i % 20 == 0:
+                    logger.info(f"  Still processing... ({i * 0.5:.0f}s)")
+                continue
+
+            # Check for answer
+            if "4" in screen_current or "four" in screen_current.lower():
+                response_received = True
+                logger.info(f"✓ AI response received after {i * 0.5:.1f} seconds")
+                break
+
+            if i % 40 == 0 and i > 0:
+                logger.info(f"  Waiting for response... ({i * 0.5:.0f}s)")
+
+        if not response_received:
+            logger.warning("⚠ AI did not respond with clear answer within 120 seconds")
+
+        # Wait for screen to stabilize
+        logger.info("✓ Processing complete, waiting for screen to stabilize...")
+        time.sleep(2.0)
+        screen_final = session.get_screen_text()
+
+        logger.info("\n" + create_terminal_snapshot(
+            screen_final,
+            title="FINAL SCREEN (query ONCE + input area at bottom)",
+        ))
+
+        # ===== CHECK 1: Query appears only ONCE =====
+        logger.info("\n" + "=" * 80)
+        logger.info("CHECK 1: Query duplication")
+        logger.info("=" * 80)
+
+        # Find all occurrences
+        lines = screen_final.split("\n")
+        query_lines = []
+        for i, line in enumerate(lines):
+            if query in line:
+                query_lines.append((i, line))
+
+        logger.info(f"Query '{query}' appears {len(query_lines)} times on screen")
+        logger.info(f"Occurrences found at lines:")
+        for line_num, line_content in query_lines:
+            logger.info(f"  Line {line_num}: {line_content}")
+
+        # Check if input field borders exist (indicates input area at bottom)
+        has_input_box = any("┌─" in line or "└─" in line or "│ >" in line for line in lines)
+
+        # Count occurrences OUTSIDE of input field area
+        # Input field is typically in last 5-10 lines of screen
+        messages_area_lines = lines[:-10]  # Exclude bottom 10 lines (input area)
+        query_in_messages = sum(1 for line in messages_area_lines if query in line)
+
+        logger.info(f"Query in messages area (excluding input): {query_in_messages}")
+
+        if query_in_messages > 1:
+            logger.error(f"❌ Query duplication in messages area: appears {query_in_messages} times!")
+            logger.error(f"This excludes input field - checking only message history")
+
+            pytest.fail(
+                f"Query duplication detected in message history!\n"
+                f"Query '{query}' appears {query_in_messages} times in messages area.\n"
+                f"Expected: 1 time\n"
+                f"Note: Text in input field is OK, but history should have only 1 copy.\n"
+                f"This violates single source of truth architecture."
+            )
+        else:
+            logger.info(f"✓ Query appears exactly once in message history (input field excluded)")
+
+        # ===== CHECK 2: Input area visible at bottom =====
+        logger.info("\n" + "=" * 80)
+        logger.info("CHECK 2: Input area visibility at bottom")
+        logger.info("=" * 80)
+
+        # Split screen into lines
+        lines = screen_final.split("\n")
+        non_empty_lines = [line for line in lines if line.strip()]
+        bottom_lines = non_empty_lines[-10:] if len(non_empty_lines) >= 10 else non_empty_lines
+
+        logger.info(f"Total lines: {len(lines)}, non-empty: {len(non_empty_lines)}")
+        logger.info("Bottom 10 lines:")
+        for i, line in enumerate(bottom_lines):
+            logger.info(f"  {i}: {repr(line[:100])}")
+
+        # Check for input area markers
+        input_markers = [
+            "│ >",  # Input prompt inside box
+            "│>",   # Input prompt without space
+            "┌─",   # Top border
+            "└─",   # Bottom border
+            "manual | shift+tab to cycle",  # Help text
+        ]
+
+        found_markers = []
+        for marker in input_markers:
+            for line in bottom_lines:
+                if marker in line:
+                    found_markers.append(marker)
+                    break
+
+        logger.info(f"Found input area markers: {found_markers}")
+
+        # Determine if input area is visible
+        has_box_border = any(marker in found_markers for marker in ["┌─", "└─"])
+        has_input_prompt = any(marker in found_markers for marker in ["│ >", "│>"])
+        input_area_visible = has_box_border and has_input_prompt
+
+        logger.info(f"Has box border: {has_box_border}")
+        logger.info(f"Has input prompt: {has_input_prompt}")
+        logger.info(f"Input area visible: {input_area_visible}")
+
+        if not input_area_visible:
+            logger.error("❌ Input area NOT visible at bottom!")
+            pytest.fail(
+                f"Input area not visible at bottom of screen.\n"
+                f"Found markers: {found_markers}\n"
+                f"Has box border: {has_box_border}\n"
+                f"Has input prompt: {has_input_prompt}\n"
+                f"User should NOT need to scroll to see input area!"
+            )
+        else:
+            logger.info("✓ Input area is visible at bottom")
+
+        # ===== ALL CHECKS PASSED =====
+        logger.info("\n" + "=" * 80)
+        logger.info("✅ TEST PASSED: Both checks successful")
+        logger.info("  ✓ Query appears only once (no duplication)")
+        logger.info("  ✓ Input area visible at bottom")
+        logger.info("=" * 80)
+
+    finally:
+        session.close()
+    # Note: Agent cleanup is handled by clean_agent fixture
 
 
 @pytest.mark.skipif(
@@ -1684,12 +1866,16 @@ def test_dwcli_input_area_immediately_visible():
 
     logger.info(f"Starting test agent: {agent_name}")
 
-    # Start agent in background
+    # Start agent in background.
+    # IMPORTANT: cwd="/tmp" ensures the agent's working directory is /tmp so
+    # that any files the AI creates during test queries land in /tmp, not in
+    # the pytest working directory (e.g. the source tree).
     agent_process = subprocess.Popen(
         ["deep-worker", agent_name, "--dir", "/tmp", "--skip-permissions"],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         preexec_fn=lambda: None,
+        cwd="/tmp",
     )
     logger.info(f"Agent launcher started (PID: {agent_process.pid})")
 

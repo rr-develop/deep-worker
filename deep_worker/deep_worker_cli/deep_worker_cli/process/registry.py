@@ -177,14 +177,18 @@ class ProcessRegistry:
             return False
 
         # Verify it's our process (deep-worker or deep_worker)
-        # Also accept pytest for testing purposes
+        # Also accept pytest and python for testing purposes (when agent runs as asyncio task in test)
         try:
             cmdline_file = proc_path / "cmdline"
             if not cmdline_file.exists():
                 return False
 
             cmdline = cmdline_file.read_text()
-            return "deep-worker" in cmdline or "deep_worker" in cmdline or "pytest" in cmdline
+            # Accept: deep-worker, deep_worker, pytest, python (for test scripts)
+            return ("deep-worker" in cmdline or
+                    "deep_worker" in cmdline or
+                    "pytest" in cmdline or
+                    "python" in cmdline)
         except (PermissionError, OSError, FileNotFoundError):
             return False
 
@@ -245,8 +249,8 @@ class ProcessRegistry:
             temp_file.write_text(json.dumps(registry, indent=2))
 
             # Set permissions to 0o666 (rw-rw-rw-) so all users can read/write
-            # This is necessary for multi-user environments where several
-            # separate services share the same registry file
+            # This is necessary for multi-user environments (e.g., a web service running
+            # alongside deep-worker under a different user)
             os.chmod(temp_file, 0o666)
 
             # Atomic replace

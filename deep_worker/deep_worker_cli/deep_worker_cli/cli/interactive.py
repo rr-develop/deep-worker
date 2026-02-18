@@ -12,9 +12,17 @@ from textual.app import App
 from textual.binding import Binding, BindingType
 from textual.containers import Container, VerticalScroll
 from textual.css.query import NoMatches
+from textual.message import Message
 from textual.widgets import Static
 
-# Add arpyc to path - workaround for import from source
+# ============================================================================
+# CRITICAL: ARPYC MUST BE IMPORTED FROM SOURCE CODE, NOT FROM PIP/VENV!
+# ============================================================================
+# DO NOT use 'pip install arpyc' or ANY virtual environment (.venv)!
+# ALWAYS import arpyc from the arpyc source directory in this checkout.
+# Using installed packages causes version conflicts and compatibility issues.
+# This project MUST run globally without venv to ensure correct arpyc version.
+# ============================================================================
 _arpyc_path = Path(__file__).parent.parent.parent.parent.parent / "arpyc"
 if _arpyc_path.exists() and str(_arpyc_path) not in sys.path:
     sys.path.insert(0, str(_arpyc_path))
@@ -35,6 +43,66 @@ from deep_worker_cli.widgets.welcome import WelcomeBanner
 if TYPE_CHECKING:
     from textual.app import ComposeResult
     from textual.events import Resize
+
+
+class ChatScroll(VerticalScroll):
+    """Scrollable chat container that posts ScrolledUp on upward user scroll.
+
+    Subclasses VerticalScroll to hook into the ``watch_scroll_y`` reactive
+    watcher.  This watcher fires on **all** scroll input sources:
+    - Mouse wheel
+    - Keyboard (Page Up, arrow keys)
+    - Scrollbar drag
+
+    This is intentionally more complete than the ``ScrollUp`` event from
+    ``textual.scrollbar``, which only fires on scrollbar arrow clicks.
+
+    The ``ScrolledUp`` message bubbles up to ``InteractiveApp``, which
+    uses it to decide whether to load the next page of conversation history.
+    """
+
+    class ScrolledUp(Message):
+        """Posted each time the user scrolls upward in the chat area.
+
+        ``InteractiveApp.on_chat_scroll_scrolled_up`` handles this message
+        and delegates to ``_maybe_load_more_history``.
+        """
+
+    def watch_scroll_y(self, old_value: float, new_value: float) -> None:
+        """Detect upward scroll and post ``ScrolledUp``.
+
+        Called automatically by Textual's reactive system whenever
+        ``scroll_y`` changes.
+
+        CRITICAL: ``super().watch_scroll_y()`` MUST be called first.
+        The parent implementation does three essential things:
+        1. Updates the visual scrollbar widget position.
+        2. Checks the anchor (sticky-scroll-to-bottom mechanism).
+        3. Calls ``_refresh_scroll()`` which redraws the scroll content.
+
+        Without the super() call, ``_refresh_scroll()`` is never invoked,
+        so the display does NOT update when ``scroll_y`` changes.  This
+        causes two visible bugs:
+        - The input area border disappears (scroll position looks "stuck"
+          at top because the display was never redrawn after scroll_end()).
+        - ``widget.region.y`` values stay stale (layout not recalculated),
+          making ``_maybe_load_more_history`` think the topmost visible
+          widget is at index 0 and spuriously loading history → query
+          duplication.
+
+        Args:
+            old_value: Previous scroll_y position (pixels from top).
+            new_value: New scroll_y position (pixels from top).
+        """
+        # Always run Textual's default scroll-watcher first so that:
+        # - the scrollbar thumb moves to the correct position,
+        # - the anchor mechanism fires (_check_anchor),
+        # - _refresh_scroll() redraws the content at the new scroll offset.
+        super().watch_scroll_y(old_value, new_value)
+
+        if new_value < old_value:
+            # Scrolled toward the top → post message that bubbles to App
+            self.post_message(self.ScrolledUp())
 
 
 class InteractiveApp(App):
@@ -98,8 +166,10 @@ class InteractiveApp(App):
         # Generate a session ID for this connection
         session_id = uuid.uuid4().hex[:8]
 
-        # Main chat area with scrollable messages
-        with VerticalScroll(id="chat"):
+        # Main chat area with scrollable messages.
+        # ChatScroll (not plain VerticalScroll) is used so that upward scrolls
+        # are detected via watch_scroll_y and trigger history pagination.
+        with ChatScroll(id="chat"):
             yield WelcomeBanner(thread_id=session_id, id="welcome-banner")
             yield Container(id="messages")
             with Container(id="bottom-app-container"):
@@ -137,12 +207,20 @@ class InteractiveApp(App):
         # 1. No history exists (checkpoint DB missing)
         # 2. History loading failed
         # 3. Textual's default scroll position hides the input
-        # We scroll to BOTTOM so the input area at bottom of content is visible.
-        chat_scroll = self.query_one("#chat", VerticalScroll)
-        chat_scroll.scroll_end(animate=False)
+        # We use call_after_refresh so the scroll runs after the first layout
+        # pass, ensuring max_scroll_y reflects the final widget heights.
+        def _scroll_to_bottom_on_mount() -> None:
+            try:
+                chat_scroll = self.query_one("#chat", VerticalScroll)
+                chat_scroll.scroll_end(animate=False, immediate=True)
+            except Exception:
+                pass
 
-        # Setup periodic scroll monitoring for pagination
-        self.set_interval(0.5, self._check_scroll_position)
+        self.call_after_refresh(_scroll_to_bottom_on_mount)
+
+        # Pagination is now event-driven via ChatScroll.watch_scroll_y.
+        # When the user scrolls up, ChatScroll posts ScrolledUp, which
+        # this app handles in on_chat_scroll_scrolled_up.  No polling needed.
 
     async def _agent_task(self, message: str) -> None:
         """Run agent request in background.
@@ -237,16 +315,13 @@ class InteractiveApp(App):
         if not self.rpyc_session:
             return
 
-        loop = asyncio.get_running_loop()
-
         # Create callback object for message events
         def handle_message(msg: dict[str, Any]) -> None:
             """Handle incoming message from agent."""
-            # Schedule message handling in main event loop
-            loop.call_soon_threadsafe(
-                asyncio.create_task,
-                self._handle_realtime_message(msg)
-            )
+            # CRITICAL: Use Textual's call_from_thread() for thread-safe scheduling
+            # This properly schedules work IN THE CONTEXT of Textual app.
+            # DO NOT use loop.call_soon_threadsafe() - it runs outside Textual context!
+            self.call_from_thread(self._handle_realtime_message, msg)
 
         # Create callback class
         self.rpyc_callback = type(
@@ -267,6 +342,21 @@ class InteractiveApp(App):
     async def _handle_realtime_message(self, msg: dict[str, Any]) -> None:
         """Handle real-time message received via RPyC callback.
 
+        This is the ONLY place where messages are displayed in dwcli!
+
+        ARCHITECTURE PRINCIPLE: AGENT IS THE SINGLE SOURCE OF TRUTH
+        ============================================================
+        The agent deep-worker is the ONLY source of truth for ALL messages.
+        ALL messages (user + assistant) MUST be displayed via this callback.
+
+        User messages can originate from:
+        - This dwcli instance
+        - Other clients (other dwcli instances, task manager, etc.)
+
+        Regardless of origin, ALL messages go through agent and come back
+        via RPyC callbacks. This ensures dwcli shows complete conversation
+        state from agent, maintaining single source of truth.
+
         Args:
             msg: Message dict with keys: type, role, content
         """
@@ -274,11 +364,24 @@ class InteractiveApp(App):
         content = msg.get("content", "")
 
         if role == "user":
-            # User message - display it
-            await self._mount_message(UserMessage(content))
+            # User message from agent - display it
+            # (Could have originated from this dwcli, another client, or task manager)
+            import uuid
+            msg_id = f"user-{uuid.uuid4().hex[:8]}"
+            await self._mount_message(UserMessage(content, id=msg_id))
         elif role == "assistant":
-            # Assistant message - display it
-            await self._mount_message(AssistantMessage(content))
+            # Assistant message from agent - display it
+            import uuid
+            msg_id = f"asst-{uuid.uuid4().hex[:8]}"
+            widget = AssistantMessage(content, id=msg_id)
+            await self._mount_message(widget)
+            # Render markdown content
+            try:
+                await widget.write_initial_content()
+            except Exception as e:
+                # Log error but don't crash
+                import sys
+                print(f"[DWCLI] Error rendering markdown: {e}", file=sys.stderr)
 
         # Update total count
         self._history_total += 1
@@ -364,12 +467,27 @@ class InteractiveApp(App):
             )
             return
 
-        # CRITICAL: Display user message IMMEDIATELY!
-        # User must see their message right away, not after agent completes.
-        await self._mount_message(UserMessage(message))
-
-        # Increment history total - we just added user message
-        self._history_total += 1
+        # ============================================================================
+        # ARCHITECTURE PRINCIPLE: AGENT IS THE SINGLE SOURCE OF TRUTH
+        # ============================================================================
+        # DO NOT display user message locally here!
+        # The agent deep-worker is the ONLY source of truth for ALL messages,
+        # including user messages.
+        #
+        # User messages can originate from:
+        # - This dwcli instance
+        # - Other dwcli instances connected to same agent
+        # - Task manager sending commands to agent
+        # - Any other client
+        #
+        # ALL messages MUST come through agent's RPyC callbacks to dwcli.
+        # This ensures dwcli displays the complete conversation state from agent,
+        # regardless of message origin.
+        #
+        # The message will be displayed when agent echoes it back via callback
+        # in _handle_realtime_message() after exposed_invoke_agent() notifies
+        # subscribers.
+        # ============================================================================
 
         if debug:
             import sys
@@ -387,36 +505,27 @@ class InteractiveApp(App):
         Args:
             widget: Message widget to mount
         """
-        log_file = "/tmp/dwcli_debug.log"
-        def log_msg(msg_text):
-            try:
-                with open(log_file, "a") as f:
-                    f.write(f"[DWCLI] {msg_text}\n")
-            except:
-                pass
-
-        log_msg(f"_mount_message: mounting {type(widget).__name__}")
         messages_container = self.query_one("#messages", Container)
-        log_msg(f"_mount_message: got messages container")
-
         await messages_container.mount(widget)
-        log_msg(f"_mount_message: widget mounted to DOM")
 
         self._scroll_chat_to_bottom()
-        log_msg(f"_mount_message: scrolled to bottom")
 
         # Make sure input is always visible (like deepagents does)
         try:
             input_container = self.query_one("#bottom-app-container", Container)
             input_container.scroll_visible()
-            log_msg(f"_mount_message: scrolled input into view")
-        except Exception as e:
-            log_msg(f"_mount_message: error scrolling input: {e}")
+        except Exception:
+            pass
 
     def _scroll_chat_to_bottom(self) -> None:
-        """Scroll chat to bottom."""
+        """Scroll chat to bottom.
+
+        Uses immediate=True so the scroll is applied in the current event-loop
+        tick rather than being queued behind pending messages.  Without it a
+        burst of incoming messages can leave scroll_y lagging behind max_scroll_y.
+        """
         chat = self.query_one("#chat", VerticalScroll)
-        chat.scroll_end(animate=False)
+        chat.scroll_end(animate=False, immediate=True)
 
     async def _load_history(self) -> None:
         """Load and display conversation history from the agent.
@@ -443,6 +552,17 @@ class InteractiveApp(App):
                 return
 
             history = response.get("history", [])
+
+            # DEBUG: Log history count
+            import os
+            debug_enabled = os.environ.get("DWCLI_DEBUG_CALLBACKS") == "1"
+            if debug_enabled:
+                with open("/tmp/dwcli_callback_debug.log", "a") as f:
+                    f.write(f"  history count: {len(history)}\n")
+                    for i, msg_data in enumerate(history):
+                        msg_type = msg_data.get("type")
+                        content = msg_data.get("content", "")[:50]
+                        f.write(f"    [{i}] {msg_type}: {content}...\n")
 
             # Update pagination state
             self._history_total = response.get("total", 0)
@@ -517,9 +637,23 @@ class InteractiveApp(App):
             # When we load many messages, #messages container grows and pushes
             # #bottom-app-container (input area) down. We MUST scroll to BOTTOM
             # so the user sees the most recent messages AND the input area.
-            # The input area must always be visible for the user to type.
-            chat_scroll = self.query_one("#chat", VerticalScroll)
-            chat_scroll.scroll_end(animate=False)
+            #
+            # TIMING: write_initial_content() queues markdown updates, but the
+            # resulting height changes are applied in a subsequent layout pass
+            # (async).  Calling scroll_end() synchronously here would use a
+            # stale max_scroll_y computed before markdown compression, landing
+            # at the wrong position.
+            #
+            # Fix (same pattern as deepagents): schedule scroll via set_timer so
+            # it runs AFTER the layout pass, when max_scroll_y is accurate.
+            def _scroll_to_bottom_after_history() -> None:
+                try:
+                    chat = self.query_one("#chat", VerticalScroll)
+                    chat.scroll_end(animate=False, immediate=True)
+                except Exception:
+                    pass
+
+            self.set_timer(0.1, _scroll_to_bottom_after_history)
 
         except Exception as e:
             import sys
@@ -609,37 +743,6 @@ class InteractiveApp(App):
         finally:
             self._loading_history = False
 
-    def _check_scroll_position(self) -> None:
-        """Periodically check scroll position and trigger pagination if near top.
-
-        This method is called every 0.5 seconds via set_interval.
-        It checks if user has scrolled near the top of chat and triggers
-        pagination to load older messages.
-        """
-        try:
-            chat_scroll = self.query_one("#chat", VerticalScroll)
-
-            # Check if scrolled near the top (within 100 pixels)
-            if chat_scroll.scroll_y <= 100:
-                # Only trigger if not already loading
-                if not self._loading_history and self._history_offset < self._history_total:
-                    # Log for debugging
-                    with open("/tmp/dwcli_scroll_debug.log", "a") as f:
-                        f.write(f"SCROLL_CHECK: y={chat_scroll.scroll_y}, offset={self._history_offset}/{self._history_total}, triggering pagination\n")
-
-                    # Trigger background history load
-                    self.run_worker(self._load_more_history())
-        except NoMatches:
-            # Chat container not yet mounted
-            pass
-        except Exception as e:
-            # Log errors but don't crash
-            try:
-                with open("/tmp/dwcli_scroll_debug.log", "a") as f:
-                    f.write(f"ERROR in scroll check: {e}\n")
-            except:
-                pass
-
     def _update_status(self, message: str) -> None:
         """Update the status bar with a message.
 
@@ -656,6 +759,88 @@ class InteractiveApp(App):
             self.call_after_refresh(lambda: None)
         except NoMatches:
             pass
+
+    # ------------------------------------------------------------------
+    # Scroll-based pagination
+    # ------------------------------------------------------------------
+
+    def on_chat_scroll_scrolled_up(self, _event: ChatScroll.ScrolledUp) -> None:
+        """Handle upward scroll in the chat area.
+
+        Called by Textual's message routing whenever ``ChatScroll`` posts
+        ``ScrolledUp`` (i.e. the user scrolled toward the top via mouse wheel,
+        keyboard, or scrollbar).  Delegates to ``_maybe_load_more_history``
+        which decides whether to fetch an older history page from the agent.
+        """
+        self._maybe_load_more_history()
+
+    def _maybe_load_more_history(self) -> None:
+        """Conditionally trigger loading of an older history page.
+
+        This is the core pagination decision function.  It applies three
+        guards in order (cheapest first) and only starts a load when all
+        pass:
+
+        1. **History not fully loaded** – checked against the cached
+           ``_history_offset`` / ``_history_total`` counters.  No RPyC call
+           is needed; the counters were set during ``_load_history()`` and
+           are kept up to date by ``_load_more_history()``.
+
+        2. **No concurrent load** – ``_loading_history`` flag prevents
+           overlapping RPyC requests.
+
+        3. **Topmost visible message is near the top of the DOM window** –
+           finds the first message widget whose ``region.y >= 0`` (i.e. the
+           topmost widget currently visible on screen).  If its index in
+           ``#messages`` children is < 10 we are close enough to the start
+           of the loaded window that the user would soon run out of content;
+           load more now.
+
+        The threshold of 10 provides comfortable read-ahead: the user will
+        see the older messages appear before reaching the very top of what
+        is currently rendered in the DOM.
+
+        Note on ``widget.region.y``:
+            In a scrollable Textual container, ``region`` gives the widget's
+            position relative to the screen after layout.  Widgets scrolled
+            above the viewport have ``region.y < 0``; widgets at or below
+            the top of the viewport have ``region.y >= 0``.
+        """
+        # Guard 1: all history already loaded (cached, no RPyC call needed)
+        if self._history_offset >= self._history_total:
+            return
+
+        # Guard 2: a load is already in progress
+        if self._loading_history:
+            return
+
+        # Guard 3: topmost visible message index
+        try:
+            messages_container = self.query_one("#messages", Container)
+            children = list(messages_container.children)
+        except NoMatches:
+            return
+
+        if not children:
+            return
+
+        # Find the index of the topmost visible widget.
+        # Widgets above the viewport: region.y < 0  (scrolled out of view)
+        # Widgets in/below viewport: region.y >= 0
+        topmost_visible_index: int | None = None
+        for i, child in enumerate(children):
+            if child.region.y >= 0:
+                topmost_visible_index = i
+                break
+
+        if topmost_visible_index is None:
+            # No visible messages (layout not yet computed, or all off-screen)
+            return
+
+        # Load if fewer than 10 earlier messages are available in the DOM
+        # above the topmost visible one.
+        if topmost_visible_index < 10:
+            self.run_worker(self._load_more_history())
 
     async def action_quit_app(self) -> None:
         """Handle quit action (Ctrl+C or Ctrl+D)."""
@@ -674,5 +859,8 @@ class InteractiveApp(App):
         if debug:
             import sys
             print(f"[DWCLI_DEBUG] on_chat_input_submitted called with message: '{message.value}'", file=sys.stderr)
+
+        # NOTE: Do NOT clear input here! Input text should stay visible while agent processes.
+        # Input will be cleared after agent responds (in _handle_realtime_message for assistant message)
 
         await self._handle_user_message(message.value)
