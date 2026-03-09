@@ -137,6 +137,21 @@ def _agent_process_entry_point(
     """Entry point for agent subprocess - runs agent.start() in its own event loop."""
     import asyncio
     import os
+    import sys
+
+    # ============================================================================
+    # CRITICAL: Ensure local deepagents code is used instead of system package
+    # ============================================================================
+    # Tests should ALWAYS use the code from this repository
+    repo_base = Path(__file__).resolve().parents[3]
+    cli_package_path = str(repo_base / "deep_worker_cli")
+    deepagents_path = str(repo_base / "deepagents")
+
+    # Insert at beginning to override system packages
+    if cli_package_path not in sys.path:
+        sys.path.insert(0, cli_package_path)
+    if deepagents_path not in sys.path:
+        sys.path.insert(0, deepagents_path)
 
     # Set API key in environment if provided
     if api_key:

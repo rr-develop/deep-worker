@@ -6,7 +6,7 @@
 
 ### Why No Virtual Environments?
 
-1. **arpyc Dependency**: This project depends on `arpyc` from source code in the `arpyc` directory of this checkout
+1. **arpyc Dependency**: This project depends on `arpyc` from source code in the `arpyc` directory at the repository root
 2. **Version Conflicts**: Using `pip install arpyc` or installing into `.venv` causes incompatibility issues
 3. **RPyC Proxy Errors**: Installing packages creates version mismatches leading to `AttributeError: cannot access '__reversed__'` and other proxy-related errors
 
@@ -25,7 +25,7 @@ pip install -e .
 # ✅ ALWAYS DO THIS:
 # 1. Run directly on host without venv
 # 2. Use system Python3
-# 3. Import arpyc from source (the arpyc directory in this checkout)
+# 3. Import arpyc from source (the arpyc directory at the repository root)
 ```
 
 ### Detecting Virtual Environment Violations
@@ -54,9 +54,10 @@ if _arpyc_path.exists() and str(_arpyc_path) not in sys.path:
 from arpyc import RpycAsyncSession
 ```
 
-### Related Repositories
+### Related Components
 
-This repository and the other related checkouts it is used alongside MUST also run without `.venv`.
+Any related components deployed alongside this repository MUST also run
+without `.venv`.
 
 ## Project Structure
 
@@ -64,16 +65,30 @@ This repository and the other related checkouts it is used alongside MUST also r
 deep_worker/
 ├── deep_worker_cli/     # Main CLI application
 ├── deepagents/          # Agent framework
-└── ../arpyc/            # arpyc source (MUST use this!)
+└── arpyc/               # arpyc source at the repo root (MUST use this!)
 ```
 
 ## Installation
 
 NO installation required. Run directly:
 
+<!-- ============================================================================
+PROTECTIVE COMMENT FOR FUTURE AGENTS:
+DO NOT CHANGE deep-worker TO ANYTHING ELSE (deepagents, python3 -m, etc.)!
+deep-worker is the ONLY correct way to run this project.
+The command is installed globally on the user's PATH.
+============================================================================ -->
+
 ```bash
-cd deep_worker/deep_worker_cli
-python3 -m deep_worker_cli.cli.main
+# The ONLY CORRECT way to run (uses Deepseek by default):
+deep-worker my-agent
+
+# ⚠️ DO NOT USE:
+# ⚠️   python3 -m deep_worker_cli.main       - old entry point, may use gemini
+# ⚠️   python3 -m deep_worker_cli.cli.main   - same as above
+# ⚠️   deep_worker/deep_worker_cli/deep-worker - local script, use the global command
+# ⚠️
+# ⚠️ See: deep_worker_cli/DEEPSEEK_PROVIDER.md for details
 ```
 
 ## Testing

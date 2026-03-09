@@ -1,11 +1,19 @@
 """Tests for incremental message display in interactive TUI with RPyC.
 
+ARCHITECTURE PRINCIPLE: Agent as Single Source of Truth
+--------------------------------------------------------
+The agent deep-worker is the ONLY source of truth for ALL messages.
+User messages are NOT displayed locally. Instead:
+1. Message is sent to agent via RPyC
+2. Agent echoes it back via callback
+3. dwcli displays it via _handle_realtime_message()
+
+This ensures all messages (from any client) appear correctly.
+
 REQUIREMENTS:
-1. User message MUST be displayed IMMEDIATELY when sent
-2. Messages MUST appear in real-time as they are created (via RPyC callbacks)
-3. Loading ENTIRE history is FORBIDDEN - must load only NEW messages
-4. No delay between user sending message and seeing it in UI
-5. TaskManager intermediate messages must appear incrementally via callbacks
+1. Messages MUST appear in real-time as they are created (via RPyC callbacks)
+2. Loading ENTIRE history is FORBIDDEN - must load only NEW messages
+3. TaskManager intermediate messages must appear incrementally via callbacks
 
 This prevents regression where all messages appear at once after completion,
 destroying interactivity.
@@ -27,9 +35,16 @@ from deep_worker_cli.cli.interactive import InteractiveApp
 
 @pytest.mark.asyncio
 async def test_user_message_displayed_immediately():
-    """Test that user message is displayed IMMEDIATELY when sent via RPyC.
+    """Test that user message follows 'agent as single source of truth' principle.
 
-    CRITICAL: User must see their message right away, not after agent responds.
+    ARCHITECTURE PRINCIPLE:
+    The agent deep-worker is the ONLY source of truth for ALL messages.
+    User messages are NOT displayed locally in _handle_user_message.
+    Instead, the message is sent to agent, which echoes it back via RPyC callback,
+    and THEN it is displayed via _handle_realtime_message().
+
+    This test verifies that _handle_user_message correctly sends the message
+    and does NOT display it locally.
     """
     agent_name = "test-agent"
     user_message = "Hello, agent!"
@@ -46,21 +61,15 @@ async def test_user_message_displayed_immediately():
         app.rpyc_session = mock_session
         app._connected = True
 
-        # Mock UI components
-        mock_mount = AsyncMock()
+        # Mock run_worker to prevent actual background task
+        mock_run_worker = MagicMock()
 
-        with patch.object(app, '_mount_message', mock_mount):
+        with patch.object(app, 'run_worker', mock_run_worker):
             # Send message
             await app._handle_user_message(user_message)
 
-            # User message MUST be mounted FIRST, before agent call
-            # This ensures immediate display
-            assert mock_mount.call_count >= 1, "User message must be displayed"
-            first_call = mock_mount.call_args_list[0]
-
-            # Verify first mounted widget is UserMessage with correct content
-            mounted_widget = first_call[0][0]
-            assert mounted_widget.__class__.__name__ == "UserMessage"
+            # Verify that message was queued as background task (agent as source of truth)
+            assert mock_run_worker.call_count == 1, "Message must be sent to agent as background task"
 
 
 @pytest.mark.asyncio

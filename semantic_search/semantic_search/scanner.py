@@ -17,26 +17,69 @@ def _has_excluded_component(path: Path) -> bool:
 def scan_files(repo_path: Path) -> Iterator[Path]:
     """Yield all indexable files under *repo_path*.
 
-    Traverses the directory tree recursively, skipping excluded directories
-    and returning only files whose extension is in ``INDEXED_EXTENSIONS``.
+    Uses git to determine which files to index, automatically respecting .gitignore.
+    Includes both tracked files and untracked files that are not gitignored.
+
+    This ensures that:
+    - Downloaded dependencies (e.g., google-cloud-sdk/) are excluded
+    - Build artifacts, virtual environments, and other ignored files are excluded
+    - Only source files that are (or could be) committed to git are indexed
 
     Args:
-        repo_path: Root directory of the repository to scan.
+        repo_path: Root directory of the repository to scan (must be a git repo).
 
     Yields:
         Absolute ``Path`` objects for each indexable file.
 
     Raises:
         FileNotFoundError: If *repo_path* does not exist or is not a directory.
+        RuntimeError: If *repo_path* is not a git repository.
     """
+    import subprocess  # noqa: PLC0415
+
     if not repo_path.exists():
         raise FileNotFoundError(f"Repository path does not exist: {repo_path}")
     if not repo_path.is_dir():
         raise FileNotFoundError(f"Repository path is not a directory: {repo_path}")
 
-    for path in repo_path.rglob("*"):
-        if not path.is_file():
+    # Check if it's a git repository
+    if not (repo_path / ".git").exists():
+        msg = (
+            f"Not a git repository: {repo_path}. "
+            "Semantic search requires a git repository to respect .gitignore patterns."
+        )
+        raise RuntimeError(msg)
+
+    # Get tracked files (already committed or staged)
+    result = subprocess.run(
+        ["git", "ls-files"],
+        cwd=repo_path,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    tracked_files = result.stdout.strip().split("\n") if result.stdout.strip() else []
+
+    # Get untracked files that are NOT in .gitignore
+    # This includes new files that haven't been committed yet but are valid source files
+    result = subprocess.run(
+        ["git", "ls-files", "--others", "--exclude-standard"],
+        cwd=repo_path,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    untracked_files = result.stdout.strip().split("\n") if result.stdout.strip() else []
+
+    # Combine and filter by extension
+    all_files = set(tracked_files + untracked_files)
+    for file_path_str in all_files:
+        if not file_path_str:  # Skip empty strings
             continue
+        path = repo_path / file_path_str
+        if not path.exists() or not path.is_file():
+            continue
+        # Apply additional exclusions (belt-and-suspenders)
         if _has_excluded_component(path):
             continue
         if path.suffix in INDEXED_EXTENSIONS:

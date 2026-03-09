@@ -82,7 +82,6 @@ EXCLUDED_DIRS: frozenset[str] = frozenset({
     ".cache",
     "coverage",
     "htmlcov",
-    # host-specific virtual env names should be added by the operator
 })
 
 # ---------------------------------------------------------------------------
@@ -99,16 +98,20 @@ class IndexConfig:
     chunk_lines_overlap: int = 5
     max_chars: int = 2000
 
-    # HierarchicalNodeParser chunk sizes in tokens
-    # parent_chunk_size > child_chunk_size
-    parent_chunk_size: int = 512
-    child_chunk_size: int = 128
+    # Chunk sizes in tokens (flat structure by default)
+    # Set parent_chunk_size to enable hierarchical retrieval with AutoMergingRetriever.
+    # If None, uses flat structure with only child_chunk_size (default: LlamaIndex 1024).
+    parent_chunk_size: int | None = None
+    child_chunk_size: int = 1024
 
     # AutoMergingRetriever: fraction of children that triggers parent merge
+    # (only used when parent_chunk_size is not None)
     simple_ratio_thresh: float = 0.5
 
-    # Hugging Face embedding model name
-    embedding_model: str = "BAAI/bge-small-en-v1.5"
+    # Hugging Face embedding model name.
+    # Multilingual model — supports Russian/English cross-lingual search.
+    # See docs/SEMANTIC_SEARCH_DESIGN.md § Embeddings for alternatives.
+    embedding_model: str = "intfloat/multilingual-e5-small"
 
 
 @dataclass(frozen=True)

@@ -75,6 +75,9 @@ Thumbs.db
 # ============================================================
 # PROJECT SPECIFIC
 # ============================================================
+# Vector index (generated, NEVER commit!)
+.vector_index/
+
 # Test outputs
 test_output/
 *.test

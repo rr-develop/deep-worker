@@ -18,6 +18,7 @@ See ARCHITECTURE.md section "History Pagination" for full design rationale.
 
 from __future__ import annotations
 
+import asyncio
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -35,6 +36,12 @@ from deep_worker_cli.cli.interactive import ChatScroll, InteractiveApp
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _close_coroutine(coro):
+    """Close a coroutine to prevent RuntimeWarning about unawaited coroutine."""
+    if asyncio.iscoroutine(coro):
+        coro.close()
+
 
 def _make_app(history_offset: int, history_total: int, loading: bool = False) -> InteractiveApp:
     """Create a minimal InteractiveApp with pagination state pre-set."""
@@ -215,7 +222,10 @@ class TestMaybeLoadMoreHistoryGuards:
         """offset >= total means all history is loaded; must not paginate."""
         app = _make_app(history_offset=100, history_total=100)
         workers: list = []
-        with patch.object(app, "run_worker", side_effect=workers.append):
+        def mock_run_worker(coro):
+            _close_coroutine(coro)
+            workers.append(coro)
+        with patch.object(app, "run_worker", side_effect=mock_run_worker):
             app._maybe_load_more_history()
         assert len(workers) == 0
 
@@ -223,7 +233,10 @@ class TestMaybeLoadMoreHistoryGuards:
         """Defensive: offset > total must also be treated as fully loaded."""
         app = _make_app(history_offset=110, history_total=100)
         workers: list = []
-        with patch.object(app, "run_worker", side_effect=workers.append):
+        def mock_run_worker(coro):
+            _close_coroutine(coro)
+            workers.append(coro)
+        with patch.object(app, "run_worker", side_effect=mock_run_worker):
             app._maybe_load_more_history()
         assert len(workers) == 0
 
@@ -231,7 +244,10 @@ class TestMaybeLoadMoreHistoryGuards:
         """Concurrent load guard: if _loading_history is True, skip."""
         app = _make_app(history_offset=20, history_total=100, loading=True)
         workers: list = []
-        with patch.object(app, "run_worker", side_effect=workers.append):
+        def mock_run_worker(coro):
+            _close_coroutine(coro)
+            workers.append(coro)
+        with patch.object(app, "run_worker", side_effect=mock_run_worker):
             app._maybe_load_more_history()
         assert len(workers) == 0
 
@@ -251,7 +267,10 @@ class TestMaybeLoadMoreHistoryGuards:
         mock_container.children = []
 
         workers: list = []
-        with patch.object(app, "run_worker", side_effect=workers.append), \
+        def mock_run_worker(coro):
+            _close_coroutine(coro)
+            workers.append(coro)
+        with patch.object(app, "run_worker", side_effect=mock_run_worker), \
              patch.object(app, "query_one", return_value=mock_container):
             app._maybe_load_more_history()
 
@@ -265,7 +284,10 @@ class TestMaybeLoadMoreHistoryGuards:
         mock_container.children = _make_children([-100, -80, -60, -40, -20])
 
         workers: list = []
-        with patch.object(app, "run_worker", side_effect=workers.append), \
+        def mock_run_worker(coro):
+            _close_coroutine(coro)
+            workers.append(coro)
+        with patch.object(app, "run_worker", side_effect=mock_run_worker), \
              patch.object(app, "query_one", return_value=mock_container):
             app._maybe_load_more_history()
 
@@ -294,7 +316,10 @@ class TestMaybeLoadMoreHistoryThreshold:
         mock_container.children = _make_children(region_ys)
 
         workers: list = []
-        with patch.object(app, "run_worker", side_effect=workers.append), \
+        def mock_run_worker(coro):
+            _close_coroutine(coro)
+            workers.append(coro)
+        with patch.object(app, "run_worker", side_effect=mock_run_worker), \
              patch.object(app, "query_one", return_value=mock_container):
             app._maybe_load_more_history()
 

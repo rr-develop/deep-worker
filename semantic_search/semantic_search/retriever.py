@@ -1,9 +1,8 @@
 """Retrieval pipeline for semantic_search.
 
-Uses AutoMergingRetriever on top of a LanceDB-backed VectorStoreIndex.
-Leaf nodes are searched by vector similarity; when a sufficient fraction of
-a parent's children are retrieved, the parent (larger context) is returned
-instead.
+Uses a LanceDB-backed VectorStoreIndex for semantic search.
+Supports both flat structure (single chunk size) and hierarchical structure
+(AutoMergingRetriever with parent/child chunks for context expansion).
 """
 
 from __future__ import annotations
@@ -13,9 +12,11 @@ from pathlib import Path
 from typing import Any
 
 from llama_index.core import Settings, StorageContext, VectorStoreIndex
-from llama_index.core.retrievers import AutoMergingRetriever
+from llama_index.core.indices.vector_store.retrievers import VectorIndexRetriever
+from llama_index.core.retrievers import AutoMergingRetriever, BaseRetriever
+from llama_index.core.schema import NodeRelationship
 from llama_index.core.storage.docstore import SimpleDocumentStore
-from llama_index.vector_stores.lancedb import LanceDBVectorStore
+from llama_index.vector_stores.lancedb import LanceDBVectorStore  # type: ignore[import-untyped]
 
 from .config import IndexConfig, RepoIndex
 from .exceptions import IndexNotFoundError
@@ -72,13 +73,29 @@ def _build_retriever(
     storage_context: StorageContext,
     config: IndexConfig,
     top_k: int,
-) -> AutoMergingRetriever:
-    """Build an AutoMergingRetriever over *index*."""
-    # Retrieve more candidates than top_k so merging has room to work
+) -> BaseRetriever:
+    """Build a retriever over *index*.
+
+    Returns AutoMergingRetriever if parent_chunk_size is set (hierarchical),
+    or plain VectorIndexRetriever if parent_chunk_size is None (flat structure).
+    """
+    # Flat structure: use plain VectorIndexRetriever
+    if config.parent_chunk_size is None:
+        return index.as_retriever(similarity_top_k=top_k)
+
+    # Hierarchical structure: use AutoMergingRetriever
+    # Retrieve more candidates than top_k so merging has room to work.
+    # VectorStoreIndex.as_retriever() always returns VectorIndexRetriever,
+    # but the base class return type is BaseRetriever — assert the real type.
     base_retriever = index.as_retriever(similarity_top_k=top_k * 2)
+    if not isinstance(base_retriever, VectorIndexRetriever):
+        raise TypeError(
+            f"Expected VectorIndexRetriever from VectorStoreIndex.as_retriever(), "
+            f"got {type(base_retriever).__name__}"
+        )
     return AutoMergingRetriever(
         base_retriever,
-        storage_context.docstore,
+        storage_context,  # AutoMergingRetriever expects StorageContext, not docstore
         simple_ratio_thresh=config.simple_ratio_thresh,
         verbose=False,
     )
@@ -136,12 +153,12 @@ def search(
 
     # Resolve embedding model
     if embedding_model is None:
-        from llama_index.embeddings.huggingface import HuggingFaceEmbedding  # noqa: PLC0415
+        from llama_index.embeddings.huggingface import HuggingFaceEmbedding  # type: ignore[import-untyped]  # noqa: PLC0415
 
         embedding_model = HuggingFaceEmbedding(model_name=config.embedding_model)
 
     Settings.embed_model = embedding_model
-    Settings.llm = None
+    Settings.llm = None  # type: ignore[assignment]  # LlamaIndex accepts None at runtime
 
     storage_context = _load_storage_context(repo_index)
     index = VectorStoreIndex.from_vector_store(
@@ -157,10 +174,10 @@ def search(
     results: list[SearchResult] = []
     for nws in raw_results[:top_k]:
         node = nws.node
-        # A "parent" node is one that has child relationships stored
+        # A "parent" node is one that has CHILD relationships
+        # Use official NodeRelationship enum instead of hardcoded strings
         has_children = bool(
-            node.relationships and
-            any(k in ("2", "3") for k in node.relationships)  # CHILD = "2", NEXT = "3"
+            node.relationships and NodeRelationship.CHILD in node.relationships
         )
         node_type = "parent" if has_children else "leaf"
         results.append(_to_search_result(nws, node_type=node_type))

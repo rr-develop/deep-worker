@@ -19,7 +19,7 @@ from textual.widgets import Static
 # CRITICAL: ARPYC MUST BE IMPORTED FROM SOURCE CODE, NOT FROM PIP/VENV!
 # ============================================================================
 # DO NOT use 'pip install arpyc' or ANY virtual environment (.venv)!
-# ALWAYS import arpyc from the arpyc source directory in this checkout.
+# ALWAYS import arpyc from the arpyc source directory at the repository root.
 # Using installed packages causes version conflicts and compatibility issues.
 # This project MUST run globally without venv to ensure correct arpyc version.
 # ============================================================================
@@ -35,6 +35,7 @@ from deep_worker_cli.widgets.message_store import MessageStore
 from deep_worker_cli.widgets.messages import (
     AppMessage,
     AssistantMessage,
+    ToolCallMessage,
     UserMessage,
 )
 from deep_worker_cli.widgets.status import StatusBar
@@ -156,6 +157,9 @@ class InteractiveApp(App):
         self._history_offset = 0  # Current pagination offset
         self._history_total = 0   # Total messages available
         self._loading_history = False  # Prevent concurrent loads
+
+        # Tool message tracking for updating status on result
+        self._current_tool_messages: dict[str, ToolCallMessage] = {}
 
     def compose(self) -> ComposeResult:
         """Compose the application layout.
@@ -347,7 +351,15 @@ class InteractiveApp(App):
         ARCHITECTURE PRINCIPLE: AGENT IS THE SINGLE SOURCE OF TRUTH
         ============================================================
         The agent deep-worker is the ONLY source of truth for ALL messages.
-        ALL messages (user + assistant) MUST be displayed via this callback.
+        ALL messages (user + assistant + tool calls + tool results) MUST be
+        displayed via this callback.
+
+        Message types:
+        - type: "user" - User message
+        - type: "assistant" - Complete assistant message
+        - type: "assistant_chunk" - Streaming text chunk from assistant
+        - type: "tool_call" - Tool invocation
+        - type: "tool_result" - Tool execution result
 
         User messages can originate from:
         - This dwcli instance
@@ -358,19 +370,23 @@ class InteractiveApp(App):
         state from agent, maintaining single source of truth.
 
         Args:
-            msg: Message dict with keys: type, role, content
+            msg: Message dict with keys: type, role, content (and others depending on type)
         """
+        msg_type = msg.get("type")
         role = msg.get("role")
         content = msg.get("content", "")
 
-        if role == "user":
+        if msg_type == "user" or (msg_type is None and role == "user"):
             # User message from agent - display it
             # (Could have originated from this dwcli, another client, or task manager)
             import uuid
             msg_id = f"user-{uuid.uuid4().hex[:8]}"
             await self._mount_message(UserMessage(content, id=msg_id))
-        elif role == "assistant":
-            # Assistant message from agent - display it
+            # Update total count
+            self._history_total += 1
+
+        elif msg_type == "assistant" or (msg_type is None and role == "assistant"):
+            # Complete assistant message from agent - display it
             import uuid
             msg_id = f"asst-{uuid.uuid4().hex[:8]}"
             widget = AssistantMessage(content, id=msg_id)
@@ -382,9 +398,72 @@ class InteractiveApp(App):
                 # Log error but don't crash
                 import sys
                 print(f"[DWCLI] Error rendering markdown: {e}", file=sys.stderr)
+            # Update total count
+            self._history_total += 1
 
-        # Update total count
-        self._history_total += 1
+        elif msg_type == "assistant_chunk":
+            # Streaming text chunk from assistant
+            # Find or create the current assistant message widget
+            messages_container = self.query_one("#messages")
+
+            # Get last message widget
+            last_widget = None
+            if messages_container.children:
+                last_widget = messages_container.children[-1]
+
+            # If last widget is AssistantMessage, append to it
+            if last_widget and isinstance(last_widget, AssistantMessage):
+                await last_widget.append_content(content)
+            else:
+                # No existing assistant message, create new one
+                import uuid
+                msg_id = f"asst-{uuid.uuid4().hex[:8]}"
+                widget = AssistantMessage("", id=msg_id)
+                await self._mount_message(widget)
+                await widget.append_content(content)
+                # Update total count only when creating new message
+                self._history_total += 1
+
+        elif msg_type == "tool_call":
+            # Tool call - create ToolCallMessage widget
+            tool_name = msg.get("name", "unknown")
+            tool_args = msg.get("args", {})
+            tool_id = msg.get("id", "unknown")
+
+            import uuid
+            msg_id = f"tool-call-{uuid.uuid4().hex[:8]}"
+            widget = ToolCallMessage(tool_name=tool_name, args=tool_args, id=msg_id)
+            await self._mount_message(widget)
+
+            # Mark as running and track for later status update
+            widget.set_running()
+            self._current_tool_messages[tool_id] = widget
+
+            # Update total count
+            self._history_total += 1
+
+        elif msg_type == "tool_result":
+            # Tool result - update corresponding ToolCallMessage status
+            tool_call_id = msg.get("tool_call_id", "")
+            tool_status = msg.get("status", "unknown")
+            tool_content = msg.get("content", "")
+
+            # Find corresponding tool call widget and update it
+            if tool_call_id in self._current_tool_messages:
+                tool_widget = self._current_tool_messages[tool_call_id]
+                if tool_status == "success":
+                    tool_widget.set_success(tool_content)
+                else:
+                    tool_widget.set_error(tool_content or "Error")
+                # Clean up - remove from tracking after update
+                del self._current_tool_messages[tool_call_id]
+            else:
+                # Orphaned tool result (no matching call) - log and ignore
+                import sys
+                print(
+                    f"[DWCLI] Received tool_result for unknown tool_call_id: {tool_call_id}",
+                    file=sys.stderr,
+                )
 
     async def send_user_message(self, message: str) -> dict[str, Any]:
         """Send a user message to the agent and get response.

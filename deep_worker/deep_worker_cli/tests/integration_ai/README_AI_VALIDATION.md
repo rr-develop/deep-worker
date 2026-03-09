@@ -346,12 +346,12 @@ result = await verify_screenshot_contains(
 - **Solution**: Install with `pip install claude-agent-sdk`
 
 **Issue**: ValidationError: Failed to parse response
-- **Cause**: AI API issue or unexpected format
-- **Solution**: Retry or check API key
+- **Cause**: claude_sdk issue or unexpected format
+- **Solution**: Retry or check claude_sdk connection
 
 **Issue**: Test takes >30 seconds
-- **Cause**: AI API latency
-- **Solution**: This is normal, API is just slow
+- **Cause**: claude_sdk processing latency
+- **Solution**: This is normal for AI validation
 
 **Issue**: High validation costs
 - **Cause**: Using Sonnet/Opus instead of Haiku

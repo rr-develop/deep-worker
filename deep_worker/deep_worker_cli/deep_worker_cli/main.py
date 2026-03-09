@@ -1,4 +1,28 @@
-"""Main entry point and CLI loop for deepagents."""
+"""Main entry point and CLI loop for deep-worker agents.
+
+============================================================================
+⚠️⚠️⚠️ CRITICALLY IMPORTANT FOR FUTURE AGENTS ⚠️⚠️⚠️
+============================================================================
+DO NOT USE THIS FILE DIRECTLY FOR TESTING OR RUNNING AGENTS!
+
+This module is the OLD entry point for the interactive CLI.
+It uses config.py's detect_model_and_provider(), which does NOT prioritize
+the Deepseek provider and may use Google Gemini by default.
+
+The ONLY CORRECT WAY to run agents:
+✅ deep-worker [agent-name]
+
+The deep-worker command is installed globally on the user's PATH.
+It uses the Deepseek provider by default (WITHOUT any extra configuration).
+
+WRONG ways (DO NOT USE):
+❌ python3 -m deep_worker_cli.main      (may use gemini instead of deepseek)
+❌ python3 -m deep_worker_cli.cli.main  (the same)
+❌ Any other direct calls to Python modules
+
+See: DEEPSEEK_PROVIDER.md in the deep_worker_cli directory for details on correct usage.
+============================================================================
+"""
 
 # ruff: noqa: E402
 # Imports placed after warning filters to suppress deprecation warnings

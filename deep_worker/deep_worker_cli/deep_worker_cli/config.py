@@ -416,6 +416,7 @@ class Settings:
     """
 
     # API keys
+    deepseek_api_key: str | None  # Deepseek (DEFAULT provider)
     openai_api_key: str | None
     anthropic_api_key: str | None
     google_api_key: str | None
@@ -449,7 +450,8 @@ class Settings:
         Returns:
             Settings instance with detected configuration
         """
-        # Detect API keys
+        # Detect API keys (Deepseek is DEFAULT provider)
+        deepseek_key = os.environ.get("DEEPSEEK_API_KEY")
         openai_key = os.environ.get("OPENAI_API_KEY")
         anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
         google_key = os.environ.get("GOOGLE_API_KEY")
@@ -474,6 +476,7 @@ class Settings:
         shell_allow_list = parse_shell_allow_list(shell_allow_list_str)
 
         return cls(
+            deepseek_api_key=deepseek_key,
             openai_api_key=openai_key,
             anthropic_api_key=anthropic_key,
             google_api_key=google_key,
@@ -484,6 +487,11 @@ class Settings:
             project_root=project_root,
             shell_allow_list=shell_allow_list,
         )
+
+    @property
+    def has_deepseek(self) -> bool:
+        """Check if Deepseek API key is configured (DEFAULT provider)."""
+        return self.deepseek_api_key is not None
 
     @property
     def has_openai(self) -> bool:
@@ -1074,6 +1082,7 @@ def create_model(model_name_override: str | None = None) -> BaseChatModel:
                 f"from model name: {model_name_override}"
             )
             console.print("\nSupported model name patterns:")
+            console.print("  - Deepseek: deepseek-* (DEFAULT PROVIDER)")
             console.print("  - OpenAI: gpt-*, o1-*, o3-*")
             console.print("  - Anthropic: claude-*")
             console.print("  - Google: gemini-* (requires GOOGLE_API_KEY)")
@@ -1084,7 +1093,13 @@ def create_model(model_name_override: str | None = None) -> BaseChatModel:
             sys.exit(1)
 
         # Check if credentials for detected provider are available
-        if provider == "openai" and not settings.has_openai:
+        if provider == "deepseek" and not settings.has_deepseek:
+            console.print(
+                f"[bold red]Error:[/bold red] Model '{model_name_override}' "
+                "requires DEEPSEEK_API_KEY"
+            )
+            sys.exit(1)
+        elif provider == "openai" and not settings.has_openai:
             console.print(
                 f"[bold red]Error:[/bold red] Model '{model_name_override}' "
                 "requires OPENAI_API_KEY"
@@ -1113,7 +1128,31 @@ def create_model(model_name_override: str | None = None) -> BaseChatModel:
             sys.exit(1)
 
         model_name = model_name_override
-    # Use environment variable defaults, detect provider by API key priority
+    # ============================================================================
+    # ⚠️⚠️⚠️ CRITICALLY IMPORTANT FOR FUTURE AGENTS ⚠️⚠️⚠️
+    # ============================================================================
+    # DO NOT CHANGE THE PROVIDER PRIORITY ORDER!
+    # DO NOT REMOVE THE has_deepseek CHECK!
+    #
+    # This code is used by the OLD entry point main.py (python3 -m deep_worker_cli.main)
+    # which must NOT be used for testing or production!
+    #
+    # The ONLY CORRECT way to run:
+    # ✅ deep-worker [agent-name]  - the command is installed globally on the user's PATH
+    #
+    # WRONG (DO NOT USE):
+    # ❌ python3 -m deep_worker_cli.main
+    # ❌ python3 -m deep_worker_cli.cli.main
+    #
+    # The deep-worker command uses agent_command.py, which explicitly sets provider="deepseek"
+    # by default, so it does NOT go through this auto-detection logic.
+    #
+    # See: DEEPSEEK_PROVIDER.md in the deep_worker_cli directory for details
+    # ============================================================================
+    # Provider auto-detection by API key priority (Deepseek FIRST)
+    elif settings.has_deepseek:
+        provider = "deepseek"
+        model_name = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
     elif settings.has_openai:
         provider = "openai"
         model_name = os.environ.get("OPENAI_MODEL", "gpt-5.2")
@@ -1129,6 +1168,7 @@ def create_model(model_name_override: str | None = None) -> BaseChatModel:
     else:
         console.print("[bold red]Error:[/bold red] No credentials configured.")
         console.print("\nPlease set one of the following environment variables:")
+        console.print("  - DEEPSEEK_API_KEY   (for Deepseek models - DEFAULT PROVIDER)")
         console.print("  - OPENAI_API_KEY     (for OpenAI models like gpt-5.2)")
         console.print("  - ANTHROPIC_API_KEY  (for Claude models)")
         console.print("  - GOOGLE_API_KEY     (for Google Gemini models)")
@@ -1137,7 +1177,7 @@ def create_model(model_name_override: str | None = None) -> BaseChatModel:
             "with Application Default Credentials)"
         )
         console.print("\nExample:")
-        console.print("  export OPENAI_API_KEY=your_api_key_here")
+        console.print("  export DEEPSEEK_API_KEY=your_api_key_here")
         console.print("\nOr add it to your .env file.")
         sys.exit(1)
 
@@ -1147,7 +1187,16 @@ def create_model(model_name_override: str | None = None) -> BaseChatModel:
 
     # Create the model
     model: BaseChatModel
-    if provider == "openai":
+    if provider == "deepseek":
+        # Deepseek uses OpenAI-compatible API
+        from langchain_openai import ChatOpenAI
+
+        model = ChatOpenAI(
+            model=model_name,
+            base_url="https://api.deepseek.com",
+            api_key=settings.deepseek_api_key,
+        )  # type: ignore[call-arg]
+    elif provider == "openai":
         from langchain_openai import ChatOpenAI
 
         model = ChatOpenAI(model=model_name)  # type: ignore[call-arg]

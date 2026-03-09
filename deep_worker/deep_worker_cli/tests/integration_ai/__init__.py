@@ -209,8 +209,7 @@ SECURITY CONSIDERATIONS
 1. Test agents use /tmp for isolation
 2. Socket permissions are user-only (600)
 3. No production data in test agents
-4. Claude API key required for validation
-5. Validation uses bypassPermissions mode
+4. Validation uses claude_sdk (no API key configuration needed)
 
 """
 

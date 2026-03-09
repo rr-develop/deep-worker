@@ -103,7 +103,7 @@ class AgentProcess:
 
         # Paths
         self.pid_file = pid_file or Path(f"/tmp/deep_worker_{name}.pid")
-        self.data_dir = data_dir or Path(f"~/.deep_worker/{name}").expanduser()
+        self.data_dir = data_dir or (Path("~/.deep_worker").expanduser() / name)
 
         # Ensure data directory exists
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -180,6 +180,7 @@ class AgentProcess:
                     enable_memory=True,
                     enable_skills=True,
                     enable_shell=True,
+                    project_memory_dir=Path(self.config.working_dir),
                 )
                 msg = f"[AGENT_INIT] Agent '{self.name}' initialized successfully (agent={self.agent})\n"
                 sys.stdout.write(msg)
@@ -679,6 +680,21 @@ class AgentProcess:
         if self.session_manager:
             await self.session_manager.set_status(AgentStatus.RUNNING)
 
+        # ============================================================
+        # ARCHITECTURE PRINCIPLE: AGENT IS THE SINGLE SOURCE OF TRUTH
+        # ============================================================
+        # Notify user message at the start (unless in streaming mode,
+        # which handles this separately to ensure proper ordering).
+        # This ensures ALL messages flow through the agent and are
+        # broadcast to ALL connected clients.
+        # ============================================================
+        if not stream and notify_callback is not None:
+            notify_callback({
+                "type": "user",
+                "role": "user",
+                "content": message,
+            })
+
         try:
             print(f"[INVOKE] Checking agent: self.agent={self.agent}", file=sys.stderr)
             if self.agent:
@@ -696,36 +712,65 @@ class AgentProcess:
 
                 # Use actual LangGraph agent if available
                 if stream:
-                    # Streaming mode: send chunks as they arrive
+                    # ============================================================
+                    # STREAMING MODE: Full message streaming with all types
+                    # ============================================================
+                    # Uses LangGraph's stream_mode=["messages", "updates"] and
+                    # subgraphs=True to capture ALL message types in real-time:
+                    # - Text chunks from assistant
+                    # - Tool calls
+                    # - Tool results
+                    # All messages are broadcast via notify_callback to uphold
+                    # the "agent as single source of truth" architecture.
+                    # ============================================================
+                    from deep_worker_cli.process.stream_processor import process_message_chunk
+
+                    # Notify user message at start (agent as source of truth)
+                    if notify_callback is not None:
+                        notify_callback({
+                            "type": "user",
+                            "role": "user",
+                            "content": message,
+                        })
+
+                    # Tool call accumulation buffer for streaming chunks
+                    tool_call_buffer: dict[str, Any] = {}
                     full_response = ""
+
+                    # Stream with full message visibility
                     async for chunk in self.agent.astream(
                         {"messages": [{"role": "user", "content": message}]},
-                        config
+                        stream_mode=["messages", "updates"],
+                        subgraphs=True,
+                        config=config,
                     ):
-                        if isinstance(chunk, dict):
-                            # Check if this is a streaming chunk format
-                            if "type" in chunk and "content" in chunk:
-                                # Direct chunk format from test
-                                chunk_content = chunk.get("content", "")
-                                full_response = chunk_content
-                                # Send streaming chunk
-                                await connection.send({
-                                    "type": "chunk",
-                                    "content": chunk_content,
-                                })
-                            else:
-                                # LangGraph format with messages
-                                chunk_data = chunk.get("messages", [])
-                                if chunk_data:
-                                    last_msg = chunk_data[-1]
-                                    if isinstance(last_msg, dict) and last_msg.get("role") == "assistant":
-                                        content = last_msg.get("content", "")
-                                        full_response = content
-                                        # Send streaming chunk
-                                        await connection.send({
-                                            "type": "chunk",
-                                            "content": content,
-                                        })
+                        # LangGraph stream format: (namespace, stream_mode, data)
+                        if not isinstance(chunk, tuple) or len(chunk) != 3:
+                            continue
+
+                        namespace, current_stream_mode, data = chunk
+
+                        # Handle MESSAGES stream - for actual message content
+                        if current_stream_mode == "messages":
+                            message_obj, metadata = data
+
+                            # Process message with stream_processor
+                            if notify_callback is not None:
+                                await process_message_chunk(
+                                    message=message_obj,
+                                    metadata=metadata,
+                                    notify_callback=notify_callback,
+                                    tool_call_buffer=tool_call_buffer,
+                                )
+
+                            # Track full response for return value
+                            if hasattr(message_obj, "content"):
+                                content = message_obj.content
+                                if isinstance(content, str):
+                                    full_response = content
+
+                        # Handle UPDATES stream - for interrupts and state changes
+                        # (Currently we don't process updates, but this is where they would go)
 
                     # Set status back to IDLE after successful completion
                     if self.session_manager:
@@ -821,6 +866,14 @@ class AgentProcess:
                             content = last_msg.content if hasattr(last_msg, "content") else last_msg.get("content", "")
                             role = getattr(last_msg, "type", "assistant")
 
+                            # Notify final assistant response (TaskManager mode)
+                            if notify_callback is not None:
+                                notify_callback({
+                                    "type": "assistant",
+                                    "role": role,
+                                    "content": content,
+                                })
+
                             if self.session_manager:
                                 await self.session_manager.set_status(AgentStatus.IDLE)
 
@@ -850,6 +903,17 @@ class AgentProcess:
                             last_msg = messages[-1]
                             # Handle both dict and LangChain Message objects
                             if isinstance(last_msg, dict):
+                                role = last_msg.get("role", "assistant")
+                                content = last_msg.get("content", "")
+
+                                # Notify assistant response
+                                if notify_callback is not None:
+                                    notify_callback({
+                                        "type": "assistant",
+                                        "role": role,
+                                        "content": content,
+                                    })
+
                                 # Set status back to IDLE after successful completion
                                 if self.session_manager:
                                     await self.session_manager.set_status(AgentStatus.IDLE)
@@ -857,8 +921,8 @@ class AgentProcess:
                                 return {
                                     "success": True,
                                     "response": {
-                                        "role": last_msg.get("role", "assistant"),
-                                        "content": last_msg.get("content", ""),
+                                        "role": role,
+                                        "content": content,
                                     },
                                 }
                             elif hasattr(last_msg, "content"):
@@ -866,6 +930,14 @@ class AgentProcess:
                                 role = getattr(last_msg, "type", "assistant")
                                 content = last_msg.content
                                 print(f"[INVOKE] Returning LangChain message: role={role}, content={content}", file=sys.stderr)
+
+                                # Notify assistant response
+                                if notify_callback is not None:
+                                    notify_callback({
+                                        "type": "assistant",
+                                        "role": role,
+                                        "content": content,
+                                    })
 
                                 # Set status back to IDLE after successful completion
                                 if self.session_manager:

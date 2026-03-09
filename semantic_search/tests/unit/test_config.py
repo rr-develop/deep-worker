@@ -145,7 +145,10 @@ class TestIndexConfig:
         assert config.chunk_lines_overlap >= 0
         assert config.chunk_lines_overlap < config.chunk_lines
         assert config.max_chars > 0
-        assert config.parent_chunk_size > config.child_chunk_size
+        assert config.child_chunk_size > 0
+        # parent_chunk_size can be None (flat structure) or > child_chunk_size
+        if config.parent_chunk_size is not None:
+            assert config.parent_chunk_size > config.child_chunk_size
         assert 0.0 < config.simple_ratio_thresh < 1.0
         assert config.embedding_model != ""
 

@@ -4,10 +4,17 @@ from __future__ import annotations
 
 import os
 import shutil
+import sys
 import tempfile
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+# CRITICAL: Ensure local deepagents is imported instead of pip-installed version
+# This is required for ProjectMemoryMiddleware which is not in official deepagents
+_deepagents_path = Path(__file__).parent.parent.parent.parent / "deepagents"
+if _deepagents_path.exists() and str(_deepagents_path) not in sys.path:
+    sys.path.insert(0, str(_deepagents_path))
 
 # Lazy import of deepagents to avoid import errors when not needed
 if TYPE_CHECKING:
@@ -424,6 +431,7 @@ def create_cli_agent(
     enable_skills: bool = True,
     enable_shell: bool = True,
     checkpointer: BaseCheckpointSaver | None = None,
+    project_memory_dir: Path | None = None,
 ) -> tuple[Pregel, CompositeBackend]:
     """Create a CLI-configured agent with flexible options.
 
@@ -458,6 +466,11 @@ def create_cli_agent(
 
             If `None`, uses `InMemorySaver` (no persistence across
             CLI invocations).
+        project_memory_dir: Directory to check for semantic search index.
+
+            If `None`, defaults to `Path.cwd()`. When a semantic index
+            exists at `{project_memory_dir}/.vector_index/`, the
+            `project_memory` tool becomes available for code search.
 
     Returns:
         2-tuple of `(agent_graph, backend)`
@@ -473,7 +486,34 @@ def create_cli_agent(
     from deepagents.middleware import MemoryMiddleware, SkillsMiddleware
     from deepagents.middleware.subagents import CompiledSubAgent, SubAgent
 
+    # Import ProjectMemoryMiddleware from local deepagents if available
+    try:
+        # Try local version first (has ProjectMemoryMiddleware)
+        from deepagents.middleware.project_memory import ProjectMemoryMiddleware
+    except (ImportError, ModuleNotFoundError):
+        # Fallback: define a no-op placeholder that is compatible with AgentMiddleware
+        from langchain.agents.middleware.types import AgentMiddleware
+
+        class ProjectMemoryMiddleware(AgentMiddleware):
+            """Placeholder when ProjectMemoryMiddleware is unavailable.
+
+            CRITICAL: This placeholder is ONLY for type compatibility.
+            In production, ProjectMemoryMiddleware MUST be available from local deepagents.
+            If you see this being used, CHECK YOUR PYTHON PATH - you are testing
+            WRONG CODE (installed packages instead of repository code)!
+            """
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                self.tools = []  # No tools available in placeholder
+
     tools = tools or []
+
+    # CRITICAL: project_memory_dir is REQUIRED - no fallback!
+    if project_memory_dir is None:
+        msg = (
+            "project_memory_dir is REQUIRED and cannot be None. "
+            "Backend MUST know its working directory unambiguously."
+        )
+        raise ValueError(msg)
 
     # Setup agent directory for persistent memory (if enabled)
     if enable_memory or enable_skills:
@@ -521,7 +561,7 @@ def create_cli_agent(
 
         agent_middleware.append(
             MemoryMiddleware(
-                backend=FilesystemBackend(),
+                backend=FilesystemBackend(root_dir=project_memory_dir),
                 sources=memory_sources,
             )
         )
@@ -536,7 +576,7 @@ def create_cli_agent(
 
         agent_middleware.append(
             SkillsMiddleware(
-                backend=FilesystemBackend(),
+                backend=FilesystemBackend(root_dir=project_memory_dir),
                 sources=sources,
             )
         )
@@ -554,22 +594,32 @@ def create_cli_agent(
             # Use CLIShellBackend for filesystem + shell execution.
             # Provides `execute` tool via FilesystemMiddleware with per-command
             # timeout support.
+            # CRITICAL: MUST use project_memory_dir, NOT Path.cwd()!
             backend = CLIShellBackend(
-                root_dir=Path.cwd(),
+                root_dir=project_memory_dir,
                 inherit_env=True,
                 env=shell_env,
             )
         else:
             # No shell access - use plain FilesystemBackend
-            backend = FilesystemBackend()
+            # CRITICAL: MUST use project_memory_dir, NOT Path.cwd()!
+            backend = FilesystemBackend(root_dir=project_memory_dir)
 
         # Local context middleware (git info, directory tree, etc.)
         agent_middleware.append(LocalContextMiddleware())
+
+        # Project memory middleware (semantic search if index exists)
+        # CRITICAL: NO FALLBACK - project_memory_dir is guaranteed to be set!
+        agent_middleware.append(ProjectMemoryMiddleware(working_dir=project_memory_dir))
     else:
         # ========== REMOTE SANDBOX MODE ==========
         backend = sandbox  # Remote sandbox (ModalBackend, etc.)
         # Note: Shell middleware not used in sandbox mode
         # File operations and execute tool are provided by the sandbox backend
+
+        # Project memory middleware (if working directory is specified)
+        if project_memory_dir is not None:
+            agent_middleware.append(ProjectMemoryMiddleware(working_dir=project_memory_dir))
 
     # Get or use custom system prompt
     if system_prompt is None:

@@ -1,4 +1,13 @@
-"""Unit tests for agent formatting functions."""
+"""Unit tests for agent formatting functions.
+
+CRITICAL: ALWAYS TEST LOCAL REPOSITORY CODE
+============================================
+These tests MUST use code from deep_worker/deepagents.
+conftest.py ensures sys.path is configured correctly.
+
+NEVER test against installed packages from site-packages!
+Testing wrong code leads to false test results and production bugs.
+"""
 
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -447,6 +456,84 @@ class TestListAgents:
         assert "(default)" not in joined
 
 
+class TestCreateCliAgentBackendWorkingDirectory:
+    """Test that create_cli_agent uses project_memory_dir for backend.cwd."""
+
+    def test_backend_uses_project_memory_dir(self, tmp_path: Path) -> None:
+        """CRITICAL: Backend MUST use project_memory_dir, NOT Path.cwd().
+
+        This test verifies that after daemonization (when process cwd is /),
+        the backend still operates in the correct working directory.
+
+        Failure scenario:
+        - Agent started with: deep-worker dw_lc --dir /path/to/your/project
+        - After daemonize: process cwd = /
+        - If backend uses Path.cwd(): backend.cwd = / (WRONG!)
+        - If backend uses project_memory_dir: backend.cwd = /path/to/your/project (CORRECT!)
+        """
+        working_dir = tmp_path / "project"
+        working_dir.mkdir()
+        agent_dir = tmp_path / "agent"
+        agent_dir.mkdir()
+        skills_dir = tmp_path / "skills"
+        skills_dir.mkdir()
+
+        # Create .vector_index directory for ProjectMemoryMiddleware
+        vector_index = working_dir / ".vector_index"
+        vector_index.mkdir()
+        (vector_index / "lancedb").mkdir()
+        (vector_index / "docstore").mkdir()
+        (vector_index / "docstore" / "docstore.json").write_text("{}")
+        (vector_index / "file_hashes.json").write_text("{}")
+
+        mock_settings = Mock()
+        mock_settings.ensure_agent_dir.return_value = agent_dir
+        mock_settings.ensure_user_skills_dir.return_value = skills_dir
+        mock_settings.get_project_skills_dir.return_value = None
+        mock_settings.get_built_in_skills_dir.return_value = Path("/fake/built-in")
+        mock_settings.get_user_agent_md_path.return_value = agent_dir / "AGENTS.md"
+        mock_settings.get_project_agent_md_path.return_value = None
+        mock_settings.get_user_agents_dir.return_value = tmp_path / "agents"
+        mock_settings.get_project_agents_dir.return_value = None
+        mock_settings.model_name = None
+        mock_settings.model_provider = None
+        mock_settings.model_context_limit = None
+        mock_settings.project_root = None
+        mock_settings.user_langchain_project = None
+
+        captured_backend = None
+
+        def capture_create_deep_agent(**kwargs: Any) -> Mock:
+            nonlocal captured_backend
+            captured_backend = kwargs.get("backend")
+            mock_agent = Mock()
+            mock_agent.with_config.return_value = mock_agent
+            return mock_agent
+
+        with (
+            patch("deep_worker_cli.agent.settings", mock_settings),
+            patch("deepagents.create_deep_agent", side_effect=capture_create_deep_agent),
+            patch("deep_worker_cli.agent.LocalContextMiddleware"),
+        ):
+            create_cli_agent(
+                model="fake-model",
+                assistant_id="test",
+                enable_shell=True,
+                enable_memory=False,
+                enable_skills=False,
+                project_memory_dir=working_dir,
+            )
+
+        # CRITICAL ASSERTION: Backend MUST use project_memory_dir
+        assert captured_backend is not None, "Backend was not captured"
+        assert hasattr(captured_backend, "default"), "Backend doesn't have default attribute"
+        assert hasattr(captured_backend.default, "cwd"), "Backend.default doesn't have cwd attribute"
+        assert captured_backend.default.cwd == working_dir, (
+            f"Backend.default.cwd is {captured_backend.default.cwd}, expected {working_dir}. "
+            "Backend MUST use project_memory_dir, NOT Path.cwd()!"
+        )
+
+
 class TestCreateCliAgentSkillsSources:
     """Test that `create_cli_agent` wires built-in skills as first source."""
 
@@ -499,6 +586,7 @@ class TestCreateCliAgentSkillsSources:
                 enable_memory=False,
                 enable_skills=True,
                 enable_shell=False,
+                project_memory_dir=tmp_path,
             )
 
         assert len(captured_sources) == 1

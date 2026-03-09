@@ -1,4 +1,13 @@
-"""End-to-end unit tests for deepagents-cli with fake LLM models."""
+"""End-to-end unit tests for deepagents-cli with fake LLM models.
+
+CRITICAL: ALWAYS TEST LOCAL REPOSITORY CODE
+============================================
+These tests MUST use code from deep_worker/deepagents.
+conftest.py ensures sys.path is configured correctly.
+
+NEVER test against installed packages from site-packages!
+Testing wrong code leads to false test results and production bugs.
+"""
 
 import uuid
 from collections.abc import Callable, Generator, Sequence
@@ -126,6 +135,7 @@ class TestDeepAgentsCLIEndToEnd:
                 model=model,
                 assistant_id="test-agent",
                 tools=[],
+                project_memory_dir=tmp_path,
             )
 
             # Invoke the agent with a simple message
@@ -164,6 +174,7 @@ class TestDeepAgentsCLIEndToEnd:
                 model=model,
                 assistant_id="test-agent",
                 tools=[],
+                project_memory_dir=tmp_path,
             )
 
             # Invoke the agent
@@ -222,6 +233,7 @@ class TestDeepAgentsCLIEndToEnd:
                 model=model,
                 assistant_id="test-agent",
                 tools=[sample_tool],
+                project_memory_dir=tmp_path,
             )
 
             # Invoke the agent
@@ -278,6 +290,7 @@ class TestDeepAgentsCLIEndToEnd:
                 model=model,
                 assistant_id="test-agent",
                 tools=[],
+                project_memory_dir=tmp_path,
             )
 
             # Invoke the agent
@@ -338,6 +351,7 @@ class TestDeepAgentsCLIEndToEnd:
                 model=model,
                 assistant_id="test-agent",
                 tools=[sample_tool],
+                project_memory_dir=tmp_path,
             )
 
             # Invoke the agent
@@ -379,6 +393,7 @@ class TestDeepAgentsCLIEndToEnd:
                 model=model,
                 assistant_id="test-agent",
                 tools=[],
+                project_memory_dir=tmp_path,
             )
 
             assert isinstance(backend, CompositeBackend)

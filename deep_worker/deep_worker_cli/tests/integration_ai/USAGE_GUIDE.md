@@ -244,12 +244,12 @@ except ImportError:
 ### "ValidationError: Failed to parse response"
 - AI response format was unexpected
 - This is a system/infrastructure error, not a test failure
-- Retry the validation or check your API key
+- Retry the validation or check claude_sdk connection
 
 ### Validation timeout (>30 seconds)
-- Claude API is slow
+- claude_sdk processing can be slow
 - Network connection issue
-- API quota exceeded
+- This is normal for AI validation
 - Solution: Retry or use a simpler validation
 
 ### High costs

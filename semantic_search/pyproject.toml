@@ -49,4 +49,4 @@ exclude_lines = [
 [tool.pyright]
 include = ["semantic_search"]
 pythonVersion = "3.11"
-strict = true
+typeCheckingMode = "strict"

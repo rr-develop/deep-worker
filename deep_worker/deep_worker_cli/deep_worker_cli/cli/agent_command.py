@@ -202,10 +202,11 @@ def main() -> int:
 
     # Save current working directory BEFORE daemonize changes it to /
     # This allows run_agent() to use the original directory after daemonization
-    # Priority: --dir arg > current directory
+    # Priority: --dir arg > DEEP_WORKER_ORIGINAL_CWD env var (from bash) > current directory
     if args.dir:
         os.environ["DEEP_WORKER_ORIGINAL_CWD"] = str(args.dir.resolve())
-    else:
+    elif "DEEP_WORKER_ORIGINAL_CWD" not in os.environ:
+        # Only set if not already set by bash wrapper
         os.environ["DEEP_WORKER_ORIGINAL_CWD"] = os.getcwd()
 
     # Daemonize before starting agent

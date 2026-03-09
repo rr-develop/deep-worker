@@ -161,12 +161,11 @@ class AgentService(rpyc.Service):
             # Wait for result with timeout
             response = future.result(timeout=300.0)  # 5 minute timeout
 
-            # Notify subscribers about assistant response
-            if response.get("success"):
-                assistant_msg = response.get("response", {}).get("content", "")
-                self._notify_subscribers(
-                    {"type": "assistant", "content": assistant_msg, "role": "assistant"}
-                )
+            # NOTE: No longer need to notify here - _handle_invoke now sends
+            # all messages (user, assistant, tool_call, tool_result) via
+            # notify_callback (which is _notify_subscribers) to uphold the
+            # "agent is single source of truth" architecture principle.
+            # This prevents duplicate assistant message notifications.
 
             return response
 

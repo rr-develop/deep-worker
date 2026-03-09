@@ -235,3 +235,55 @@ class TestMainSetsEnvironmentVariable:
                     os.environ["DEEP_WORKER_ORIGINAL_CWD"] = original_env
                 else:
                     os.environ.pop("DEEP_WORKER_ORIGINAL_CWD", None)
+
+    def test_main_preserves_env_var_from_bash_wrapper(self):
+        """Test that main() does NOT overwrite env var already set by bash wrapper.
+
+        This is the critical test that catches the regression where Python code
+        overwrites DEEP_WORKER_ORIGINAL_CWD set by the bash wrapper.
+
+        Real-world scenario:
+        1. User runs: cd /path/to/your/project && deep-worker vc_dw
+        2. Bash wrapper saves: ORIGINAL_CWD=/path/to/your/project
+        3. Bash wrapper does: cd $SCRIPT_DIR (to deep_worker_cli/)
+        4. Bash wrapper sets: DEEP_WORKER_ORIGINAL_CWD=/path/to/your/project
+        5. Bash wrapper runs: python3 -m deep_worker_cli.cli.agent_command
+        6. Python main() should NOT overwrite with os.getcwd() (which is deep_worker_cli/)
+        """
+        with tempfile.TemporaryDirectory() as user_dir:
+            with tempfile.TemporaryDirectory() as script_dir:
+                original_cwd = os.getcwd()
+                original_env = os.environ.get("DEEP_WORKER_ORIGINAL_CWD")
+                try:
+                    # Simulate bash wrapper behavior:
+                    # 1. User was in user_dir
+                    # 2. Bash did: cd script_dir
+                    # 3. Bash set: DEEP_WORKER_ORIGINAL_CWD=user_dir
+                    os.chdir(script_dir)  # Current dir is now script_dir
+                    os.environ["DEEP_WORKER_ORIGINAL_CWD"] = user_dir  # But bash saved user_dir
+
+                    # Mock sys.argv WITHOUT --dir argument
+                    with patch.object(sys, 'argv', ['deep-worker', 'test_agent']):
+                        # Mock daemonize and asyncio.run
+                        def mock_daemonize(name):
+                            # CRITICAL CHECK: env var should STILL be user_dir, NOT script_dir!
+                            assert "DEEP_WORKER_ORIGINAL_CWD" in os.environ
+                            assert os.environ["DEEP_WORKER_ORIGINAL_CWD"] == user_dir
+                            assert os.environ["DEEP_WORKER_ORIGINAL_CWD"] != script_dir
+                            assert os.environ["DEEP_WORKER_ORIGINAL_CWD"] != os.getcwd()
+
+                        with patch('deep_worker_cli.cli.agent_command.daemonize', mock_daemonize):
+                            with patch('deep_worker_cli.cli.agent_command.asyncio.run', return_value=0):
+                                # Call main()
+                                main()
+
+                    # Final verification: env var should STILL be user_dir
+                    assert os.environ["DEEP_WORKER_ORIGINAL_CWD"] == user_dir
+                    assert os.environ["DEEP_WORKER_ORIGINAL_CWD"] != script_dir
+
+                finally:
+                    os.chdir(original_cwd)
+                    if original_env is not None:
+                        os.environ["DEEP_WORKER_ORIGINAL_CWD"] = original_env
+                    else:
+                        os.environ.pop("DEEP_WORKER_ORIGINAL_CWD", None)

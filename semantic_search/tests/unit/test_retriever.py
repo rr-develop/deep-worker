@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from llama_index.core.embeddings.mock_embed_model import MockEmbedding
+from llama_index.core.schema import NodeRelationship, RelatedNodeInfo
 
 from semantic_search.exceptions import IndexNotFoundError
 from semantic_search.retriever import SearchResult, search
@@ -82,7 +83,7 @@ class TestSearchWithMocks:
         node_with_score.score = score
         return node_with_score
 
-    @patch("semantic_search.retriever.AutoMergingRetriever")
+    @patch("semantic_search.retriever._build_retriever")
     @patch("semantic_search.retriever.StorageContext")
     @patch("semantic_search.retriever.VectorStoreIndex")
     @patch("semantic_search.retriever.LanceDBVectorStore")
@@ -93,7 +94,7 @@ class TestSearchWithMocks:
         mock_vs_cls: MagicMock,
         mock_index_cls: MagicMock,
         mock_sc_cls: MagicMock,
-        mock_retriever_cls: MagicMock,
+        mock_build_retriever: MagicMock,
         tmp_path: Path,
     ) -> None:
         # Arrange: create .vector_index to pass exists() check
@@ -104,7 +105,7 @@ class TestSearchWithMocks:
         )
         mock_retriever = MagicMock()
         mock_retriever.retrieve.return_value = [node_with_score]
-        mock_retriever_cls.return_value = mock_retriever
+        mock_build_retriever.return_value = mock_retriever
 
         embed = MockEmbedding(embed_dim=16)
 
@@ -116,7 +117,7 @@ class TestSearchWithMocks:
         assert len(results) == 1
         assert isinstance(results[0], SearchResult)
 
-    @patch("semantic_search.retriever.AutoMergingRetriever")
+    @patch("semantic_search.retriever._build_retriever")
     @patch("semantic_search.retriever.StorageContext")
     @patch("semantic_search.retriever.VectorStoreIndex")
     @patch("semantic_search.retriever.LanceDBVectorStore")
@@ -127,7 +128,7 @@ class TestSearchWithMocks:
         mock_vs_cls: MagicMock,
         mock_index_cls: MagicMock,
         mock_sc_cls: MagicMock,
-        mock_retriever_cls: MagicMock,
+        mock_build_retriever: MagicMock,
         tmp_path: Path,
     ) -> None:
         (tmp_path / ".vector_index").mkdir()
@@ -136,7 +137,7 @@ class TestSearchWithMocks:
         node_with_score = self._mock_node_with_score("def hello(): pass", file_path, score=0.85)
         mock_retriever = MagicMock()
         mock_retriever.retrieve.return_value = [node_with_score]
-        mock_retriever_cls.return_value = mock_retriever
+        mock_build_retriever.return_value = mock_retriever
 
         embed = MockEmbedding(embed_dim=16)
 
@@ -148,7 +149,7 @@ class TestSearchWithMocks:
         assert r.score == pytest.approx(0.85)
         assert r.language == "python"
 
-    @patch("semantic_search.retriever.AutoMergingRetriever")
+    @patch("semantic_search.retriever._build_retriever")
     @patch("semantic_search.retriever.StorageContext")
     @patch("semantic_search.retriever.VectorStoreIndex")
     @patch("semantic_search.retriever.LanceDBVectorStore")
@@ -159,7 +160,7 @@ class TestSearchWithMocks:
         mock_vs_cls: MagicMock,
         mock_index_cls: MagicMock,
         mock_sc_cls: MagicMock,
-        mock_retriever_cls: MagicMock,
+        mock_build_retriever: MagicMock,
         tmp_path: Path,
     ) -> None:
         (tmp_path / ".vector_index").mkdir()
@@ -170,7 +171,7 @@ class TestSearchWithMocks:
         ]
         mock_retriever = MagicMock()
         mock_retriever.retrieve.return_value = nodes[:3]
-        mock_retriever_cls.return_value = mock_retriever
+        mock_build_retriever.return_value = mock_retriever
 
         embed = MockEmbedding(embed_dim=16)
 
@@ -178,7 +179,7 @@ class TestSearchWithMocks:
 
         assert len(results) == 3
 
-    @patch("semantic_search.retriever.AutoMergingRetriever")
+    @patch("semantic_search.retriever._build_retriever")
     @patch("semantic_search.retriever.StorageContext")
     @patch("semantic_search.retriever.VectorStoreIndex")
     @patch("semantic_search.retriever.LanceDBVectorStore")
@@ -189,17 +190,191 @@ class TestSearchWithMocks:
         mock_vs_cls: MagicMock,
         mock_index_cls: MagicMock,
         mock_sc_cls: MagicMock,
-        mock_retriever_cls: MagicMock,
+        mock_build_retriever: MagicMock,
         tmp_path: Path,
     ) -> None:
         (tmp_path / ".vector_index").mkdir()
 
         mock_retriever = MagicMock()
         mock_retriever.retrieve.return_value = []
-        mock_retriever_cls.return_value = mock_retriever
+        mock_build_retriever.return_value = mock_retriever
 
         embed = MockEmbedding(embed_dim=16)
 
         results = search("nonexistent thing", repo_path=tmp_path, embedding_model=embed)
 
         assert results == []
+
+
+class TestNodeTypeDetection:
+    """Test correct node_type detection using NodeRelationship enum (not hardcoded strings)."""
+
+    def _mock_node_with_relationships(
+        self,
+        text: str,
+        file_path: str,
+        relationships: dict[str, RelatedNodeInfo],
+    ) -> MagicMock:
+        """Create a mock node with specific relationships."""
+        node = MagicMock()
+        node.get_content.return_value = text
+        node.metadata = {
+            "file_path": file_path,
+            "language": "python",
+        }
+        node.relationships = relationships
+        node.score = 0.9
+        return node
+
+    def _mock_node_with_score_and_relationships(
+        self,
+        text: str,
+        file_path: str,
+        relationships: dict[str, RelatedNodeInfo],
+        score: float = 0.9,
+    ) -> MagicMock:
+        """Create a NodeWithScore mock with specific relationships."""
+        node_with_score = MagicMock()
+        node_with_score.node = self._mock_node_with_relationships(text, file_path, relationships)
+        node_with_score.score = score
+        return node_with_score
+
+    @patch("semantic_search.retriever._build_retriever")
+    @patch("semantic_search.retriever.StorageContext")
+    @patch("semantic_search.retriever.VectorStoreIndex")
+    @patch("semantic_search.retriever.LanceDBVectorStore")
+    @patch("semantic_search.retriever.SimpleDocumentStore")
+    def test_node_with_only_source_is_leaf(
+        self,
+        mock_ds_cls: MagicMock,
+        mock_vs_cls: MagicMock,
+        mock_index_cls: MagicMock,
+        mock_sc_cls: MagicMock,
+        mock_build_retriever: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Node with only SOURCE relationship should be detected as leaf."""
+        (tmp_path / ".vector_index").mkdir()
+
+        relationships = {
+            NodeRelationship.SOURCE: RelatedNodeInfo(node_id="doc_123")
+        }
+        node_with_score = self._mock_node_with_score_and_relationships(
+            "def hello(): pass", str(tmp_path / "main.py"), relationships
+        )
+
+        mock_retriever = MagicMock()
+        mock_retriever.retrieve.return_value = [node_with_score]
+        mock_build_retriever.return_value = mock_retriever
+
+        embed = MockEmbedding(embed_dim=16)
+        results = search("hello", repo_path=tmp_path, embedding_model=embed)
+
+        assert len(results) == 1
+        assert results[0].node_type == "leaf"
+
+    @patch("semantic_search.retriever._build_retriever")
+    @patch("semantic_search.retriever.StorageContext")
+    @patch("semantic_search.retriever.VectorStoreIndex")
+    @patch("semantic_search.retriever.LanceDBVectorStore")
+    @patch("semantic_search.retriever.SimpleDocumentStore")
+    def test_node_with_previous_next_is_leaf(
+        self,
+        mock_ds_cls: MagicMock,
+        mock_vs_cls: MagicMock,
+        mock_index_cls: MagicMock,
+        mock_sc_cls: MagicMock,
+        mock_build_retriever: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Node with SOURCE + PREVIOUS + NEXT relationships should be leaf (not parent)."""
+        (tmp_path / ".vector_index").mkdir()
+
+        relationships = {
+            NodeRelationship.SOURCE: RelatedNodeInfo(node_id="doc_123"),
+            NodeRelationship.PREVIOUS: RelatedNodeInfo(node_id="node_prev"),
+            NodeRelationship.NEXT: RelatedNodeInfo(node_id="node_next"),
+        }
+        node_with_score = self._mock_node_with_score_and_relationships(
+            "def world(): pass", str(tmp_path / "main.py"), relationships
+        )
+
+        mock_retriever = MagicMock()
+        mock_retriever.retrieve.return_value = [node_with_score]
+        mock_build_retriever.return_value = mock_retriever
+
+        embed = MockEmbedding(embed_dim=16)
+        results = search("world", repo_path=tmp_path, embedding_model=embed)
+
+        assert len(results) == 1
+        assert results[0].node_type == "leaf"
+
+    @patch("semantic_search.retriever._build_retriever")
+    @patch("semantic_search.retriever.StorageContext")
+    @patch("semantic_search.retriever.VectorStoreIndex")
+    @patch("semantic_search.retriever.LanceDBVectorStore")
+    @patch("semantic_search.retriever.SimpleDocumentStore")
+    def test_node_with_child_is_parent(
+        self,
+        mock_ds_cls: MagicMock,
+        mock_vs_cls: MagicMock,
+        mock_index_cls: MagicMock,
+        mock_sc_cls: MagicMock,
+        mock_build_retriever: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Node with CHILD relationship should be detected as parent."""
+        (tmp_path / ".vector_index").mkdir()
+
+        relationships = {
+            NodeRelationship.SOURCE: RelatedNodeInfo(node_id="doc_123"),
+            NodeRelationship.CHILD: RelatedNodeInfo(node_id="child_node_1"),
+        }
+        node_with_score = self._mock_node_with_score_and_relationships(
+            "class MyClass:", str(tmp_path / "main.py"), relationships
+        )
+
+        mock_retriever = MagicMock()
+        mock_retriever.retrieve.return_value = [node_with_score]
+        mock_build_retriever.return_value = mock_retriever
+
+        embed = MockEmbedding(embed_dim=16)
+        results = search("class", repo_path=tmp_path, embedding_model=embed)
+
+        assert len(results) == 1
+        assert results[0].node_type == "parent"
+
+    @patch("semantic_search.retriever._build_retriever")
+    @patch("semantic_search.retriever.StorageContext")
+    @patch("semantic_search.retriever.VectorStoreIndex")
+    @patch("semantic_search.retriever.LanceDBVectorStore")
+    @patch("semantic_search.retriever.SimpleDocumentStore")
+    def test_node_without_child_is_leaf(
+        self,
+        mock_ds_cls: MagicMock,
+        mock_vs_cls: MagicMock,
+        mock_index_cls: MagicMock,
+        mock_sc_cls: MagicMock,
+        mock_build_retriever: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Node without CHILD relationship should be leaf, even with PARENT."""
+        (tmp_path / ".vector_index").mkdir()
+
+        relationships = {
+            NodeRelationship.SOURCE: RelatedNodeInfo(node_id="doc_123"),
+            NodeRelationship.PARENT: RelatedNodeInfo(node_id="parent_node"),
+        }
+        node_with_score = self._mock_node_with_score_and_relationships(
+            "x = 1", str(tmp_path / "main.py"), relationships
+        )
+
+        mock_retriever = MagicMock()
+        mock_retriever.retrieve.return_value = [node_with_score]
+        mock_build_retriever.return_value = mock_retriever
+
+        embed = MockEmbedding(embed_dim=16)
+        results = search("x", repo_path=tmp_path, embedding_model=embed)
+
+        assert len(results) == 1
+        assert results[0].node_type == "leaf"
