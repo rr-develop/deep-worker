@@ -1,0 +1,59 @@
+[project]
+name = "claude-code-provider"
+version = "0.1.0"
+description = "Claude Code SDK provider for deep-worker with full LangChain compatibility"
+requires-python = ">=3.11"
+dependencies = [
+    "langchain-core>=0.3.0",
+]
+
+[dependency-groups]
+test = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-mock>=3.12",
+    "pytest-cov>=4.0",
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["claude_code_provider*"]
+
+[tool.setuptools.package-data]
+"claude_code_provider" = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-v --tb=short"
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+
+[tool.coverage.run]
+source = ["claude_code_provider"]
+omit = ["tests/*"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "@abstractmethod",
+    "raise NotImplementedError",
+    "assert False",
+]
+
+[tool.pyright]
+include = ["claude_code_provider", "tests"]
+exclude = ["**/__pycache__", "**/.pytest_cache"]
+pythonVersion = "3.11"
+typeCheckingMode = "strict"
+reportMissingTypeStubs = false
+reportUnknownMemberType = false
+reportUnknownArgumentType = false
+reportUnknownVariableType = false
+reportUnknownParameterType = false
