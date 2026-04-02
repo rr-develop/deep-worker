@@ -43,7 +43,7 @@ from deep_worker_cli.config import (
 )
 from deep_worker_cli.file_ops import FileOpTracker
 from deep_worker_cli.sessions import generate_thread_id, get_checkpointer
-from deep_worker_cli.tools import fetch_url, http_request, web_search
+from deep_worker_cli.tools import fetch_url, http_request, web_search_delegation_tool
 
 if TYPE_CHECKING:
     from langchain_core.runnables import RunnableConfig
@@ -596,9 +596,9 @@ async def run_non_interactive(
 
     try:
         async with get_checkpointer() as checkpointer:
-            tools = [http_request, fetch_url]
-            if settings.has_tavily:
-                tools.append(web_search)
+            # Always include web_search_delegation_tool (works with any provider via Claude Code SDK)
+            # No API key required like Tavily
+            tools = [http_request, fetch_url, web_search_delegation_tool]
 
             # If an allow-list is provided, enable shell but disable
             # auto-approve so HITL can gate commands. If no allow-list, disable

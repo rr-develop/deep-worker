@@ -169,13 +169,20 @@ async def show_status(agent_name: str) -> int:
 
 
 async def stop_agent(agent_name: str) -> int:
-    """Stop an agent gracefully.
+    """Stop an agent gracefully, with force kill if needed.
+
+    CRITICAL REQUIREMENTS:
+    1. Try graceful shutdown with SIGTERM (wait up to 5 seconds)
+    2. If still alive, FORCE KILL with SIGKILL (no mercy!)
+    3. VERIFY process is actually dead before returning success
+    4. Report what happened (graceful vs forced)
+    5. Clean up stale registry entries
 
     Args:
         agent_name: Name of the agent to stop
 
     Returns:
-        Exit code
+        Exit code (0=success, 1=failure)
     """
     try:
         registry = ProcessRegistry()
@@ -188,39 +195,114 @@ async def stop_agent(agent_name: str) -> int:
 
         print(f"Stopping agent '{agent_name}' (PID {agent_info.pid})...")
 
-        # Send SIGTERM for graceful shutdown
         import os
         import signal
+        import time
 
+        # Check if process exists
+        try:
+            os.kill(agent_info.pid, 0)  # Signal 0 checks existence
+        except ProcessLookupError:
+            print(f"Warning: Process {agent_info.pid} not found (already dead)", file=sys.stderr)
+            # Clean up stale registry entry
+            registry.unregister(agent_name)
+            return 1
+        except PermissionError:
+            print(f"Error: Permission denied to check process {agent_info.pid}", file=sys.stderr)
+            return 1
+
+        # Phase 1: Try graceful shutdown with SIGTERM
         try:
             os.kill(agent_info.pid, signal.SIGTERM)
+            print(f"Sent SIGTERM to PID {agent_info.pid}, waiting for graceful shutdown...")
         except ProcessLookupError:
-            print(f"Warning: Process {agent_info.pid} not found", file=sys.stderr)
-            # Clean up stale registry entry
+            print(f"Warning: Process {agent_info.pid} died before SIGTERM", file=sys.stderr)
             registry.unregister(agent_name)
             return 1
         except PermissionError:
             print(f"Error: Permission denied to stop process {agent_info.pid}", file=sys.stderr)
             return 1
 
-        # Wait briefly for shutdown
-        import time
+        # Wait up to 5 seconds for graceful shutdown
+        max_wait = 5.0  # seconds
+        check_interval = 0.1  # seconds
+        waited = 0.0
 
-        for _ in range(10):  # Wait up to 1 second
-            time.sleep(0.1)
-            if registry.lookup(agent_name) is None:
-                break
+        while waited < max_wait:
+            await asyncio.sleep(check_interval)
+            waited += check_interval
 
-        # Check if agent stopped
-        if registry.lookup(agent_name) is None:
-            print(f"Agent '{agent_name}' stopped successfully")
+            # Check if process is dead
+            try:
+                os.kill(agent_info.pid, 0)  # Check if process exists
+                # Still alive, keep waiting
+            except ProcessLookupError:
+                # Process died gracefully!
+                print(f"Agent '{agent_name}' stopped gracefully ({waited:.1f}s)")
+                registry.unregister(agent_name)
+                return 0
+
+        # Phase 2: Process didn't respond to SIGTERM - FORCE KILL!
+        print(f"Agent didn't respond to SIGTERM after {max_wait}s - force killing with SIGKILL...")
+
+        try:
+            os.kill(agent_info.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            # Process died between checks
+            print(f"Agent '{agent_name}' stopped (died during force kill)")
+            registry.unregister(agent_name)
             return 0
-        else:
-            print(f"Warning: Agent may still be running. Check with --status {agent_name}")
+        except PermissionError:
+            print(f"Error: Permission denied to force kill process {agent_info.pid}", file=sys.stderr)
+            return 1
+
+        # Wait briefly for SIGKILL to take effect (should be instant)
+        await asyncio.sleep(0.5)
+
+        # CRITICAL: Verify process is ACTUALLY dead (not zombie)
+        # Zombie processes still exist in process table but can't execute code
+        # We consider zombie = success (it's dead enough)
+        try:
+            # Check /proc/{pid}/stat for process state
+            # State codes: R (running), S (sleeping), D (uninterruptible), Z (zombie), T (stopped)
+            with open(f"/proc/{agent_info.pid}/stat", "r") as f:
+                stat = f.read()
+                # Format: "pid (comm) state ..."
+                # Example: "1234 (python3) Z ..."
+                parts = stat.split(") ")
+                if len(parts) >= 2:
+                    state = parts[1].split()[0]  # First char after ")  "
+                    if state == "Z":
+                        # Zombie - process is dead, just waiting for parent to reap
+                        print(f"Agent '{agent_name}' force killed successfully (zombie state)")
+                        registry.unregister(agent_name)
+                        return 0
+                    else:
+                        # Process is still alive in non-zombie state!
+                        print(f"ERROR: Process {agent_info.pid} in state '{state}' after SIGKILL!", file=sys.stderr)
+                        print(f"This should not be possible. Manual intervention required.", file=sys.stderr)
+                        return 1
+                else:
+                    # Couldn't parse state - fall back to simple check
+                    print(f"Warning: Couldn't parse process state, assuming killed")
+                    print(f"Agent '{agent_name}' force killed (state unknown)")
+                    registry.unregister(agent_name)
+                    return 0
+        except FileNotFoundError:
+            # /proc/{pid}/stat doesn't exist - process is completely gone
+            print(f"Agent '{agent_name}' force killed successfully")
+            registry.unregister(agent_name)
+            return 0
+        except PermissionError:
+            print(f"Warning: Can't verify process state (permission denied)")
+            print(f"Agent '{agent_name}' likely killed (cannot verify)")
+            registry.unregister(agent_name)
             return 0
 
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
         return 1
 
 

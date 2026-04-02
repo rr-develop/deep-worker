@@ -399,6 +399,16 @@ async def execute_task_textual(
                                 assistant_message_by_namespace,
                             )
                             pending_text_by_namespace[ns_key] = ""
+
+                        # Display user message from agent (single source of truth)
+                        # Skip system messages that were auto-injected
+                        if not content.startswith("[SYSTEM]"):
+                            from deep_worker_cli.widgets.messages import UserMessage
+                            import uuid
+                            msg_id = f"user-{uuid.uuid4().hex[:8]}"
+                            user_msg = UserMessage(content, id=msg_id)
+                            if adapter._mount_message:
+                                await adapter._mount_message(user_msg)
                         continue
 
                     if isinstance(message, ToolMessage):

@@ -1,12 +1,20 @@
 """Manager thread implementation for TaskManager.
 
-This module provides a separate thread that runs the manager LangGraph agent
-for task evaluation. The thread communicates with the main thread via asyncio queues.
+⚠️ DEPRECATED: This module is deprecated and no longer used.
+
+TaskManager now runs in the main event loop using direct async calls
+instead of a separate thread with its own event loop.
+
+See: IMPLEMENTATION_PLAN_SINGLE_THREAD_ARCHITECTURE.md
+
+This file is kept for reference but should not be imported or used.
+All functionality has been moved into TaskManager class itself.
 """
 
 import asyncio
 import logging
 import threading
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
 if TYPE_CHECKING:
@@ -88,15 +96,23 @@ class ManagerThread(threading.Thread):
             # Create model using same configuration as subordinate
             model = create_model()
 
+            # Get project_memory_dir from config (required by create_cli_agent)
+            from pathlib import Path
+            project_memory_dir = Path(self.task_manager.config.working_dir)
+
             # Create manager agent with TaskManager system prompt
+            # CRITICAL: Use colon ':' not underscore '_' to avoid conflicts
+            # with agent names that contain '_tm' suffix
             self.manager_agent, self.manager_backend = create_cli_agent(
                 model=model,
-                assistant_id=f"{self.agent_name}_tm",
+                assistant_id=f"{self.agent_name}:tm",  # Changed from _tm to :tm
                 system_prompt=TASK_MANAGER_SYSTEM_PROMPT,
                 auto_approve=True,  # Manager doesn't need approvals
                 enable_memory=False,  # Manager doesn't need memory
                 enable_skills=False,  # Manager doesn't use skills
                 enable_shell=False,  # Manager doesn't execute shell commands
+                project_memory_dir=project_memory_dir,  # Required by create_cli_agent
+                checkpointer=self.task_manager.checkpointer,  # Use same as main agent
             )
 
             logger.info(f"[{self.name}] Manager agent initialized")
@@ -166,10 +182,33 @@ class ManagerThread(threading.Thread):
 
             logger.debug(f"[{self.name}] Invoking manager agent with prompt length={len(prompt)}")
 
+            # Type narrowing: manager_agent must be initialized before use
+            if self.manager_agent is None:
+                logger.error(f"[{self.name}] Manager agent not initialized")
+                await self.task_manager.result_queue.put({
+                    'success': False,
+                    'error': 'Manager agent not initialized'
+                })
+                return
+
             # Invoke manager agent
+            # CRITICAL: Metadata field meanings:
+            # - thread_id: Unique identifier for this conversation thread (agent_name:tm)
+            # - assistant_id: Technical ID for the assistant/agent instance (agent_name:tm)
+            # - agent_name: The MAIN agent name (WITHOUT :tm suffix) - identifies which agent this thread belongs to
+            # - updated_at: ISO 8601 UTC timestamp of last update
+            #
+            # This ensures TaskManager threads are associated with the parent agent in --list output
             result = await self.manager_agent.ainvoke(
                 {"messages": [{"role": "user", "content": prompt}]},
-                {"configurable": {"thread_id": f"{self.agent_name}_tm"}}
+                {
+                    "configurable": {"thread_id": f"{self.agent_name}:tm"},
+                    "metadata": {
+                        "assistant_id": f"{self.agent_name}:tm",
+                        "agent_name": self.agent_name,  # Parent agent name (without :tm)
+                        "updated_at": datetime.now(UTC).isoformat(),
+                    }
+                }
             )
 
             # Extract response

@@ -1,0 +1,628 @@
+Study the agent. Study the ClaudeSDKClient class from the Claude SDK.
+Map these two things onto each other. Obviously, the LangChain/DeepAgents terminology and that of the agent derived from them differ to some degree from the terminology of Claude Code and its SDK.
+I want to map similar things from these two worlds and explain the corresponding names for each of them. Do not change anything in the code. This is just an analysis.
+
+-------------------------------------------------------------
+
+
+
+## Summary
+
+I performed a detailed analysis and mapping of the terminology between the two systems:
+
+### Main conclusions:
+
+1. **The agent/DeepAgents** - this is an architecture based on LangChain/LangGraph, where the agent is created as a Python graph with middleware for handling requests
+
+2. **Claude SDK** - this is a client for interacting with the finished Claude Code product via a subprocess and a control protocol
+
+3. **Main correspondences:**
+   - `create_deep_agent()` ↔ `ClaudeSDKClient()`
+   - `SubAgent` ↔ `AgentDefinition`
+   - `middleware` ↔ `hooks`
+   - `BackendProtocol` ↔ built-in tools (Read, Write, Bash, etc.)
+   - `task()` tool ↔ Task tool (both for invoking subagents)
+
+4. **Key difference:** DeepAgents works in-process with full control over the entire architecture, whereas the Claude SDK is a high-level client for interacting with the Claude Code CLI via inter-process communication.
+
+The table above contains 14 categories with detailed correspondences and explanations for each concept. This should help you understand how concepts from one world relate to the other when developing an integration or porting functionality.
+
+-------------------------------
+
+I have no way of viewing tables in intermediate messages. So please take the trouble to give the complete final answer. It is also interesting what corresponds to the notion of a session (from Claude Code) in the agent.
+
+----------------------------------------
+
+
+
+# Full analysis: Mapping the terminology of DeepAgents/the agent and the Claude Code SDK
+
+I analyzed both systems and compiled a detailed terminology mapping. Here is the complete final report.
+
+---
+
+## 1. Core concepts of agent creation
+
+| DeepAgents/the agent | Claude Code SDK | Explanation |
+|------------------------|-----------------|-----------|
+| `create_deep_agent()` | `ClaudeSDKClient()` | Creating an agent. The agent builds a LangGraph graph with middleware; the Claude SDK creates a client for interacting with the Claude Code CLI |
+| `model: BaseChatModel` | `options.model: str` | The LLM model. DeepAgents uses LangChain models, the Claude SDK accepts a string with the model name |
+| `system_prompt: str` | `options.system_prompt: str \| SystemPromptPreset` | System instructions for the agent |
+| `tools: Sequence[BaseTool]` | `options.allowed_tools: list[str]` + built-in tools | DeepAgents accepts tool objects, the Claude SDK works with built-in tools by name |
+
+---
+
+## 2. Subagents
+
+| DeepAgents/the agent | Claude Code SDK | Explanation |
+|------------------------|-----------------|-----------|
+| `SubAgent` TypedDict | `AgentDefinition` dataclass | Subagent definition. Both have name, description, prompt/system_prompt |
+| `subagents: list[SubAgent]` | `options.agents: dict[str, AgentDefinition]` | DeepAgents uses a list, the Claude SDK - a dictionary keyed by name |
+| `task()` tool | Task tool (built-in) | Invoking a subagent. In DeepAgents this is a tool from SubAgentMiddleware, in Claude Code it is also a built-in Task tool |
+| `SubAgentMiddleware` | Built-in support in the CLI | DeepAgents uses middleware for handling, Claude Code built this into the CLI |
+| `CompiledSubAgent` | N/A | DeepAgents allows using pre-compiled agents, the Claude SDK has nothing like that |
+| `GENERAL_PURPOSE_SUBAGENT` | "general-purpose" agent type | A general-purpose subagent with all the tools of the main agent |
+
+---
+
+## 3. Middleware and Hooks
+
+| DeepAgents/the agent | Claude Code SDK | Explanation |
+|------------------------|-----------------|-----------|
+| `middleware: Sequence[AgentMiddleware]` | `options.hooks: dict[HookEvent, list[HookMatcher]]` | Event handling. DeepAgents uses the middleware pattern, the Claude SDK - the hooks pattern |
+| `TodoListMiddleware` | TodoWrite tool (built-in) | Task list management |
+| `FilesystemMiddleware` | Read, Write, Edit, Glob, Grep tools (built-in) | File operations |
+| `SubAgentMiddleware` | Task tool support | Delegating tasks to subagents |
+| `SkillsMiddleware` | Skill tool (built-in) | Skills/plugins |
+| `MemoryMiddleware` | N/A (no direct analogue) | DeepAgents can load memory from AGENTS.md files |
+| `SummarizationMiddleware` | N/A (built into the CLI) | Automatic context compaction |
+| `HumanInTheLoopMiddleware` + `interrupt_on` | `can_use_tool` callback + hooks | Permissions for tool use |
+| `AnthropicPromptCachingMiddleware` | N/A (built into the CLI) | Prompt caching for Anthropic |
+| `PatchToolCallsMiddleware` | N/A (built into the CLI) | Patching tool calls |
+
+---
+
+## 4. Hooks vs Middleware Events
+
+| DeepAgents/the agent | Claude Code SDK | Explanation |
+|------------------------|-----------------|-----------|
+| `ModelRequest` handling in middleware | `PreToolUse` hook | Before a tool call |
+| `ModelResponse` handling in middleware | `PostToolUse` hook | After a tool call |
+| N/A | `UserPromptSubmit` hook | When the user submits a prompt |
+| N/A | `Stop` / `SubagentStop` hooks | When the agent stops |
+| N/A | `PreCompact` hook | Before context compaction |
+
+---
+
+## 5. Backend and command/file execution
+
+| DeepAgents/the agent | Claude Code SDK | Explanation |
+|------------------------|-----------------|-----------|
+| `BackendProtocol` | Transport (internal) | Abstraction for storage and execution |
+| `StateBackend` | N/A | Storing files in LangGraph state |
+| `FilesystemBackend` | Default behavior | Working with the real file system |
+| `SandboxBackendProtocol` | N/A (always a sandbox) | Isolated command execution |
+| `backend.execute(command)` | Bash tool | Running shell commands |
+| `backend.read(path)` | Read tool | Reading files |
+| `backend.write(path, content)` | Write tool | Writing files |
+| `backend.edit(...)` | Edit tool | Editing files |
+| `backend.ls_info(path)` | LS tool | Listing files |
+| `backend.grep_raw(pattern)` | Grep tool | Searching inside files |
+| `backend.glob_info(pattern)` | Glob tool | Finding files by pattern |
+
+---
+
+## 6. Sessions and state
+
+| DeepAgents/the agent | Claude Code SDK | Explanation |
+|------------------------|-----------------|-----------|
+| `checkpointer: Checkpointer` | `options.resume: str` | Saving/restoring state |
+| `thread_id` (in RunnableConfig) | `session_id: str` | **Conversation session/thread identifier** |
+| `store: BaseStore` | N/A | Persistent storage (LangGraph Store) |
+| State schema | N/A (managed by the CLI) | Agent state schema |
+| `config={"configurable": {"thread_id": "xyz"}}` | `query(prompt, session_id="xyz")` | Passing the session identifier on invocation |
+
+**Important about sessions:**
+- In **DeepAgents**: a session is identified by `thread_id` in `RunnableConfig`. When calling `graph.invoke(input, config={"configurable": {"thread_id": "my-session"}})`, this thread_id is used by the checkpointer to save/restore the conversation state.
+- In the **Claude SDK**: a session is identified by `session_id` when calling `client.query(prompt, session_id="my-session")`. The CLI uses session_id to manage the conversation context and history.
+
+---
+
+## 7. Permissions and control
+
+| DeepAgents/the agent | Claude Code SDK | Explanation |
+|------------------------|-----------------|-----------|
+| `interrupt_on: dict[str, InterruptOnConfig]` | `permission_mode: PermissionMode` | Control over tool execution |
+| `HumanInTheLoopMiddleware` | `can_use_tool: CanUseTool` callback | Human-in-the-loop for approving actions |
+| N/A | `PermissionUpdate` | Dynamic update of permission rules |
+| N/A | `set_permission_mode()` | Changing the permission mode at run time |
+| N/A | `PermissionMode`: "default" / "acceptEdits" / "plan" / "bypassPermissions" | Preset permission modes |
+
+---
+
+## 8. Messages and content
+
+| DeepAgents/the agent | Claude Code SDK | Explanation |
+|------------------------|-----------------|-----------|
+| `HumanMessage` | `UserMessage` | A message from the user |
+| `AIMessage` | `AssistantMessage` | The assistant's response |
+| `ToolMessage` | `ToolResultBlock` in the content | The result of a tool execution |
+| `SystemMessage` (LangChain) | `SystemMessage` (SDK, a different format) | System messages/events |
+| N/A | `ResultMessage` | The final result with metrics (cost, usage, duration) |
+| N/A | `StreamEvent` | Streaming events for partial messages |
+| `content: str` in a message | `TextBlock` / `ThinkingBlock` / `ToolUseBlock` | Content blocks inside messages |
+
+---
+
+## 9. Skills and plugins
+
+| DeepAgents/the agent | Claude Code SDK | Explanation |
+|------------------------|-----------------|-----------|
+| `skills: list[str]` (paths) | Skill tool | Paths to skill directories |
+| `SkillsMiddleware` | Built-in support | Loading and executing skills |
+| N/A | `options.plugins: list[SdkPluginConfig]` | Local plugins for extending functionality |
+
+---
+
+## 10. MCP (Model Context Protocol)
+
+| DeepAgents/the agent | Claude Code SDK | Explanation |
+|------------------------|-----------------|-----------|
+| N/A (possible via custom tools) | `options.mcp_servers: dict[str, McpServerConfig]` | MCP server integration |
+| N/A | `McpStdioServerConfig` | MCP over stdio |
+| N/A | `McpSSEServerConfig` | MCP over Server-Sent Events |
+| N/A | `McpHttpServerConfig` | MCP over HTTP |
+| N/A | `McpSdkServerConfig` | MCP via the SDK (in-process) |
+
+---
+
+## 11. Interaction and execution
+
+| DeepAgents/the agent | Claude Code SDK | Explanation |
+|------------------------|-----------------|-----------|
+| `graph.invoke(input)` | `client.query(prompt)` | A single request |
+| `graph.stream(input)` | `client.receive_messages()` | Streaming of all messages |
+| N/A | `client.receive_response()` | Receiving one complete response (up to ResultMessage) |
+| `graph.ainvoke()` / `graph.astream()` | All methods are async | Asynchronous execution (in the SDK all methods are async) |
+| `RunnableConfig` | `session_id` in query() | Execution configuration |
+| N/A | `client.interrupt()` | Interrupting execution |
+| N/A | `client.set_model()` | Dynamically switching the model during a conversation |
+| N/A | `client.connect()` / `disconnect()` | Managing the connection to the CLI |
+
+---
+
+## 12. Transport and communication
+
+| DeepAgents/the agent | Claude Code SDK | Explanation |
+|------------------------|-----------------|-----------|
+| Direct calls to Python functions | `Transport` (SubprocessCLITransport) | DeepAgents works in-process, the SDK via a subprocess |
+| N/A | Control Protocol (requests/responses) | The SDK uses a JSON-based protocol for two-way communication |
+| N/A | `SDKControlRequest` / `SDKControlResponse` | Structured control requests |
+| N/A | `permission_prompt_tool_name="stdio"` | The channel for the can_use_tool callback |
+
+---
+
+## 13. Concepts specific to the agent
+
+| DeepAgents/the agent | Claude Code SDK | Explanation |
+|------------------------|-----------------|-----------|
+| `TextualUIAdapter` | N/A | TUI for the agent's interactive mode |
+| `deep_worker_cli.app` | N/A | A Textual-based application with ChatInput, MessageStore, etc. |
+| Project context/memory | N/A | Project indexing for context via the project_memory tool |
+| `BackendFactory` | N/A | A factory for creating a backend with access to the runtime |
+| `response_format: ResponseFormat` | N/A | Structured output |
+| `context_schema: type` | N/A | Agent context schema |
+
+---
+
+## 14. Concepts specific to the Claude SDK
+
+| DeepAgents/the agent | Claude Code SDK | Explanation |
+|------------------------|-----------------|-----------|
+| N/A | `SettingSource` (user/project/local) | Settings sources |
+| N/A | `options.setting_sources` | Controlling the loading of settings from different sources |
+| N/A | `options.fork_session` | Forking a session instead of continuing it on resume |
+| N/A | `options.include_partial_messages` | Streaming partial messages via StreamEvent |
+| N/A | `options.max_budget_usd` | Cost limit for a session |
+| N/A | `options.max_thinking_tokens` | Token limit for extended thinking |
+| N/A | `options.continue_conversation` | Continuing the previous conversation |
+| N/A | `options.add_dirs` | Adding directories to the sandbox |
+| N/A | `options.cli_path` | Path to the Claude Code CLI |
+| N/A | `get_server_info()` | Getting information about the server (commands, output styles) |
+
+---
+
+## Key architectural differences
+
+### 1. Level of abstraction
+- **DeepAgents**: a low-level library for building agents (LangChain/LangGraph)
+- **Claude SDK**: a client for interacting with a finished CLI (Claude Code)
+
+### 2. Execution
+- **DeepAgents**: in-process, everything runs in the same Python process
+- **Claude SDK**: inter-process, the SDK talks to the Claude Code CLI via a subprocess
+
+### 3. Extensibility
+- **DeepAgents**: through the middleware pattern (ModelRequest/ModelResponse handlers)
+- **Claude SDK**: through the hooks pattern (event callbacks) and MCP servers
+
+### 4. File operations
+- **DeepAgents**: through BackendProtocol (state, filesystem or sandbox)
+- **Claude SDK**: through the built-in CLI tools (Read, Write, Edit, etc.)
+
+### 5. Subagents
+- **DeepAgents**: created as separate LangGraph graphs with their own middleware stack
+- **Claude SDK**: defined via AgentDefinition, executed by the CLI
+
+### 6. Sessions (in detail)
+- **DeepAgents**: 
+  - Use `thread_id` in `RunnableConfig`
+  - Passed on invocation: `graph.invoke(input, config={"configurable": {"thread_id": "session-123"}})`
+  - The checkpointer saves state by thread_id
+  - Different thread_ids can be used for parallel conversations
+  
+- **Claude SDK**:
+  - Use `session_id` as a query parameter
+  - Passed on invocation: `await client.query(prompt, session_id="session-123")`
+  - The CLI manages history and context by session_id
+  - Supports `resume` for restoring a session and `fork_session` for branching
+
+---
+
+## Practical correspondences for development
+
+If you want to use the Claude SDK as a provider for a DeepAgents-like system, here is how to map the concepts:
+
+```python
+# The DeepAgents approach
+graph = create_deep_agent(
+    model="claude-sonnet-4-5-20250929",
+    system_prompt="You are a helpful assistant",
+    tools=[custom_tool],
+    subagents=[{
+        "name": "researcher",
+        "description": "Research topics",
+        "system_prompt": "You are a researcher"
+    }],
+    checkpointer=checkpointer
+)
+
+result = graph.invoke(
+    {"messages": [HumanMessage("Hello")]},
+    config={"configurable": {"thread_id": "session-1"}}
+)
+
+# ====================================
+
+# The Claude SDK approach
+client = ClaudeSDKClient(
+    options=ClaudeAgentOptions(
+        model="claude-sonnet-4-5-20250929",
+        system_prompt="You are a helpful assistant",
+        # custom tools via MCP
+        agents={
+            "researcher": AgentDefinition(
+                description="Research topics",
+                prompt="You are a researcher"
+            )
+        }
+    )
+)
+
+async with client:
+    await client.query("Hello", session_id="session-1")
+    async for msg in client.receive_response():
+        # Message handling
+        pass
+```
+
+---
+
+**Conclusion:** DeepAgents and the Claude SDK solve similar problems, but at different levels of abstraction. DeepAgents gives full control over the agent's architecture, while the Claude SDK provides a high-level interface to the finished Claude Code product.
+
+
+-----------------------------------------
+
+Good.
+I want to use Claude Code as the AI provider for the agent. This is not about the Anthropic API, but specifically about Claude Code, which can be integrated with through the Claude SDK. The reason is the different pricing models of these products.
+I plan to integrate with Claude Code by using the ClaudeSDKClient class (from the Claude SDK). The intent is that this class should process individual messages received from the user or from tools.
+Using Claude Code's own tools is not planned. When I speak about tools here, I mean the tools already used in the agent (with any AI provider). All messages (except model responses) first pass through the agent (LangGraph). When the Claude SDK is used as the AI provider, these messages then arrive at ClaudeSDKClient as the next messages that must be processed by the AI provider. The response message from the model must likewise arrive in the agent exactly as happens with any other provider.
+In essence, ClaudeSDKClient (when used as an AI provider) mirrors the messages that exist in LangChain (in the thread). When the Claude model calls a tool, it must do so through an in-process MCP server, which ClaudeSDKClient supports as far as I know. That tool call must be passed into the agent and handled there EXACTLY THE SAME as a tool call when working with any other provider. The tool call result is then returned back to ClaudeSDKClient.
+
+For the agent, working with the designed Claude-SDK-based AI provider must be absolutely transparent and look EXACTLY THE SAME as working with any other AI provider. Proposing solutions that violate this approach is forbidden. If you do not know how to do this, then say so rather than proposing something that would violate these requirements.
+
+You must take into account that the agent may work with several threads in parallel, and each such thread must have its own separate ClaudeSDKClient instance.
+
+In the agent (LangGraph) messages are processed one at a time. Accordingly, this must be ensured when working with ClaudeSDKClient. It must not return messages in a way that would be incompatible with the architecture and the message processing approach of the agent.
+
+Do not change the code!!!!! This is design work and analysis of various aspects. Carefully research how these requirements could be implemented and write a design document (or report that you do not know how to do it).
+
+
+-----------------------------------------------------------------------
+
+
+● Excellent! After careful research I can confirm that this is feasible. Here is the complete design document:
+
+  ---
+  Design document: The Claude Code SDK as an AI provider for the agent
+
+  Summary
+
+  This document describes the architecture for integrating Claude Code (via ClaudeSDKClient) as an AI provider for the agent,
+  ensuring full transparency at the LangGraph level.
+
+  Key findings from the research
+
+  1. The MCP mechanism in the Claude SDK
+
+  The Claude SDK supports in-process MCP servers via the control protocol:
+
+  1. The Claude Code CLI sends a control_request with subtype "mcp_message" (query.py:274-289)
+  2. The SDK routes the request to the registered MCP server (query.py:357-484)
+  3. The MCP server invokes the handler for CallToolRequest (query.py:437-469)
+  
+  ....
+
+                            }                                                                                                  01:45:58 [253/1322]
+
+                  # Resolve the Future in ProxyMCPServer
+                  # IMPORTANT: this unblocks the MCP handler
+                  # which will return the result to Claude
+                  # There is NO need to send a message to client.query()!
+
+          return claude_msgs
+
+      def _convert_from_claude(
+          self,
+          messages: List[Message]
+      ) -> AIMessage:
+          """Convert Claude messages into an AIMessage."""
+          # Aggregate all text blocks
+          text_parts = []
+
+          for msg in messages:
+              if isinstance(msg, AssistantMessage):
+                  for block in msg.content:
+                      if isinstance(block, TextBlock):
+                          text_parts.append(block.text)
+						  
+          return AIMessage(content="\n".join(text_parts))
+
+  ---
+  Critical point: Handling ToolMessage
+
+  When the agent executes a tool and creates a ToolMessage, the next ainvoke() call must:
+
+  1. NOT send a new message to client.query()
+  2. Instead, resolve the corresponding Future in ProxyMCPServer
+  3. The Future is unblocked → the MCP handler returns the result → Claude receives the result
+  4. Claude continues generating and returns the next response
+
+  Implementation:
+
+  # In ClaudeCodeChatModel.ainvoke()
+
+  # Check whether there is a ToolMessage among the messages
+  tool_messages = [m for m in messages if isinstance(m, ToolMessage)]
+
+  if tool_messages:
+      # This is a continuation after a tool execution
+
+      for tool_msg in tool_messages:                                                                            
+          call_id = tool_msg.tool_call_id                                                                       
+                                                                                                                                  'name': pending['name'],                                                                           01:45:58 [186/1322]
+          # Resolve the Future in ProxyMCPServer                                                                                     'args': pending['args']
+          proxy_mcp.resolve_call(call_id, {                                                                                   }]
+              "content": [{"type": "text", "text": str(tool_msg.content)}]                                                )
+          })                                                                                                          else:
+                                                                                                                          # Final response
+      # Now Claude has the results and will continue generating                                                            return self._convert_from_claude(response_messages)
+      # Wait for the next response                                                                                    
+      response_messages = []                                                                                      ---
+      async for msg in client.receive_response():                                                                 Execution flow
+          response_messages.append(msg)                                                                         
+                                                                                                                  Scenario 1: A simple request without tools
+      # Process the response (may be another tool call or the final response)                                         
+      if proxy_mcp.has_pending_calls():                                                                           1. LangGraph → ainvoke([HumanMessage("Hello")])
+          # Another tool call                                                                                    2. ClaudeCodeChatModel:
+          pending = proxy_mcp.get_pending_calls()[0]                                                                 - Get the client for thread_id
+          return AIMessage(                                                                                          - Send it to client.query()
+              content="",                                                                                         3. Claude generates a response (text, no tool calls)
+              tool_calls=[{                                                                                       4. ClaudeCodeChatModel:
+                  'id': pending['id'],                                                                               - Collect the AssistantMessage
+     - Convert it into an AIMessage
+     - Return it to LangGraph
+  Scenario 2: A request with a tool call                                                                           01:45:58 [163/1322]
+
+  1. LangGraph → ainvoke([HumanMessage("What files are in /tmp?")])
+
+  2. ClaudeCodeChatModel:
+     - Get the client for thread_id
+     - Send it to client.query()
+
+  3. Claude decides to call the "ls" tool
+     - The CLI sends an MCP control_request
+     - ProxyMCPServer.handler("ls") is invoked
+     - The handler creates a Future and BLOCKS
+
+  4. ClaudeCodeChatModel:
+     - Sees a pending call in proxy_mcp
+     - Returns AIMessage(tool_calls=[{id, name:"ls", args}])
+
+  5. LangGraph:
+     - Sees tool_calls in the AIMessage
+     - Executes the "ls" tool through the agent
+     - Creates a ToolMessage with the result
+     - Calls ainvoke([HumanMessage, AIMessage, ToolMessage])
+  6. ClaudeCodeChatModel:                                                                                            01:45:58 [140/1322]
+     - Sees the ToolMessage
+     - Calls proxy_mcp.resolve_call(call_id, result)
+     - The Future in the handler is resolved
+     - The handler returns the result to the CLI
+     - The CLI passes the result to Claude
+
+  7. Claude:
+     - Receives the tool result
+     - Generates the final response
+     - "The files in /tmp are: file1, file2, ..."
+
+  8. ClaudeCodeChatModel:
+     - Collects the response
+     - Returns AIMessage(content="The files...")
+
+  9. LangGraph receives the final response
+
+  ---
+  Session management
+
+  Creating a client for a new thread
+  
+  # LangGraph calls with a new thread_id                                                                             01:45:58 [117/1322]
+  config = {"configurable": {"thread_id": "session-123"}}
+  response = await model.ainvoke([HumanMessage("Hello")], config=config)
+
+  # ClaudeCodeChatModel:
+  # - ClientManager creates a new ClaudeSDKClient
+  # - Creates a new ProxyMCPServer
+  # - Caches the (client, proxy) pair for "session-123"
+
+  Continuing an existing session
+
+  # LangGraph calls with the same thread_id
+  config = {"configurable": {"thread_id": "session-123"}}
+  response = await model.ainvoke([new_message], config=config)
+
+  # ClaudeCodeChatModel:
+  # - ClientManager returns the existing client from the cache
+  # - The history is kept in the Claude Code CLI
+
+  Cleaning up finished sessions
+
+  # After the session ends
+  await client_manager.cleanup_client("session-123")                                                                  01:45:58 [95/1322]
+
+  # Or periodic cleanup of inactive ones
+  async def cleanup_inactive(max_idle_time):
+      for thread_id, (client, _) in list(client_manager.clients.items()):
+          if is_inactive(thread_id, max_idle_time):
+              await client_manager.cleanup_client(thread_id)
+
+  ---
+  Limitations and edge cases
+
+  1. Multiple tool calls in a single response
+
+  Claude may return several tool calls at once. ProxyMCPServer supports this through the pending_calls dictionary.
+
+  Solution:
+  if proxy_mcp.has_pending_calls():
+      pending_list = proxy_mcp.get_pending_calls()
+
+      # Return an AIMessage with all the tool_calls
+      return AIMessage(
+          content="",
+          tool_calls=[                                                                                                01:45:58 [73/1322]
+              {'id': p['id'], 'name': p['name'], 'args': p['args']}
+              for p in pending_list
+          ]
+      )
+
+  2. Errors during tool execution
+
+  When the agent returns an error via a ToolMessage:
+
+  # ToolMessage with is_error=True
+  tool_msg = ToolMessage(
+      content="Error: file not found",
+      tool_call_id=call_id,
+      is_error=True
+  )
+
+  # ProxyMCPServer must return the MCP error format
+  proxy_mcp.resolve_call(call_id, {
+      "content": [{"type": "text", "text": "Error: file not found"}],
+      "is_error": True
+  })
+     3. Timeout for tool execution                                                                                       01:45:58 [50/1322]
+
+  If the agent "hangs" and does not return a result:
+
+  # In the ProxyMCPServer handler
+  async def handler(args):
+      future = asyncio.Future()
+      # ...
+
+      try:
+          # A 60-second timeout
+          result = await asyncio.wait_for(future, timeout=60.0)
+          return result
+      except asyncio.TimeoutError:
+          return {
+              "content": [{"type": "text", "text": "Tool execution timeout"}],
+              "is_error": True
+          }
+
+  4. Parallel threads
+
+  ClientManager supports parallel threads automatically through separate ClaudeSDKClient instances.                                                                                                                   
+  ---
+  Advantages of this approach
+
+  1. Full transparency: the agent knows nothing about Claude Code - it is just a regular AI provider
+  2. Tool isolation: All tools are executed in the agent, not in the Claude CLI
+  3. LangChain compatibility: The standard BaseChatModel interface
+  4. Session support: Each thread_id has its own context
+  5. The Claude Code pricing model: We use Claude Code, not the Anthropic API
+
+  ---
+  Next implementation steps
+
+  1. Implement ProxyMCPServer with Future-based blocking
+  2. Implement ClientManager with client caching
+  3. Implement ClaudeCodeChatModel with message conversion
+  4. Tests:
+    - A simple request without tools
+    - A request with one tool call
+    - A request with several tool calls
+    - Error handling
+    - Parallel threads
+ 5. Integration into the agent                                                                                          01:45:58 [6/1322]
+  6. Optimization (caching, cleanup, timeouts)
+
+  ---
+  Conclusion
+
+  This architecture is fully feasible and satisfies all the requirements:
+
+  ✅ ClaudeSDKClient processes messages from the agent
+  ✅ Tools are executed in the agent, not in the Claude Code CLI
+  ✅ Full transparency for the agent (a standard LangChain provider)
+  ✅ Support for parallel threads via separate instances
+  ✅ Sequential message processing (one at a time)
+  ✅ Mirroring the LangChain message history into Claude sessions
+
+  The key innovation: using asyncio.Future to block MCP handlers, which makes it possible to pause Claude until the results
+  from the agent are available.
+
+● The design document is ready! Conclusion: this is entirely feasible.
+
+  The key finding is the async futures mechanism in ProxyMCPServer, which allows blocking the execution of the Claude Code CLI until
+  results from the agent arrive. This ensures full transparency of the integration.
+
+--------------------------------------------
+
+Good. Save this design to a file in this project and send me the full path to it.
+
+---------------------------------------------------
+
+
+
+The design document has been saved successfully!
+
+**Full path to the file:**
+```
+docs/claude_code_provider_design.md
+```
+
+The file contains the complete design document with the architecture, pseudocode, usage scenarios and all the technical details for implementing the Claude Code SDK as an AI provider for the agent.
+

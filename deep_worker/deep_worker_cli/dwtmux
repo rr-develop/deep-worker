@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+
+# dwtmux - Launch or attach to tmux session with deep-worker agent CLI
+#
+# This script provides tmux session management for deep-worker agents:
+# - If tmux session with agent name exists: attach to it
+# - If no session exists but agent is running: create session and run dwcli
+# - If agent is not running: show error (same as dwcli)
+#
+# Usage:
+#   dwtmux <agent-name>
+#
+# Example:
+#   dwtmux my_agent    # Creates/attaches to tmux session "my_agent"
+
+set -e
+
+# Get the script directory
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+
+# The parent directory containing deepagents
+PARENT_DIR="$(dirname "$SCRIPT_DIR")"
+
+# Add the module paths to PYTHONPATH for the Python commands
+export PYTHONPATH="$SCRIPT_DIR:$PARENT_DIR/deepagents:${PYTHONPATH:-}"
+
+# Show help if requested
+if [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
+    cat <<EOF
+dwtmux - Launch or attach to tmux session with deep-worker agent CLI
+
+USAGE:
+    dwtmux <agent-name>
+
+DESCRIPTION:
+    Creates or attaches to a tmux session for interacting with a deep-worker agent.
+
+    Behavior:
+    - If tmux session with agent name exists: attach to it
+    - If no session but agent is running: create new tmux session with dwcli
+    - If agent is not running: show error (same as dwcli)
+
+EXAMPLES:
+    dwtmux my_agent       # Create/attach to tmux session for 'my_agent'
+    dwtmux test_agent     # Create/attach to tmux session for 'test_agent'
+
+RELATED COMMANDS:
+    dwcli --list          # List all running agents
+    deep-worker <name>    # Start a new agent
+    tmux ls               # List all tmux sessions
+
+EOF
+    exit 0
+fi
+
+# Check if agent name provided
+if [ -z "$1" ]; then
+    echo "Error: agent name required" >&2
+    echo "" >&2
+    echo "Usage: dwtmux <agent-name>" >&2
+    echo "" >&2
+    echo "Examples:" >&2
+    echo "  dwtmux my_agent    # Create/attach to tmux session for 'my_agent'" >&2
+    echo "" >&2
+    echo "Use 'dwcli --list' to see running agents" >&2
+    echo "Use 'dwtmux --help' for more information" >&2
+    exit 1
+fi
+
+AGENT_NAME="$1"
+SESSION_NAME="$AGENT_NAME"
+
+# Function to check if agent is running using ProcessRegistry
+check_agent_running() {
+    local agent_name="$1"
+
+    # Use Python to check if agent exists in ProcessRegistry
+    cd "$SCRIPT_DIR" && python3 -c "
+import sys
+from deep_worker_cli.process.registry import ProcessRegistry
+
+registry = ProcessRegistry()
+agent_info = registry.lookup('$agent_name')
+
+if not agent_info:
+    print(f'\nError: Agent \'$agent_name\' not found', file=sys.stderr)
+    print(f'\nAvailable agents:', file=sys.stderr)
+    agents = registry.list_all()
+    if agents:
+        for agent in agents:
+            print(f'  - {agent.name}', file=sys.stderr)
+    else:
+        print('  (none)', file=sys.stderr)
+    print(f'\nStart an agent with: deep-worker $agent_name', file=sys.stderr)
+    sys.exit(1)
+else:
+    sys.exit(0)
+" 2>&1
+}
+
+# Check if tmux is installed
+if ! command -v tmux &> /dev/null; then
+    echo "Error: tmux is not installed" >&2
+    echo "Install it with: sudo apt-get install tmux  (or your package manager)" >&2
+    exit 1
+fi
+
+# Check if tmux session already exists
+if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+    # Session exists - attach to it
+    echo "Attaching to existing tmux session '$SESSION_NAME'..."
+    exec tmux attach-session -t "$SESSION_NAME"
+else
+    # Session doesn't exist - check if agent is running
+    if ! check_agent_running "$AGENT_NAME"; then
+        # Agent not running - error message already printed by check_agent_running
+        exit 1
+    fi
+
+    # Agent is running - create new tmux session and run dwcli
+    echo "Creating new tmux session '$SESSION_NAME' with dwcli..."
+
+    # Create new tmux session with dwcli command
+    # -s: session name
+    # dwcli command will run in the session
+    exec tmux new-session -s "$SESSION_NAME" "$SCRIPT_DIR/dwcli" "$AGENT_NAME"
+fi

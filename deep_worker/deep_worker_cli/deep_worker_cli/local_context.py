@@ -81,14 +81,20 @@ class LocalContextMiddleware(AgentMiddleware):
     state_schema = LocalContextState
 
     @staticmethod
-    def _get_git_info() -> dict[str, str | list[str]]:
+    def _get_git_info(cwd: Path) -> dict[str, str | list[str]]:
         """Gather git state information.
+
+        Args:
+            cwd: Directory to check git info in (NOT Path.cwd()!)
 
         Returns:
             Dict with 'branch' (current branch) and 'main_branches'
                 (list of main/master if they exist). Returns empty dict if not in
                 git repo.
         """
+        # REGRESSION PREVENTION: cwd parameter must be passed from working_dir state!
+        # Do NOT use Path.cwd() here - it returns process cwd, not user's working dir
+
         git_path = _get_git_executable()
         if not git_path:
             return {}
@@ -101,7 +107,7 @@ class LocalContextMiddleware(AgentMiddleware):
                 capture_output=True,
                 text=True,
                 timeout=2,
-                cwd=Path.cwd(),
+                cwd=cwd,
                 check=False,
             )
             if result.returncode != 0:
@@ -117,7 +123,7 @@ class LocalContextMiddleware(AgentMiddleware):
                 capture_output=True,
                 text=True,
                 timeout=2,
-                cwd=Path.cwd(),
+                cwd=cwd,
                 check=False,
             )
             if result.returncode == 0:
@@ -138,16 +144,18 @@ class LocalContextMiddleware(AgentMiddleware):
             return {"branch": current_branch, "main_branches": main_branches}
 
     @staticmethod
-    def _get_file_list(max_files: int = 20) -> list[str]:
-        """Get list of files in current directory (non-recursive).
+    def _get_file_list(cwd: Path, max_files: int = 20) -> list[str]:
+        """Get list of files in specified directory (non-recursive).
 
         Args:
+            cwd: Directory to list files from (NOT Path.cwd()!)
             max_files: Maximum number of files to show (default 20).
 
         Returns:
             List of file paths (sorted), truncated to max_files.
         """
-        cwd = Path.cwd()
+        # REGRESSION PREVENTION: cwd parameter must be passed from working_dir state!
+        # Do NOT use Path.cwd() here - it returns process cwd, not user's working dir
 
         files = []
         try:
@@ -175,17 +183,19 @@ class LocalContextMiddleware(AgentMiddleware):
         return files
 
     @staticmethod
-    def _get_directory_tree(max_depth: int = 3, max_entries: int = 20) -> str:
+    def _get_directory_tree(cwd: Path, max_depth: int = 3, max_entries: int = 20) -> str:
         """Get directory tree structure.
 
         Args:
+            cwd: Directory to build tree from (NOT Path.cwd()!)
             max_depth: Maximum depth to traverse (default 3).
             max_entries: Maximum total entries to show (default 20).
 
         Returns:
             Formatted tree string or empty if error.
         """
-        cwd = Path.cwd()
+        # REGRESSION PREVENTION: cwd parameter must be passed from working_dir state!
+        # Do NOT use Path.cwd() here - it returns process cwd, not user's working dir
 
         lines: list[str] = []
         entry_count = [0]  # Mutable for closure
@@ -244,7 +254,7 @@ class LocalContextMiddleware(AgentMiddleware):
         return "\n".join(lines)
 
     @staticmethod
-    def _detect_package_manager() -> str | None:
+    def _detect_package_manager(cwd: Path) -> str | None:
         """Detect Python package manager in use.
 
         Checks for lock files and config files to determine the package manager.
@@ -252,10 +262,14 @@ class LocalContextMiddleware(AgentMiddleware):
         Uses priority order: `uv > poetry > pipenv > pip`. First match wins if multiple
         indicators are present.
 
+        Args:
+            cwd: Directory to check package manager in (NOT Path.cwd()!)
+
         Returns:
             Package manager name (uv, poetry, pipenv, pip) or `None` if not detected.
         """
-        cwd = Path.cwd()
+        # REGRESSION PREVENTION: cwd parameter must be passed from working_dir state!
+        # Do NOT use Path.cwd() here - it returns process cwd, not user's working dir
 
         # Check for uv (uv.lock or pyproject.toml with [tool.uv])
         if (cwd / "uv.lock").exists():
@@ -291,17 +305,21 @@ class LocalContextMiddleware(AgentMiddleware):
         return None
 
     @staticmethod
-    def _detect_node_package_manager() -> str | None:
+    def _detect_node_package_manager(cwd: Path) -> str | None:
         """Detect Node.js package manager in use.
 
         Uses priority order: `bun > pnpm > yarn > npm`.
 
         First match wins if multiple lock files are present.
 
+        Args:
+            cwd: Directory to check package manager in (NOT Path.cwd()!)
+
         Returns:
             Package manager name (bun, pnpm, yarn, npm) or `None` if not detected.
         """
-        cwd = Path.cwd()
+        # REGRESSION PREVENTION: cwd parameter must be passed from working_dir state!
+        # Do NOT use Path.cwd() here - it returns process cwd, not user's working dir
 
         if (cwd / "bun.lockb").exists() or (cwd / "bun.lock").exists():
             return "bun"
@@ -315,16 +333,19 @@ class LocalContextMiddleware(AgentMiddleware):
         return None
 
     @staticmethod
-    def _get_makefile_preview(max_lines: int = 20) -> str | None:
+    def _get_makefile_preview(cwd: Path, max_lines: int = 20) -> str | None:
         """Get first N lines of `Makefile` if present.
 
         Args:
+            cwd: Directory to check for Makefile in (NOT Path.cwd()!)
             max_lines: Maximum lines to show.
 
         Returns:
             `Makefile` preview or `None` if not found.
         """
-        cwd = Path.cwd()
+        # REGRESSION PREVENTION: cwd parameter must be passed from working_dir state!
+        # Do NOT use Path.cwd() here - it returns process cwd, not user's working dir
+
         makefile = cwd / "Makefile"
 
         if not makefile.exists():
@@ -342,14 +363,19 @@ class LocalContextMiddleware(AgentMiddleware):
             return preview
 
     @staticmethod
-    def _detect_project_info() -> dict[str, str | bool | None]:
+    def _detect_project_info(cwd: Path) -> dict[str, str | bool | None]:
         """Detect project type, language, and structure.
+
+        Args:
+            cwd: Directory to check project info in (NOT Path.cwd()!)
 
         Returns:
             Dict with `language`, `is_monorepo`, `project_root`, `has_venv`,
                 `has_node_modules`.
         """
-        cwd = Path.cwd()
+        # REGRESSION PREVENTION: cwd parameter must be passed from working_dir state!
+        # Do NOT use Path.cwd() here - it returns process cwd, not user's working dir
+
         info: dict[str, str | bool | None] = {
             "language": None,
             "is_monorepo": False,
@@ -406,13 +432,17 @@ class LocalContextMiddleware(AgentMiddleware):
         return info
 
     @staticmethod
-    def _detect_test_command() -> str | None:
+    def _detect_test_command(cwd: Path) -> str | None:
         """Detect how to run tests based on project structure.
+
+        Args:
+            cwd: Directory to check test command in (NOT Path.cwd()!)
 
         Returns:
             Suggested test command or `None` if not detected.
         """
-        cwd = Path.cwd()
+        # REGRESSION PREVENTION: cwd parameter must be passed from working_dir state!
+        # Do NOT use Path.cwd() here - it returns process cwd, not user's working dir
 
         # Check Makefile for test target
         makefile = cwd / "Makefile"
@@ -473,18 +503,49 @@ class LocalContextMiddleware(AgentMiddleware):
         Returns:
             Updated state with local_context populated, or None if already set.
         """
+        # ============================================================================
+        # CRITICAL REGRESSION PREVENTION: USE working_dir FROM STATE, NOT Path.cwd()
+        # ============================================================================
+        # ALWAYS use working_dir from runtime.state when available!
+        #
+        # Path.cwd() returns the PROCESS's current directory, which is often "/"
+        # for daemon processes, NOT the user's intended working directory.
+        #
+        # When an agent is started with `deep-worker myagent --dir /tmp`, the
+        # working_dir="/tmp" is stored in state by ProjectMemoryMiddleware.
+        # LocalContext MUST use this value, NOT Path.cwd()!
+        #
+        # BUG HISTORY:
+        # - Before fix: Used Path.cwd() everywhere → showed "/" for agents started in /tmp
+        # - After fix: Use working_dir from state → correctly shows /tmp
+        #
+        # CRITICAL: We must check working_dir EVERY TIME because ProjectMemoryMiddleware
+        # may set it AFTER our first before_agent() call. Do NOT cache if working_dir
+        # was not available on first call!
+        #
+        # TEST: test_local_context_uses_working_dir_from_state verifies this behavior
+        # ============================================================================
+        working_dir_str = state.get("working_dir")
+        if not working_dir_str:
+            # working_dir not yet set - skip context generation this time
+            # It will be set by ProjectMemoryMiddleware on next call
+            return None
+
+        cwd = Path(working_dir_str)
+
         # Only compute context on first interaction to preserve prompt caching
+        # BUT we must have working_dir first!
         if state.get("local_context"):
             return None
 
-        cwd = Path.cwd()
         sections = ["## Local Context", ""]
 
         # Current directory
         sections.extend([f"**Current Directory**: `{cwd}`", ""])
 
         # Project info (language, monorepo, root, environments)
-        project_info = self._detect_project_info()
+        # REGRESSION PREVENTION: Pass cwd from working_dir state!
+        project_info = self._detect_project_info(cwd)
         project_lines = []
         if project_info.get("language"):
             project_lines.append(f"Language: {project_info['language']}")
@@ -507,18 +568,20 @@ class LocalContextMiddleware(AgentMiddleware):
             sections.append("")
 
         # Package managers
+        # REGRESSION PREVENTION: Pass cwd from working_dir state!
         pkg_managers = []
-        python_pkg = self._detect_package_manager()
+        python_pkg = self._detect_package_manager(cwd)
         if python_pkg:
             pkg_managers.append(f"Python: {python_pkg}")
-        node_pkg = self._detect_node_package_manager()
+        node_pkg = self._detect_node_package_manager(cwd)
         if node_pkg:
             pkg_managers.append(f"Node: {node_pkg}")
         if pkg_managers:
             sections.extend([f"**Package Manager**: {', '.join(pkg_managers)}", ""])
 
         # Git info
-        git_info = self._get_git_info()
+        # REGRESSION PREVENTION: Pass cwd from working_dir state!
+        git_info = self._get_git_info(cwd)
         if git_info:
             git_text = f"**Git**: Current branch `{git_info['branch']}`"
             if git_info.get("main_branches"):
@@ -527,14 +590,20 @@ class LocalContextMiddleware(AgentMiddleware):
             sections.extend([git_text, ""])
 
         # Test command
-        test_cmd = self._detect_test_command()
+        # REGRESSION PREVENTION: Pass cwd from working_dir state!
+        test_cmd = self._detect_test_command(cwd)
         if test_cmd:
             sections.extend([f"**Run Tests**: `{test_cmd}`", ""])
 
         # File list
-        files = self._get_file_list()
+        # REGRESSION PREVENTION: Pass cwd from working_dir state, NOT Path.cwd()!
+        files = self._get_file_list(cwd)
         if files:
-            total_items = len(list(Path.cwd().iterdir()))
+            try:
+                total_items = len(list(cwd.iterdir()))
+            except (OSError, PermissionError):
+                total_items = len(files)
+
             sections.append(f"**Files** ({len(files)} shown):")
             sections.extend(f"- {file}" for file in files)
             if len(files) < total_items:
@@ -543,12 +612,14 @@ class LocalContextMiddleware(AgentMiddleware):
             sections.append("")
 
         # Directory tree
-        tree = self._get_directory_tree()
+        # REGRESSION PREVENTION: Pass cwd from working_dir state, NOT Path.cwd()!
+        tree = self._get_directory_tree(cwd)
         if tree:
             sections.extend(["**Tree** (3 levels):", "```text", tree, "```", ""])
 
         # Makefile preview
-        makefile_preview = self._get_makefile_preview()
+        # REGRESSION PREVENTION: Pass cwd from working_dir state!
+        makefile_preview = self._get_makefile_preview(cwd)
         if makefile_preview:
             sections.extend(
                 [

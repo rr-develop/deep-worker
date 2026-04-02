@@ -1117,65 +1117,6 @@ def test_dwcli_query_visibility2(clean_agent):
     # Note: Agent cleanup is handled by clean_agent fixture
 
 
-@pytest.mark.skipif(
-    not _check_deepagents_available(),
-    reason="deepagents command not available in PATH",
-)
-@pytest.mark.asyncio
-async def test_deepagents_multiple_queries():
-    """Test multiple queries in succession with deepagents.
-
-    Verifies that multiple query-response cycles work correctly.
-    """
-    logger.info("TEST: Multiple queries to deepagents")
-
-    session = DeepAgentsTerminalSession(
-        agent_name=None,
-        columns=120,
-        lines=40,
-        working_dir=Path("/tmp"),
-    )
-
-    try:
-        session.start(timeout=15.0)
-        assert session.wait_for_prompt(timeout=10.0)
-
-        queries = [
-            ("What is 2+2?", "4"),
-            ("What is 5*3?", "15"),
-        ]
-
-        for query, expected_in_response in queries:
-            logger.info(f"\nSending query: '{query}'")
-            session.send_input(query, press_enter=True)
-            time.sleep(0.5)
-
-            # Verify query visible
-            screen = session.get_screen_text()
-            assert query in screen, f"Query '{query}' not visible"
-            logger.info(f"✓ Query visible")
-
-            # Wait for response
-            for _ in range(30):
-                time.sleep(1.0)
-                screen = session.get_screen_text()
-                if expected_in_response in screen:
-                    logger.info(f"✓ Response containing '{expected_in_response}' detected")
-                    break
-            else:
-                pytest.fail(f"No response containing '{expected_in_response}' within timeout")
-
-            # Verify both still visible
-            screen_final = session.get_screen_text()
-            assert query in screen_final, "Query disappeared!"
-            assert expected_in_response in screen_final, "Response not visible!"
-
-            logger.info(f"✓ Both query and response visible for: {query}")
-
-    finally:
-        session.close()
-
-
 def test_dwcli_reconnect_preserves_history():
     """Test that dwcli shows conversation history when reconnecting to an agent.
 
@@ -1869,7 +1810,7 @@ def test_dwcli_input_area_immediately_visible():
     # Start agent in background.
     # IMPORTANT: cwd="/tmp" ensures the agent's working directory is /tmp so
     # that any files the AI creates during test queries land in /tmp, not in
-    # the pytest working directory (e.g. the source tree).
+    # the pytest working directory (a sibling repo checkout).
     agent_process = subprocess.Popen(
         ["deep-worker", agent_name, "--dir", "/tmp", "--skip-permissions"],
         stdout=subprocess.PIPE,

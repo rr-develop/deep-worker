@@ -1,0 +1,295 @@
+Yes. The most convenient scheme is usually this:
+
+**RPyC transport → a fast callback in the event loop → `asyncio.Queue` or `asyncio.Future` → a normal async consumer**
+
+Why this is convenient:
+
+* An RPyC connection supports `fileno()`, `poll()` and `async_request()`, and `poll()` serves a single transaction and can pull in nested requests. ([rpyc.readthedocs.io][1])
+* The `asyncio` event loop can watch a file descriptor via `add_reader(fd, callback, *args)`, that is, invoke a callback when the descriptor is ready for reading. ([Python documentation][2])
+* `asyncio.Queue` is intended for safely passing events between the callback layer and async coroutines within a single event loop. ([Python documentation][3])
+
+Below are two working architectures.
+
+---
+
+## Option 1. RPyC → `asyncio.Queue` → async consumer
+
+This is the best option if **many events** arrive from RPyC.
+
+### The idea
+
+1. `loop.add_reader(conn.fileno(), on_rpyc_readable)`
+   tells the loop to watch the RPyC socket.
+2. When there is data, `on_rpyc_readable()` quickly calls `conn.poll(0)` in a loop.
+3. If an RPyC callback on the client receives an event from the server, it **does not do heavy work**, it simply puts the event into an `asyncio.Queue`.
+4. A separate `consumer()` coroutine reads from the queue and performs the main async logic.
+
+### Example
+
+```python
+import asyncio
+from dataclasses import dataclass
+import rpyc
+from rpyc.utils.helpers import async_
+
+
+@dataclass
+class Event:
+    kind: str
+    payload: object
+
+
+class ClientService(rpyc.Service):
+    def __init__(self, loop: asyncio.AbstractEventLoop, queue: asyncio.Queue[Event]):
+        super().__init__()
+        self._loop = loop
+        self._queue = queue
+
+    def exposed_on_event(self, kind: str, payload: object) -> None:
+        """
+        Called remotely by the server.
+        This method runs during RPyC request handling, so it should stay lightweight.
+        """
+        event = Event(kind=kind, payload=payload)
+        self._loop.call_soon_threadsafe(self._queue.put_nowait, event)
+
+
+def install_rpyc_reader(conn: rpyc.Connection, loop: asyncio.AbstractEventLoop) -> None:
+    fd = conn.fileno()
+
+    def on_rpyc_readable() -> None:
+        try:
+            # Drain all currently available RPyC transactions without blocking.
+            while conn.poll(0):
+                pass
+        except EOFError:
+            loop.remove_reader(fd)
+            conn.close()
+        except Exception:
+            loop.remove_reader(fd)
+            conn.close()
+            raise
+
+    loop.add_reader(fd, on_rpyc_readable)
+
+
+async def consumer(queue: asyncio.Queue[Event]) -> None:
+    while True:
+        event = await queue.get()
+        try:
+            print(f"received event: kind={event.kind!r}, payload={event.payload!r}")
+            await asyncio.sleep(0)  # Replace with real async work
+        finally:
+            queue.task_done()
+
+
+async def make_remote_call(conn: rpyc.Connection) -> object:
+    """
+    Example of turning an RPyC AsyncResult into an awaitable asyncio Future.
+    """
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[object] = loop.create_future()
+
+    remote_func = async_(conn.root.long_operation)
+    async_result = remote_func("hello")
+
+    def on_done(result) -> None:
+        try:
+            value = result.value
+        except Exception as exc:
+            loop.call_soon_threadsafe(future.set_exception, exc)
+        else:
+            loop.call_soon_threadsafe(future.set_result, value)
+
+    async_result.add_callback(on_done)
+    return await future
+
+
+async def main() -> None:
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue[Event] = asyncio.Queue()
+
+    service = ClientService(loop, queue)
+
+    # Example connection creation; adapt host/port/service wiring to your setup.
+    conn = rpyc.connect("localhost", 18861, service=service)
+
+    install_rpyc_reader(conn, loop)
+
+    consumer_task = asyncio.create_task(consumer(queue))
+
+    try:
+        result = await make_remote_call(conn)
+        print("remote call result:", result)
+
+        await asyncio.sleep(3600)
+    finally:
+        consumer_task.cancel()
+        loop.remove_reader(conn.fileno())
+        conn.close()
+```
+
+---
+
+## What matters here
+
+### 1. Why a `Queue` rather than logic directly in `exposed_on_event`
+
+Because `exposed_on_event()` is called while an RPyC request is being handled. If you do heavy work or blocking there, you will delay the servicing of the connection. And `poll()` in RPyC is precisely what services transactions and can start nested requests. ([rpyc.readthedocs.io][1])
+
+### 2. Why `call_soon_threadsafe`
+
+Because it is a safe way to schedule a callback in the event loop, including from an external thread. It is the standard thread-safe event loop API. ([Python documentation][2])
+
+### 3. Why `poll(0)` rather than `serve(None)`
+
+Because `add_reader()` has already fired on the "socket readable" event. Inside the callback it is better **not to block** the event loop. RPyC's `poll(timeout=0)` serves exactly one transaction if one is already available, and returns `False` if there is nothing more to read right now. ([rpyc.readthedocs.io][1])
+
+---
+
+## Option 2. RPyC `AsyncResult` → `asyncio.Future`
+
+This is the best option if you need not a stream of events but **a single awaitable result**.
+
+### The idea
+
+* make an RPyC async call via `rpyc.async_(...)`
+* get an `AsyncResult`
+* in `add_callback(...)` forward the completion into an `asyncio.Future`
+* then do a normal `await future`
+
+Here is a minimal standalone version:
+
+```python
+import asyncio
+import rpyc
+from rpyc.utils.helpers import async_
+
+
+def async_result_to_future(
+    async_result,
+    loop: asyncio.AbstractEventLoop,
+) -> asyncio.Future:
+    future = loop.create_future()
+
+    def on_done(result) -> None:
+        try:
+            value = result.value
+        except Exception as exc:
+            loop.call_soon_threadsafe(future.set_exception, exc)
+        else:
+            loop.call_soon_threadsafe(future.set_result, value)
+
+    async_result.add_callback(on_done)
+    return future
+
+
+async def call_remote(conn: rpyc.Connection, x: int) -> object:
+    loop = asyncio.get_running_loop()
+    remote_func = async_(conn.root.compute)
+    async_result = remote_func(x)
+    return await async_result_to_future(async_result, loop)
+```
+
+This is especially convenient when you want to write code in the style of:
+
+```python
+result = await call_remote(conn, 123)
+```
+
+instead of waiting manually via `.value` or blocking calls.
+
+---
+
+## When to choose `Queue` and when to choose `Future`
+
+Choose **`Queue`** if:
+
+* the server sends many callback events
+* sequential processing is needed
+* a buffer between the transport and the business logic is needed
+
+Choose **`Future`** if:
+
+* you have a one-shot result
+* you just need `await remote_call(...)`
+
+Often a single application needs **both**:
+
+* a `Queue` for incoming events
+* a `Future` for responses to specific requests
+
+---
+
+## What this looks like architecturally
+
+```text
+RPyC socket
+   │
+   ▼
+asyncio loop.add_reader(conn.fileno(), on_rpyc_readable)
+   │
+   ▼
+conn.poll(0)  # drains ready RPyC traffic
+   │
+   ├─ incoming callback from remote side
+   │      ▼
+   │   exposed_on_event(...)
+   │      ▼
+   │   loop.call_soon_threadsafe(queue.put_nowait, event)
+   │      ▼
+   │   async consumer processes event
+   │
+   └─ reply for an RPyC AsyncResult
+          ▼
+       add_callback(...)
+          ▼
+       loop.call_soon_threadsafe(future.set_result, value)
+          ▼
+       await future
+```
+
+---
+
+## Practical rules to avoid running into a deadlock
+
+Do not do the following inside an RPyC callback:
+
+* long CPU-bound code
+* blocking I/O
+* `future.result()` / `queue.get()` / `time.sleep()`
+
+It is better to do only:
+
+* `queue.put_nowait(...)`
+* `future.set_result(...)`
+* `asyncio.create_task(...)` via the loop
+
+This minimizes the time you stay inside the RPyC handling path.
+
+---
+
+## An important caveat about `add_reader`
+
+`add_reader()` is a low-level event loop API for watching a file descriptor. It is well suited to Unix-like systems; on Windows the event loop implementation has platform limitations. This is stated explicitly in the Python documentation. ([Python documentation][2])
+
+---
+
+## What I would recommend for your scenario
+
+For the combination of **RPyC + agent + callbacks + asyncio** I would take this as the base:
+
+* a single `asyncio` loop
+* `conn.fileno()` hooked up via `loop.add_reader(...)`
+* incoming callbacks placed into an `asyncio.Queue`
+* responses to specific requests mapped into an `asyncio.Future`
+
+This gives:
+
+* no sleep/polling loop
+* no separate serving thread
+* a clean async model on top
+
+[1]: https://rpyc.readthedocs.io/en/latest/api/core_protocol.html "Protocol — RPyC"
+[2]: https://docs.python.org/3/library/asyncio-eventloop.html "Event loop — Python 3.14.3 documentation"
+[3]: https://docs.python.org/3/library/asyncio-queue.html "Queues — Python 3.14.3 documentation"

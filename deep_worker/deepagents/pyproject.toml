@@ -147,5 +147,11 @@ ignore-var-parameters = true
 "tests/utils.py" = ["ANN001", "ANN201", "RUF012", "SIM118"]
 "scripts/check_imports.py" = ["INP001", "BLE001"]
 
+[tool.ty.environment]
+extra-paths = [
+    "..",
+    "../../semantic_search",
+]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

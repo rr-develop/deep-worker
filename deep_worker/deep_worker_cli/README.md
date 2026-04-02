@@ -21,6 +21,15 @@ uv tool install deepagents-cli
 deepagents
 ```
 
+## Key Features
+
+- 🚀 **Background Agent Processes**: Run agents as daemon processes with `deep-worker`
+- 💬 **Interactive CLI**: Connect to running agents with `dwcli`
+- 🧹 **Clean History**: Start agents with fresh state using `--clean` option
+- 🔧 **Customizable**: Support for custom prompts, skills, and configurations
+- 📊 **Session Management**: Conversation history and thread management with `-rm`, `--history`, `--remove-before`
+- 💾 **Flexible Storage**: Choose between persistent SQLite or in-memory storage
+
 ## 🔒 Security Notice
 
 **⚠️ IMPORTANT: deep-worker-cli is designed for LOCAL TRUSTED ENVIRONMENTS ONLY**
@@ -43,6 +52,62 @@ Applications like "Deep Research", "Manus", and "Claude Code" have gotten around
 
 **Acknowledgements: This project was primarily inspired by Claude Code, and initially was largely an attempt to see what made Claude Code general purpose, and make it even more so.**
 
+## 💾 Storage Options
+
+By default, agents persist conversation history to SQLite database. You can control storage behavior:
+
+```bash
+# Default: SQLite persistence (production)
+deep-worker my_agent
+
+# Temporary in-memory storage (no persistence)
+deep-worker --memory-only temp_agent
+
+# Force SQLite even in test environment
+deep-worker --use-sqlite test_agent
+```
+
+**List all conversation threads:**
+```bash
+# List all threads
+deep-worker --list
+
+# List with message counts (slower)
+deep-worker --list --with-counts
+
+# Filter by agent name
+deep-worker --list --agent my_agent
+
+# JSON output
+deep-worker --list --format json
+```
+
+**Thread management commands:**
+```bash
+# Remove a specific thread
+deep-worker -rm thread_id
+
+# Dry run (preview without deleting)
+deep-worker -rm thread_id --dry-run
+
+# View thread history (works offline)
+deep-worker --history thread_id
+
+# View history as JSON
+deep-worker --history thread_id --format json
+
+# Remove old threads (before specific date)
+deep-worker --remove-before 2026-01-01
+
+# Remove threads older than 30 days
+deep-worker --remove-before 30d
+
+# Other relative formats: 7d, 2w, 3m, 1y
+deep-worker --remove-before 1y --dry-run
+```
+
+**Note:** Tests automatically use in-memory storage by default for faster execution and test isolation.
+
 ## 📖 Resources
 
 - **[Documentation](https://docs.langchain.com/oss/python/deepagents/cli)** — Full documentation
@@ -58,3 +123,4 @@ See our [Releases](https://docs.langchain.com/oss/python/release-policy) and [Ve
 As an open-source project in a rapidly developing field, we are extremely open to contributions, whether it be in the form of a new feature, improved infrastructure, or better documentation.
 
 For detailed information on how to contribute, see the [Contributing Guide](https://docs.langchain.com/oss/python/contributing/overview).
+# Test cleanup

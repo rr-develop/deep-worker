@@ -40,7 +40,32 @@ assert result.is_valid  # Works for any correct answer
 
 ## Critical Testing Principles
 
-### 1. Agent Session Isolation
+### 1. Skip Permissions by Default
+
+**⚠️ CRITICAL: All tests MUST use `skip_permissions=True` (default)!**
+
+Integration tests invoke tools (read, write, execute, etc.) and would hang forever
+waiting for approval prompts that can't be provided in CI/CD environments.
+
+```python
+# ✓ CORRECT - uses default skip_permissions=True
+with agent_fixture('test_my_agent'):
+    ...
+
+# ✓ CORRECT - explicitly set to True
+with agent_fixture('test_my_agent', skip_permissions=True):
+    ...
+
+# ✗ WRONG - will hang forever on tool approvals!
+with agent_fixture('test_my_agent', skip_permissions=False):
+    ...  # Test will NEVER complete
+```
+
+**Exception:** Only set `skip_permissions=False` for tests that specifically test
+the approval/interrupt workflow (HITL - human-in-the-loop). These tests are rare
+and must be marked accordingly.
+
+### 2. Agent Session Isolation
 
 **NEVER use production agents in tests!**
 
@@ -99,7 +124,7 @@ The `agent_fixture` handles three scenarios intelligently:
 
 ```bash
 # Ensure claude_sdk is available
-export CLAUDE_SDK_PATH="<path to your claude_sdk checkout>"
+export CLAUDE_SDK_PATH="/path/to/claude_sdk"
 
 # Install dependencies
 uv pip install -e .
@@ -235,6 +260,9 @@ Context manager for test agent lifecycle.
 - `model`: AI model to use
 - `provider`: AI provider
 - `skip_permissions`: Skip prompts (default: True)
+  - ⚠️ **CRITICAL**: This MUST be True for all tests that invoke tools!
+  - Only set to False for tests that specifically test the approval workflow (HITL)
+  - Changing this default will break 95% of integration tests
 
 **Yields:**
 - `AgentFixtureInfo`: Agent details
@@ -463,7 +491,7 @@ rm /tmp/deep_worker_registry.json
 **Solution:**
 ```bash
 # Check claude_sdk location
-ls -la "$CLAUDE_SDK_PATH/src/claude_agent_sdk/"
+ls -la $CLAUDE_SDK_PATH/src/claude_agent_sdk/
 
 # Add to PYTHONPATH
 export PYTHONPATH="$CLAUDE_SDK_PATH/src:$PYTHONPATH"

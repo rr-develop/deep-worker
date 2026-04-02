@@ -28,8 +28,8 @@ class AgentConfig:
         api_key: Optional API key (defaults to DEEPSEEK_API_KEY from .env)
     """
 
-    model: str
     working_dir: Path
+    model: str | None = None  # None = use provider default
     provider: str = "deepseek"
     system_prompt: str | None = None
     tools: list[str] = field(default_factory=list)
@@ -44,12 +44,12 @@ class AgentConfig:
         if isinstance(self.working_dir, str):
             self.working_dir = Path(self.working_dir)
 
-        # Validate model
-        if not self.model or not self.model.strip():
-            raise ValueError("model must be a non-empty string")
+        # Validate model (allow None - will use provider's default)
+        if self.model is not None and not self.model.strip():
+            raise ValueError("model must be a non-empty string or None")
 
         # Validate provider
-        valid_providers = ["deepseek", "gemini", "openai"]
+        valid_providers = ["deepseek", "gemini", "openai", "claude-code"]
         if self.provider not in valid_providers:
             raise ValueError(
                 f"provider must be one of {valid_providers}, got '{self.provider}'"
@@ -57,7 +57,10 @@ class AgentConfig:
 
         # Auto-load API key from environment if not provided
         if self.api_key is None:
-            if self.provider == "deepseek":
+            if self.provider == "claude-code":
+                # Claude Code doesn't require API key (uses local installation)
+                self.api_key = None
+            elif self.provider == "deepseek":
                 self.api_key = os.getenv("DEEPSEEK_API_KEY")
                 if not self.api_key:
                     raise ValueError(

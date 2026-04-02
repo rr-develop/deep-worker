@@ -1,6 +1,14 @@
 """Pytest fixture for launching deep-worker agents with clean state.
 
 This fixture provides a way to ensure agent has clean history before test execution.
+
+CRITICAL: skip_permissions=True by default
+==========================================
+This fixture ALWAYS uses --skip-permissions by default to prevent tests from hanging
+on approval prompts. Only set skip_permissions=False for tests that specifically
+test the approval workflow (HITL - human-in-the-loop).
+
+⚠️  DO NOT CHANGE THE DEFAULT! This would break 95% of integration tests.
 """
 
 import logging
@@ -16,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 
 @pytest.fixture
-def clean_agent():
+def clean_agent(request):
     """Fixture to ensure a clean agent with no history.
 
     Usage in tests:
@@ -26,8 +34,14 @@ def clean_agent():
             # Agent is guaranteed to have clean history
             ...
 
+    To reuse existing agent (for debugging):
+        @pytest.mark.reuse_agent
+        def test_something(clean_agent):
+            agent_process = clean_agent("test_my_agent")
+            # Will reuse existing agent if running, won't kill it
+
     The fixture:
-    1. Kills existing agent process if running
+    1. Kills existing agent process if running (unless reuse_agent marker present)
     2. Cleans up checkpoint/data directories
     3. Starts fresh agent process
     4. Waits for agent registration
@@ -37,42 +51,121 @@ def clean_agent():
     agent_name = None
     agent_process = None
 
-    def _setup_clean_agent(name: str, working_dir: str = "/tmp") -> subprocess.Popen:
-        """Set up a clean agent with no history."""
+    # Check for reuse_agent marker
+    reuse = request.node.get_closest_marker("reuse_agent") is not None
+
+    def _setup_clean_agent(
+        name: str,
+        working_dir: str = "/tmp",
+        provider: str | None = None,
+        skip_permissions: bool = True
+    ) -> subprocess.Popen:
+        """Set up a clean agent with no history.
+
+        Args:
+            name: Agent name
+            working_dir: Working directory for agent
+            provider: Optional provider (e.g., "claude-code", "anthropic")
+            skip_permissions: Skip permission prompts (default: True for tests)
+                             ⚠️  CRITICAL: This MUST be True for all tests that invoke tools!
+                             Only set to False for tests that specifically test the approval workflow.
+        """
         nonlocal agent_name, agent_process
         agent_name = name
 
-        logger.info(f"Setting up clean agent: {name}")
+        logger.info(f"Setting up clean agent: {name}" + (f" with provider: {provider}" if provider else ""))
 
-        # 1. Kill existing agent process if running
+        # 1. Kill existing agent process if running (unless reuse=True)
         from deep_worker_cli.process.registry import ProcessRegistry
+        import os
+        import signal
+
         registry = ProcessRegistry()
         existing = registry.lookup(name)
+
+        if existing and reuse:
+            logger.info(
+                f"REUSE MODE: Keeping existing agent process PID {existing.pid}. "
+                f"Will NOT kill or restart. Connect with: dwcli {name}"
+            )
+            # Return early - reuse existing process
+            return existing.process if hasattr(existing, 'process') else None
+
         if existing:
             logger.info(f"Killing existing agent process: PID {existing.pid}")
             try:
-                import os
-                import signal
                 os.kill(existing.pid, signal.SIGKILL)
-                time.sleep(0.5)
             except ProcessLookupError:
-                pass
+                logger.info(f"Process {existing.pid} already dead")
+
+            # CRITICAL: Wait for process to actually die and disappear from registry
+            # This prevents testing old agent code when bug fixes were made
+            kill_timeout = 5.0
+            kill_start = time.time()
+            process_dead = False
+
+            while time.time() - kill_start < kill_timeout:
+                # Check if still in registry
+                if not registry.lookup(name):
+                    process_dead = True
+                    logger.info(f"✓ Process {existing.pid} confirmed dead and removed from registry")
+                    break
+
+                # Also check if process exists in OS
+                try:
+                    os.kill(existing.pid, 0)  # signal 0 just checks if process exists
+                    logger.debug(f"Process {existing.pid} still exists, waiting...")
+                except ProcessLookupError:
+                    logger.info(f"✓ Process {existing.pid} no longer exists in OS")
+                    # Give registry time to update
+                    time.sleep(0.2)
+                    if not registry.lookup(name):
+                        process_dead = True
+                        logger.info(f"✓ Confirmed removal from registry")
+                        break
+
+                time.sleep(0.1)
+
+            if not process_dead:
+                raise RuntimeError(
+                    f"Old agent process {existing.pid} did not die within {kill_timeout}s. "
+                    f"Cannot safely start new agent - would test old code!"
+                )
 
         # 2. Clean up data directories
-        data_dir = Path(f"~/.deep_worker/{name}").expanduser()
+        data_dir = Path("~/.deep_worker").expanduser() / name
         if data_dir.exists():
             logger.info(f"Removing data directory: {data_dir}")
             shutil.rmtree(data_dir)
 
-        log_dir = Path("~/.deep_worker/logs").expanduser()
+        log_dir = Path("~/.deep_worker").expanduser() / "logs"
         for log_file in log_dir.glob(f"{name}.*"):
             logger.info(f"Removing log file: {log_file}")
             log_file.unlink()
 
         # 3. Start fresh agent process
         logger.info(f"Starting fresh agent: {name}")
+
+        # ============================================================================
+        # CRITICAL: skip_permissions MUST be True by default for all integration tests!
+        # ============================================================================
+        # WHY: Integration tests invoke tools (read, write, execute, etc.) and would
+        # hang forever waiting for approval prompts that can't be provided in CI/CD.
+        #
+        # ONLY set skip_permissions=False for tests that specifically test the
+        # approval/interrupt workflow (HITL - human-in-the-loop).
+        #
+        # ⚠️  DO NOT CHANGE THIS DEFAULT WITHOUT EXPLICIT APPROVAL! ⚠️
+        # Changing this will break 95% of integration tests.
+        # ============================================================================
+        cmd = ["deep-worker", name, "--dir", working_dir]
+        if skip_permissions:
+            cmd.append("--skip-permissions")
+        if provider:
+            cmd.extend(["--provider", provider])
+
         agent_process = subprocess.Popen(
-            ["deep-worker", name, "--dir", working_dir, "--skip-permissions"],
+            cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )

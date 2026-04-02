@@ -165,20 +165,23 @@ def parse_manager_response(result_text: str) -> tuple[Literal['done', 'in_progre
     # Parse the structured output
     for line in lines:
         line = line.strip()
-        if line.startswith('STATUS:'):
-            status_text = line.replace('STATUS:', '').strip().lower()
+        # Remove markdown formatting (**, ##, etc.) before checking
+        line_clean = line.replace('**', '').replace('##', '').strip()
+
+        if line_clean.startswith('STATUS:'):
+            status_text = line_clean.replace('STATUS:', '').strip().lower()
             if status_text in ('done', 'in_progress', 'unable'):
-                status = status_text  # type: ignore
+                status = status_text
             else:
                 raise ValueError(
                     f"Invalid STATUS value: '{status_text}'. "
                     f"Must be one of: done, in_progress, unable. "
                     f"Full response: {result_text[:200]}"
                 )
-        elif line.startswith('REASONING:'):
-            reasoning = line.replace('REASONING:', '').strip()
-        elif line.startswith('MESSAGE:'):
-            msg_text = line.replace('MESSAGE:', '').strip()
+        elif line_clean.startswith('REASONING:'):
+            reasoning = line_clean.replace('REASONING:', '').strip()
+        elif line_clean.startswith('MESSAGE:'):
+            msg_text = line_clean.replace('MESSAGE:', '').strip()
             if msg_text and msg_text.upper() != 'NONE':
                 message = msg_text
 

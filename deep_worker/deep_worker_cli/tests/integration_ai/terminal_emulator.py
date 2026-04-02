@@ -548,6 +548,7 @@ class DeepAgentsTerminalSession(TerminalSession):
         columns: int = 120,
         lines: int = 40,
         working_dir: Optional[Path] = None,
+        skip_permissions: bool = True,  # ← DEFAULT: True for integration tests
     ):
         """Initialize deepagents terminal session.
 
@@ -556,10 +557,17 @@ class DeepAgentsTerminalSession(TerminalSession):
             columns: Terminal width (default: 120)
             lines: Terminal height (default: 40)
             working_dir: Working directory for deepagents process
+            skip_permissions: Skip permission prompts (default: True for tests)
+                             ⚠️ CRITICAL: Must be True to prevent approval menu blocking tests!
         """
         command = ["deepagents"]
         if agent_name:
             command.append(agent_name)
+
+        # CRITICAL: Add --skip-permissions by default for integration tests
+        # Without this, approval menus will block test execution
+        if skip_permissions:
+            command.append("--skip-permissions")
 
         super().__init__(
             command=command,

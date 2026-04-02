@@ -2,15 +2,34 @@
 
 ## 🚨 ABSOLUTE PROHIBITIONS 🚨
 
-### 1. NEVER CREATE OR USE VIRTUAL ENVIRONMENTS
+### 1. NEVER INSTALL PACKAGES FROM THIS REPOSITORY
+
+**🔥 CRITICAL: EVERYTHING MUST RUN FROM SOURCE CODE ONLY! 🔥**
+
+**ABSOLUTELY FORBIDDEN COMMANDS:**
+```bash
+pip install -e .
+pip install --break-system-packages -e .
+pip install deep-worker
+pip install deep-worker-cli
+pip install arpyc
+python setup.py install
+python setup.py develop
+```
+
+**IF YOU INSTALLED ANYTHING - UNINSTALL IT IMMEDIATELY:**
+```bash
+pip uninstall --break-system-packages -y deep-worker deep-worker-cli arpyc
+rm -f ~/.local/bin/dwcli ~/.local/bin/deep-worker
+```
+
+### 2. NEVER CREATE OR USE VIRTUAL ENVIRONMENTS
 
 **FORBIDDEN COMMANDS:**
 ```bash
 python -m venv .venv
 python3 -m venv .venv
 virtualenv .venv
-pip install -e .
-pip install arpyc
 ```
 
 **IF YOU SEE `.venv` DIRECTORY - DELETE IT IMMEDIATELY!**
@@ -23,7 +42,7 @@ find . -name ".venv" -type d
 rm -rf <path>/.venv
 ```
 
-### 2. ARPYC MUST ALWAYS BE FROM SOURCE
+### 3. ARPYC MUST ALWAYS BE FROM SOURCE
 
 **CORRECT:**
 ```python
@@ -40,7 +59,7 @@ from arpyc import RpycAsyncSession
 pip install arpyc  # ❌ NEVER DO THIS
 ```
 
-### 3. Why This Matters
+### 4. Why This Matters
 
 Using installed packages instead of source code causes:
 - RPyC proxy errors: `AttributeError: cannot access '__reversed__'`
@@ -54,7 +73,7 @@ Using installed packages instead of source code causes:
 
 1. **Check for .venv:**
    ```bash
-   # Run from the repository root (and any related checkouts you work with):
+   # Check this repository and any related project directories:
    find . -name ".venv" -type d
    ```
 
@@ -66,7 +85,7 @@ Using installed packages instead of source code causes:
 3. **Verify arpyc is from source:**
    ```bash
    python3 -c "import sys; import arpyc; print(arpyc.__file__)"
-   # Should show the arpyc source directory in this checkout, e.g. .../arpyc/...
+   # Should show: the in-repo arpyc source directory, e.g. .../arpyc/...
    # NOT: .venv/lib/python.../site-packages/arpyc/...
    ```
 
@@ -79,7 +98,7 @@ Always use this pattern with CRITICAL warning comment:
 # CRITICAL: ARPYC MUST BE IMPORTED FROM SOURCE CODE, NOT FROM PIP/VENV!
 # ============================================================================
 # DO NOT use 'pip install arpyc' or ANY virtual environment (.venv)!
-# ALWAYS import arpyc from the arpyc source directory in this checkout.
+# ALWAYS import arpyc from the in-repo arpyc source directory.
 # Using installed packages causes version conflicts and compatibility issues.
 # This project MUST run globally without venv to ensure correct arpyc version.
 # ============================================================================
@@ -120,7 +139,7 @@ python3 -m deep_worker_cli.cli.main
 
 ### ✅ CORRECT: Running globally with source imports
 ```
-"This project runs globally. Verify arpyc is imported from the arpyc source directory"
+"This project runs globally. Verify arpyc is imported from the in-repo arpyc source"
 ```
 
 ## When User Reports RPyC Errors
@@ -141,10 +160,13 @@ This is likely the root cause!
 
 ## Summary for Claude
 
-1. **NEVER** suggest creating virtual environments
-2. **NEVER** suggest `pip install arpyc`
-3. **ALWAYS** import arpyc from the `arpyc` source directory in this checkout
-4. **ALWAYS** check for and delete `.venv` directories when encountered
-5. **ALWAYS** add the CRITICAL warning comment block when importing arpyc
+1. **NEVER** install packages from this repository (`pip install -e .`, `pip install deep-worker`, etc.)
+2. **NEVER** suggest creating virtual environments
+3. **NEVER** suggest `pip install arpyc`
+4. **ALWAYS** run everything from source code directly
+5. **ALWAYS** import arpyc from the in-repo `arpyc` source
+6. **ALWAYS** check for and delete `.venv` directories when encountered
+7. **ALWAYS** add the CRITICAL warning comment block when importing arpyc
+8. **IF YOU INSTALLED ANYTHING** - uninstall it immediately using the commands in section 1
 
-Remember: The user spent hours debugging issues caused by `.venv`. Don't repeat this mistake!
+Remember: The user spent hours debugging issues caused by `.venv` and installed packages. Everything MUST run from source code ONLY!

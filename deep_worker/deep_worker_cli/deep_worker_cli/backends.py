@@ -1,11 +1,38 @@
 """CLI-specific backend and middleware overrides for per-command timeout support.
 
-Subclasses `LocalShellBackend` and `FilesystemMiddleware` to add a per-command
-`timeout` keyword argument to `execute()`, so the LLM can override the default
-timeout for long-running commands. Uses monkey-patching via
-`patch_filesystem_middleware()` to replace the SDK's `FilesystemMiddleware`
-class reference with `CLIFilesystemMiddleware`, so the SDK constructs the CLI
-subclass transparently.
+Subclasses `LocalShellBackend` and `FilesystemMiddleware` to add:
+1. Per-command `timeout` keyword argument to `execute()`, so the LLM can override
+   the default timeout for long-running commands
+2. Async subprocess execution to prevent event loop blocking during command execution
+
+CRITICAL BUG FIX (commit 2026-04-01):
+=====================================
+The original implementation used synchronous `subprocess.run()` which BLOCKED
+the entire asyncio event loop during command execution. This caused:
+- Agent freezing during long-running commands (sleep, npm install, pytest)
+- RPC calls like get_status() timing out while commands execute
+- Multiple client connections hanging simultaneously
+- RPyC garbage collection failures with "result expired" errors
+
+The fix replaces `subprocess.run()` with `asyncio.create_subprocess_shell()`,
+making execute() truly async. This allows the event loop to remain responsive
+and process concurrent RPC calls while commands execute in the background.
+
+RELATED FIX (commit 2026-04-02):
+================================
+Enhanced `dwcli --stop` command to FORCE KILL frozen agents:
+1. Try graceful shutdown with SIGTERM (wait up to 5 seconds)
+2. If agent doesn't respond, FORCE KILL with SIGKILL (no mercy!)
+3. Verify process is dead (not just zombie) before returning success
+4. Clean up registry entries for dead processes
+5. Report what happened (graceful vs forced kill)
+
+This ensures `dwcli --stop` ALWAYS stops agents, even if they're frozen
+in infinite loops or unresponsive to SIGTERM.
+
+Uses monkey-patching via `patch_filesystem_middleware()` to replace the SDK's
+`FilesystemMiddleware` class reference with `CLIFilesystemMiddleware`, so the
+SDK constructs the CLI subclass transparently.
 
 When the SDK adds this natively, these subclasses can be removed.
 """
@@ -48,16 +75,22 @@ class CLIShellBackend(LocalShellBackend):
     each `execute()` call.
     """
 
-    def execute(
+    async def execute(  # type: ignore[override]
         self,
         command: str,
         *,
         timeout: int | None = None,
     ) -> ExecuteResponse:
-        r"""Execute a shell command with optional per-command timeout.
+        r"""Execute a shell command asynchronously with optional per-command timeout.
 
-        Overrides `LocalShellBackend.execute()` to accept a per-command
-        `timeout` that overrides the default set at init time.
+        CRITICAL: This method is async to prevent blocking the event loop during
+        long-running commands (e.g., sleep 15, npm install, pytest). When commands
+        execute, the event loop remains responsive for concurrent RPC calls like
+        get_status().
+
+        Overrides `LocalShellBackend.execute()` to:
+        1. Use async subprocess execution (asyncio.create_subprocess_shell)
+        2. Accept a per-command `timeout` that overrides the default
 
         Args:
             command: Shell command string to execute.
@@ -88,24 +121,55 @@ class CLIShellBackend(LocalShellBackend):
             raise ValueError(msg)
 
         try:
-            result = subprocess.run(  # noqa: S602
+            # Create async subprocess - DOES NOT block event loop!
+            proc = await asyncio.create_subprocess_shell(
                 command,
-                check=False,
-                shell=True,  # Intentional: designed for LLM-controlled shell execution
-                capture_output=True,
-                text=True,
-                timeout=effective_timeout,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
                 env=self._env,
                 cwd=str(self.cwd),
             )
 
+            # Wait for process with timeout - event loop remains responsive!
+            try:
+                stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                    proc.communicate(),
+                    timeout=effective_timeout
+                )
+            except asyncio.TimeoutError:
+                # Kill the process if it times out
+                # Use terminate() first (SIGTERM), then kill() if needed (SIGKILL)
+                try:
+                    proc.terminate()  # Send SIGTERM
+                    try:
+                        await asyncio.wait_for(proc.wait(), timeout=1.0)
+                    except asyncio.TimeoutError:
+                        # Process didn't terminate gracefully, force kill
+                        proc.kill()  # Send SIGKILL
+                        await proc.wait()
+                except ProcessLookupError:
+                    pass  # Process already died
+
+                return ExecuteResponse(
+                    output=(
+                        f"Error: Command timed out after {effective_timeout} seconds."
+                        " For long-running commands, re-run using the timeout parameter."
+                    ),
+                    exit_code=124,  # Standard timeout exit code
+                    truncated=False,
+                )
+
+            # Decode output
+            stdout = stdout_bytes.decode('utf-8', errors='replace') if stdout_bytes else ""
+            stderr = stderr_bytes.decode('utf-8', errors='replace') if stderr_bytes else ""
+
             # Combine stdout and stderr
             # Prefix each stderr line with [stderr] for clear attribution.
             output_parts = []
-            if result.stdout:
-                output_parts.append(result.stdout)
-            if result.stderr:
-                stderr_lines = result.stderr.strip().split("\n")
+            if stdout:
+                output_parts.append(stdout)
+            if stderr:
+                stderr_lines = stderr.strip().split("\n")
                 output_parts.extend(f"[stderr] {line}" for line in stderr_lines)
 
             output = "\n".join(output_parts) if output_parts else "<no output>"
@@ -118,19 +182,10 @@ class CLIShellBackend(LocalShellBackend):
 
             return ExecuteResponse(
                 output=output,
-                exit_code=result.returncode,
+                exit_code=proc.returncode if proc.returncode is not None else 0,
                 truncated=truncated,
             )
 
-        except subprocess.TimeoutExpired:
-            return ExecuteResponse(
-                output=(
-                    f"Error: Command timed out after {effective_timeout} seconds."
-                    " For long-running commands, re-run using the timeout parameter."
-                ),
-                exit_code=124,  # Standard timeout exit code
-                truncated=False,
-            )
         except Exception as e:  # noqa: BLE001
             # Broad exception catch is intentional: we want to catch all
             # execution errors and return a consistent ExecuteResponse rather
@@ -221,6 +276,9 @@ class CLIFilesystemMiddleware(FilesystemMiddleware):
         ) -> str:
             """Synchronous wrapper for execute tool.
 
+            CRITICAL: execute() is now async, so we need to run it in event loop.
+            This is needed for backwards compatibility with sync tool calls.
+
             Args:
                 command: Shell command to execute.
                 runtime: Tool runtime context for backend resolution.
@@ -232,7 +290,7 @@ class CLIFilesystemMiddleware(FilesystemMiddleware):
             if timeout is not None and timeout <= 0:
                 return f"Error: timeout must be a positive integer, got {timeout}."
 
-            resolved_backend = self._get_backend(runtime)  # type: ignore[arg-type]
+            resolved_backend = self._get_backend(runtime)
             proto = _get_sandbox_backend(resolved_backend)
 
             if proto is None:
@@ -243,7 +301,22 @@ class CLIFilesystemMiddleware(FilesystemMiddleware):
 
             sandbox = cast("CLIShellBackend", proto)
             try:
-                result = sandbox.execute(command, timeout=timeout)
+                # CRITICAL: execute() is now async!
+                # Try to get running event loop, otherwise create new one
+                try:
+                    loop = asyncio.get_running_loop()
+                    # We're in an event loop - use asyncio.create_task()
+                    # But this is tricky - sync function can't await
+                    # Use run_coroutine_threadsafe instead
+                    import concurrent.futures
+                    future = asyncio.run_coroutine_threadsafe(
+                        sandbox.execute(command, timeout=timeout),
+                        loop
+                    )
+                    result = future.result()
+                except RuntimeError:
+                    # No event loop running - create one
+                    result = asyncio.run(sandbox.execute(command, timeout=timeout))
             except NotImplementedError as e:
                 return f"Error: Execution not available. {e}"
             except ValueError as e:
@@ -262,6 +335,9 @@ class CLIFilesystemMiddleware(FilesystemMiddleware):
         ) -> str:
             """Asynchronous wrapper for execute tool.
 
+            CRITICAL: Now calls execute() directly since it's async!
+            No need for asyncio.to_thread() wrapper anymore.
+
             Args:
                 command: Shell command to execute.
                 runtime: Tool runtime context for backend resolution.
@@ -273,7 +349,7 @@ class CLIFilesystemMiddleware(FilesystemMiddleware):
             if timeout is not None and timeout <= 0:
                 return f"Error: timeout must be a positive integer, got {timeout}."
 
-            resolved_backend = self._get_backend(runtime)  # type: ignore[arg-type]
+            resolved_backend = self._get_backend(runtime)
             proto = _get_sandbox_backend(resolved_backend)
 
             if proto is None:
@@ -284,9 +360,9 @@ class CLIFilesystemMiddleware(FilesystemMiddleware):
 
             sandbox = cast("CLIShellBackend", proto)
             try:
-                result = await asyncio.to_thread(
-                    lambda: sandbox.execute(command, timeout=timeout),
-                )
+                # CRITICAL: execute() is now async, call it directly with await!
+                # This prevents event loop blocking during long-running commands.
+                result = await sandbox.execute(command, timeout=timeout)
             except NotImplementedError as e:
                 return f"Error: Execution not available. {e}"
             except ValueError as e:

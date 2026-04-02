@@ -9,6 +9,7 @@ import sys
 import uuid
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import Any
 from importlib.metadata import PackageNotFoundError, distribution
 from pathlib import Path
 
@@ -386,6 +387,238 @@ def parse_shell_allow_list(allow_list_str: str | None) -> list[str] | None:
     return unique
 
 
+# ==============================================================================
+# Provider Context Limits and Summarization Configuration
+# ==============================================================================
+# Context window sizes (in tokens) for different AI providers
+# Used as fallback when model profile doesn't provide max_input_tokens
+# Sources: Official documentation from Anthropic, DeepSeek, OpenAI, Google
+
+PROVIDER_CONTEXT_LIMITS: dict[str, int] = {
+    # Anthropic Claude models
+    "claude-opus-4.6": 1_000_000,  # Requires anthropic-beta header
+    "claude-sonnet-4.6": 1_000_000,  # Requires anthropic-beta header
+    "claude-sonnet-4.5": 200_000,
+    "claude-sonnet-4": 200_000,
+    "claude-haiku-4.5": 200_000,
+    "claude-3.5-sonnet": 200_000,
+    "claude-3.5-haiku": 200_000,
+    "claude-3-opus": 200_000,
+    "claude-3-sonnet": 200_000,
+    "claude-3-haiku": 200_000,
+    # DeepSeek models
+    "deepseek-chat": 128_000,  # V3.2 API
+    "deepseek-reasoner": 128_000,  # V3.2 API
+    "deepseek-v3": 128_000,
+    "deepseek-v3.1": 128_000,
+    "deepseek-v3.2": 128_000,
+    "deepseek-coder-v2": 128_000,
+    "deepseek-r1": 64_000,  # R1 has smaller context
+    # OpenAI models
+    "gpt-5": 400_000,
+    "gpt-4-turbo": 128_000,
+    "gpt-4": 128_000,
+    "gpt-3.5-turbo": 16_385,
+    # Google Gemini models
+    "gemini-2.0-flash": 1_000_000,
+    "gemini-1.5-pro": 2_000_000,
+    # Mistral models
+    "mistral-large": 128_000,
+    # Cohere models
+    "command-r-plus": 128_000,
+    # Fallback for unknown models
+    "default": 100_000,
+}
+
+
+@dataclass(frozen=True)
+class SummarizationConfig:
+    """Configuration for SummarizationMiddleware based on model context limit.
+
+    This dataclass holds all settings needed to configure automatic
+    conversation summarization, dynamically chosen based on the model's
+    context window size.
+
+    Attributes:
+        trigger_fraction: Fraction of context (0.0-1.0) at which to trigger
+            summarization. E.g., 0.80 means trigger at 80% full.
+        keep_fraction: Fraction of context (0.0-1.0) to keep after
+            summarization. E.g., 0.15 means keep last 15%.
+        truncate_after_messages: Truncate tool call arguments in messages
+            older than this count.
+        max_arg_length: Maximum length for truncated tool call arguments.
+        context_limit: Model's maximum input tokens (for reference).
+        trigger_tokens: Absolute token count at which summarization triggers.
+        keep_tokens: Absolute token count to keep after summarization.
+    """
+
+    trigger_fraction: float
+    keep_fraction: float
+    truncate_after_messages: int
+    max_arg_length: int
+    # Metadata for logging/debugging
+    context_limit: int
+    trigger_tokens: int
+    keep_tokens: int
+
+
+def get_model_context_limit(
+    model_name: str | None,
+    model_profile: dict[str, Any] | None,
+) -> int:
+    """Get context limit for a model.
+
+    Priority order:
+    1. model_profile["max_input_tokens"] (from LangChain model introspection)
+    2. PROVIDER_CONTEXT_LIMITS[model_name] (known model mapping)
+    3. PROVIDER_CONTEXT_LIMITS["default"] (fallback: 100K tokens)
+
+    Args:
+        model_name: Model name (e.g., "claude-sonnet-4.5" or
+            "anthropic:claude-sonnet-4.5"). May include provider prefix.
+        model_profile: Model profile dict from LangChain, may contain
+            "max_input_tokens" key.
+
+    Returns:
+        Context limit in tokens.
+
+    Examples:
+        >>> get_model_context_limit("claude-sonnet-4.5", None)
+        200000
+        >>> get_model_context_limit("deepseek-chat", None)
+        128000
+        >>> get_model_context_limit(None, {"max_input_tokens": 150000})
+        150000
+    """
+    # Priority 1: Model profile from LangChain
+    if model_profile and isinstance(model_profile.get("max_input_tokens"), int):
+        return model_profile["max_input_tokens"]
+
+    # Priority 2: Known model mapping
+    if model_name:
+        # Try exact match first
+        if model_name in PROVIDER_CONTEXT_LIMITS:
+            return PROVIDER_CONTEXT_LIMITS[model_name]
+
+        # Try partial match (e.g., "anthropic:claude-sonnet-4.5" → "claude-sonnet-4.5")
+        # or "openrouter/anthropic/claude-sonnet-4.5" → "claude-sonnet-4.5"
+        for known_model, limit in PROVIDER_CONTEXT_LIMITS.items():
+            if known_model != "default" and known_model in model_name:
+                return limit
+
+    # Priority 3: Fallback
+    return PROVIDER_CONTEXT_LIMITS["default"]
+
+
+def get_summarization_config(
+    model_context_limit: int | None,
+    model_name: str | None = None,
+    override_trigger: float | None = None,
+    override_keep: float | None = None,
+) -> SummarizationConfig:
+    """Get summarization configuration based on model context limit.
+
+    Automatically selects optimal trigger/keep fractions and argument
+    truncation settings based on the model's context window size.
+
+    Configuration ranges:
+    - 1M+ tokens: trigger=0.85, keep=0.10 (e.g., Claude Opus 4.6)
+    - 400K tokens: trigger=0.80, keep=0.12 (e.g., GPT-5)
+    - 200K tokens: trigger=0.80, keep=0.15 (e.g., Claude Sonnet 4.5)
+    - 128K tokens: trigger=0.75, keep=0.20 (e.g., DeepSeek V3)
+    - 64K tokens: trigger=0.70, keep=0.25 (e.g., DeepSeek R1)
+    - 16K tokens: trigger=0.60, keep=0.30 (e.g., GPT-3.5)
+    - <16K tokens: trigger=0.50, keep=0.35 (very small models)
+
+    Args:
+        model_context_limit: Max input tokens from model profile. If None,
+            defaults to 100K tokens.
+        model_name: Model name for logging (not used for logic currently).
+        override_trigger: Override trigger fraction from CLI/settings.
+            Takes precedence over automatic selection.
+        override_keep: Override keep fraction from CLI/settings.
+            Takes precedence over automatic selection.
+
+    Returns:
+        SummarizationConfig with recommended settings.
+
+    Examples:
+        >>> config = get_summarization_config(200_000)
+        >>> config.trigger_fraction
+        0.80
+        >>> config.trigger_tokens
+        160000
+        >>> config.keep_tokens
+        30000
+    """
+    # Determine context limit (fallback to 100K if None)
+    context_limit = model_context_limit if model_context_limit is not None else 100_000
+
+    # Select trigger/keep fractions based on context size
+    if context_limit >= 1_000_000:
+        # Very large context (1M+): Claude Opus 4.6, Gemini 1.5 Pro
+        trigger_fraction = 0.85
+        keep_fraction = 0.10
+    elif context_limit >= 400_000:
+        # Large context (400K): GPT-5
+        trigger_fraction = 0.80
+        keep_fraction = 0.12
+    elif context_limit >= 200_000:
+        # Medium-large context (200K): Claude Sonnet 4.5, Gemini 2.0
+        trigger_fraction = 0.80
+        keep_fraction = 0.15
+    elif context_limit >= 128_000:
+        # Medium context (128K): DeepSeek V3, GPT-4, Mistral
+        trigger_fraction = 0.75
+        keep_fraction = 0.20
+    elif context_limit >= 64_000:
+        # Small-medium context (64K): DeepSeek R1
+        trigger_fraction = 0.70
+        keep_fraction = 0.25
+    elif context_limit >= 16_000:
+        # Small context (16K): GPT-3.5 Turbo
+        trigger_fraction = 0.60
+        keep_fraction = 0.30
+    else:
+        # Very small context (<16K): old models
+        trigger_fraction = 0.50
+        keep_fraction = 0.35
+
+    # Apply overrides from CLI/settings if provided
+    if override_trigger is not None:
+        trigger_fraction = override_trigger
+    if override_keep is not None:
+        keep_fraction = override_keep
+
+    # Determine argument truncation settings based on context size
+    if context_limit >= 200_000:
+        # Large context: more aggressive truncation (more room)
+        truncate_after_messages = 20
+        max_arg_length = 500
+    elif context_limit >= 64_000:
+        # Medium context: moderate truncation
+        truncate_after_messages = 15
+        max_arg_length = 300
+    else:
+        # Small context: early truncation to save space
+        truncate_after_messages = 10
+        max_arg_length = 200
+
+    # Calculate absolute token counts
+    trigger_tokens = int(context_limit * trigger_fraction)
+    keep_tokens = int(context_limit * keep_fraction)
+
+    return SummarizationConfig(
+        trigger_fraction=trigger_fraction,
+        keep_fraction=keep_fraction,
+        truncate_after_messages=truncate_after_messages,
+        max_arg_length=max_arg_length,
+        context_limit=context_limit,
+        trigger_tokens=trigger_tokens,
+        keep_tokens=keep_tokens,
+    )
+
+
 @dataclass
 class Settings:
     """Global settings and environment detection for deepagents-cli.
@@ -395,6 +628,7 @@ class Settings:
     - Current project information
     - Tool availability (e.g., Tavily)
     - File system paths
+    - Summarization configuration
 
     Attributes:
         openai_api_key: OpenAI API key if available.
@@ -413,6 +647,12 @@ class Settings:
         model_context_limit: Maximum input token count from the model profile.
         project_root: Current project root directory (if in a git project).
         shell_allow_list: List of shell commands that don't require approval.
+        summarization_enabled: Enable automatic conversation summarization.
+        summarization_trigger_fraction: When to trigger summarization (0.0-1.0).
+        summarization_keep_fraction: How much history to keep after summarization.
+        summarization_truncate_after: Truncate old arguments after N messages.
+        summarization_max_arg_length: Max length for old tool call arguments.
+        summarization_history_backend: History storage backend ("temp" or "persistent").
     """
 
     # API keys
@@ -439,6 +679,14 @@ class Settings:
 
     # Shell command allow-list for auto-approval
     shell_allow_list: list[str] | None = None
+
+    # Summarization configuration
+    summarization_enabled: bool = True
+    summarization_trigger_fraction: float | None = None  # Auto-detect from model
+    summarization_keep_fraction: float | None = None  # Auto-detect from model
+    summarization_truncate_after: int | None = None  # Auto-detect from model
+    summarization_max_arg_length: int | None = None  # Auto-detect from model
+    summarization_history_backend: str = "temp"  # "temp" or "persistent"
 
     @classmethod
     def from_environment(cls, *, start_path: Path | None = None) -> "Settings":
@@ -475,6 +723,40 @@ class Settings:
         shell_allow_list_str = os.environ.get("DEEPAGENTS_SHELL_ALLOW_LIST")
         shell_allow_list = parse_shell_allow_list(shell_allow_list_str)
 
+        # Parse summarization configuration from environment
+        summarization_enabled_str = os.environ.get("DEEPAGENTS_SUMMARIZATION_ENABLED")
+        if summarization_enabled_str is not None:
+            summarization_enabled = summarization_enabled_str.lower() == "true"
+        else:
+            summarization_enabled = True  # Default: enabled
+
+        # Parse optional float/int values (None if not set or invalid)
+        def parse_float(env_var: str) -> float | None:
+            value = os.environ.get(env_var)
+            if value is None:
+                return None
+            try:
+                return float(value)
+            except ValueError:
+                return None
+
+        def parse_int(env_var: str) -> int | None:
+            value = os.environ.get(env_var)
+            if value is None:
+                return None
+            try:
+                return int(value)
+            except ValueError:
+                return None
+
+        summarization_trigger = parse_float("DEEPAGENTS_SUMMARIZATION_TRIGGER")
+        summarization_keep = parse_float("DEEPAGENTS_SUMMARIZATION_KEEP")
+        summarization_truncate = parse_int("DEEPAGENTS_SUMMARIZATION_TRUNCATE_AFTER")
+        summarization_max_arg = parse_int("DEEPAGENTS_SUMMARIZATION_MAX_ARG_LENGTH")
+        summarization_backend = os.environ.get(
+            "DEEPAGENTS_SUMMARIZATION_HISTORY_BACKEND", "temp"
+        )
+
         return cls(
             deepseek_api_key=deepseek_key,
             openai_api_key=openai_key,
@@ -486,6 +768,12 @@ class Settings:
             user_langchain_project=user_langchain_project,
             project_root=project_root,
             shell_allow_list=shell_allow_list,
+            summarization_enabled=summarization_enabled,
+            summarization_trigger_fraction=summarization_trigger,
+            summarization_keep_fraction=summarization_keep,
+            summarization_truncate_after=summarization_truncate,
+            summarization_max_arg_length=summarization_max_arg,
+            summarization_history_backend=summarization_backend,
         )
 
     @property
@@ -577,8 +865,9 @@ class Settings:
         """
         if not agent_name or not agent_name.strip():
             return False
-        # Allow only alphanumeric, hyphens, underscores, and whitespace
-        return bool(re.match(r"^[a-zA-Z0-9_\-\s]+$", agent_name))
+        # Allow alphanumeric, hyphens, underscores, colons, and whitespace
+        # Colon is allowed for TaskManager naming (e.g., "agent:tm")
+        return bool(re.match(r"^[a-zA-Z0-9_\-:\s]+$", agent_name))
 
     def get_agent_dir(self, agent_name: str) -> Path:
         """Get the global agent directory path.
@@ -595,7 +884,7 @@ class Settings:
         if not self._is_valid_agent_name(agent_name):
             msg = (
                 f"Invalid agent name: {agent_name!r}. Agent names can only "
-                "contain letters, numbers, hyphens, underscores, and spaces."
+                "contain letters, numbers, hyphens, underscores, colons, and spaces."
             )
             raise ValueError(msg)
         return Path.home() / ".deepagents" / agent_name
@@ -615,7 +904,7 @@ class Settings:
         if not self._is_valid_agent_name(agent_name):
             msg = (
                 f"Invalid agent name: {agent_name!r}. Agent names can only "
-                "contain letters, numbers, hyphens, underscores, and spaces."
+                "contain letters, numbers, hyphens, underscores, colons, and spaces."
             )
             raise ValueError(msg)
         agent_dir = self.get_agent_dir(agent_name)
@@ -1039,13 +1328,21 @@ def _detect_provider(model_name: str) -> str | None:
         model_name: Model name to detect provider from
 
     Returns:
-        Provider name (openai, anthropic, google, vertexai) or None if can't detect
+        Provider name (deepseek, openai, anthropic, google, vertexai, claude-code) or None if can't detect
     """
     model_lower = model_name.lower()
 
     # Check for model name patterns
+    if "deepseek" in model_lower:
+        return "deepseek"
     if any(x in model_lower for x in ["gpt", "o1", "o3"]):
         return "openai"
+
+    # Check for Claude Code simple names (sonnet, haiku, opus, inherit)
+    # These are Claude Code-specific short names that Claude SDK resolves
+    if model_lower in ("sonnet", "haiku", "opus", "inherit"):
+        return "claude-code"
+
     if "claude" in model_lower:
         if not settings.has_anthropic and settings.has_vertex_ai:
             return "vertexai"
@@ -1058,28 +1355,82 @@ def _detect_provider(model_name: str) -> str | None:
     return None
 
 
-def create_model(model_name_override: str | None = None) -> BaseChatModel:
-    """Create the appropriate model based on available API keys.
-
-    Uses the global settings instance to determine which model to create.
+def create_model(
+    model_name_override: str | None = None,
+    *,
+    provider: str | None = None,
+    model_name: str | None = None,
+) -> BaseChatModel:
+    """Create the appropriate model based on provider and model name.
 
     Args:
-        model_name_override: Optional model name to use instead of environment variable
+        model_name_override: DEPRECATED - First positional arg for backward compatibility.
+                            Use model_name keyword arg instead.
+        provider: Provider name ("deepseek", "openai", "anthropic", "google", "vertexai", "claude-code")
+                 If None, auto-detects based on available API keys or model name.
+        model_name: Model name (e.g., "deepseek-chat", "gpt-4o", "sonnet", "haiku", "opus")
+                   If None, uses environment variable or provider default.
 
     Returns:
-        ChatModel instance (OpenAI, Anthropic, or Google)
+        ChatModel instance (OpenAI, Anthropic, Google, or ClaudeCode)
 
     Raises:
         SystemExit if no API key is configured or model provider can't be determined
     """
+    # Support legacy positional argument for backward compatibility
+    # Old API: create_model("model-name")
+    # New API: create_model(provider="...", model_name="...")
+    if model_name_override and not model_name:
+        model_name = model_name_override
+
     # Determine provider and model
-    if model_name_override:
+    # CASE 1: Explicit provider provided - use it (model_name may or may not be provided)
+    if provider:
+        # Validate provider has credentials (except claude-code which doesn't need API key)
+        if provider == "deepseek" and not settings.has_deepseek:
+            console.print(f"[bold red]Error:[/bold red] Provider '{provider}' requires DEEPSEEK_API_KEY")
+            sys.exit(1)
+        elif provider == "openai" and not settings.has_openai:
+            console.print(f"[bold red]Error:[/bold red] Provider '{provider}' requires OPENAI_API_KEY")
+            sys.exit(1)
+        elif provider == "anthropic" and not settings.has_anthropic:
+            console.print(f"[bold red]Error:[/bold red] Provider '{provider}' requires ANTHROPIC_API_KEY")
+            sys.exit(1)
+        elif provider == "google" and not settings.has_google:
+            console.print(f"[bold red]Error:[/bold red] Provider '{provider}' requires GOOGLE_API_KEY")
+            sys.exit(1)
+        elif provider == "vertexai" and not settings.has_vertex_ai:
+            console.print(
+                f"[bold red]Error:[/bold red] Provider '{provider}' requires GOOGLE_CLOUD_PROJECT"
+            )
+            sys.exit(1)
+        # claude-code doesn't need API key validation
+
+        # Provider is valid and has credentials (or doesn't need them)
+        # If model_name is None, get from environment or use provider default
+        if not model_name:
+            if provider == "deepseek":
+                model_name = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
+            elif provider == "openai":
+                model_name = os.environ.get("OPENAI_MODEL", "gpt-5.2")
+            elif provider == "anthropic":
+                model_name = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-5-20250929")
+            elif provider == "google":
+                model_name = os.environ.get("GOOGLE_MODEL", "gemini-3-pro-preview")
+            elif provider == "vertexai":
+                model_name = os.environ.get("VERTEX_AI_MODEL", "gemini-3-pro-preview")
+            elif provider == "claude-code":
+                model_name = "sonnet"  # Default Claude Code model
+        # Continue with this provider and model_name
+
+    # CASE 2: Only model_name provided (old behavior) - auto-detect provider
+    elif model_name:
         # Use provided model, auto-detect provider
-        provider = _detect_provider(model_name_override)
+        provider = _detect_provider(model_name)
         if not provider:
             console.print(
                 "[bold red]Error:[/bold red] Could not detect provider "
-                f"from model name: {model_name_override}"
+                f"from model name: {model_name}"
             )
             console.print("\nSupported model name patterns:")
             console.print("  - Deepseek: deepseek-* (DEFAULT PROVIDER)")
@@ -1095,31 +1446,31 @@ def create_model(model_name_override: str | None = None) -> BaseChatModel:
         # Check if credentials for detected provider are available
         if provider == "deepseek" and not settings.has_deepseek:
             console.print(
-                f"[bold red]Error:[/bold red] Model '{model_name_override}' "
+                f"[bold red]Error:[/bold red] Model '{model_name}' "
                 "requires DEEPSEEK_API_KEY"
             )
             sys.exit(1)
         elif provider == "openai" and not settings.has_openai:
             console.print(
-                f"[bold red]Error:[/bold red] Model '{model_name_override}' "
+                f"[bold red]Error:[/bold red] Model '{model_name}' "
                 "requires OPENAI_API_KEY"
             )
             sys.exit(1)
         elif provider == "anthropic" and not settings.has_anthropic:
             console.print(
-                f"[bold red]Error:[/bold red] Model '{model_name_override}' "
+                f"[bold red]Error:[/bold red] Model '{model_name}' "
                 "requires ANTHROPIC_API_KEY"
             )
             sys.exit(1)
         elif provider == "google" and not settings.has_google:
             console.print(
-                f"[bold red]Error:[/bold red] Model '{model_name_override}' "
+                f"[bold red]Error:[/bold red] Model '{model_name}' "
                 "requires GOOGLE_API_KEY"
             )
             sys.exit(1)
         elif provider == "vertexai" and not settings.has_vertex_ai:
             console.print(
-                f"[bold red]Error:[/bold red] Model '{model_name_override}' requires "
+                f"[bold red]Error:[/bold red] Model '{model_name}' requires "
                 "GOOGLE_CLOUD_PROJECT to be set"
             )
             console.print("\nPlease set GOOGLE_CLOUD_PROJECT environment variable.")
@@ -1127,59 +1478,62 @@ def create_model(model_name_override: str | None = None) -> BaseChatModel:
             console.print("  gcloud auth application-default login")
             sys.exit(1)
 
-        model_name = model_name_override
+        # model_name already set from parameter
+
+    # CASE 3: No provider or model_name provided - auto-detect (fallback for backward compatibility)
     # ============================================================================
     # ⚠️⚠️⚠️ CRITICALLY IMPORTANT FOR FUTURE AGENTS ⚠️⚠️⚠️
     # ============================================================================
     # DO NOT CHANGE THE PROVIDER PRIORITY ORDER!
     # DO NOT REMOVE THE has_deepseek CHECK!
     #
-    # This code is used by the OLD entry point main.py (python3 -m deep_worker_cli.main)
+    # This code is used by the OLD main.py entry point (python3 -m deep_worker_cli.main)
     # which must NOT be used for testing or production!
     #
-    # The ONLY CORRECT way to run:
-    # ✅ deep-worker [agent-name]  - the command is installed globally on the user's PATH
+    # The ONLY CORRECT way to start it:
+    # ✅ deep-worker [agent-name]  - the command is installed in ~/.local/bin/deep-worker
     #
     # WRONG (DO NOT USE):
     # ❌ python3 -m deep_worker_cli.main
     # ❌ python3 -m deep_worker_cli.cli.main
     #
     # The deep-worker command uses agent_command.py, which explicitly sets provider="deepseek"
-    # by default, so it does NOT go through this auto-detection logic.
+    # by default, so it now PASSES the provider explicitly to create_model().
     #
-    # See: DEEPSEEK_PROVIDER.md in the deep_worker_cli directory for details
+    # See: DEEPSEEK_PROVIDER.md for details
     # ============================================================================
     # Provider auto-detection by API key priority (Deepseek FIRST)
-    elif settings.has_deepseek:
-        provider = "deepseek"
-        model_name = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
-    elif settings.has_openai:
-        provider = "openai"
-        model_name = os.environ.get("OPENAI_MODEL", "gpt-5.2")
-    elif settings.has_anthropic:
-        provider = "anthropic"
-        model_name = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-5-20250929")
-    elif settings.has_google:
-        provider = "google"
-        model_name = os.environ.get("GOOGLE_MODEL", "gemini-3-pro-preview")
-    elif settings.has_vertex_ai:
-        provider = "vertexai"
-        model_name = os.environ.get("VERTEX_AI_MODEL", "gemini-3-pro-preview")
     else:
-        console.print("[bold red]Error:[/bold red] No credentials configured.")
-        console.print("\nPlease set one of the following environment variables:")
-        console.print("  - DEEPSEEK_API_KEY   (for Deepseek models - DEFAULT PROVIDER)")
-        console.print("  - OPENAI_API_KEY     (for OpenAI models like gpt-5.2)")
-        console.print("  - ANTHROPIC_API_KEY  (for Claude models)")
-        console.print("  - GOOGLE_API_KEY     (for Google Gemini models)")
-        console.print(
-            "  - GOOGLE_CLOUD_PROJECT (for VertexAI models, "
-            "with Application Default Credentials)"
-        )
-        console.print("\nExample:")
-        console.print("  export DEEPSEEK_API_KEY=your_api_key_here")
-        console.print("\nOr add it to your .env file.")
-        sys.exit(1)
+        if settings.has_deepseek:
+            provider = "deepseek"
+            model_name = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
+        elif settings.has_openai:
+            provider = "openai"
+            model_name = os.environ.get("OPENAI_MODEL", "gpt-5.2")
+        elif settings.has_anthropic:
+            provider = "anthropic"
+            model_name = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-5-20250929")
+        elif settings.has_google:
+            provider = "google"
+            model_name = os.environ.get("GOOGLE_MODEL", "gemini-3-pro-preview")
+        elif settings.has_vertex_ai:
+            provider = "vertexai"
+            model_name = os.environ.get("VERTEX_AI_MODEL", "gemini-3-pro-preview")
+        else:
+            console.print("[bold red]Error:[/bold red] No credentials configured.")
+            console.print("\nPlease set one of the following environment variables:")
+            console.print("  - DEEPSEEK_API_KEY   (for Deepseek models - DEFAULT PROVIDER)")
+            console.print("  - OPENAI_API_KEY     (for OpenAI models like gpt-5.2)")
+            console.print("  - ANTHROPIC_API_KEY  (for Claude models)")
+            console.print("  - GOOGLE_API_KEY     (for Google Gemini models)")
+            console.print(
+                "  - GOOGLE_CLOUD_PROJECT (for VertexAI models, "
+                "with Application Default Credentials)"
+            )
+            console.print("\nExample:")
+            console.print("  export DEEPSEEK_API_KEY=your_api_key_here")
+            console.print("\nOr add it to your .env file.")
+            sys.exit(1)
 
     # Store model info in settings for display
     settings.model_name = model_name
@@ -1195,11 +1549,11 @@ def create_model(model_name_override: str | None = None) -> BaseChatModel:
             model=model_name,
             base_url="https://api.deepseek.com",
             api_key=settings.deepseek_api_key,
-        )  # type: ignore[call-arg]
+        )
     elif provider == "openai":
         from langchain_openai import ChatOpenAI
 
-        model = ChatOpenAI(model=model_name)  # type: ignore[call-arg]
+        model = ChatOpenAI(model=model_name)
     elif provider == "anthropic":
         from langchain_anthropic import ChatAnthropic
 
@@ -1216,6 +1570,7 @@ def create_model(model_name_override: str | None = None) -> BaseChatModel:
             max_tokens=None,
         )
     elif provider == "vertexai":
+        assert model_name is not None  # Type narrowing: model_name is set above
         model_lower = model_name.lower()
 
         if "claude" in model_lower:
@@ -1251,6 +1606,26 @@ def create_model(model_name_override: str | None = None) -> BaseChatModel:
                 temperature=0,
                 max_tokens=None,
             )
+    elif provider == "claude-code":
+        # ============================================================================
+        # CRITICAL: CLAUDE_CODE_PROVIDER MUST BE IMPORTED FROM SOURCE CODE!
+        # ============================================================================
+        # Import claude_code_provider from the repository root
+        # This is a local package that provides LangChain wrapper for Claude Code SDK
+        # ============================================================================
+        _repo_root = Path(__file__).parent.parent.parent.parent
+        if str(_repo_root) not in sys.path:
+            sys.path.insert(0, str(_repo_root))
+
+        from claude_code_provider import ClaudeCodeChatModel
+
+        # Claude Code accepts simple model names (sonnet, haiku, opus, inherit)
+        # or full model names (claude-sonnet-4-5-20250929)
+        # The Claude SDK automatically resolves simple names to latest versions
+        model = ClaudeCodeChatModel(
+            model=model_name,
+            max_tokens=20_000,
+        )
     else:
         # Should not reach here due to earlier validation
         console.print(f"[bold red]Error:[/bold red] Unknown provider: {provider}")

@@ -1,16 +1,22 @@
 """TaskManager class for deep-worker agent task evaluation and correction.
 
 This module provides TaskManager functionality similar to ai_lib TaskManager,
-adapted to run within the same process as deep-worker agent using a separate thread.
+adapted to run within the same process as deep-worker agent using async tasks
+in the main event loop (single-thread architecture).
 """
 
 import asyncio
+import contextlib
 import logging
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Optional
+from typing import TYPE_CHECKING, Any, Literal
 
-from deep_worker_cli.task_manager.manager_thread import ManagerThread
+from langgraph.checkpoint.base import BaseCheckpointSaver
+from langgraph.pregel import Pregel
+
 from deep_worker_cli.task_manager.prompts import (
+    TASK_MANAGER_SYSTEM_PROMPT,
     format_evaluation_prompt,
     format_followup_prompt,
     parse_manager_response,
@@ -19,6 +25,7 @@ from deep_worker_cli.task_manager.prompts import (
 if TYPE_CHECKING:
     from deep_worker_cli.agent_config_pkg.agent_config import AgentConfig
     from deep_worker_cli.session.session_manager import SessionManager
+    from deepagents.backends.composite import CompositeBackend
 
 logger = logging.getLogger(__name__)
 
@@ -27,14 +34,14 @@ class TaskManager:
     """
     TaskManager for deep-worker agent task evaluation and correction.
 
-    This class manages task completion with AI-powered evaluation using a
-    separate manager thread. Similar to ai_lib TaskManager but adapted for
-    deep-worker architecture.
+    This class manages task completion with AI-powered evaluation using async tasks
+    in the main event loop. Similar to ai_lib TaskManager but adapted for
+    single-thread, single event loop architecture.
 
     Architecture:
-        - Main thread: Subordinate agent executes tasks
-        - Manager thread ({agent_name}:tm): Evaluates task completion
-        - Communication: asyncio.Queue between threads
+        - Main event loop: Subordinate agent executes tasks
+        - Background async task: Manager agent evaluates task completion
+        - Communication: Direct async calls (no queues, no threads)
 
     Example:
         >>> tm = TaskManager(agent_name="my_agent", config=config, session_manager=sm)
@@ -48,71 +55,111 @@ class TaskManager:
         self,
         agent_name: str,
         config: 'AgentConfig',
-        session_manager: 'SessionManager'
+        session_manager: 'SessionManager',
+        checkpointer: BaseCheckpointSaver | None = None,
     ):
         """
         Initialize TaskManager.
 
         Args:
-            agent_name: Name of the subordinate agent (for thread naming)
+            agent_name: Name of the subordinate agent
             config: Agent configuration for creating manager agent
             session_manager: For accessing conversation history
+            checkpointer: Checkpointer for manager agent persistence.
+                         MUST be same type as main agent:
+                         - InMemorySaver if main agent uses InMemorySaver
+                         - AsyncSqliteSaver if main agent uses AsyncSqliteSaver
+                         If None, defaults to InMemorySaver (test mode)
         """
         self.agent_name = agent_name
         self.config = config
         self.session_manager = session_manager
+        self.checkpointer = checkpointer
 
-        # Inter-thread communication queues
-        self.task_queue: asyncio.Queue = asyncio.Queue()
-        self.result_queue: asyncio.Queue = asyncio.Queue()
-
-        # Manager thread
-        self.manager_thread: Optional[ManagerThread] = None
+        # Manager agent components (initialized in start())
+        self.manager_agent: Pregel | None = None
+        self.manager_backend: 'CompositeBackend | None' = None
 
         # Task state
         self.state: Literal['inactive', 'waiting', 'evaluating'] = 'inactive'
-        self.initial_request: Optional[str] = None
-        self.project_path: Optional[str] = None
-        self.session_file_path: Optional[str] = None
+        self.initial_request: str | None = None
+        self.project_path: str | None = None
+        self.session_file_path: str | None = None
         self.is_first_evaluation = True
         self.evaluation_count = 0
 
         # Callback for sending corrective prompts to subordinate
         self.send_to_subordinate_callback = None
 
+        # Running flag for lifecycle management
+        self._running = False
+
     async def start(self) -> None:
         """
-        Start the TaskManager and initialize manager thread.
+        Start the TaskManager and initialize manager agent.
 
-        This creates and starts the manager thread that will process
-        evaluation requests.
+        This initializes the manager LangGraph agent that will evaluate
+        the subordinate agent's work. No threads are created - the manager
+        runs in the same event loop as the main agent.
         """
-        if self.manager_thread and self.manager_thread.is_alive():
-            logger.warning(f"[TaskManager] Manager thread already running")
+        if self._running:
+            logger.warning(f"[TaskManager] Already running")
             return
 
-        logger.info(f"[TaskManager] Starting manager thread for agent '{self.agent_name}'")
+        logger.info(f"[TaskManager] Starting for agent '{self.agent_name}'")
 
-        # Create and start manager thread
-        self.manager_thread = ManagerThread(
-            agent_name=self.agent_name,
-            task_manager=self
-        )
-        self.manager_thread.start()
+        # Initialize manager agent
+        await self._initialize_manager()
 
-        # Wait a bit for thread to initialize
-        await asyncio.sleep(0.1)
+        self._running = True
+        logger.info(f"[TaskManager] Started successfully (manager_id: {self.agent_name}:tm)")
 
-        if not self.manager_thread.is_alive():
-            raise RuntimeError("Manager thread failed to start")
+    async def _initialize_manager(self) -> None:
+        """
+        Initialize manager LangGraph agent.
 
-        logger.info(f"[TaskManager] Manager thread '{self.manager_thread.name}' started")
+        Creates a LangGraph agent with TaskManager system prompt for
+        evaluating subordinate agent's work. This runs in the same event
+        loop as the main agent.
+        """
+        try:
+            from deep_worker_cli.agent import create_cli_agent
+            from deep_worker_cli.config import create_model
+
+            logger.info(f"[TaskManager] Initializing manager agent...")
+
+            # Create model using same configuration as subordinate
+            model = create_model()
+
+            # Get project_memory_dir from config (required by create_cli_agent)
+            project_memory_dir = Path(self.config.working_dir)
+
+            # Create manager agent with TaskManager system prompt
+            # CRITICAL: Use colon ':' not underscore '_' to avoid conflicts
+            # with agent names that contain '_tm' suffix
+            self.manager_agent, self.manager_backend = create_cli_agent(
+                model=model,
+                assistant_id=f"{self.agent_name}:tm",  # Colon separator
+                system_prompt=TASK_MANAGER_SYSTEM_PROMPT,
+                auto_approve=True,  # Manager doesn't need approvals
+                enable_memory=False,  # Manager doesn't need memory
+                enable_skills=False,  # Manager doesn't use skills
+                enable_shell=False,  # Manager doesn't execute shell commands
+                project_memory_dir=project_memory_dir,
+                checkpointer=self.checkpointer,  # Same as main agent
+            )
+
+            logger.info(f"[TaskManager] Manager agent initialized")
+
+        except Exception as e:
+            logger.exception(f"[TaskManager] Failed to initialize manager agent: {e}")
+            raise
 
     async def init_task(
         self,
         initial_request: str,
-        project_path: Optional[str] = None,
-        session_file_path: Optional[str] = None
+        project_path: str | None = None,
+        session_file_path: str | None = None
     ) -> None:
         """
         Initialize a new task for evaluation.
@@ -136,12 +183,13 @@ class TaskManager:
     async def on_subordinate_response(
         self,
         response: str,
-        send_to_subordinate_callback
-    ) -> Optional[str]:
+        send_to_subordinate_callback: Any,
+    ) -> str | None:
         """
         Handle subordinate agent response and evaluate it.
 
         This is called by middleware when subordinate completes a response.
+        Evaluation happens directly in this method (no queues, no threads).
 
         Args:
             response: The subordinate's response text
@@ -186,23 +234,15 @@ class TaskManager:
             else:
                 eval_prompt = format_followup_prompt(response)
 
-            # Send evaluation request to manager thread
-            await self.task_queue.put({
-                'type': 'evaluate',
-                'prompt': eval_prompt
-            })
+            # Invoke manager agent directly (no thread, no queue)
+            manager_response = await self._evaluate_with_manager(eval_prompt)
 
-            # Wait for evaluation result
-            result = await self.result_queue.get()
-
-            if not result.get('success'):
-                error = result.get('error', 'Unknown error')
-                logger.error(f"[TaskManager] Evaluation failed: {error}")
+            if not manager_response:
+                logger.error(f"[TaskManager] Evaluation failed")
                 self.state = 'inactive'
                 return None
 
             # Parse manager response
-            manager_response = result.get('content', '')
             status, message = parse_manager_response(manager_response)
 
             logger.info(f"[TaskManager] Evaluation result: status={status}")
@@ -230,26 +270,94 @@ class TaskManager:
             self.state = 'inactive'
             return None
 
+    async def _evaluate_with_manager(self, prompt: str) -> str | None:
+        """
+        Evaluate a prompt using the manager agent.
+
+        This method directly invokes the manager agent in the current event loop.
+        No threads, no queues - just a direct async call.
+
+        Args:
+            prompt: The evaluation prompt to send to manager
+
+        Returns:
+            Manager agent's response content, or None on error
+        """
+        try:
+            if self.manager_agent is None:
+                logger.error(f"[TaskManager] Manager agent not initialized")
+                return None
+
+            logger.debug(f"[TaskManager] Invoking manager agent with prompt length={len(prompt)}")
+
+            # Invoke manager agent
+            # CRITICAL: Metadata field meanings:
+            # - thread_id: Unique identifier for this conversation thread (agent_name:tm)
+            # - assistant_id: Technical ID for the assistant/agent instance (agent_name:tm)
+            # - agent_name: The MAIN agent name (WITHOUT :tm suffix) - identifies which agent this thread belongs to
+            # - updated_at: ISO 8601 UTC timestamp of last update
+            #
+            # This ensures TaskManager threads are associated with the parent agent in --list output
+            result = await self.manager_agent.ainvoke(
+                {"messages": [{"role": "user", "content": prompt}]},
+                {
+                    "configurable": {"thread_id": f"{self.agent_name}:tm"},
+                    "metadata": {
+                        "assistant_id": f"{self.agent_name}:tm",
+                        "agent_name": self.agent_name,  # Parent agent name (without :tm)
+                        "updated_at": datetime.now(UTC).isoformat(),
+                    }
+                }
+            )
+
+            # Extract response
+            messages = result.get("messages", [])
+            if not messages:
+                logger.error(f"[TaskManager] Manager agent returned no messages")
+                return None
+
+            last_msg = messages[-1]
+
+            # Handle both dict and LangChain Message objects
+            if isinstance(last_msg, dict):
+                content = last_msg.get("content", "")
+            else:
+                content = last_msg.content if hasattr(last_msg, 'content') else ""
+
+            logger.debug(f"[TaskManager] Manager agent responded with {len(content)} chars")
+
+            return content
+
+        except Exception as e:
+            logger.exception(f"[TaskManager] Error invoking manager agent: {e}")
+            return None
+
     async def stop(self) -> None:
         """
-        Stop the TaskManager and shutdown manager thread.
+        Stop the TaskManager and cleanup manager agent.
+
+        This is a graceful shutdown that doesn't need to wait for threads
+        since everything runs in the same event loop.
         """
+        if not self._running:
+            return
+
         logger.info(f"[TaskManager] Stopping...")
 
         self.state = 'inactive'
+        self._running = False
 
-        if self.manager_thread and self.manager_thread.is_alive():
-            self.manager_thread.stop()
+        # Cleanup manager backend if it has a cleanup method
+        if self.manager_backend and hasattr(self.manager_backend, 'cleanup'):
+            with contextlib.suppress(Exception):
+                cleanup_method = getattr(self.manager_backend, 'cleanup')
+                if callable(cleanup_method):
+                    await cleanup_method()
 
-            # Wait for thread to finish (with timeout)
-            self.manager_thread.join(timeout=5.0)
+        self.manager_agent = None
+        self.manager_backend = None
 
-            if self.manager_thread.is_alive():
-                logger.warning(f"[TaskManager] Manager thread did not stop within timeout")
-            else:
-                logger.info(f"[TaskManager] Manager thread stopped")
-
-        self.manager_thread = None
+        logger.info(f"[TaskManager] Stopped successfully")
 
     def get_state(self) -> str:
         """

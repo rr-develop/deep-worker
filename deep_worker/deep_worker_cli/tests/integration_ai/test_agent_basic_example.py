@@ -3,6 +3,22 @@
 This module demonstrates how to use the integration_ai infrastructure
 for testing deep_worker agents with AI-powered response validation.
 
+⚠️ CRITICAL: PORT USAGE IN INTEGRATION TESTS ⚠️
+================================================
+These tests use agent_fixture which creates REAL agents with RPyC servers.
+
+NEVER pass fixed rpyc_port values to agent_fixture or AgentProcess!
+ALWAYS rely on automatic port assignment (rpyc_port=True).
+
+Fixed ports cause flaky tests when:
+- Multiple tests run in parallel
+- Previous test didn't clean up
+- Port already in use
+
+The agent_fixture automatically uses dynamic port assignment.
+DO NOT modify this behavior!
+================================================
+
 Run with:
     pytest tests/integration_ai/test_agent_basic_example.py -v -s
 """

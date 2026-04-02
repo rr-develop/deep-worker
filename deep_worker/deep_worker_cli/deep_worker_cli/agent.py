@@ -133,7 +133,11 @@ def reset_agent(agent_name: str, source_agent: str | None = None) -> None:
     console.print(f"Location: {agent_dir}\n", style=COLORS["dim"])
 
 
-def get_system_prompt(assistant_id: str, sandbox_type: str | None = None) -> str:
+def get_system_prompt(
+    assistant_id: str,
+    sandbox_type: str | None = None,
+    project_memory_dir: Path | None = None,
+) -> str:
     """Get the base system prompt for the agent.
 
     This includes:
@@ -146,6 +150,10 @@ def get_system_prompt(assistant_id: str, sandbox_type: str | None = None) -> str
             ("daytona", "langsmith", "modal", "runloop").
 
             If None, agent is operating in local mode.
+        project_memory_dir: Working directory for the agent.
+
+            CRITICAL: This MUST be the same directory passed to backend!
+            If None, Path.cwd() is used (DANGEROUS after daemonization!).
 
     Returns:
         The system prompt string (base instructions + environment context)
@@ -186,7 +194,10 @@ All code execution and file operations happen in this sandbox environment.
 
 """
     else:
-        cwd = Path.cwd()
+        # CRITICAL: MUST use project_memory_dir, NOT Path.cwd()!
+        # After daemonization, Path.cwd() returns "/" instead of the original directory.
+        # Backend uses project_memory_dir, so prompt MUST match!
+        cwd = project_memory_dir if project_memory_dir else Path.cwd()
         working_dir_section = f"""### Current Working Directory
 
 The filesystem backend is currently operating in: `{cwd}`
@@ -364,7 +375,10 @@ def _format_execute_description(
     """
     args = tool_call["args"]
     command = args.get("command", "N/A")
-    return f"Execute Command: {command}\nWorking Directory: {Path.cwd()}"
+    # NOTE: Backend knows the correct working directory (project_memory_dir).
+    # Don't display Path.cwd() here as it returns "/" after daemonization.
+    # The command will execute in the backend's root_dir regardless.
+    return f"Execute Command: {command}"
 
 
 def _add_interrupt_on() -> dict[str, InterruptOnConfig]:
@@ -380,32 +394,32 @@ def _add_interrupt_on() -> dict[str, InterruptOnConfig]:
     """
     execute_interrupt_config: InterruptOnConfig = {
         "allowed_decisions": ["approve", "reject"],
-        "description": _format_execute_description,  # type: ignore[typeddict-item]
+        "description": _format_execute_description,
     }
 
     write_file_interrupt_config: InterruptOnConfig = {
         "allowed_decisions": ["approve", "reject"],
-        "description": _format_write_file_description,  # type: ignore[typeddict-item]
+        "description": _format_write_file_description,
     }
 
     edit_file_interrupt_config: InterruptOnConfig = {
         "allowed_decisions": ["approve", "reject"],
-        "description": _format_edit_file_description,  # type: ignore[typeddict-item]
+        "description": _format_edit_file_description,
     }
 
     web_search_interrupt_config: InterruptOnConfig = {
         "allowed_decisions": ["approve", "reject"],
-        "description": _format_web_search_description,  # type: ignore[typeddict-item]
+        "description": _format_web_search_description,
     }
 
     fetch_url_interrupt_config: InterruptOnConfig = {
         "allowed_decisions": ["approve", "reject"],
-        "description": _format_fetch_url_description,  # type: ignore[typeddict-item]
+        "description": _format_fetch_url_description,
     }
 
     task_interrupt_config: InterruptOnConfig = {
         "allowed_decisions": ["approve", "reject"],
-        "description": _format_task_description,  # type: ignore[typeddict-item]
+        "description": _format_task_description,
     }
 
     return {
@@ -624,7 +638,9 @@ def create_cli_agent(
     # Get or use custom system prompt
     if system_prompt is None:
         system_prompt = get_system_prompt(
-            assistant_id=assistant_id, sandbox_type=sandbox_type
+            assistant_id=assistant_id,
+            sandbox_type=sandbox_type,
+            project_memory_dir=project_memory_dir,
         )
 
     # Configure interrupt_on based on auto_approve setting

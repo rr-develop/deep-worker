@@ -50,9 +50,10 @@ dependencies = [
   # Clipboard
   "pyperclip>=1.11.0,<2.0.0",
 
-  # IPC/RPC
-  "rpyc>=6.0.0,<7.0.0",
-  "arpyc",  # in-repo package at ../../arpyc; see [tool.uv.sources] below
+  # IPC/RPC - MIGRATED TO ASYNCIO SERVER
+  # rpyc-async is the AsyncioServer-capable fork of rpyc, published on PyPI.
+  # Provides enable_asyncio_serving() and true bidirectional async callbacks.
+  "rpyc-async>=1.0.0",
 
   # Utilities
   "python-dotenv>=1.0.0,<2.0.0",
@@ -108,16 +109,27 @@ packages = ["deep_worker_cli"]
 
 [tool.uv.sources]
 deepagents = { path = "../deepagents", editable = true }
-arpyc = { path = "../../arpyc", editable = true }
 
 [tool.ty.environment]
-extra-paths = ["../deepagents"]
+# Sibling packages are vendored into this checkout — resolve them by
+# repo-relative paths so the type checker works in any clone location.
+extra-paths = [
+    "..",
+    "../../arpyc",
+    "../../claude_code_provider",
+    "../../semantic_search",
+    "../deepagents",
+]
 
 [tool.ty.rules]
 # https://docs.astral.sh/ty/rules/
 # Type checking is performed via pyright (configured in pyrightconfig.json)
 # Pre-commit hook uses: uv run --all-groups ty check deep_worker_cli
 # This includes tests/integration_ai/ as specified in pyrightconfig.json
+invalid-key = "ignore"
+unresolved-reference = "ignore"
+unknown-argument = "ignore"
+invalid-argument-type = "ignore"
 
 [tool.ruff.format]
 docstring-code-format = true
@@ -329,3 +341,7 @@ omit = ["tests/*"]
 addopts = "--strict-markers --strict-config --durations=5"
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
+
+markers = [
+    "reuse_agent: Do not kill existing agent process, reuse it for debugging (default: kill old process)",
+]

@@ -474,7 +474,7 @@ class ChatInput(Vertical):
             [
                 SlashCommandController(SLASH_COMMANDS, self),
                 FuzzyFileController(self, cwd=self._cwd),
-            ]  # type: ignore[list-item]
+            ]
         )
 
         self._text_area.focus()

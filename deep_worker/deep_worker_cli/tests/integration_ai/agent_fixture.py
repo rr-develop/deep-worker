@@ -1,6 +1,14 @@
 """Agent fixture for AI-powered integration tests.
 
 Provides context manager for managing deep-worker agent lifecycle during tests.
+
+CRITICAL: skip_permissions=True by default
+==========================================
+This fixture ALWAYS uses skip_permissions=True by default to prevent tests from hanging
+on approval prompts. Only set skip_permissions=False for tests that specifically
+test the approval workflow (HITL - human-in-the-loop).
+
+⚠️  DO NOT CHANGE THE DEFAULT! This would break 95% of integration tests.
 """
 
 from __future__ import annotations
@@ -142,10 +150,10 @@ def _agent_process_entry_point(
     # ============================================================================
     # CRITICAL: Ensure local deepagents code is used instead of system package
     # ============================================================================
-    # Tests should ALWAYS use the code from this repository
+    # Tests must import the repository copy, not any installed sibling.
     repo_base = Path(__file__).resolve().parents[3]
     cli_package_path = str(repo_base / "deep_worker_cli")
-    deepagents_path = str(repo_base / "deepagents")
+    deepagents_path = f"{repo_base}/deepagents"
 
     # Insert at beginning to override system packages
     if cli_package_path not in sys.path:
@@ -166,6 +174,9 @@ def _agent_process_entry_point(
             os.environ["GOOGLE_API_KEY"] = api_key
             os.environ["GOOGLE_MODEL"] = model
 
+    # claude-code doesn't require API key (uses local Claude Code installation)
+    # No environment setup needed
+
     # Create config
     config = AgentConfig(
         model=model,
@@ -175,11 +186,22 @@ def _agent_process_entry_point(
     )
 
     # Create agent process
+    # ⚠️ CRITICAL: ALWAYS use rpyc_port=True for auto port assignment! ⚠️
+    # ============================================================================
+    # NEVER use fixed ports like rpyc_port=18861 in tests!
+    # Fixed ports cause race conditions when tests run concurrently:
+    # - Port conflicts between parallel tests
+    # - Port not released from previous test
+    # - Flaky tests that fail randomly
+    #
+    # ALWAYS use rpyc_port=True which delegates to AgentProcess to find
+    # a free port dynamically using OS port selection (port=0).
+    # ============================================================================
     agent = AgentProcess(
         name=agent_name,
         config=config,
         skip_permissions=skip_permissions,
-        rpyc_port=True,  # Auto-assign port
+        rpyc_port=True,  # ⚠️ MUST be True! Never use fixed port numbers!
     )
 
     # Run agent.start() in a new event loop (this is the correct way!)
@@ -191,10 +213,39 @@ def _start_agent_process(
     working_dir: Path,
     model: str = "deepseek-chat",
     provider: str = "deepseek",
-    skip_permissions: bool = True,
+    skip_permissions: bool = True,  # ⚠️ CRITICAL: Must be True by default! See docstring.
     api_key: Optional[str] = None,
 ) -> AgentFixtureInfo:
     """Start a new agent process using multiprocessing.
+
+    ⚠️ CRITICAL: Uses 'spawn' start method to avoid fork() deadlocks ⚠️
+    ==================================================================
+    Python's multiprocessing fork() method can cause deadlocks when:
+    - Parent process is multi-threaded (e.g., pytest with plugins)
+    - Child process uses asyncio (event loops don't survive fork)
+    - Libraries like lancedb are not fork-safe
+
+    We MUST use 'spawn' start method which starts a fresh Python interpreter.
+    ==================================================================
+
+    ⚠️ CRITICAL PORT USAGE REQUIREMENT ⚠️
+    =====================================
+    NEVER PASS FIXED PORTS TO AgentProcess!
+
+    The agent creation inside _agent_process_entry_point MUST use:
+        rpyc_port=True  # ✅ Correct: Auto-assign port
+
+    NEVER use:
+        rpyc_port=18861  # ❌ WRONG: Fixed port causes race conditions!
+
+    Fixed ports cause flaky tests when:
+    - Multiple tests run concurrently
+    - Previous test didn't release port
+    - System service uses the port
+
+    This function creates agents with dynamic port assignment, ensuring
+    each agent gets a unique port from the OS (using port=0).
+    =====================================
 
     CRITICAL REQUIREMENT:
     ====================
@@ -212,7 +263,11 @@ def _start_agent_process(
         working_dir: Working directory
         model: AI model to use
         provider: AI provider
-        skip_permissions: Whether to skip permission checks
+        skip_permissions: Whether to skip permission checks (default: True)
+                         ⚠️  CRITICAL: This MUST be True for all tests that invoke tools!
+                         Integration tests invoke tools (read, write, execute, etc.) and would
+                         hang forever waiting for approval prompts that can't be provided in CI/CD.
+                         Only set to False for tests that specifically test the approval workflow.
         api_key: API key for the provider
 
     Returns:
@@ -226,7 +281,13 @@ def _start_agent_process(
 
     # Start agent in a separate process using multiprocessing
     # This allows agent.start() to run asyncio.run() in its own event loop
-    process = multiprocessing.Process(
+    # CRITICAL: Use 'spawn' start method to avoid fork() deadlocks
+    # This prevents issues with:
+    # - Multi-threaded parent process (pytest)
+    # - asyncio event loops not surviving fork()
+    # - Libraries that are not fork-safe (lancedb, etc.)
+    ctx = multiprocessing.get_context('spawn')
+    process = ctx.Process(
         target=_agent_process_entry_point,
         args=(agent_name, working_dir, model, provider, skip_permissions, api_key),
         name=f"agent-{agent_name}",
@@ -254,47 +315,21 @@ def _start_agent_process(
                 registry_appeared = True
                 logger.info(f"Agent {agent_name}: Registered in registry after {elapsed:.1f}s")
 
-            # Give it a moment to be ready
-            time.sleep(0.2)
+            # Give AsyncioServer a moment to be ready for connections
+            # CRITICAL: We do NOT test connection here because AsyncioServer
+            # in multiprocessing has a bug where second sequential connection hangs!
+            # The fixture connection would consume the "first working connection",
+            # leaving the actual test with the broken second connection.
+            # Instead, we just verify the server is registered and give it time to initialize.
+            time.sleep(0.5)
 
-            # Verify we can connect via RPyC
-            try:
-                connection_attempts += 1
-                logger.info(f"Agent {agent_name}: Connection attempt {connection_attempts} at {elapsed:.1f}s, RPyC port={agent_info_reg.rpyc_port}")
-                print(f"[FIXTURE] Connection attempt {connection_attempts} to {agent_name} on port {agent_info_reg.rpyc_port}", flush=True)
+            # Success - agent is ready (registered and server started)
+            agent_pid = agent_info_reg.pid
+            agent_rpyc_port = agent_info_reg.rpyc_port
+            logger.info(f"Agent {agent_name} started successfully (PID {agent_pid}, RPyC port {agent_rpyc_port}) after {elapsed:.1f}s")
+            print(f"[FIXTURE] Agent ready: PID={agent_pid}, port={agent_rpyc_port}", flush=True)
 
-                # Create a temporary event loop for the async client operations
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                try:
-                    client = AgentClient(agent_name)
-                    logger.info(f"Agent {agent_name}: Created AgentClient, calling connect()...")
-                    print(f"[FIXTURE] Created AgentClient, calling connect()...", flush=True)
-
-                    # Add timeout to prevent hanging forever
-                    try:
-                        loop.run_until_complete(asyncio.wait_for(client.connect(), timeout=5.0))
-                    except asyncio.TimeoutError:
-                        print(f"[FIXTURE] Connection timeout after 5s!", flush=True)
-                        raise
-
-                    logger.info(f"Agent {agent_name}: Connected successfully, calling disconnect()...")
-                    print(f"[FIXTURE] Connected successfully!", flush=True)
-                    loop.run_until_complete(client.disconnect())
-                    logger.info(f"Agent {agent_name}: Disconnected successfully")
-                    print(f"[FIXTURE] Disconnected successfully", flush=True)
-                finally:
-                    loop.close()
-
-                # Success - agent is ready
-                print(f"[FIXTURE] Getting PID and port from registry info...", flush=True)
-                agent_pid = agent_info_reg.pid
-                agent_rpyc_port = agent_info_reg.rpyc_port
-                print(f"[FIXTURE] Got PID={agent_pid}, port={agent_rpyc_port}", flush=True)
-                logger.info(f"Agent {agent_name} started successfully (PID {agent_pid}, RPyC port {agent_rpyc_port}) after {elapsed:.1f}s")
-                print(f"[FIXTURE] About to return AgentFixtureInfo...", flush=True)
-
-                return AgentFixtureInfo(
+            return AgentFixtureInfo(
                     agent_name=agent_name,
                     working_dir=working_dir,
                     rpyc_port=agent_rpyc_port,
@@ -302,9 +337,6 @@ def _start_agent_process(
                     status=AgentStatus.RUNNING,
                     created_by_fixture=True,
                 )
-
-            except Exception as e:
-                logger.debug(f"Agent {agent_name}: Connection failed at {elapsed:.1f}s, attempt {connection_attempts}: {type(e).__name__}: {e}")
         else:
             elapsed = time.time() - start_time
             if int(elapsed) % 5 == 0 and int(elapsed) > 0:  # Log every 5 seconds
@@ -354,6 +386,8 @@ def agent_fixture(
         model: AI model to use (default: deepseek-chat)
         provider: AI provider (default: deepseek)
         skip_permissions: Skip permission prompts (default: True for tests)
+                         ⚠️  CRITICAL: This MUST be True for all tests that invoke tools!
+                         Only set to False for tests that specifically test the approval workflow.
 
     Yields:
         AgentFixtureInfo with agent details

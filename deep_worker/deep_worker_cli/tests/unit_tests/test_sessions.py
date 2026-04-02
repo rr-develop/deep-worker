@@ -5,7 +5,7 @@ import json
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
@@ -494,3 +494,200 @@ class TestMessageCountFromCheckpointBlob:
             # BUG: Currently returns 0 because it looks at writes table
             # EXPECTED: 4 messages from checkpoint blob
             assert threads[0]["message_count"] == 4
+
+
+class TestCleanAgentHistory:
+    """Tests for clean_agent_history function."""
+
+    @pytest.fixture
+    def temp_agent_env(self, tmp_path: Path):
+        """Create temporary agent environment with all data structures."""
+        # Create database with agent threads
+        db_path = tmp_path / "sessions.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS checkpoints (
+                thread_id TEXT NOT NULL,
+                checkpoint_ns TEXT NOT NULL DEFAULT '',
+                checkpoint_id TEXT NOT NULL,
+                parent_checkpoint_id TEXT,
+                type TEXT,
+                checkpoint BLOB,
+                metadata BLOB,
+                PRIMARY KEY (thread_id, checkpoint_ns, checkpoint_id)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS writes (
+                thread_id TEXT NOT NULL,
+                checkpoint_ns TEXT NOT NULL DEFAULT '',
+                checkpoint_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                idx INTEGER NOT NULL,
+                channel TEXT NOT NULL,
+                type TEXT,
+                value BLOB,
+                PRIMARY KEY (thread_id, checkpoint_ns, checkpoint_id, task_id, idx)
+            )
+        """)
+
+        # Insert test threads for different agents
+        metadata_agent1 = json.dumps({"agent_name": "test_agent1", "updated_at": "2024-01-01"})
+        metadata_agent2 = json.dumps({"agent_name": "test_agent2", "updated_at": "2024-01-01"})
+
+        conn.execute(
+            "INSERT INTO checkpoints "
+            "(thread_id, checkpoint_ns, checkpoint_id, metadata) "
+            "VALUES (?, '', ?, ?)",
+            ("thread1_agent1", "cp_1", metadata_agent1),
+        )
+        conn.execute(
+            "INSERT INTO checkpoints "
+            "(thread_id, checkpoint_ns, checkpoint_id, metadata) "
+            "VALUES (?, '', ?, ?)",
+            ("thread2_agent1", "cp_2", metadata_agent1),
+        )
+        conn.execute(
+            "INSERT INTO checkpoints "
+            "(thread_id, checkpoint_ns, checkpoint_id, metadata) "
+            "VALUES (?, '', ?, ?)",
+            ("thread1_agent2", "cp_3", metadata_agent2),
+        )
+
+        # Insert writes for one of the threads
+        conn.execute(
+            "INSERT INTO writes "
+            "(thread_id, checkpoint_ns, checkpoint_id, task_id, idx, channel) "
+            "VALUES (?, '', ?, ?, ?, ?)",
+            ("thread1_agent1", "cp_1", "task1", 0, "messages"),
+        )
+
+        conn.commit()
+        conn.close()
+
+        # Create agent data directory
+        data_dir = tmp_path / Path("~/.deep_worker").expanduser().name / "test_agent1"
+        data_dir.mkdir(parents=True)
+        metadata_file = data_dir / "session_metadata.json"
+        metadata_file.write_text(json.dumps({
+            "status": "idle",
+            "tasks_completed": 5,
+            "message_count": 10,
+            "error_message": None,
+            "last_activity": "2024-01-01T00:00:00"
+        }))
+
+        # Create log files
+        log_dir = tmp_path / Path("~/.deep_worker").expanduser().name / "logs"
+        log_dir.mkdir(parents=True)
+        (log_dir / "test_agent1.out.log").write_text("stdout log content")
+        (log_dir / "test_agent1.err.log").write_text("stderr log content")
+
+        # Create user config directory (should NOT be deleted)
+        config_dir = tmp_path / "deepagents" / "test_agent1"
+        config_dir.mkdir(parents=True)
+        (config_dir / "AGENTS.md").write_text("# User config")
+        skills_dir = config_dir / "skills"
+        skills_dir.mkdir()
+        (skills_dir / "test_skill.py").write_text("# User skill")
+
+        return {
+            "db_path": db_path,
+            "data_dir": data_dir,
+            "log_dir": log_dir,
+            "config_dir": config_dir,
+            "tmp_path": tmp_path,
+        }
+
+    def test_clean_agent_removes_checkpoints(self, temp_agent_env):
+        """Clean agent removes all checkpoints for the agent."""
+        with patch.object(sessions, "get_db_path", return_value=temp_agent_env["db_path"]):
+            # Verify threads exist before cleaning
+            threads_before = asyncio.run(sessions.list_threads(agent_name="test_agent1"))
+            assert len(threads_before) == 2
+
+            # Clean agent history
+            asyncio.run(sessions.clean_agent_history("test_agent1", _home_dir=temp_agent_env["tmp_path"]))
+
+            # Verify threads are removed
+            threads_after = asyncio.run(sessions.list_threads(agent_name="test_agent1"))
+            assert len(threads_after) == 0
+
+            # Verify other agent's threads are NOT removed
+            threads_agent2 = asyncio.run(sessions.list_threads(agent_name="test_agent2"))
+            assert len(threads_agent2) == 1
+
+    def test_clean_agent_removes_writes(self, temp_agent_env):
+        """Clean agent removes writes for the agent's threads."""
+        with patch.object(sessions, "get_db_path", return_value=temp_agent_env["db_path"]):
+            # Clean agent history
+            asyncio.run(sessions.clean_agent_history("test_agent1", _home_dir=temp_agent_env["tmp_path"]))
+
+            # Verify writes are removed
+            conn = sqlite3.connect(str(temp_agent_env["db_path"]))
+            cursor = conn.execute("SELECT COUNT(*) FROM writes WHERE thread_id = ?", ("thread1_agent1",))
+            count = cursor.fetchone()[0]
+            conn.close()
+            assert count == 0
+
+    def test_clean_agent_removes_data_directory(self, temp_agent_env):
+        """Clean agent removes agent data directory."""
+        with patch.object(sessions, "get_db_path", return_value=temp_agent_env["db_path"]):
+            # Verify data directory exists
+            assert temp_agent_env["data_dir"].exists()
+
+            # Clean agent history
+            asyncio.run(sessions.clean_agent_history("test_agent1", _home_dir=temp_agent_env["tmp_path"]))
+
+            # Verify data directory is removed
+            assert not temp_agent_env["data_dir"].exists()
+
+    def test_clean_agent_removes_log_files(self, temp_agent_env):
+        """Clean agent removes log files."""
+        with patch.object(sessions, "get_db_path", return_value=temp_agent_env["db_path"]):
+            # Verify log files exist
+            out_log = temp_agent_env["log_dir"] / "test_agent1.out.log"
+            err_log = temp_agent_env["log_dir"] / "test_agent1.err.log"
+            assert out_log.exists()
+            assert err_log.exists()
+
+            # Clean agent history
+            asyncio.run(sessions.clean_agent_history("test_agent1", _home_dir=temp_agent_env["tmp_path"]))
+
+            # Verify log files are removed
+            assert not out_log.exists()
+            assert not err_log.exists()
+
+    def test_clean_agent_preserves_user_config(self, temp_agent_env):
+        """Clean agent preserves user configuration directory."""
+        with patch.object(sessions, "get_db_path", return_value=temp_agent_env["db_path"]):
+            # Verify config exists
+            agents_md = temp_agent_env["config_dir"] / "AGENTS.md"
+            skill_file = temp_agent_env["config_dir"] / "skills" / "test_skill.py"
+            assert agents_md.exists()
+            assert skill_file.exists()
+
+            # Clean agent history
+            asyncio.run(sessions.clean_agent_history("test_agent1", _home_dir=temp_agent_env["tmp_path"]))
+
+            # Verify config is preserved
+            assert agents_md.exists()
+            assert skill_file.exists()
+            assert agents_md.read_text() == "# User config"
+            assert skill_file.read_text() == "# User skill"
+
+    def test_clean_agent_with_nonexistent_agent(self, temp_agent_env):
+        """Clean agent handles non-existent agent gracefully."""
+        with patch.object(sessions, "get_db_path", return_value=temp_agent_env["db_path"]):
+            # Should not raise exception
+            asyncio.run(sessions.clean_agent_history("nonexistent_agent", _home_dir=temp_agent_env["tmp_path"]))
+
+    def test_clean_agent_with_empty_database(self, tmp_path):
+        """Clean agent handles empty database gracefully."""
+        db_path = tmp_path / "empty.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.close()
+
+        with patch.object(sessions, "get_db_path", return_value=db_path):
+            # Should not raise exception
+            asyncio.run(sessions.clean_agent_history("test_agent", _home_dir=tmp_path))

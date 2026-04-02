@@ -1,7 +1,7 @@
 """Test that interactive.py module can be imported without errors.
 
 This test ensures that all imports in interactive.py work correctly,
-particularly the arpyc module import which requires sys.path setup.
+particularly the rpyc module import which requires sys.path setup.
 """
 
 import sys
@@ -13,7 +13,7 @@ import pytest
 def test_interactive_module_can_be_imported():
     """Test that interactive.py can be imported without ModuleNotFoundError.
 
-    This test verifies that the arpyc module is properly accessible
+    This test verifies that the rpyc module is properly accessible
     when importing the interactive module.
     """
     # This test should pass after we fix the import issue in interactive.py
@@ -29,17 +29,17 @@ def test_interactive_module_can_be_imported():
         pytest.fail(f"Failed to import interactive module: {e}")
 
 
-def test_arpyc_is_importable_from_interactive():
-    """Test that arpyc module is accessible when interactive.py imports it."""
+def test_rpyc_is_importable_from_interactive():
+    """Test that rpyc module is accessible when interactive.py imports it."""
     # Import the interactive module
     from deep_worker_cli.cli.interactive import InteractiveApp
 
-    # Try to import arpyc directly
+    # Try to import rpyc directly
     try:
-        from arpyc import RpycAsyncSession
-        assert RpycAsyncSession is not None
+        import rpyc
+        assert rpyc is not None
     except ModuleNotFoundError:
-        pytest.fail("arpyc module not found - sys.path not properly configured")
+        pytest.fail("rpyc module not found - sys.path not properly configured")
 
 
 if __name__ == "__main__":

@@ -203,24 +203,6 @@ wheels = [
 ]
 
 [[package]]
-name = "arpyc"
-version = "0.1.0"
-source = { directory = "../../arpyc" }
-dependencies = [
-    { name = "rpyc" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "pyright", marker = "extra == 'dev'", specifier = ">=1.1.0" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0" },
-    { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.21" },
-    { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=4.0" },
-    { name = "rpyc", specifier = ">=6.0.0" },
-]
-provides-extras = ["dev"]
-
-[[package]]
 name = "attrs"
 version = "25.4.0"
 source = { registry = "https://pypi.org/simple" }
@@ -782,7 +764,6 @@ version = "0.0.19"
 source = { editable = "." }
 dependencies = [
     { name = "aiosqlite" },
-    { name = "arpyc" },
     { name = "daytona" },
     { name = "deepagents" },
     { name = "langchain" },
@@ -831,7 +812,6 @@ test = [
 [package.metadata]
 requires-dist = [
     { name = "aiosqlite", specifier = ">=0.19.0,<1.0.0" },
-    { name = "arpyc", directory = "../../arpyc" },
     { name = "daytona", specifier = ">=0.113.0,<1.0.0" },
     { name = "deepagents", editable = "../deepagents" },
     { name = "langchain", specifier = ">=1.2.7,<2.0.0" },
@@ -848,7 +828,7 @@ requires-dist = [
     { name = "pyyaml", specifier = ">=6.0.0" },
     { name = "requests", specifier = ">=2.0.0,<3.0.0" },
     { name = "rich", specifier = ">=14.0.0,<15.0.0" },
-    { name = "rpyc", specifier = ">=6.0.0,<7.0.0" },
+    { name = "rpyc", directory = "../../../rpyc_async" },
     { name = "runloop-api-client", specifier = ">=0.69.0" },
     { name = "tavily-python", specifier = ">=0.7.21,<1.0.0" },
     { name = "textual", specifier = ">=6.0.0,<8.0.0" },
@@ -3446,15 +3426,13 @@ wheels = [
 
 [[package]]
 name = "rpyc"
-version = "6.0.2"
-source = { registry = "https://pypi.org/simple" }
+source = { directory = "../../../rpyc_async" }
 dependencies = [
     { name = "plumbum" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/8b/e7/1c17410673b634f4658bb5d2232d0c4507432a97508b2c6708e59481644a/rpyc-6.0.2.tar.gz", hash = "sha256:8e780a6a71b842128a80a337c64adfb6f919014e069951832161c9efc630c93b", size = 62321, upload-time = "2025-04-18T16:33:21.693Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/3f/99/2e119d541d596daea39643eb9312b47c7847383951300f889166938035b1/rpyc-6.0.2-py3-none-any.whl", hash = "sha256:8072308ad30725bc281c42c011fc8c922be15f3eeda6eafb2917cafe1b6f00ec", size = 74768, upload-time = "2025-04-18T16:33:20.147Z" },
-]
+
+[package.metadata]
+requires-dist = [{ name = "plumbum" }]
 
 [[package]]
 name = "rsa"

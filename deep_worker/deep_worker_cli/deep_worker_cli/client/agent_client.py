@@ -1,9 +1,10 @@
 """Agent client SDK for connecting to deep_worker agents via RPyC.
 
 This client ONLY supports RPyC connections. Unix sockets are NOT supported.
-All communication is done via arpyc (Async RPyC).
+All communication is done via native rpyc with AsyncioServer.
 """
 
+import asyncio
 import sys
 import uuid
 from pathlib import Path
@@ -12,23 +13,10 @@ from typing import TYPE_CHECKING, Any
 from deep_worker_cli.exceptions import AgentNotFoundError, IPCConnectionError
 from deep_worker_cli.process.registry import ProcessRegistry
 
-# ============================================================================
-# CRITICAL: ARPYC MUST BE IMPORTED FROM SOURCE CODE, NOT FROM PIP/VENV!
-# ============================================================================
-# DO NOT use 'pip install arpyc' or ANY virtual environment (.venv)!
-# ALWAYS import arpyc from the arpyc source directory in this checkout.
-# Using installed packages causes version conflicts and compatibility issues.
-# This project MUST run globally without venv to ensure correct arpyc version.
-# ============================================================================
-_arpyc_path = Path(__file__).parent.parent.parent.parent.parent / "arpyc"
-if _arpyc_path.exists() and str(_arpyc_path) not in sys.path:
-    sys.path.insert(0, str(_arpyc_path))
-
-from arpyc import RpycAsyncSession
+import rpyc
 
 if TYPE_CHECKING:
     from deep_worker_cli.basesession.protocol_types import SessionInfo
-
 
 class AgentClient:
     """
@@ -62,7 +50,8 @@ class AgentClient:
         self.connected = False
 
         # RPyC is the ONLY connection method
-        self.rpyc_session: RpycAsyncSession | None = None
+        self._conn: rpyc.Connection | None = None
+        self._root: Any = None  # RPyC root reference (obtained before enable_asyncio_serving)
 
     async def connect(self) -> None:
         """Connect to the agent process via RPyC.
@@ -91,9 +80,24 @@ class AgentClient:
         # Connect via RPyC (ONLY method)
         try:
             # SECURITY: Connect only to localhost (127.0.0.1)
-            self.rpyc_session = RpycAsyncSession("127.0.0.1", agent_info.rpyc_port)
-            await self.rpyc_session.connect()
+            self._conn = rpyc.connect(
+                "127.0.0.1",
+                agent_info.rpyc_port,
+                config={"allow_public_attrs": True}
+            )
+
+            # CRITICAL: Enable asyncio serving BEFORE accessing root!
+            # With AsyncioServer, we must enable asyncio serving first,
+            # otherwise conn.root will hang/timeout.
+            # See: rpyc_async tests/test_asyncio_server_bidirectional.py:180-183
+            loop = asyncio.get_running_loop()
+            self._conn.enable_asyncio_serving(loop=loop)
+
+            # Now safe to get root (after asyncio serving is enabled)
+            self._root = self._conn.root
+
             self.connected = True
+
         except Exception as e:
             raise IPCConnectionError(f"Failed to connect via RPyC: {e}") from e
 
@@ -103,12 +107,14 @@ class AgentClient:
             return
 
         # Close RPyC connection
-        if self.rpyc_session:
+        if self._conn:
             try:
-                await self.rpyc_session.disconnect()
+                self._conn.disable_asyncio_serving()
+                self._conn.close()
             except Exception:
                 pass  # Ignore errors during disconnect
-            self.rpyc_session = None
+            self._conn = None
+            self._root = None
 
         self.connected = False
 
@@ -124,7 +130,7 @@ class AgentClient:
         Raises:
             IPCConnectionError: If not connected or communication fails
         """
-        if not self.connected or not self.rpyc_session:
+        if not self.connected or not self._root:
             raise IPCConnectionError("Not connected to agent")
 
         try:
@@ -134,32 +140,22 @@ class AgentClient:
             if command_type == "status":
                 import logging
                 logger = logging.getLogger(__name__)
-                logger.info("[CLIENT] About to call rpyc_session.async_call(get_status)...")
-                response = await self.rpyc_session.async_call(
-                    self.rpyc_session.root.get_status
-                )
-                logger.info(f"[CLIENT] async_call returned: {response}")
+                logger.info("[CLIENT] About to call await root.get_status()...")
+                response = await self._root.get_status()
+                logger.info(f"[CLIENT] await root.get_status() returned: {response}")
                 # Server already returns {"success": True, "session_info": {...}}, no need to wrap again
                 return response
 
             elif command_type == "invoke":
                 message = command.get("message", "")
                 stream = command.get("stream", False)
-                response = await self.rpyc_session.async_call(
-                    self.rpyc_session.root.invoke_agent,
-                    message,
-                    stream
-                )
+                response = await self._root.invoke_agent(message, stream)
                 return response
 
             elif command_type == "get_history":
                 limit = command.get("limit", 50)
                 offset = command.get("offset", 0)
-                response = await self.rpyc_session.async_call(
-                    self.rpyc_session.root.get_history,
-                    limit,
-                    offset
-                )
+                response = await self._root.get_history(limit, offset)
                 return response
 
             elif command_type in ("attach", "detach"):

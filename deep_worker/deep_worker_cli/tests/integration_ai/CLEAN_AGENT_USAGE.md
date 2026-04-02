@@ -12,6 +12,17 @@ Deep-worker agents use `InMemorySaver` for checkpoint storage, which accumulates
 
 Use the `clean_agent` fixture to ensure agent has clean state before test execution.
 
+### ⚠️ CRITICAL: skip_permissions=True by default
+
+The `clean_agent` fixture ALWAYS uses `--skip-permissions` by default to prevent tests
+from hanging on approval prompts. This is essential for:
+
+- **CI/CD environments**: No human to approve tool calls
+- **Automated testing**: Tests must run without interaction
+- **Tool invocation tests**: Most tests invoke tools (read, write, execute)
+
+**Only set `skip_permissions=False` for tests that specifically test the approval workflow.**
+
 ## Usage Examples
 
 ### Example 1: Basic Clean Agent
@@ -97,6 +108,7 @@ def test_second(module_clean_agent):
 - Testing that UI shows correct state with no messages
 - Benchmarking first-message performance
 - Ensuring reproducible test results
+- **Any test that invokes tools** (uses skip_permissions=True by default)
 
 ### ❌ Don't Use Clean Agent When:
 
@@ -113,7 +125,10 @@ The `clean_agent` fixture performs these steps:
 1. **Kill existing agent** - Terminates running agent process if exists
 2. **Clean directories** - Removes `~/.deep_worker/{agent_name}/` data
 3. **Remove logs** - Deletes `~/.deep_worker/logs/{agent_name}.*`
-4. **Start fresh** - Launches new agent with `--skip-permissions`
+4. **Start fresh** - Launches new agent with `--skip-permissions` (default: True)
+   - ⚠️ **CRITICAL**: `--skip-permissions` is ALWAYS used by default
+   - This prevents tests from hanging on approval prompts
+   - Only disable for tests that specifically test the approval workflow
 5. **Wait for registration** - Ensures agent is ready before test
 6. **Cleanup** - Terminates agent after test completion
 

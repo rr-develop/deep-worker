@@ -1,5 +1,7 @@
 """Custom tools for the CLI agent."""
 
+import sys
+from pathlib import Path
 from typing import Any, Literal
 
 import requests
@@ -15,10 +17,43 @@ from tavily.errors import ForbiddenError, TimeoutError as TavilyTimeoutError
 
 from deep_worker_cli.config import settings
 
+# ============================================================================
+# CRITICAL: CLAUDE_CODE_PROVIDER MUST BE IMPORTED FROM SOURCE CODE, NOT FROM PIP/VENV!
+# ============================================================================
+# Path calculation: __file__ is at deep_worker/deep_worker_cli/deep_worker_cli/tools.py
+# .parent x4 = repository root
+_repo_root = Path(__file__).parent.parent.parent.parent
+_claude_code_provider_path = _repo_root / "claude_code_provider"
+if not _claude_code_provider_path.exists():
+    raise ImportError(
+        f"CRITICAL: claude_code_provider not found at {_claude_code_provider_path}\n"
+        f"This is required for WebSearchDelegationTool.\n"
+        f"Expected structure: {_repo_root}/claude_code_provider/"
+    )
+# Add REPOSITORY ROOT to sys.path, not the claude_code_provider dir itself
+if str(_repo_root) not in sys.path:
+    sys.path.insert(0, str(_repo_root))
+
+from claude_code_provider.web_search import WebSearchDelegationTool  # noqa: E402
+
 # Initialize Tavily client if API key is available
 tavily_client = (
     TavilyClient(api_key=settings.tavily_api_key) if settings.has_tavily else None
 )
+
+# ============================================================================
+# CRITICAL: WebSearch Delegation Tool - DO NOT MODIFY WITHOUT TESTING!
+# ============================================================================
+# This tool delegates web searches to Claude Code's built-in WebSearch capability.
+# Works with ANY LLM provider (DeepSeek, OpenAI, Gemini, Claude, etc.)
+# NO additional API keys required - uses Claude Code SDK.
+#
+# REGRESSION WARNING:
+# - ToolResultBlock is in UserMessage, NOT AssistantMessage!
+# - See web_search_delegation.py:_extract_results() for critical implementation
+# - Always test with: pytest tests/integration_ai/test_websearch_delegation_deepseek.py
+# ============================================================================
+web_search_delegation_tool = WebSearchDelegationTool(verbose=False, timeout=30.0)
 
 
 def http_request(
@@ -194,3 +229,4 @@ def fetch_url(url: str, timeout: int = 30) -> dict[str, Any]:
         }
     except requests.exceptions.RequestException as e:
         return {"error": f"Fetch URL error: {e!s}", "url": url}
+# Test comment

@@ -31,7 +31,7 @@ class TestStreamEndToEnd:
         # Track notifications
         notifications: list[dict[str, Any]] = []
 
-        def notify_callback(msg: dict[str, Any]) -> None:
+        async def notify_callback(msg: dict[str, Any]) -> None:
             notifications.append(msg)
 
         # Simulate streaming messages
@@ -210,7 +210,7 @@ class TestStreamEndToEnd:
         # Track notifications
         notifications: list[dict[str, Any]] = []
 
-        def notify_callback(msg: dict[str, Any]) -> None:
+        async def notify_callback(msg: dict[str, Any]) -> None:
             notifications.append(msg)
 
         # Tool call buffer for accumulation

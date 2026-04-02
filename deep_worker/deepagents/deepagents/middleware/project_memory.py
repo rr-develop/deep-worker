@@ -67,7 +67,7 @@ class ProjectMemoryMiddleware(AgentMiddleware):
                      Defaults to Path.cwd() if None.
 
     Example:
-        >>> middleware = ProjectMemoryMiddleware(working_dir=Path("/path/to/my_project"))
+        >>> middleware = ProjectMemoryMiddleware(working_dir=Path("/path/to/your/project"))
         >>> # If index exists, project_memory tool will be registered
     """
 
@@ -96,18 +96,23 @@ class ProjectMemoryMiddleware(AgentMiddleware):
         This allows the project_memory tool to access the working directory
         via runtime.state.
 
+        CRITICAL FIX: working_dir MUST be set in state regardless of whether
+        semantic index exists. This ensures tools and agent can always determine
+        the correct working directory, even when no index is present.
+
+        Without this, agents fall back to Path.cwd() which returns the process's
+        current directory (often "/" for daemon processes), not the configured
+        working directory.
+
         Args:
             state: Current agent state.
             runtime: Runtime context.
 
         Returns:
-            State update with working_dir, or None if not applicable.
+            State update with working_dir.
         """
-        # Only set working_dir if index exists
-        if not self._has_index:
-            return None
-
-        # Set working_dir in state
+        # ALWAYS set working_dir in state, regardless of index existence
+        # This is critical for tools that need to know the working directory
         return {"working_dir": str(self.working_dir)}
 
     def wrap_model_call(

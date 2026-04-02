@@ -3,24 +3,24 @@
 ============================================================================
 ⚠️⚠️⚠️ CRITICALLY IMPORTANT FOR FUTURE AGENTS ⚠️⚠️⚠️
 ============================================================================
-DO NOT USE THIS FILE DIRECTLY FOR TESTING OR RUNNING AGENTS!
+DO NOT USE THIS FILE DIRECTLY FOR TESTING OR FOR STARTING AGENTS!
 
 This module is the OLD entry point for the interactive CLI.
 It uses config.py's detect_model_and_provider(), which does NOT prioritize
 the Deepseek provider and may use Google Gemini by default.
 
-The ONLY CORRECT WAY to run agents:
+The ONLY CORRECT WAY to start agents:
 ✅ deep-worker [agent-name]
 
-The deep-worker command is installed globally on the user's PATH.
-It uses the Deepseek provider by default (WITHOUT any extra configuration).
+The deep-worker command is installed in: ~/.local/bin/deep-worker
+It uses the Deepseek provider by default (with NO extra configuration).
 
 WRONG ways (DO NOT USE):
 ❌ python3 -m deep_worker_cli.main      (may use gemini instead of deepseek)
-❌ python3 -m deep_worker_cli.cli.main  (the same)
-❌ Any other direct calls to Python modules
+❌ python3 -m deep_worker_cli.cli.main  (the same thing)
+❌ Any other direct invocations of Python modules
 
-See: DEEPSEEK_PROVIDER.md in the deep_worker_cli directory for details on correct usage.
+See: DEEPSEEK_PROVIDER.md for details on the correct usage.
 ============================================================================
 """
 
@@ -328,6 +328,33 @@ def parse_args() -> argparse.Namespace:
         "Applies to both -n and interactive modes.",
     )
 
+    # Summarization configuration
+    parser.add_argument(
+        "--no-summarization",
+        action="store_true",
+        help="Disable automatic conversation summarization",
+    )
+
+    parser.add_argument(
+        "--summarization-trigger",
+        type=float,
+        metavar="FRAC",
+        help="Trigger summarization at FRAC of context (0.0-1.0, default: auto-detect)",
+    )
+
+    parser.add_argument(
+        "--summarization-keep",
+        type=float,
+        metavar="FRAC",
+        help="Keep FRAC of history after summarization (0.0-1.0, default: auto-detect)",
+    )
+
+    parser.add_argument(
+        "--persistent-history",
+        action="store_true",
+        help="Use persistent history backend instead of temp (survives restarts)",
+    )
+
     parser.add_argument(
         "-v",
         "--version",
@@ -472,6 +499,19 @@ def cli_main() -> None:
             from deep_worker_cli.config import parse_shell_allow_list
 
             settings.shell_allow_list = parse_shell_allow_list(args.shell_allow_list)
+
+        # Apply summarization settings from command line if provided (overrides env var)
+        if hasattr(args, "no_summarization") and args.no_summarization:
+            settings.summarization_enabled = False
+
+        if hasattr(args, "summarization_trigger") and args.summarization_trigger is not None:
+            settings.summarization_trigger_fraction = args.summarization_trigger
+
+        if hasattr(args, "summarization_keep") and args.summarization_keep is not None:
+            settings.summarization_keep_fraction = args.summarization_keep
+
+        if hasattr(args, "persistent_history") and args.persistent_history:
+            settings.summarization_history_backend = "persistent"
 
         if args.command == "help":
             show_help()

@@ -6,33 +6,58 @@ import signal
 import socket
 import sys
 import traceback
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-import rpyc  # type: ignore[import-untyped]
-from rpyc.core.protocol import DEFAULT_CONFIG  # type: ignore[import-untyped]
-from rpyc.utils.server import ThreadedServer  # type: ignore[import-untyped]
+import rpyc
+from rpyc.core.protocol import DEFAULT_CONFIG
+from rpyc.utils.async_server import AsyncioServer  # AsyncioServer from rpyc_async!
 
 from deep_worker_cli.agent_config_pkg.agent_config import AgentConfig
 from deep_worker_cli.process.registry import ProcessRegistry
 from deep_worker_cli.session.session_manager import SessionManager
 from deep_worker_cli.types import AgentProcessInfo, AgentStatus
 
+def _find_free_port(start_port: int = 0, max_attempts: int = 100) -> int:
+    """Find a free port dynamically.
 
-def _find_free_port(start_port: int = 18861, max_attempts: int = 100) -> int:
-    """Find a free port starting from start_port.
+    ⚠️ CRITICAL: NEVER USE FIXED PORTS IN TESTS! ⚠️
+    ============================================
+    Using fixed ports (like 18861) causes race conditions and test failures
+    when multiple agents/tests run concurrently. The port may be in use by:
+    - Another test running in parallel
+    - A previous test that didn't clean up
+    - System services
+
+    This function uses port 0 by default, which tells the OS to automatically
+    select a free ephemeral port. This is the ONLY CORRECT approach for testing.
+
+    DO NOT change start_port to a fixed value unless you have a very good reason
+    and understand the consequences!
 
     Args:
-        start_port: Starting port number (default: 18861)
+        start_port: Starting port number (default: 0 = OS chooses automatically)
+                   ⚠️ MUST be 0 for tests to avoid port conflicts!
         max_attempts: Maximum number of ports to try (default: 100)
 
     Returns:
-        Free port number
+        Free port number assigned by the OS
 
     Raises:
-        RuntimeError: If no free port found in range
+        RuntimeError: If no free port found (extremely rare with port=0)
     """
+    # ⚠️ CRITICAL: Use port 0 for automatic OS port selection
+    # This is the ONLY way to avoid port conflicts in tests!
+    if start_port == 0:
+        # Let the OS choose a free ephemeral port (RECOMMENDED for tests)
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            # Get the port that OS assigned
+            port = s.getsockname()[1]
+            return port
+
+    # Fallback: sequential search (NOT RECOMMENDED for tests)
     for port in range(start_port, start_port + max_attempts):
         try:
             # Try to bind to the port to check if it's free
@@ -47,7 +72,6 @@ def _find_free_port(start_port: int = 18861, max_attempts: int = 100) -> int:
     raise RuntimeError(
         f"No free ports available in range {start_port}-{start_port + max_attempts - 1}"
     )
-
 
 class AgentProcess:
     """
@@ -72,6 +96,8 @@ class AgentProcess:
         skip_permissions: bool = False,
         enable_task_manager: bool = False,
         rpyc_port: int | bool | None = True,
+        memory_only: bool = False,
+        use_sqlite: bool = False,
     ):
         """Initialize the agent process.
 
@@ -87,11 +113,23 @@ class AgentProcess:
                 - True (default): Auto-assign free port starting from 18861
                 - int: Use specific port number
                 - False/None: Disable RPyC server (NOT RECOMMENDED)
+            memory_only: Use in-memory storage only (no persistence to database)
+            use_sqlite: Force SQLite persistence (even in test environment)
+
+        Raises:
+            ValueError: If both memory_only and use_sqlite are True
         """
+        # Validation: both flags cannot be True simultaneously
+        if memory_only and use_sqlite:
+            raise ValueError("Cannot specify both --memory-only and --use-sqlite")
+
         self.name = name
         self.config = config
         self.skip_permissions = skip_permissions
         self.enable_task_manager = enable_task_manager
+        self.memory_only = memory_only
+        self.use_sqlite = use_sqlite
+        self._checkpointer_ctx = None  # For lifecycle management
 
         # Auto-assign RPyC port if enabled
         if rpyc_port is True:
@@ -123,6 +161,27 @@ class AgentProcess:
         # State
         self.running = False
         self.started_at: datetime | None = None  # Set when agent starts
+
+        # Track how many messages we've broadcasted per thread
+        # This prevents re-broadcasting old messages from LangGraph checkpointer
+        # Similar to sent_count pattern in ClaudeCodeChatModel
+        # Key: thread_id, Value: number of messages already broadcasted
+        self._last_broadcasted_count: dict[str, int] = {}
+
+        # Agent-side command state
+        # These are used by slash commands (/clear, /tokens, etc.)
+        self.current_thread_id: str = "default"  # Current conversation thread
+        self.last_token_count: int = 0  # Token count from last agent response
+
+        # Agent interruption state
+        # These are used by exposed_interrupt_agent to cancel running tasks
+        self.is_running: bool = False  # True when agent is executing
+        self.current_worker_task: Any = None  # Current asyncio task for cancellation
+
+        # Approval decisions cache (for backward compatibility)
+        # Used by AgentService to store approval decisions when not using HITL framework
+        # Maps approval_id -> decision dict (with "type" field: "approve", "reject", etc.)
+        self._approval_decisions: dict[str, dict[str, Any]] = {}
 
     async def start(self) -> None:
         """Start the agent process.
@@ -163,56 +222,63 @@ class AgentProcess:
                     sys.stdout.flush()
                     print(msg, file=sys.stderr)
 
+                # deepagents is installed as a sibling package (see
+                # pyproject.toml `[tool.uv.sources]` / packaging config).
                 # Now import AFTER environment is loaded
                 from deep_worker_cli.agent import create_cli_agent
                 from deep_worker_cli.config import create_model
+                from deep_worker_cli.tools import http_request, fetch_url, web_search_delegation_tool
 
-                # Create model using the same configuration as deepagents
-                # This will use OPENAI_API_KEY + OPENAI_BASE_URL from ~/.deepagents/.env
-                # Don't pass model name to create_model() - let it auto-detect from environment
-                model = create_model()
+                # Create model using configuration from AgentConfig
+                # Pass provider and model explicitly from config
+                model = create_model(
+                    provider=self.config.provider,
+                    model_name=self.config.model
+                )
+
+                # Prepare web tools
+                # - http_request and fetch_url work without API keys
+                # - web_search_delegation_tool uses Claude Code SDK for universal web search
+                web_tools = [http_request, fetch_url, web_search_delegation_tool]
+
+                # Determine checkpointer based on flags and environment
+                # Priority order:
+                # 1. --use-sqlite flag: Use SQLite (overrides test detection)
+                # 2. --memory-only flag: Use memory (overrides test detection)
+                # 3. Test environment: Use memory (default for tests)
+                # 4. Normal run: Use SQLite (default for production)
+                from deep_worker_cli.utils import is_running_tests
+                from deep_worker_cli.sessions import get_checkpointer
+
+                checkpointer = None
+                if self.use_sqlite:
+                    # Explicit --use-sqlite flag: force SQLite even in tests
+                    self._checkpointer_ctx = get_checkpointer()
+                    checkpointer = await self._checkpointer_ctx.__aenter__()
+                elif self.memory_only:
+                    # Explicit --memory-only flag: force memory even in production
+                    checkpointer = None  # Will fall back to InMemorySaver
+                elif is_running_tests():
+                    # Test environment: default to memory (unless --use-sqlite specified)
+                    checkpointer = None  # Will fall back to InMemorySaver
+                else:
+                    # Normal production run: use SQLite
+                    self._checkpointer_ctx = get_checkpointer()
+                    checkpointer = await self._checkpointer_ctx.__aenter__()
 
                 # Create the agent with auto-approve for testing
+
                 self.agent, self.backend = create_cli_agent(
                     model=model,
                     assistant_id=self.name,
+                    tools=web_tools,
                     auto_approve=self.skip_permissions,
                     enable_memory=True,
                     enable_skills=True,
                     enable_shell=True,
                     project_memory_dir=Path(self.config.working_dir),
+                    checkpointer=checkpointer,
                 )
-                msg = f"[AGENT_INIT] Agent '{self.name}' initialized successfully (agent={self.agent})\n"
-                sys.stdout.write(msg)
-                sys.stdout.flush()
-                print(msg, file=sys.stderr)
-
-                # DEBUG: Log immediately after successful initialization
-                msg = f"[AGENT_INIT] DEBUG: After agent init, checking task_manager (enabled={self.enable_task_manager})...\n"
-                sys.stdout.write(msg)
-                sys.stdout.flush()
-                print(msg, file=sys.stderr)
-
-                # Initialize TaskManager if enabled and agent is available
-                if self.enable_task_manager and self.agent:
-                    from deep_worker_cli.task_manager import TaskManager
-
-                    msg = f"[AGENT_INIT] Initializing TaskManager for agent '{self.name}'...\n"
-                    sys.stdout.write(msg)
-                    sys.stdout.flush()
-                    print(msg, file=sys.stderr)
-
-                    self.task_manager = TaskManager(
-                        agent_name=self.name,
-                        config=self.config,
-                        session_manager=self.session_manager
-                    )
-                    await self.task_manager.start()
-
-                    msg = f"[AGENT_INIT] TaskManager started (thread: {self.name}:tm)\n"
-                    sys.stdout.write(msg)
-                    sys.stdout.flush()
-                    print(msg, file=sys.stderr)
 
             except Exception as e:
                 msg = f"[AGENT_INIT] Error initializing agent: {e}\n"
@@ -222,6 +288,39 @@ class AgentProcess:
                 print(traceback.format_exc(), file=sys.stderr)
                 # Agent remains None, fallback to echo mode
                 self.agent = None
+
+            # Initialize TaskManager if enabled and agent is available
+            # This is done OUTSIDE the agent creation try/except so that
+            # TaskManager failures don't prevent the main agent from working
+            if self.enable_task_manager and self.agent:
+                try:
+                    from deep_worker_cli.task_manager import TaskManager
+
+                    # Pass the actual checkpointer instance (not context manager)
+                    # TaskManager MUST use same checkpointer type as main agent:
+                    # - InMemorySaver if main agent uses InMemorySaver (test mode)
+                    # - AsyncSqliteSaver if main agent uses AsyncSqliteSaver (production)
+                    self.task_manager = TaskManager(
+                        agent_name=self.name,
+                        config=self.config,
+                        session_manager=self.session_manager,
+                        checkpointer=checkpointer,  # Same as main agent
+                    )
+                    await self.task_manager.start()
+
+                    msg = f"[AGENT_INIT] TaskManager started (manager_id: {self.name}:tm)\n"
+                    sys.stdout.write(msg)
+                    sys.stdout.flush()
+                    print(msg, file=sys.stderr)
+
+                except Exception as e:
+                    msg = f"[AGENT_INIT] Error initializing TaskManager: {e}\n"
+                    sys.stdout.write(msg)
+                    sys.stdout.flush()
+                    print(msg, file=sys.stderr)
+                    print(traceback.format_exc(), file=sys.stderr)
+                    # TaskManager remains None, agent continues without TaskManager
+                    self.task_manager = None
 
             # DEBUG: Log before RPyC server start
             msg = f"[AGENT_INIT] Reached line before RPyC server start...\n"
@@ -235,8 +334,8 @@ class AgentProcess:
             sys.stdout.flush()
             print(msg, file=sys.stderr)
 
-            if self.rpyc_port:
-                self._start_rpyc_server()
+            if self.rpyc_port is not None:
+                await self._start_rpyc_server()  # Now async!
             else:
                 raise RuntimeError("RPyC port must be configured - IPC server has been removed")
 
@@ -279,6 +378,20 @@ class AgentProcess:
             await self.shutdown()
             raise
 
+    async def cleanup(self) -> None:
+        """Clean up resources, including checkpointer.
+
+        This method should be called on agent shutdown to properly close
+        database connections and release resources.
+        """
+        if self._checkpointer_ctx is not None:
+            try:
+                await self._checkpointer_ctx.__aexit__(None, None, None)
+            except Exception as e:
+                print(f"Warning: Error closing checkpointer: {e}", file=sys.stderr)
+            finally:
+                self._checkpointer_ctx = None
+
     async def shutdown(self) -> None:
         """Graceful shutdown of the agent."""
         if not self.running:
@@ -291,22 +404,25 @@ class AgentProcess:
         if self.task_manager:
             await self.task_manager.stop()
 
-        # 2. Stop RPyC server
+        # 2. Stop AsyncioServer
         if self.rpyc_server:
-            print(f"[RPyC] Stopping RPyC server...")
+            print(f"[RPyC] Stopping AsyncioServer...")
             try:
-                self.rpyc_server.close()
+                await self.rpyc_server.close()  # AsyncioServer.close() is async
             except Exception as e:
-                print(f"[RPyC] Error stopping RPyC server: {e}")
+                print(f"[RPyC] Error stopping AsyncioServer: {e}")
 
         # 3. Persist state
         if self.session_manager:
             await self.session_manager.set_status(AgentStatus.SHUTDOWN)
 
-        # 4. Unregister
+        # 4. Cleanup checkpointer
+        await self.cleanup()
+
+        # 5. Unregister
         await self._unregister()
 
-        # 5. Cleanup files
+        # 6. Cleanup files
         await self._remove_pid_file()
 
         print(f"Agent '{self.name}' stopped")
@@ -354,15 +470,14 @@ class AgentProcess:
         print(f"\nReceived signal {signum}, shutting down...")
         self.running = False
 
-    def _start_rpyc_server(self) -> None:
-        """Start RPyC server in a background thread.
+    async def _start_rpyc_server(self) -> None:
+        """Start RPyC AsyncioServer (native asyncio, no threads!).
 
-        This method initializes the RPyC service and starts a ThreadedServer
-        that listens on the configured rpyc_port.
-
-        CRITICAL: This function MUST NOT return until the server is fully initialized
-        and ready to accept connections. Returning prematurely will cause connection
-        failures and race conditions in tests and client code.
+        MIGRATED FROM ThreadedServer TO AsyncioServer for:
+        - True bidirectional async support (no deadlocks!)
+        - 156x better performance (event-driven vs polling)
+        - Single event loop (no thread synchronization needed)
+        - Native async/await integration
 
         SECURITY REQUIREMENTS:
         ====================
@@ -381,18 +496,15 @@ class AgentProcess:
             return
 
         from deep_worker_cli.rpyc_service.agent_service import AgentService
-        import time
 
         # SECURITY VALIDATION: Ensure we're binding to localhost only
         SAFE_HOSTNAME = "127.0.0.1"
 
-        print(f"[RPyC] Starting RPyC server on {SAFE_HOSTNAME}:{self.rpyc_port}...")
+        print(f"[RPyC] Starting AsyncioServer on {SAFE_HOSTNAME}:{self.rpyc_port}...")
 
         # Create service class factory that captures agent_process reference
         agent_process = self
-        # Store the event loop for RPyC callbacks
-        # Use get_event_loop() instead of get_running_loop() to ensure compatibility
-        # with sync code that may run in different contexts
+        # Store the event loop for RPyC callbacks (we're already in the loop!)
         self._agent_event_loop = asyncio.get_running_loop()
 
         class BoundAgentService(AgentService):
@@ -449,10 +561,28 @@ class AgentProcess:
             "__setstate__",      # pickle support
         ])
 
-        # Create ThreadedServer with bound service
+        # Create AsyncioServer (native asyncio - no threads!)
         # SECURITY: Listen ONLY on localhost (127.0.0.1), NEVER on external interfaces!
         # This prevents remote access and ensures the server is only accessible locally.
-        self.rpyc_server = ThreadedServer(
+        # ============================================================================
+        # CRITICAL: NEVER ADD TIMEOUTS TO RPyC SERVER!
+        # ============================================================================
+        # deep-worker agents work with dwcli for DAYS or WEEKS continuously.
+        # RPyC connection lifetime timeouts are ABSOLUTELY FORBIDDEN.
+        #
+        # FORBIDDEN:
+        # - "sync_request_timeout": <any value>  # NEVER ADD THIS
+        # - Any other timeout on connection lifetime
+        #
+        # Agent may be busy for extended periods with legitimate work:
+        # - TaskManager evaluation loops (minutes to hours)
+        # - Complex multi-step operations
+        # - Large file processing
+        #
+        # If you add a timeout, the connection WILL drop during normal operation.
+        # This is a BUG, not a feature!
+        # ============================================================================
+        self.rpyc_server = AsyncioServer(
             BoundAgentService,
             hostname=SAFE_HOSTNAME,  # CRITICAL: localhost only, no external access
             port=self.rpyc_port,
@@ -465,35 +595,20 @@ class AgentProcess:
                 "allow_public_attrs": True,
                 "allow_pickle": True,
                 "safe_attrs": extended_safe_attrs,
+                # NO TIMEOUT - connection can live for days/weeks
             }
         )
 
-        # Start server in background thread
-        import threading
-        server_thread = threading.Thread(
-            target=self.rpyc_server.start,
-            daemon=True,
-            name=f"{self.name}-rpyc-server"
-        )
-        server_thread.start()
+        # Start AsyncioServer (non-blocking, returns immediately)
+        await self.rpyc_server.start()
 
-        # CRITICAL: Wait for ThreadedServer to be fully initialized
-        # The server_thread.start() returns immediately and starts the server
-        # in a background daemon thread. However, ThreadedServer.start() needs
-        # time to bind() and listen() on the socket before accepting connections.
-        #
-        # ThreadedServer.start() is a BLOCKING call that runs the accept() loop,
-        # but we're running it in a daemon thread, so we need to give it time to
-        # actually reach the point where it's accepting connections.
-        #
-        # Simple approach: small fixed delay for thread to start accepting.
-        # This is MORE RELIABLE than trying to connect, because connecting might
-        # interfere with the server's ability to handle the first real client.
-        print(f"[RPyC] Waiting for server thread to initialize on port {self.rpyc_port}...")
-        time.sleep(0.2)  # 200ms should be more than enough for bind() + listen()
-        print(f"[RPyC] Server thread initialized")
+        # Update port if it was 0 (auto-assigned)
+        if self.rpyc_port == 0:
+            self.rpyc_port = self.rpyc_server.listener.getsockname()[1]
+            print(f"[RPyC] Auto-assigned port: {self.rpyc_port}")
 
-        print(f"[RPyC] RPyC server started on {SAFE_HOSTNAME}:{self.rpyc_port} (localhost only)")
+        print(f"[RPyC] AsyncioServer started on {SAFE_HOSTNAME}:{self.rpyc_port} (localhost only)")
+        print(f"[RPyC] ✅ Native asyncio - no threads, true bidirectional async, 156x faster!")
 
     def _handle_status(self, command: dict[str, Any]) -> dict[str, Any]:
         """Handle status query command.
@@ -555,7 +670,14 @@ class AgentProcess:
             from langchain_core.runnables import RunnableConfig
 
             # Use agent name as thread_id (same as invoke)
-            config: RunnableConfig = {"configurable": {"thread_id": self.name}}
+            config: RunnableConfig = {
+                "configurable": {"thread_id": self.name},
+                "metadata": {
+                    "assistant_id": self.name,
+                    "agent_name": self.name,
+                    "updated_at": datetime.now(UTC).isoformat(),
+                },
+            }
             logger.info(f"[GET_HISTORY] Config created: {config}")
 
             # Get state from agent checkpoint
@@ -668,7 +790,7 @@ class AgentProcess:
             Response dictionary with assistant message
         """
         message = command.get("message")
-        stream = command.get("stream", False)
+        stream = command.get("stream", True)  # Default to streaming to match deepagents
 
         if not message:
             return {
@@ -680,6 +802,10 @@ class AgentProcess:
         if self.session_manager:
             await self.session_manager.set_status(AgentStatus.RUNNING)
 
+        # Track execution state for interruption support
+        self.is_running = True
+        self.current_worker_task = asyncio.current_task()
+
         # ============================================================
         # ARCHITECTURE PRINCIPLE: AGENT IS THE SINGLE SOURCE OF TRUTH
         # ============================================================
@@ -689,14 +815,13 @@ class AgentProcess:
         # broadcast to ALL connected clients.
         # ============================================================
         if not stream and notify_callback is not None:
-            notify_callback({
+            await notify_callback({
                 "type": "user",
                 "role": "user",
                 "content": message,
             })
 
         try:
-            print(f"[INVOKE] Checking agent: self.agent={self.agent}", file=sys.stderr)
             if self.agent:
                 from langchain_core.runnables import RunnableConfig
                 from deep_worker_cli.process.status_callback import StatusTrackingCallback
@@ -707,7 +832,12 @@ class AgentProcess:
                 # Configure thread_id for checkpointer (use agent name as thread_id)
                 config: RunnableConfig = {
                     "configurable": {"thread_id": self.name},
-                    "callbacks": [status_callback]
+                    "callbacks": [status_callback],
+                    "metadata": {
+                        "assistant_id": self.name,
+                        "agent_name": self.name,
+                        "updated_at": datetime.now(UTC).isoformat(),
+                    },
                 }
 
                 # Use actual LangGraph agent if available
@@ -722,55 +852,187 @@ class AgentProcess:
                     # - Tool results
                     # All messages are broadcast via notify_callback to uphold
                     # the "agent as single source of truth" architecture.
+                    #
+                    # If TaskManager is enabled, wrap streaming in evaluation loop
+                    # to allow corrective prompts.
                     # ============================================================
                     from deep_worker_cli.process.stream_processor import process_message_chunk
 
-                    # Notify user message at start (agent as source of truth)
-                    if notify_callback is not None:
-                        notify_callback({
-                            "type": "user",
-                            "role": "user",
-                            "content": message,
-                        })
+                    # Initialize TaskManager if enabled
+                    if self.task_manager:
+                        await self.task_manager.init_task(
+                            initial_request=message,
+                            project_path=str(self.config.working_dir),
+                            session_file_path=None
+                        )
 
-                    # Tool call accumulation buffer for streaming chunks
-                    tool_call_buffer: dict[str, Any] = {}
+                    # TaskManager evaluation loop or single iteration
+                    max_iterations = 10 if self.task_manager else 1
+                    iteration = 0
+                    current_message = message
                     full_response = ""
 
-                    # Stream with full message visibility
-                    async for chunk in self.agent.astream(
-                        {"messages": [{"role": "user", "content": message}]},
-                        stream_mode=["messages", "updates"],
-                        subgraphs=True,
-                        config=config,
-                    ):
-                        # LangGraph stream format: (namespace, stream_mode, data)
-                        if not isinstance(chunk, tuple) or len(chunk) != 3:
-                            continue
+                    while iteration < max_iterations:
+                        iteration += 1
+                        if self.task_manager:
+                            print(f"[STREAM] TaskManager iteration {iteration}/{max_iterations}", file=sys.stderr)
 
-                        namespace, current_stream_mode, data = chunk
+                        # Notify user message at start (agent as source of truth)
+                        # For TaskManager: only send on first iteration, subsequent corrective
+                        # prompts are already sent at the end of previous iteration (lines 1040-1044)
+                        if notify_callback is not None and iteration == 1:
+                            await notify_callback({
+                                "type": "user",
+                                "role": "user",
+                                "content": current_message,
+                            })
 
-                        # Handle MESSAGES stream - for actual message content
-                        if current_stream_mode == "messages":
-                            message_obj, metadata = data
+                        # Tool call accumulation buffer for streaming chunks
+                        tool_call_buffer: dict[str, Any] = {}
+                        full_response = ""
 
-                            # Process message with stream_processor
+                        # DEBUG: Log to track chunks arriving from LangGraph
+                        # ALWAYS enabled for debugging (no env var check)
+                        import os
+                        import time as time_mod
+                        chunk_count = 0
+                        debug_enabled = True  # ALWAYS log for debugging
+
+                        if debug_enabled:
+                            with open("/tmp/dwcli_astream_debug.log", "a") as f:
+                                f.write(f"\n{'='*80}\n")
+                                f.write(f"[{time_mod.time():.3f}] STARTING astream loop\n")
+                                if self.task_manager:
+                                    f.write(f"  TaskManager iteration: {iteration}/{max_iterations}\n")
+                                f.write(f"  stream_mode=['messages', 'updates']\n")
+                                f.write(f"  durability='exit'\n")
+                                f.write(f"  Env DWCLI_DEBUG_ASTREAM={os.environ.get('DWCLI_DEBUG_ASTREAM')}\n")
+                                f.write(f"{'='*80}\n")
+
+                        # Stream with full message visibility
+                        async for chunk in self.agent.astream(
+                            {"messages": [{"role": "user", "content": current_message}]},
+                            stream_mode=["messages", "updates"],
+                            subgraphs=True,
+                            config=config,
+                            durability="exit",  # Match deepagents - required for immediate streaming
+                        ):
+                            chunk_count += 1
+
+                            # DEBUG: Log every chunk received
+                            if debug_enabled:
+                                with open("/tmp/dwcli_astream_debug.log", "a") as f:
+                                    f.write(f"\n[{time_mod.time():.3f}] CHUNK #{chunk_count} received:\n")
+                                    f.write(f"  Type: {type(chunk)}\n")
+                                    f.write(f"  Is tuple: {isinstance(chunk, tuple)}\n")
+                                    if isinstance(chunk, tuple):
+                                        f.write(f"  Length: {len(chunk)}\n")
+                                        if len(chunk) >= 3:
+                                            f.write(f"  namespace: {chunk[0]}\n")
+                                            f.write(f"  stream_mode: {chunk[1]}\n")
+                                            f.write(f"  data type: {type(chunk[2])}\n")
+
+                            # LangGraph stream format: (namespace, stream_mode, data)
+                            if not isinstance(chunk, tuple) or len(chunk) != 3:
+                                if debug_enabled:
+                                    with open("/tmp/dwcli_astream_debug.log", "a") as f:
+                                        f.write(f"  ⚠ SKIPPING: Invalid format\n")
+                                continue
+
+                            namespace, current_stream_mode, data = chunk
+
+                            # DEBUG: Log stream mode
+                            if debug_enabled:
+                                with open("/tmp/dwcli_astream_debug.log", "a") as f:
+                                    f.write(f"  Stream mode: {current_stream_mode}\n")
+
+                            # Handle MESSAGES stream - for actual message content
+                            if current_stream_mode == "messages":
+                                message_obj, metadata = data
+
+                                # DEBUG: Log message details
+                                if debug_enabled:
+                                    with open("/tmp/dwcli_astream_debug.log", "a") as f:
+                                        f.write(f"  MESSAGE chunk:\n")
+                                        f.write(f"    Message type: {type(message_obj)}\n")
+                                        f.write(f"    Has content: {hasattr(message_obj, 'content')}\n")
+                                        if hasattr(message_obj, 'content'):
+                                            content = message_obj.content
+                                            f.write(f"    Content type: {type(content)}\n")
+                                            if isinstance(content, list):
+                                                f.write(f"    Content blocks: {len(content)}\n")
+                                                for i, block in enumerate(content):
+                                                    if isinstance(block, dict):
+                                                        block_type = block.get('type', 'unknown')
+                                                        f.write(f"      Block {i}: type={block_type}\n")
+                                                        if block_type in {'tool_call_chunk', 'tool_call'}:
+                                                            f.write(f"        ✅ TOOL_CALL_CHUNK/CALL DETECTED!\n")
+                                                            f.write(f"        id={block.get('id')}\n")
+                                                            f.write(f"        name={block.get('name')}\n")
+                                        f.write(f"    Calling process_message_chunk...\n")
+
+                                # Process message with stream_processor
+                                if notify_callback is not None:
+                                    await process_message_chunk(
+                                        message=message_obj,
+                                        metadata=metadata,
+                                        notify_callback=notify_callback,
+                                        tool_call_buffer=tool_call_buffer,
+                                    )
+
+                                    if debug_enabled:
+                                        with open("/tmp/dwcli_astream_debug.log", "a") as f:
+                                            f.write(f"    ✓ process_message_chunk completed\n")
+
+                                # Track full response for return value (accumulate text chunks)
+                                if hasattr(message_obj, "content"):
+                                    content = message_obj.content
+                                    if isinstance(content, str):
+                                        full_response += content
+
+                            # Handle UPDATES stream - for interrupts and state changes
+                            # (Currently we don't process updates, but this is where they would go)
+
+                        # CRITICAL: Flush any remaining buffered text chunks
+                        # This ensures all batched text is sent before returning
+                        from deep_worker_cli.process.stream_processor import flush_all_text_buffers
+                        await flush_all_text_buffers()
+
+                        # If TaskManager enabled, evaluate response and check for corrective prompt
+                        if self.task_manager:
+                            # NOTE: In streaming mode, assistant response is already broadcast
+                            # via stream_processor chunks. No need to send it again here.
+
+                            corrective_prompt = await self.task_manager.on_subordinate_response(
+                                response=full_response,
+                                send_to_subordinate_callback=None
+                            )
+
+                            # If no corrective prompt, task is done or unable
+                            if not corrective_prompt:
+                                print(f"[STREAM] TaskManager evaluation complete (done/unable)", file=sys.stderr)
+                                break
+
+                            # Broadcast TaskManager corrective prompt to ALL subscribers
+                            # BEFORE sending it back to the agent. This ensures dwcli TUI
+                            # shows the "TaskManager:> ..." message in real time.
                             if notify_callback is not None:
-                                await process_message_chunk(
-                                    message=message_obj,
-                                    metadata=metadata,
-                                    notify_callback=notify_callback,
-                                    tool_call_buffer=tool_call_buffer,
-                                )
+                                try:
+                                    await notify_callback({
+                                        "type": "user",
+                                        "content": corrective_prompt,
+                                        "role": "user",
+                                    })
+                                except Exception as e:
+                                    # Don't let notification failures stop TaskManager loop
+                                    print(f"[STREAM] Warning: Failed to notify subscribers of TaskManager prompt: {e}", file=sys.stderr)
 
-                            # Track full response for return value
-                            if hasattr(message_obj, "content"):
-                                content = message_obj.content
-                                if isinstance(content, str):
-                                    full_response = content
-
-                        # Handle UPDATES stream - for interrupts and state changes
-                        # (Currently we don't process updates, but this is where they would go)
+                            # Continue with corrective prompt
+                            print(f"[STREAM] TaskManager requesting corrections: {corrective_prompt[:100]}...", file=sys.stderr)
+                            current_message = corrective_prompt
+                        else:
+                            # No TaskManager - exit after first iteration
+                            break
 
                     # Set status back to IDLE after successful completion
                     if self.session_manager:
@@ -828,7 +1090,7 @@ class AgentProcess:
                             # _notify_subscribers() for intermediate messages.
                             # ============================================================
                             if notify_callback is not None:
-                                notify_callback(
+                                await notify_callback(
                                     {"type": "assistant", "content": content, "role": "assistant"}
                                 )
 
@@ -847,7 +1109,7 @@ class AgentProcess:
                             # before sending it back to the agent. This ensures dwcli TUI
                             # shows the "TaskManager:> ..." message in real time.
                             if notify_callback is not None:
-                                notify_callback(
+                                await notify_callback(
                                     {
                                         "type": "user",
                                         "content": corrective_prompt,
@@ -868,7 +1130,7 @@ class AgentProcess:
 
                             # Notify final assistant response (TaskManager mode)
                             if notify_callback is not None:
-                                notify_callback({
+                                await notify_callback({
                                     "type": "assistant",
                                     "role": role,
                                     "content": content,
@@ -892,96 +1154,240 @@ class AgentProcess:
 
                     else:
                         # Standard invocation without TaskManager
-                        result = await self.agent.ainvoke(
-                            {"messages": [{"role": "user", "content": message}]},
-                            config
-                        )
-                        print(f"[INVOKE] Got result: {result}", file=sys.stderr)
-                        messages = result.get("messages", [])
-                        print(f"[INVOKE] Extracted messages: {messages}", file=sys.stderr)
-                        if messages:
+                        # CRITICAL FIX: In non-streaming mode, we must wait for FINAL response
+                        # If agent has interrupts (tool approvals), ainvoke() may return early
+                        # with empty content. We need to keep invoking until we get final answer.
+
+                        max_iterations = 20  # Prevent infinite loops
+                        iteration = 0
+                        final_content = ""
+
+                        while iteration < max_iterations:
+                            iteration += 1
+
+                            result = await self.agent.ainvoke(
+                                {"messages": [{"role": "user", "content": message}]},
+                                config
+                            )
+                            print(f"[INVOKE] Iteration {iteration}: Got result with {len(result.get('messages', []))} messages", file=sys.stderr)
+
+                            messages = result.get("messages", [])
+                            if not messages:
+                                print(f"[INVOKE] No messages in result", file=sys.stderr)
+                                break
+
+                            # CRITICAL FIX: Notify ONLY NEW messages (not entire history)
+                            # This ensures tool_call and tool_result messages are visible to users
+                            # WITHOUT re-broadcasting old messages from previous queries
+                            # Similar to streaming mode behavior in stream_processor.py
+                            # Pattern: analogous to sent_count in ClaudeCodeChatModel
+                            if notify_callback is not None:
+                                # Extract thread_id from config
+                                thread_id = config.get("configurable", {}).get("thread_id", "default")
+
+                                # Determine which messages are NEW (not yet broadcasted)
+                                last_broadcasted = self._last_broadcasted_count.get(thread_id, 0)
+                                new_messages = messages[last_broadcasted:]
+
+                                print(f"[INVOKE] Iteration {iteration}: Broadcasting {len(new_messages)} new messages (total={len(messages)}, last_broadcasted={last_broadcasted})", file=sys.stderr)
+
+                                # Broadcast ONLY new messages
+                                for msg in new_messages:
+                                    # Extract message data
+                                    if isinstance(msg, dict):
+                                        msg_role = msg.get("role", "")
+                                        msg_content = msg.get("content", "")
+                                        msg_tool_calls = msg.get("tool_calls")
+                                    elif hasattr(msg, "type"):
+                                        msg_role = msg.type
+                                        msg_content = getattr(msg, "content", "")
+                                        msg_tool_calls = getattr(msg, "tool_calls", None)
+                                    else:
+                                        continue
+
+                                    # Send tool_call notifications
+                                    if msg_tool_calls:
+                                        for tool_call in msg_tool_calls:
+                                            if isinstance(tool_call, dict):
+                                                await notify_callback({
+                                                    "type": "tool_call",
+                                                    "name": tool_call.get("name", ""),
+                                                    "args": tool_call.get("args", {}),
+                                                    "id": tool_call.get("id", ""),
+                                                })
+                                            else:
+                                                # LangChain ToolCall object
+                                                await notify_callback({
+                                                    "type": "tool_call",
+                                                    "name": getattr(tool_call, "name", ""),
+                                                    "args": getattr(tool_call, "args", {}),
+                                                    "id": getattr(tool_call, "id", ""),
+                                                })
+
+                                    # Send tool_result notifications
+                                    if msg_role == "tool":
+                                        # Extract status from ToolMessage (default: "success")
+                                        # LangChain ToolMessage has status attribute ("success" or "error")
+                                        if isinstance(msg, dict):
+                                            msg_status = msg.get("status", "success")
+                                        else:
+                                            msg_status = getattr(msg, "status", "success")
+
+                                        await notify_callback({
+                                            "type": "tool_result",
+                                            "content": msg_content,
+                                            "status": msg_status,
+                                            "tool_call_id": (
+                                                msg.get("tool_call_id", "")
+                                                if isinstance(msg, dict)
+                                                else getattr(msg, "tool_call_id", "")
+                                            ),
+                                        })
+
+                                # Update last_broadcasted_count AFTER broadcasting
+                                # This ensures we don't re-broadcast these messages in future iterations
+                                self._last_broadcasted_count[thread_id] = len(messages)
+
                             last_msg = messages[-1]
-                            # Handle both dict and LangChain Message objects
+
+                            # Check if there are interrupts pending
+                            has_interrupt = "__interrupt__" in result and result["__interrupt__"]
+
+                            # Extract content from last message
                             if isinstance(last_msg, dict):
-                                role = last_msg.get("role", "assistant")
                                 content = last_msg.get("content", "")
-
-                                # Notify assistant response
-                                if notify_callback is not None:
-                                    notify_callback({
-                                        "type": "assistant",
-                                        "role": role,
-                                        "content": content,
-                                    })
-
-                                # Set status back to IDLE after successful completion
-                                if self.session_manager:
-                                    await self.session_manager.set_status(AgentStatus.IDLE)
-
-                                return {
-                                    "success": True,
-                                    "response": {
-                                        "role": role,
-                                        "content": content,
-                                    },
-                                }
+                                role = last_msg.get("role", "")
                             elif hasattr(last_msg, "content"):
-                                # LangChain Message object (AIMessage, HumanMessage, etc.)
-                                role = getattr(last_msg, "type", "assistant")
                                 content = last_msg.content
-                                print(f"[INVOKE] Returning LangChain message: role={role}, content={content}", file=sys.stderr)
-
-                                # Notify assistant response
-                                if notify_callback is not None:
-                                    notify_callback({
-                                        "type": "assistant",
-                                        "role": role,
-                                        "content": content,
-                                    })
-
-                                # Set status back to IDLE after successful completion
-                                if self.session_manager:
-                                    await self.session_manager.set_status(AgentStatus.IDLE)
-
-                                return {
-                                    "success": True,
-                                    "response": {
-                                        "role": role,
-                                        "content": content,
-                                    },
-                                }
+                                role = getattr(last_msg, "type", "")
                             else:
-                                print(f"[INVOKE] last_msg is not dict or Message: {type(last_msg)}", file=sys.stderr)
-                                return {
-                                    "success": False,
-                                    "error": f"Invalid message format: expected dict or Message, got {type(last_msg)}",
-                                }
-                        else:
-                            print(f"[INVOKE] No messages in result", file=sys.stderr)
+                                content = ""
+                                role = ""
+
+                            # Check if this message has tool calls
+                            has_tool_calls = False
+                            if isinstance(last_msg, dict):
+                                has_tool_calls = bool(last_msg.get("tool_calls"))
+                            elif hasattr(last_msg, "tool_calls"):
+                                has_tool_calls = bool(last_msg.tool_calls)
+
+                            print(f"[INVOKE] Iteration {iteration}: content='{content[:100] if content else '(empty)'}', role={role}, has_tool_calls={has_tool_calls}, has_interrupt={has_interrupt}", file=sys.stderr)
+
+                            # If we have real content and no pending tool calls AND it's from assistant, this is final response
+                            # CRITICAL: Must check role in ('assistant', 'ai') to avoid treating tool results as final response!
+                            # LangGraph uses 'ai' for AIMessage.type, while dicts may use 'assistant'
+                            if content and not has_tool_calls and role in ('assistant', 'ai'):
+                                final_content = content
+                                print(f"[INVOKE] Got final response: {content[:100]}...", file=sys.stderr)
+                                break
+
+                            # If there's an interrupt, we need to handle it
+                            # In non-interactive mode with skip_permissions, it should auto-approve
+                            # But if we're here with an interrupt, something is wrong
+                            if has_interrupt:
+                                print(f"[INVOKE] WARNING: Interrupt detected in iteration {iteration}, but agent should auto-approve with skip_permissions", file=sys.stderr)
+                                # The interrupt should be auto-approved on next iteration
+                                # Continue to next iteration which will process the approved tool call
+                                continue
+
+                            # If we have tool calls but no interrupt, they're being executed
+                            # Continue to next iteration to get the result
+                            if has_tool_calls:
+                                print(f"[INVOKE] Tool calls detected, continuing to next iteration...", file=sys.stderr)
+                                # In this case, the tool is executed but we haven't gotten response yet
+                                # This shouldn't happen with ainvoke - it should wait
+                                # But let's handle it gracefully
+                                await asyncio.sleep(0.1)  # Brief pause
+                                continue
+
+                            # If we got here with empty content and no tool calls,
+                            # the agent finished but has nothing to say (shouldn't happen normally)
+                            if not content:
+                                print(f"[INVOKE] Empty response with no tool calls at iteration {iteration}", file=sys.stderr)
+                                break
+
+                        if iteration >= max_iterations:
+                            print(f"[INVOKE] Max iterations reached without final response", file=sys.stderr)
                             return {
                                 "success": False,
-                                "error": "No messages returned from agent",
+                                "error": "Agent exceeded maximum iterations without producing final response"
                             }
+
+                        if not final_content:
+                            print(f"[INVOKE] No final content found after {iteration} iterations", file=sys.stderr)
+                            return {
+                                "success": False,
+                                "error": "Agent did not produce a response"
+                            }
+
+                        # ✨ NO FINAL MESSAGE IN STREAMING MODE!
+                        # In streaming mode, all content was already sent via process_message_chunk
+                        # Sending a final message would cause duplication (e.g., "44" instead of "4")
+                        # This matches deepagents architecture which only calls _set_active_message(None)
+                        # after streaming completes - no final message notification!
+
+                        # Set status back to IDLE after successful completion
+                        if self.session_manager:
+                            await self.session_manager.set_status(AgentStatus.IDLE)
+
+                        return {
+                            "success": True,
+                            "response": {
+                                "role": "assistant",
+                                "content": final_content,
+                            },
+                        }
             else:
-                # Fallback: simple echo response if no agent available
-                print(f"[INVOKE] Returning fallback echo (self.agent={self.agent})", file=sys.stderr)
+                # STRICT FAILURE: Agent MUST be initialized, NO SILENT FALLBACKS
+                error_msg = (
+                    "CRITICAL: Agent not initialized! Cannot process requests.\n"
+                    "This indicates a fatal initialization error that must be fixed.\n"
+                    f"Agent state: {self.agent}\n"
+                    "Check agent process logs for initialization errors."
+                )
+                print(f"[INVOKE] {error_msg}", file=sys.stderr)
 
-                # Set status back to IDLE (fallback doesn't change status)
                 if self.session_manager:
-                    await self.session_manager.set_status(AgentStatus.IDLE)
+                    await self.session_manager.set_error("Agent not initialized")
 
-                return {
-                    "success": True,
-                    "response": {
-                        "role": "assistant",
-                        "content": f"Echo: {message} (Agent not fully initialized)",
-                    },
-                }
+                raise RuntimeError(error_msg)
+
+        except asyncio.CancelledError:
+            # Task was cancelled (interrupted)
+            print("[INVOKE] Agent task cancelled (interrupted)", file=sys.stderr)
+
+            # Notify cancellation via callback (if provided)
+            if notify_callback is not None:
+                await notify_callback({
+                    "type": "agent_interrupted",
+                    "role": "system",
+                    "content": "Interrupted",
+                })
+
+            # Set error status for cancelled task
+            if self.session_manager:
+                await self.session_manager.set_error("Agent interrupted")
+
+            # Re-raise to properly handle cancellation
+            raise
 
         except Exception as e:
             import traceback
             print(f"[INVOKE] Exception occurred: {e}", file=sys.stderr)
             print(f"[INVOKE] Traceback:\n{traceback.format_exc()}", file=sys.stderr)
+
+            # CRITICAL: Notify error to TUI so users see what went wrong
+            # This matches deepagents architecture where errors are displayed via ErrorMessage
+            error_msg = f"Agent error: {str(e)}"
+            if notify_callback is not None:
+                try:
+                    await notify_callback({
+                        "type": "error",
+                        "role": "system",
+                        "content": error_msg,
+                    })
+                except Exception as notify_err:
+                    print(f"[INVOKE] Warning: Failed to notify error to TUI: {notify_err}", file=sys.stderr)
 
             # Set error status on exception
             if self.session_manager:
@@ -991,3 +1397,8 @@ class AgentProcess:
                 "success": False,
                 "error": f"Agent invocation failed: {str(e)}",
             }
+
+        finally:
+            # Always reset execution state
+            self.is_running = False
+            self.current_worker_task = None

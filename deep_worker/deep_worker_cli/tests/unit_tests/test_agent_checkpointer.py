@@ -1,0 +1,314 @@
+"""Unit tests for AgentProcess checkpointer selection logic."""
+
+import pytest
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch, ANY
+from deep_worker_cli.agent_config_pkg.agent_config import AgentConfig
+from deep_worker_cli.process.agent_process import AgentProcess
+
+
+@pytest.fixture
+def agent_config(tmp_path):
+    """Create test agent config."""
+    working_dir = tmp_path / "working"
+    working_dir.mkdir()
+    return AgentConfig(
+        model="claude-sonnet-4-5-20250929",
+        working_dir=working_dir,
+    )
+
+
+class TestAgentProcessInit:
+    """Tests for AgentProcess initialization with checkpointer flags."""
+
+    def test_init_defaults(self, agent_config):
+        """Test default initialization without flags."""
+        process = AgentProcess(
+            name="test-agent",
+            config=agent_config,
+        )
+
+        assert process.memory_only is False
+        assert process.use_sqlite is False
+        assert process._checkpointer_ctx is None
+
+    def test_init_with_memory_only(self, agent_config):
+        """Test initialization with memory_only flag."""
+        process = AgentProcess(
+            name="test-agent",
+            config=agent_config,
+            memory_only=True,
+        )
+
+        assert process.memory_only is True
+        assert process.use_sqlite is False
+
+    def test_init_with_use_sqlite(self, agent_config):
+        """Test initialization with use_sqlite flag."""
+        process = AgentProcess(
+            name="test-agent",
+            config=agent_config,
+            use_sqlite=True,
+        )
+
+        assert process.memory_only is False
+        assert process.use_sqlite is True
+
+    def test_init_with_both_flags_raises_error(self, agent_config):
+        """Test that both flags raise ValueError."""
+        with pytest.raises(ValueError, match="Cannot specify both"):
+            AgentProcess(
+                name="test-agent",
+                config=agent_config,
+                memory_only=True,
+                use_sqlite=True,
+            )
+
+
+class TestCheckpointerSelectionLogic:
+    """Tests for checkpointer selection priority logic."""
+
+    @pytest.mark.asyncio
+    async def test_use_sqlite_flag_overrides_test_detection(self, agent_config, monkeypatch):
+        """Test --use-sqlite flag forces SQLite even in test environment."""
+        # Set test environment indicator
+        monkeypatch.setenv("PYTEST_CURRENT_TEST", "test")
+
+        process = AgentProcess(
+            name="test-agent",
+            config=agent_config,
+            use_sqlite=True,
+        )
+
+        # Mock get_checkpointer and create_cli_agent
+        mock_checkpointer_ctx = AsyncMock()
+        mock_checkpointer = MagicMock()
+        mock_checkpointer_ctx.__aenter__ = AsyncMock(return_value=mock_checkpointer)
+
+        with patch("deep_worker_cli.sessions.get_checkpointer", return_value=mock_checkpointer_ctx):
+            with patch("deep_worker_cli.agent.create_cli_agent") as mock_create:
+                mock_create.return_value = (MagicMock(), MagicMock())
+
+                await process.start()
+
+                # Verify create_cli_agent was called with checkpointer (not None)
+                mock_create.assert_called_once()
+                call_kwargs = mock_create.call_args.kwargs
+                assert call_kwargs["checkpointer"] is mock_checkpointer
+                assert call_kwargs["checkpointer"] is not None
+
+    @pytest.mark.asyncio
+    async def test_memory_only_flag_overrides_production(self, agent_config, monkeypatch):
+        """Test --memory-only flag forces memory even in production."""
+        # Clear test indicators (simulate production)
+        monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+        monkeypatch.delenv("DEEP_WORKER_TEST_MODE", raising=False)
+
+        process = AgentProcess(
+            name="test-agent",
+            config=agent_config,
+            memory_only=True,
+        )
+
+        with patch("deep_worker_cli.agent.create_cli_agent") as mock_create:
+            mock_create.return_value = (MagicMock(), MagicMock())
+            with patch("deep_worker_cli.utils.is_running_tests", return_value=False):
+                await process.start()
+
+                # Verify create_cli_agent was called with checkpointer=None
+                mock_create.assert_called_once()
+                call_kwargs = mock_create.call_args.kwargs
+                assert call_kwargs["checkpointer"] is None
+
+    @pytest.mark.asyncio
+    async def test_test_environment_defaults_to_memory(self, agent_config):
+        """Test that test environment automatically uses InMemorySaver."""
+        process = AgentProcess(
+            name="test-agent",
+            config=agent_config,
+        )
+
+        with patch("deep_worker_cli.agent.create_cli_agent") as mock_create:
+            mock_create.return_value = (MagicMock(), MagicMock())
+            with patch("deep_worker_cli.utils.is_running_tests", return_value=True):
+                await process.start()
+
+                # Verify checkpointer is None (InMemorySaver fallback)
+                mock_create.assert_called_once()
+                call_kwargs = mock_create.call_args.kwargs
+                assert call_kwargs["checkpointer"] is None
+
+    @pytest.mark.asyncio
+    async def test_production_defaults_to_sqlite(self, agent_config):
+        """Test that production environment uses SQLite by default."""
+        process = AgentProcess(
+            name="test-agent",
+            config=agent_config,
+        )
+
+        mock_checkpointer_ctx = AsyncMock()
+        mock_checkpointer = MagicMock()
+        mock_checkpointer_ctx.__aenter__ = AsyncMock(return_value=mock_checkpointer)
+
+        with patch("deep_worker_cli.sessions.get_checkpointer", return_value=mock_checkpointer_ctx):
+            with patch("deep_worker_cli.agent.create_cli_agent") as mock_create:
+                mock_create.return_value = (MagicMock(), MagicMock())
+                with patch("deep_worker_cli.utils.is_running_tests", return_value=False):
+                    await process.start()
+
+                    # Verify create_cli_agent was called with checkpointer
+                    mock_create.assert_called_once()
+                    call_kwargs = mock_create.call_args.kwargs
+                    assert call_kwargs["checkpointer"] is mock_checkpointer
+                    assert call_kwargs["checkpointer"] is not None
+
+
+class TestCheckpointerCleanup:
+    """Tests for checkpointer cleanup."""
+
+    @pytest.mark.asyncio
+    async def test_cleanup_closes_checkpointer(self, agent_config):
+        """Test cleanup() closes checkpointer context manager."""
+        process = AgentProcess(
+            name="test-agent",
+            config=agent_config,
+        )
+
+        # Mock checkpointer context manager
+        mock_checkpointer_ctx = AsyncMock()
+        mock_checkpointer_ctx.__aexit__ = AsyncMock()
+        process._checkpointer_ctx = mock_checkpointer_ctx
+
+        # Call cleanup
+        await process.cleanup()
+
+        # Verify __aexit__ was called
+        mock_checkpointer_ctx.__aexit__.assert_called_once_with(None, None, None)
+        assert process._checkpointer_ctx is None
+
+    @pytest.mark.asyncio
+    async def test_cleanup_without_checkpointer(self, agent_config):
+        """Test cleanup() when no checkpointer exists."""
+        process = AgentProcess(
+            name="test-agent",
+            config=agent_config,
+        )
+
+        # No checkpointer
+        process._checkpointer_ctx = None
+
+        # Should not raise
+        await process.cleanup()
+
+        assert process._checkpointer_ctx is None
+
+    @pytest.mark.asyncio
+    async def test_cleanup_handles_exception(self, agent_config, capsys):
+        """Test cleanup() handles exception gracefully."""
+        process = AgentProcess(
+            name="test-agent",
+            config=agent_config,
+        )
+
+        # Mock checkpointer that raises exception
+        mock_checkpointer_ctx = AsyncMock()
+        mock_checkpointer_ctx.__aexit__ = AsyncMock(side_effect=Exception("DB error"))
+        process._checkpointer_ctx = mock_checkpointer_ctx
+
+        # Should not raise, but print warning
+        await process.cleanup()
+
+        # Verify error message was printed
+        captured = capsys.readouterr()
+        assert "Error closing checkpointer" in captured.err
+
+        # Context should be cleared even after error
+        assert process._checkpointer_ctx is None
+
+
+class TestPriorityLogic:
+    """Tests to verify priority order of checkpointer selection."""
+
+    @pytest.mark.asyncio
+    async def test_priority_1_use_sqlite_beats_all(self, agent_config, monkeypatch):
+        """Test priority 1: --use-sqlite overrides everything."""
+        # Set test indicators
+        monkeypatch.setenv("PYTEST_CURRENT_TEST", "test")
+
+        process = AgentProcess(
+            name="test-agent",
+            config=agent_config,
+            use_sqlite=True,
+        )
+
+        mock_checkpointer_ctx = AsyncMock()
+        mock_checkpointer = MagicMock()
+        mock_checkpointer_ctx.__aenter__ = AsyncMock(return_value=mock_checkpointer)
+
+        with patch("deep_worker_cli.sessions.get_checkpointer", return_value=mock_checkpointer_ctx):
+            with patch("deep_worker_cli.agent.create_cli_agent") as mock_create:
+                mock_create.return_value = (MagicMock(), MagicMock())
+
+                await process.start()
+
+                # Should use SQLite despite test environment
+                call_kwargs = mock_create.call_args.kwargs
+                assert call_kwargs["checkpointer"] is not None
+
+    @pytest.mark.asyncio
+    async def test_priority_2_memory_only_beats_test_and_prod(self, agent_config):
+        """Test priority 2: --memory-only overrides test detection and production."""
+        process = AgentProcess(
+            name="test-agent",
+            config=agent_config,
+            memory_only=True,
+        )
+
+        with patch("deep_worker_cli.agent.create_cli_agent") as mock_create:
+            mock_create.return_value = (MagicMock(), MagicMock())
+            # Test both in production and test mode
+            with patch("deep_worker_cli.utils.is_running_tests", return_value=False):
+                await process.start()
+
+                # Should use memory despite production
+                call_kwargs = mock_create.call_args.kwargs
+                assert call_kwargs["checkpointer"] is None
+
+    @pytest.mark.asyncio
+    async def test_priority_3_test_detection_beats_production(self, agent_config):
+        """Test priority 3: test detection beats default production."""
+        process = AgentProcess(
+            name="test-agent",
+            config=agent_config,
+        )
+
+        with patch("deep_worker_cli.agent.create_cli_agent") as mock_create:
+            mock_create.return_value = (MagicMock(), MagicMock())
+            with patch("deep_worker_cli.utils.is_running_tests", return_value=True):
+                await process.start()
+
+                # Should use memory in test environment
+                call_kwargs = mock_create.call_args.kwargs
+                assert call_kwargs["checkpointer"] is None
+
+    @pytest.mark.asyncio
+    async def test_priority_4_default_production_uses_sqlite(self, agent_config):
+        """Test priority 4: default production uses SQLite."""
+        process = AgentProcess(
+            name="test-agent",
+            config=agent_config,
+        )
+
+        mock_checkpointer_ctx = AsyncMock()
+        mock_checkpointer = MagicMock()
+        mock_checkpointer_ctx.__aenter__ = AsyncMock(return_value=mock_checkpointer)
+
+        with patch("deep_worker_cli.sessions.get_checkpointer", return_value=mock_checkpointer_ctx):
+            with patch("deep_worker_cli.agent.create_cli_agent") as mock_create:
+                mock_create.return_value = (MagicMock(), MagicMock())
+                with patch("deep_worker_cli.utils.is_running_tests", return_value=False):
+                    await process.start()
+
+                    # Should use SQLite in normal production
+                    call_kwargs = mock_create.call_args.kwargs
+                    assert call_kwargs["checkpointer"] is not None

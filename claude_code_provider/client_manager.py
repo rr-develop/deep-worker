@@ -45,6 +45,12 @@ BUILT_IN_TOOLS = [
 ]
 
 
+# Global singleton instance - shared across all ClaudeCodeChatModel instances
+# This ensures _sent_count and clients persist even when LangGraph creates
+# new model instances during deserialization/pickling
+_global_client_manager: "ClientManager | None" = None
+
+
 class ClientManager:
     """Manages ClaudeSDKClient instances for different thread_ids.
 
@@ -88,6 +94,10 @@ class ClientManager:
         self.base_options = base_options
         self.clients: dict[str, tuple[ClaudeSDKClient, ProxyMCPServer]] = {}
         self._creation_locks: dict[str, asyncio.Lock] = {}
+        # Track sent message count per thread for proper message mirroring
+        # This is stored in ClientManager (not ClaudeCodeChatModel) because
+        # LangGraph may create new model instances, but ClientManager is stable
+        self._sent_count: dict[str, int] = {}
 
     async def get_or_create_client(
         self, thread_id: str, tools_metadata: list[ToolMetadata]
@@ -124,18 +134,26 @@ class ClientManager:
             proxy_mcp = ProxyMCPServer(tools_metadata)
 
             # Build options for this client
+            # ⚠️ CRITICAL: Permission delegation architecture
+            # ALL tool approval decisions MUST be made by deep-worker's AgentProcess,
+            # NOT by Claude SDK's internal permission system. This prevents double-layer
+            # prompts and ensures consistent approval flow:
+            #   User → deep-worker (ONLY approval layer) → ClaudeSDKClient (NO prompts) → tools
             if self.base_options is not None:
                 # Use replace to create new instance with updated fields
+                # ALWAYS override permission_mode to ensure bypass, even if user specified otherwise
                 options = replace(
                     self.base_options,
                     mcp_servers={"deepworker": proxy_mcp.mcp_server_config},
                     disallowed_tools=BUILT_IN_TOOLS,
+                    permission_mode="bypassPermissions",  # Delegate all approval to deep-worker
                 )
             else:
                 # Create default options
                 options = ClaudeAgentOptions(
                     mcp_servers={"deepworker": proxy_mcp.mcp_server_config},
                     disallowed_tools=BUILT_IN_TOOLS,
+                    permission_mode="bypassPermissions",  # Delegate all approval to deep-worker
                 )
 
             # Create and connect client
@@ -146,6 +164,26 @@ class ClientManager:
             self.clients[thread_id] = (client, proxy_mcp)
 
             return client, proxy_mcp
+
+    def get_sent_count(self, thread_id: str) -> int:
+        """Get number of messages sent for a thread.
+
+        Args:
+            thread_id: Thread ID to check
+
+        Returns:
+            Number of messages sent to Claude for this thread
+        """
+        return self._sent_count.get(thread_id, 0)
+
+    def update_sent_count(self, thread_id: str, count: int) -> None:
+        """Update sent message count for a thread.
+
+        Args:
+            thread_id: Thread ID to update
+            count: New sent count value
+        """
+        self._sent_count[thread_id] = count
 
     async def cleanup_client(self, thread_id: str) -> None:
         """Cleanup client for a thread_id.
@@ -164,3 +202,22 @@ class ClientManager:
             # Also remove lock
             if thread_id in self._creation_locks:
                 del self._creation_locks[thread_id]
+
+        # Remove sent_count tracking
+        self._sent_count.pop(thread_id, None)
+
+
+def get_global_client_manager() -> ClientManager:
+    """Get or create global ClientManager singleton.
+
+    This ensures all ClaudeCodeChatModel instances share the same ClientManager,
+    which is crucial for maintaining _sent_count across model instance changes
+    (e.g., when LangGraph deserializes models).
+
+    Returns:
+        Global ClientManager singleton
+    """
+    global _global_client_manager
+    if _global_client_manager is None:
+        _global_client_manager = ClientManager()
+    return _global_client_manager

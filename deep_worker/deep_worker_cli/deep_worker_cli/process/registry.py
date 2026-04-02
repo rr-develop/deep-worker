@@ -2,6 +2,7 @@
 
 import fcntl
 import json
+import logging
 import os
 from contextlib import contextmanager
 from datetime import datetime
@@ -39,6 +40,7 @@ class ProcessRegistry:
         """
         self.registry_file = registry_file or self.DEFAULT_REGISTRY_FILE
         self.lock_file = lock_file or self.DEFAULT_LOCK_FILE
+        self.logger = logging.getLogger(__name__)
 
     def register(self, agent_info: AgentProcessInfo) -> None:
         """
@@ -242,6 +244,18 @@ class ProcessRegistry:
         # Ensure parent directory exists
         self.registry_file.parent.mkdir(parents=True, exist_ok=True)
 
+        # CRITICAL: Preserve original file ownership (especially for develop user)
+        # This is needed when daemon (root) writes to registry - must keep owner=develop
+        original_uid = None
+        original_gid = None
+        if self.registry_file.exists():
+            try:
+                file_stat = os.stat(self.registry_file)
+                original_uid = file_stat.st_uid
+                original_gid = file_stat.st_gid
+            except OSError:
+                pass  # If stat fails, will use current process owner
+
         # Write atomically using a temp file
         temp_file = self.registry_file.with_suffix(".tmp")
         try:
@@ -249,13 +263,118 @@ class ProcessRegistry:
             temp_file.write_text(json.dumps(registry, indent=2))
 
             # Set permissions to 0o666 (rw-rw-rw-) so all users can read/write
-            # This is necessary for multi-user environments (e.g., a web service running
-            # alongside deep-worker under a different user)
+            # This is necessary for multi-user environments (e.g., multiple deep-worker instances)
             os.chmod(temp_file, 0o666)
 
             # Atomic replace
             temp_file.replace(self.registry_file)
+
+            # CRITICAL FIX: Restore original ownership after replace()
+            # Problem: replace() creates file with current process owner (root for daemon)
+            # Solution: Explicitly restore original owner=develop after replace
+            if original_uid is not None and original_gid is not None:
+                try:
+                    # If current process is root, can directly chown
+                    # If current process is develop, this is a no-op (already correct owner)
+                    os.chown(self.registry_file, original_uid, original_gid)
+                except OSError as e:
+                    # If chown fails (permission denied), file might be root-owned
+                    # This is the exact problem the user reported - MUST be fixed!
+                    # Only root can chown files, so if we're not root and file is root-owned,
+                    # we have a problem. But since daemon runs as root, this should succeed.
+                    self.logger.warning(
+                        f"Failed to restore ownership of {self.registry_file} to "
+                        f"{original_uid}:{original_gid}: {e}. File may have wrong owner!"
+                    )
         except OSError as e:
             if temp_file.exists():
                 temp_file.unlink()
             raise RegistryLockError(f"Failed to save registry: {e}") from e
+
+    def validate_writable(self) -> dict[str, Any]:
+        """Validate that registry file is writable BEFORE daemonizing.
+
+        This method checks if the registry file can be written to, and attempts
+        to fix ownership issues if the file is owned by root or another user.
+
+        Returns:
+            Dictionary with validation result:
+            - writable (bool): True if registry is writable
+            - error (str): Error message if not writable
+            - fixed (bool): True if ownership was fixed automatically
+        """
+        # Check if parent directory is writable (needed if file doesn't exist)
+        if not self.registry_file.exists():
+            if not os.access(self.registry_file.parent, os.W_OK):
+                return {
+                    "writable": False,
+                    "error": f"Parent directory {self.registry_file.parent} is not writable",
+                    "fixed": False,
+                }
+            return {"writable": True, "fixed": False}
+
+        # File exists - check if it's writable
+        if os.access(self.registry_file, os.W_OK):
+            return {"writable": True, "fixed": False}
+
+        # File is NOT writable - check if it's owned by root
+        try:
+            file_stat = os.stat(self.registry_file)
+            file_owner = file_stat.st_uid
+            current_user = os.getuid()
+
+            if file_owner == 0 and current_user != 0:
+                # File is owned by root, current user is not root
+                # Try to fix ownership using sudo
+                try:
+                    import subprocess
+
+                    # Try to change ownership to current user
+                    result = subprocess.run(
+                        ["sudo", "-n", "chown", f"{current_user}:{current_user}", str(self.registry_file)],
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                    )
+
+                    if result.returncode == 0:
+                        # Successfully fixed ownership
+                        return {
+                            "writable": True,
+                            "fixed": True,
+                            "message": f"Fixed ownership of {self.registry_file}",
+                        }
+                    else:
+                        # sudo failed or requires password
+                        return {
+                            "writable": False,
+                            "error": (
+                                f"Registry file {self.registry_file} is owned by root. "
+                                f"Run: sudo chown {current_user}:{current_user} {self.registry_file}"
+                            ),
+                            "fixed": False,
+                        }
+                except (subprocess.SubprocessError, FileNotFoundError):
+                    # sudo not available or failed
+                    return {
+                        "writable": False,
+                        "error": (
+                            f"Registry file {self.registry_file} is owned by root. "
+                            f"Run: sudo chown {current_user}:{current_user} {self.registry_file}"
+                        ),
+                        "fixed": False,
+                    }
+            else:
+                # File is owned by current user but not writable (read-only)
+                return {
+                    "writable": False,
+                    "error": f"Registry file {self.registry_file} is read-only. Check file permissions.",
+                    "fixed": False,
+                }
+
+        except OSError as e:
+            return {
+                "writable": False,
+                "error": f"Failed to check registry file permissions: {e}",
+                "fixed": False,
+            }

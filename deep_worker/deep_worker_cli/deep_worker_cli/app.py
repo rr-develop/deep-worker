@@ -360,7 +360,7 @@ class DeepAgentsApp(App):
         """Initialize the Deep Agents application.
 
         Args:
-            agent: Pre-configured LangGraph agent (optional for standalone mode)
+            agent: Pre-configured LangGraph agent (optional - can be set later)
             assistant_id: Agent identifier for memory storage
             backend: Backend for file operations
             auto_approve: Whether to start with auto-approve enabled
@@ -963,8 +963,20 @@ class DeepAgentsApp(App):
         Args:
             message: The user's message
         """
-        # Mount the user message
-        await self._mount_message(UserMessage(message))
+        # ============================================================================
+        # ARCHITECTURE PRINCIPLE: AGENT IS THE SINGLE SOURCE OF TRUTH
+        # ============================================================================
+        # DO NOT display user message locally here!
+        # The agent deep-worker is the ONLY source of truth for ALL messages,
+        # including user messages.
+        #
+        # User messages will be displayed when agent processes them and they appear
+        # in agent.astream() as HumanMessage, which textual_adapter will convert
+        # to UserMessage for display.
+        #
+        # This ensures the conversation history matches agent state exactly and
+        # prevents message duplication bugs.
+        # ============================================================================
 
         # Scroll to bottom when user sends a new message
         chat = self.query_one("#chat", VerticalScroll)
@@ -989,8 +1001,7 @@ class DeepAgentsApp(App):
         else:
             await self._mount_message(
                 AppMessage(
-                    "Agent not configured. "
-                    "Run with --agent flag or use standalone mode."
+                    "Agent not available. Ensure deep-worker agent is running."
                 )
             )
 
@@ -1011,6 +1022,11 @@ class DeepAgentsApp(App):
                 adapter=self._ui_adapter,
                 backend=self._backend,
             )
+            # After task completes, scroll to ensure input area is visible
+            # (all messages from stream have been added, now scroll to bottom)
+            chat = self.query_one("#chat", VerticalScroll)
+            if chat.max_scroll_y > 0:
+                chat.scroll_end(animate=False)
         except Exception as e:
             await self._mount_message(ErrorMessage(f"Agent error: {e}"))
         finally:
@@ -1024,6 +1040,11 @@ class DeepAgentsApp(App):
 
         # Remove spinner if present
         await self._set_spinner(None)
+
+        # Clear input field after agent finishes processing
+        # This ensures UserMessage from agent stream is displayed before clearing
+        if self._chat_input:
+            self._chat_input.clear_input()
 
         # Re-enable submission now that agent is done
         if self._chat_input:
@@ -1183,9 +1204,11 @@ class DeepAgentsApp(App):
         await self._prune_old_messages()
 
         # Scroll to keep input bar visible
+        # Use call_after_refresh to ensure layout is updated first
         try:
-            input_container = self.query_one("#bottom-app-container", Container)
-            input_container.scroll_visible()
+            chat = self.query_one("#chat", VerticalScroll)
+            # Scroll to end to ensure input area is always visible
+            self.call_after_refresh(lambda: chat.scroll_end(animate=False))
         except NoMatches:
             pass
 

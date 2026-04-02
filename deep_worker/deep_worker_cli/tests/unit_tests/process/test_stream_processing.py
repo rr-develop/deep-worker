@@ -54,7 +54,7 @@ class TestStreamProcessing:
 
         notifications: list[dict[str, Any]] = []
 
-        def mock_notify(msg: dict[str, Any]) -> None:
+        async def mock_notify(msg: dict[str, Any]) -> None:
             notifications.append(msg)
 
         # Act
@@ -96,7 +96,7 @@ class TestStreamProcessing:
 
         notifications: list[dict[str, Any]] = []
 
-        def mock_notify(msg: dict[str, Any]) -> None:
+        async def mock_notify(msg: dict[str, Any]) -> None:
             notifications.append(msg)
 
         # Act
@@ -131,7 +131,7 @@ class TestStreamProcessing:
 
         notifications: list[dict[str, Any]] = []
 
-        def mock_notify(msg: dict[str, Any]) -> None:
+        async def mock_notify(msg: dict[str, Any]) -> None:
             notifications.append(msg)
 
         # Act
@@ -161,7 +161,7 @@ class TestStreamProcessing:
 
         notifications: list[dict[str, Any]] = []
 
-        def mock_notify(msg: dict[str, Any]) -> None:
+        async def mock_notify(msg: dict[str, Any]) -> None:
             notifications.append(msg)
 
         # Act
@@ -205,7 +205,7 @@ class TestStreamProcessing:
 
         notifications: list[dict[str, Any]] = []
 
-        def mock_notify(msg: dict[str, Any]) -> None:
+        async def mock_notify(msg: dict[str, Any]) -> None:
             notifications.append(msg)
 
         # Act
@@ -249,7 +249,7 @@ class TestStreamFiltering:
 
         notifications: list[dict[str, Any]] = []
 
-        def mock_notify(msg: dict[str, Any]) -> None:
+        async def mock_notify(msg: dict[str, Any]) -> None:
             notifications.append(msg)
 
         # Act

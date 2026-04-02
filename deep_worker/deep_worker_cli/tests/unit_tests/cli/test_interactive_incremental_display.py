@@ -25,13 +25,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+# Add rpyc_async to path (required for AsyncioServer import in agent_process.py)
 # Add arpyc to path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent.parent.parent / "arpyc"))
 
 from arpyc import RpycAsyncSession
 
 from deep_worker_cli.cli.interactive import InteractiveApp
-
 
 @pytest.mark.asyncio
 async def test_user_message_displayed_immediately():
@@ -70,7 +70,6 @@ async def test_user_message_displayed_immediately():
 
             # Verify that message was queued as background task (agent as source of truth)
             assert mock_run_worker.call_count == 1, "Message must be sent to agent as background task"
-
 
 @pytest.mark.asyncio
 async def test_incremental_history_loading_not_full_reload():
@@ -151,7 +150,6 @@ async def test_incremental_history_loading_not_full_reload():
             # With RPyC callbacks, messages arrive in real-time
             await app._handle_user_message("Test message")
 
-
 @pytest.mark.asyncio
 async def test_taskmanager_messages_appear_incrementally():
     """Test that TaskManager intermediate messages appear via RPyC callbacks.
@@ -229,7 +227,6 @@ async def test_taskmanager_messages_appear_incrementally():
 
         # Verify incremental loading works
         assert "TaskManager" in result2["history"][0]["content"]
-
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
