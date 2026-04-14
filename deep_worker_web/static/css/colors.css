@@ -1,0 +1,58 @@
+/* Material3 Dark Theme Color Scheme */
+/* Based on Material Design 3 color system */
+
+:root {
+    /* Primary colors */
+    --material-primary: #8BD0EF;
+    --material-on-primary: #003546;
+    --material-primary-container: #004D64;
+    --material-on-primary-container: #BDE9FF;
+
+    /* Secondary colors */
+    --material-secondary: #B4CAD6;
+    --material-on-secondary: #1F333C;
+    --material-secondary-container: #354A53;
+    --material-on-secondary-container: #D0E6F2;
+
+    /* Tertiary colors */
+    --material-tertiary: #C6C2EA;
+    --material-on-tertiary: #2E2D4D;
+    --material-tertiary-container: #454364;
+    --material-on-tertiary-container: #E3DFFF;
+
+    /* Error colors */
+    --material-error: #FFB4AB;
+    --material-on-error: #690005;
+    --material-error-container: #93000A;
+    --material-on-error-container: #FFDAD6;
+
+    /* Background colors */
+    --material-background: #0F1417;
+    --material-on-background: #DFE3E7;
+
+    /* Surface colors */
+    --material-surface: #0F1417;
+    --material-on-surface: #DFE3E7;
+    --material-surface-variant: #40484C;
+    --material-on-surface-variant: #C0C8CD;
+    --material-surface-tint: #8BD0EF;
+
+    /* Surface container colors - Different elevation levels */
+    --material-surface-container-lowest: #0A0F11;
+    --material-surface-container-low: #171C1F;
+    --material-surface-container: #1B2023;
+    --material-surface-container-high: #262B2D;
+    --material-surface-container-highest: #303538;
+
+    /* Inverse colors */
+    --material-inverse-surface: #DFE3E7;
+    --material-inverse-on-surface: #2C3134;
+    --material-inverse-primary: #116682;
+
+    /* Outline colors */
+    --material-outline: #8A9297;
+    --material-outline-variant: #40484C;
+
+    /* Scrim */
+    --material-scrim: #000000;
+}

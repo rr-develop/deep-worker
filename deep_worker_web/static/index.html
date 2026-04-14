@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Deep-Worker-Web</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Deep-Worker-Web</h1>
+        </header>
+
+        <div class="main-content">
+            <!-- Agent List Panel -->
+            <div class="agent-list-panel">
+                <div class="agent-list-header">
+                    <h2>Active Agents</h2>
+                    <label class="select-all-toggle" title="Select all">
+                        <input type="checkbox" id="select-all-checkbox" onchange="toggleSelectAll(this.checked)">
+                    </label>
+                </div>
+                <div id="agent-list" class="agent-list">
+                    <p class="loading">Loading agents...</p>
+                </div>
+                <div id="batch-toolbar" class="batch-toolbar" style="display: none;">
+                    <span id="selection-count" class="selection-count">0 selected</span>
+                    <div class="batch-buttons">
+                        <button id="batch-stop-btn" class="btn btn-danger btn-sm" onclick="batchStop()">⏹ Stop</button>
+                        <button id="batch-restart-btn" class="btn btn-primary btn-sm" onclick="batchRestart()">🔄 Restart</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Agent Interaction Panel -->
+            <div class="agent-interaction-panel">
+                <div id="no-agent-selected" class="no-selection">
+                    <p>← Select an agent to start</p>
+                </div>
+
+                <div id="agent-selected" class="agent-selected" style="display: none;">
+                    <div class="agent-header">
+                        <h2 id="selected-agent-name">Agent Name</h2>
+                        <div class="agent-controls">
+                            <button id="full-dialog-btn" class="btn btn-secondary btn-sm">📜 Full Dialog</button>
+                            <button id="stop-agent-btn" class="btn btn-danger btn-sm" onclick="stopCurrentAgent()">⏹ Stop</button>
+                            <button id="restart-agent-btn" class="btn btn-primary btn-sm" onclick="restartCurrentAgent()">🔄 Restart</button>
+                            <button id="stop-taskmanager-btn" class="btn btn-danger btn-sm">⏹️ Stop TM</button>
+                            <label id="tm-toggle-label" class="tm-toggle" style="display: none;">
+                                <input type="checkbox" id="tm-enabled-checkbox" checked
+                                       onchange="toggleTaskManager(this.checked)">
+                                TM
+                            </label>
+                            <button id="reset-tm-btn" class="btn btn-secondary btn-sm"
+                                    onclick="resetTaskManager()" title="Reset TaskManager history"
+                                    style="display: none;">
+                                🔄 Reset TM
+                            </button>
+                        </div>
+                    </div>
+
+                    <div class="agent-info-bar">
+                        <span class="status-label">Provider:</span>
+                        <span id="agent-provider">unknown</span>
+                        <span class="status-label">Model:</span>
+                        <span id="agent-model">unknown</span>
+                    </div>
+
+                    <!-- Approval Panel (hidden by default) -->
+                    <div id="approval-panel" class="approval-panel" style="display: none;">
+                        <div class="approval-header">
+                            <span class="approval-icon">⏸️</span>
+                            <h3>Tool Approval Required</h3>
+                        </div>
+                        <div id="approval-details" class="approval-details"></div>
+                        <div class="approval-actions">
+                            <button id="approve-btn" class="btn btn-approve" onclick="approveAction()">✅ Approve</button>
+                            <button id="reject-btn" class="btn btn-reject" onclick="rejectAction()">❌ Reject</button>
+                            <button id="auto-approve-btn" class="btn btn-secondary btn-sm" onclick="autoApproveAll()">⚡ Auto-approve all</button>
+                        </div>
+                    </div>
+
+                    <!-- Last Response Panel -->
+                    <div class="last-response-panel">
+                        <div class="last-response-header">
+                            <h3>Last Response</h3>
+                            <button id="copy-response-btn" onclick="copyLastResponse(event)" class="btn btn-secondary btn-sm" title="Copy response">
+                                📋 Copy
+                            </button>
+                        </div>
+                        <div id="last-response-content" class="response-content">
+                            <em>No response yet</em>
+                        </div>
+                    </div>
+
+                    <!-- Message Input -->
+                    <div class="message-input-panel">
+                        <h3>Send Message</h3>
+                        <textarea id="message-input" placeholder="Enter your message here..." rows="4"></textarea>
+                        <button id="send-btn" class="btn btn-primary">Send Message</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <footer>
+            <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 1rem;">
+                <div>
+                    <p>Deep-Worker-Web | Running on <strong>127.0.0.1:7887</strong> (localhost only)</p>
+                </div>
+                <div style="display: flex; align-items: center; gap: 1rem;">
+                    <span id="server-uptime" style="font-size: 0.875rem; color: #888; font-family: 'Consolas', monospace;">Uptime: --</span>
+                    <button onclick="restartServer()" class="btn btn-secondary" style="padding: 0.5rem 1rem; font-size: 0.875rem;" title="Restart deep-worker-web server">
+                        🔄 Restart Server
+                    </button>
+                </div>
+            </div>
+        </footer>
+    </div>
+
+    <script src="/static/js/main.js"></script>
+</body>
+</html>

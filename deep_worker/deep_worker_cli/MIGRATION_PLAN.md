@@ -1,22 +1,30 @@
 # Migration Plan: Deep Worker → RPyC AsyncioServer
 
+> **✅ MIGRATION COMPLETE (April 2026).** The `arpyc` library and its directory
+> have been fully removed from the repository.
+> All code now uses the local `rpyc_async` source checkout with `AsyncioServer` directly.
+> All references to `arpyc`, `RpycAsyncSession`, `ThreadedServer`, and
+> `BgServingThread` below are **HISTORICAL** — they describe what was replaced.
+> This document is kept for historical reference only. DO NOT follow any
+> instructions below that reference arpyc.
+
 **Project:** deep_worker + dwcli
 **Target:** Full migration from classic RPyC/arpyc to native AsyncioServer
 **Date:** 2026-03-22
-**Status:** Planning Phase
+**Status:** ✅ COMPLETED
 
 ---
 
 ## Executive Summary
 
-This document outlines the complete migration plan to transition the `deep_worker` project from classic RPyC with arpyc wrappers to the native AsyncioServer implementation from a local `rpyc_async` source checkout. The migration will enable true bidirectional asynchronous communication and eliminate the performance bottlenecks and architectural limitations of the current approach.
+This document outlines the complete migration plan to transition the `deep_worker` project from classic RPyC with arpyc wrappers to the native AsyncioServer implementation from the local `rpyc_async` source checkout. The migration will enable true bidirectional asynchronous communication and eliminate the performance bottlenecks and architectural limitations of the current approach.
 
 ### Key Objectives
 
 1. **Replace ThreadedServer with AsyncioServer** - Enable persistent event loops for true bidirectional async
 2. **Eliminate arpyc wrapper dependency** - Use native rpyc_async directly from source
 3. **Maintain full functionality** - All existing features must work identically
-4. **Direct source integration** - Use rpyc_async from a local source checkout without pip installation
+4. **Direct source integration** - Use rpyc_async from its local source checkout without pip installation
 5. **Enable immediate testing** - Any fixes in rpyc_async can be tested immediately in deep_worker
 
 ### Expected Benefits
@@ -213,7 +221,7 @@ class AgentClient:
 
 ### 1.3 Current Dependencies
 
-**arpyc Wrapper Location:** `arpyc/` (repository root)
+**arpyc Wrapper Location:** the `arpyc/` directory at the repository root
 
 **Files:**
 - `arpyc/arpyc/session.py` - RpycAsyncSession (BgServingThread approach)
@@ -356,8 +364,8 @@ def run(self):
 
 **Directory Structure:**
 ```
-<workspace>/
-├── <main-project>/                # Main project
+<checkout root>/
+├── <main project>/                # Main project
 │   ├── deep_worker/
 │   │   └── deep_worker_cli/
 │   │       ├── pyproject.toml     # Add rpyc_async as path dependency
@@ -1809,7 +1817,7 @@ After successful migration and verification:
 
 | File/Directory | Reason |
 |----------------|--------|
-| `arpyc/` | No longer needed - replaced by rpyc_async |
+| the `arpyc/` directory at the repository root | No longer needed - replaced by rpyc_async |
 | `ARPYC_ASYNCIO_NATIVE_RESEARCH.md` | Historical - can archive |
 | `ARPYC_ASYNC_RECURSION_GUIDE.md` | Historical - can archive |
 
@@ -1821,11 +1829,11 @@ After successful migration and verification:
 
 | Example File | Purpose |
 |--------------|---------|
-| `rpyc_async/examples/bidirectional_async/01_simple_bidirectional.py` | Basic bidirectional pattern |
-| `rpyc_async/examples/bidirectional_async/02_recursive_callbacks.py` | Recursive bidirectional pattern |
-| `rpyc_async/examples/bidirectional_async/asyncio_server_success.py` | Full AsyncioServer implementation |
-| `rpyc_async/docs/ASYNCIO_SERVER_MIGRATION.md` | Official migration guide |
-| `rpyc_async/docs/API_REFERENCE.md` | API reference |
+| `examples/bidirectional_async/01_simple_bidirectional.py` (in rpyc_async) | Basic bidirectional pattern |
+| `examples/bidirectional_async/02_recursive_callbacks.py` (in rpyc_async) | Recursive bidirectional pattern |
+| `examples/bidirectional_async/asyncio_server_success.py` (in rpyc_async) | Full AsyncioServer implementation |
+| `docs/ASYNCIO_SERVER_MIGRATION.md` (in rpyc_async) | Official migration guide |
+| `docs/API_REFERENCE.md` (in rpyc_async) | API reference |
 
 ---
 

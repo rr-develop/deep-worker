@@ -39,6 +39,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
 
 from langchain.agents.middleware.summarization import (
+    _DEFAULT_FALLBACK_MESSAGE_COUNT,
     _DEFAULT_MESSAGES_TO_KEEP,
     _DEFAULT_TRIM_TOKEN_LIMIT,
     DEFAULT_SUMMARY_PROMPT,
@@ -48,7 +49,7 @@ from langchain.agents.middleware.summarization import (
 )
 from langchain.tools import ToolRuntime
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, RemoveMessage, get_buffer_string
-from langchain_core.messages.utils import count_tokens_approximately
+from langchain_core.messages.utils import count_tokens_approximately, trim_messages
 from langgraph.config import get_config
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from typing_extensions import TypedDict, override
@@ -210,6 +211,57 @@ class SummarizationMiddleware(BaseSummarizationMiddleware):
             self._truncate_args_keep = truncate_args_settings.get("keep", ("messages", 20))
             self._max_arg_length = truncate_args_settings.get("max_length", 2000)
             self._truncation_text = truncate_args_settings.get("truncation_text", "...(argument truncated)")
+
+    @override
+    def _trim_messages_for_summary(self, messages: list[AnyMessage]) -> list[AnyMessage]:
+        """Trim messages to fit within summary generation limits, accounting for prompt size.
+
+        This override fixes a bug where the summary prompt itself could exceed context limits.
+        The base implementation trims messages to `trim_tokens_to_summarize` tokens but then
+        adds the summary_prompt on top, potentially exceeding the model's context limit.
+
+        This implementation:
+        1. Calculates the token count of the summary_prompt
+        2. Subtracts that from the trim limit to get an adjusted limit
+        3. Uses the adjusted limit when trimming messages
+
+        Args:
+            messages: Messages to trim for summary generation.
+
+        Returns:
+            Trimmed messages that, when combined with summary_prompt, fit within context limits.
+        """
+        try:
+            if self.trim_tokens_to_summarize is None:
+                return messages
+
+            # Calculate prompt token count using a dummy HumanMessage
+            # (token_counter expects a list of messages)
+            prompt_tokens = self.token_counter([HumanMessage(content=self.summary_prompt)])
+
+            # Adjust limit to account for prompt, with minimum safety buffer of 1000 tokens
+            adjusted_limit = max(1000, self.trim_tokens_to_summarize - prompt_tokens)
+
+            logger.debug(
+                f"Trimming messages for summary: prompt_tokens={prompt_tokens}, "
+                f"trim_limit={self.trim_tokens_to_summarize}, adjusted_limit={adjusted_limit}"
+            )
+
+            return cast(
+                "list[AnyMessage]",
+                trim_messages(
+                    messages,
+                    max_tokens=adjusted_limit,
+                    token_counter=self.token_counter,
+                    start_on="human",
+                    strategy="last",
+                    allow_partial=True,
+                    include_system=True,
+                ),
+            )
+        except Exception as e:
+            logger.warning(f"Error trimming messages for summary: {e}, using fallback")
+            return messages[-_DEFAULT_FALLBACK_MESSAGE_COUNT:]
 
     def _get_backend(
         self,

@@ -5,12 +5,13 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
-from langchain_core.tools import tool as langchain_tool
+from langchain_core.tools import BaseTool, tool as langchain_tool
+from pydantic import BaseModel, Field
 
 from claude_code_provider.chat_model import ClaudeCodeChatModel
 
 
-# Test tool for binding
+# Test tool for binding — StructuredTool (via @tool decorator)
 @langchain_tool
 def test_calculator(a: float, b: float) -> float:
     """Add two numbers."""
@@ -21,6 +22,26 @@ def test_calculator(a: float, b: float) -> float:
 def test_reader(path: str) -> str:
     """Read a file."""
     return f"Content of {path}"
+
+
+# Test tool — manual BaseTool subclass (like WebSearchDelegationTool).
+# Has _arun() but NO .coroutine/.func attributes.
+class _CustomSearchInput(BaseModel):
+    query: str = Field(description="Search query")
+
+
+class CustomSearchTool(BaseTool):
+    """Manual BaseTool subclass for testing executor extraction."""
+
+    name: str = "custom_search"
+    description: str = "Search the web"
+    args_schema: type[BaseModel] = _CustomSearchInput  # type: ignore[assignment]
+
+    async def _arun(self, query: str) -> str:
+        return f"Results for: {query}"
+
+    def _run(self, query: str) -> str:
+        raise NotImplementedError("Use async")
 
 
 class TestClaudeCodeChatModelInit:
@@ -60,6 +81,23 @@ class TestClaudeCodeChatModelBindTools:
         assert bound_model.tools_metadata[0]["name"] == "test_calculator"
         assert "Add" in bound_model.tools_metadata[0]["description"]
         assert "input_schema" in bound_model.tools_metadata[0]
+
+    def test_bind_tools_extracts_metadata_for_all_tool_types(self) -> None:
+        """bind_tools must extract metadata for ALL BaseTool subclasses.
+
+        Both StructuredTool (@tool decorator) and manual BaseTool subclasses
+        (like WebSearchDelegationTool) must have their metadata extracted.
+        Tools execute via LangGraph ToolNode, not MCP handler (proxy architecture).
+        """
+        model = ClaudeCodeChatModel(base_options=None)
+        custom_tool = CustomSearchTool()
+
+        bound_model = model.bind_tools([test_calculator, custom_tool])
+
+        # Both tools must have metadata
+        names = [m["name"] for m in bound_model.tools_metadata]
+        assert "test_calculator" in names
+        assert "custom_search" in names
 
     def test_bind_tools_returns_new_instance(self) -> None:
         """Should return new instance (LangChain pattern)."""
@@ -141,7 +179,7 @@ class TestClaudeCodeChatModelSimpleInvoke:
         get_or_create_called = False
         thread_id_used = None
 
-        async def mock_get_or_create(thread_id: str, tools_metadata: list[Any]) -> tuple[Mock, Mock]:
+        async def mock_get_or_create(thread_id: str, tools_metadata: list[Any], **kwargs: Any) -> tuple[Mock, Mock]:
             nonlocal get_or_create_called, thread_id_used
             get_or_create_called = True
             thread_id_used = thread_id
@@ -156,35 +194,17 @@ class TestClaudeCodeChatModelSimpleInvoke:
         assert thread_id_used == "session-123"
 
     @pytest.mark.asyncio
-    async def test_ainvoke_default_thread_id(self) -> None:
-        """Should use default thread_id if not provided."""
+    async def test_ainvoke_raises_without_thread_id(self) -> None:
+        """ainvoke MUST raise ValueError when thread_id is not provided.
+
+        ClaudeCodeChatModel is stateful — each thread_id maps to a separate
+        Claude SDK session. Implicit defaults are forbidden to prevent
+        session state corruption between main agent and subagents.
+        """
         model = ClaudeCodeChatModel(base_options=None)
 
-        mock_client = Mock()
-        mock_client.query = AsyncMock()
-
-        async def mock_receive():
-            return
-            yield
-
-        mock_client.receive_response = mock_receive
-
-        mock_proxy = Mock()
-        mock_proxy.has_pending_calls = Mock(return_value=False)
-
-        thread_id_used = None
-
-        async def mock_get_or_create(thread_id: str, tools_metadata: list[Any]) -> tuple[Mock, Mock]:
-            nonlocal thread_id_used
-            thread_id_used = thread_id
-            return mock_client, mock_proxy
-
-        with patch.object(model.client_manager, "get_or_create_client", side_effect=mock_get_or_create):
-            # No config provided
+        with pytest.raises(ValueError, match="requires explicit thread_id"):
             await model.ainvoke([HumanMessage(content="Test")])
-
-        # Should use default
-        assert thread_id_used == "default"
 
 
 class TestClaudeCodeChatModelToolCalls:
@@ -215,7 +235,10 @@ class TestClaudeCodeChatModelToolCalls:
         with patch.object(
             model.client_manager, "get_or_create_client", return_value=(mock_client, mock_proxy)
         ):
-            result = await model.ainvoke([HumanMessage(content="Calculate 5+3")])
+            result = await model.ainvoke(
+                [HumanMessage(content="Calculate 5+3")],
+                config={"configurable": {"thread_id": "test_chat"}},
+            )
 
         # Should return AIMessage with tool_calls
         assert isinstance(result, AIMessage)
@@ -252,7 +275,10 @@ class TestClaudeCodeChatModelToolCalls:
         with patch.object(
             model.client_manager, "get_or_create_client", return_value=(mock_client, mock_proxy)
         ):
-            result = await model.ainvoke([HumanMessage(content="Do multiple things")])
+            result = await model.ainvoke(
+                [HumanMessage(content="Do multiple things")],
+                config={"configurable": {"thread_id": "test_chat"}},
+            )
 
         # Should return both tool calls
         assert isinstance(result, AIMessage)
@@ -304,13 +330,16 @@ class TestClaudeCodeChatModelToolResults:
         with patch.object(
             model.client_manager, "get_or_create_client", return_value=(mock_client, mock_proxy)
         ):
-            result = await model.ainvoke(messages)
+            result = await model.ainvoke(
+                messages,
+                config={"configurable": {"thread_id": "test_chat"}},
+            )
 
-        # Should have called resolve_call
-        mock_proxy.resolve_call.assert_called_once()
-        call_args = mock_proxy.resolve_call.call_args[0]
-        assert call_args[0] == "call_1"  # call_id
-        assert "content" in call_args[1]  # MCP result
+        # ⚠️ PROXY ARCHITECTURE: ToolMessage resolved via resolve_call, NOT query
+        # This returns tool result to Claude via MCP Future proxy.
+        mock_proxy.resolve_call.assert_called_once_with("call_1", {
+            "content": [{"type": "text", "text": "8"}],
+        })
 
         # Should return final answer
         assert isinstance(result, AIMessage)
@@ -340,7 +369,10 @@ class TestClaudeCodeChatModelMessageConversion:
         with patch.object(
             model.client_manager, "get_or_create_client", return_value=(mock_client, mock_proxy)
         ):
-            await model.ainvoke([HumanMessage(content="Test message")])
+            await model.ainvoke(
+                [HumanMessage(content="Test message")],
+                config={"configurable": {"thread_id": "test_chat"}},
+            )
 
         # Check that query was called with proper format
         mock_client.query.assert_called_once()
@@ -377,7 +409,11 @@ class TestClaudeCodeChatModelMessageConversion:
         with patch.object(
             model.client_manager, "get_or_create_client", return_value=(mock_client, mock_proxy)
         ):
-            await model.ainvoke(messages)
+            await model.ainvoke(
+                messages,
+                config={"configurable": {"thread_id": "test_chat"}},
+            )
 
-        # Should have resolved tool call (not re-sent AIMessage)
+        # ⚠️ PROXY: ToolMessage resolved via resolve_call, NOT query
         mock_proxy.resolve_call.assert_called_once()
+        # query called only for HumanMessage, NOT for ToolMessage

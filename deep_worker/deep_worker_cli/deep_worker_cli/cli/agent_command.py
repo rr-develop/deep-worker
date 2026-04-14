@@ -12,6 +12,204 @@ from deep_worker_cli.agent_config_pkg.agent_config import AgentConfig
 from deep_worker_cli.process.agent_process import AgentProcess
 
 
+# ---------------------------------------------------------------------------
+# Restart helpers
+# ---------------------------------------------------------------------------
+
+# Argparse defaults for detecting explicit CLI overrides.
+# Must match the defaults in create_parser().
+_PARSER_DEFAULTS = {
+    "provider": "deepseek",
+    "model": None,
+    "dir": None,
+    "skip_permissions": False,
+    "task_manager": False,
+    "clean": False,
+    "memory_only": False,
+    "use_sqlite": False,
+}
+
+
+def _get_agent_data_dir(name: str) -> Path:
+    """Return the data directory for an agent."""
+    return Path("~/.deep_worker").expanduser() / name
+
+
+def load_launch_config(name: str) -> dict | None:
+    """Load launch_config from session_metadata.json.
+
+    Returns:
+        The launch_config dict, or None if not available.
+    """
+    data_dir = _get_agent_data_dir(name)
+    metadata_file = data_dir / "session_metadata.json"
+
+    if not metadata_file.exists():
+        return None
+
+    try:
+        data = json.loads(metadata_file.read_text())
+        return data.get("launch_config")
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def merge_restart_config(
+    saved: dict,
+    args: argparse.Namespace,
+) -> argparse.Namespace:
+    """Merge saved launch_config with CLI args.
+
+    Saved values are used as defaults.  Any CLI flag that differs from
+    the argparse parser default is treated as an explicit override.
+
+    ``--clean`` is NEVER inherited from saved config.
+
+    Args:
+        saved: The launch_config dict from session_metadata.json.
+        args: Parsed CLI arguments (may contain overrides).
+
+    Returns:
+        New argparse.Namespace with effective values.
+    """
+    effective = argparse.Namespace(**vars(args))
+
+    # Apply saved values as defaults
+    effective.provider = saved.get("provider", _PARSER_DEFAULTS["provider"])
+    effective.model = saved.get("model", _PARSER_DEFAULTS["model"])
+    effective.dir = Path(saved["working_dir"]) if saved.get("working_dir") else _PARSER_DEFAULTS["dir"]
+    effective.skip_permissions = saved.get("skip_permissions", False)
+    effective.task_manager = saved.get("task_manager", False)
+    effective.memory_only = saved.get("memory_only", False)
+    effective.use_sqlite = saved.get("use_sqlite", False)
+    effective.clean = False  # NEVER inherit --clean
+
+    # Override with explicitly provided CLI args
+    if args.provider != _PARSER_DEFAULTS["provider"]:
+        effective.provider = args.provider
+    if args.model is not _PARSER_DEFAULTS["model"]:
+        effective.model = args.model
+    if args.dir is not _PARSER_DEFAULTS["dir"]:
+        effective.dir = args.dir
+    if args.skip_permissions != _PARSER_DEFAULTS["skip_permissions"]:
+        effective.skip_permissions = args.skip_permissions
+    if args.task_manager != _PARSER_DEFAULTS["task_manager"]:
+        effective.task_manager = args.task_manager
+    if args.clean != _PARSER_DEFAULTS["clean"]:
+        effective.clean = args.clean
+    if args.memory_only != _PARSER_DEFAULTS["memory_only"]:
+        effective.memory_only = args.memory_only
+    if args.use_sqlite != _PARSER_DEFAULTS["use_sqlite"]:
+        effective.use_sqlite = args.use_sqlite
+
+    return effective
+
+
+def build_launch_config(args: argparse.Namespace) -> dict:
+    """Build a launch_config dict from effective argparse namespace.
+
+    Args:
+        args: Namespace with effective (merged) values.
+
+    Returns:
+        Dict suitable for storage in session_metadata.json.
+    """
+    from deep_worker_cli.config import get_default_model_name
+
+    model = args.model
+    if model is None:
+        model = get_default_model_name(args.provider) or "unknown"
+
+    working_dir = args.dir
+    if working_dir is None:
+        original_cwd = os.environ.get("DEEP_WORKER_ORIGINAL_CWD")
+        working_dir = Path(original_cwd) if original_cwd else Path.cwd()
+
+    return {
+        "provider": args.provider,
+        "model": model,
+        "working_dir": str(working_dir),
+        "skip_permissions": args.skip_permissions,
+        "task_manager": args.task_manager,
+        "memory_only": args.memory_only,
+        "use_sqlite": args.use_sqlite,
+        "clean": args.clean,
+        "started_at": datetime.now().isoformat(),
+        "pid": os.getpid(),
+        "cli_args": " ".join(sys.argv[1:]),
+    }
+
+
+async def restart_agent(args: argparse.Namespace) -> int:
+    """Handle --restart command.
+
+    Loads saved launch_config, merges with CLI overrides,
+    stops running agent if needed, then launches.
+
+    Args:
+        args: Parsed command-line arguments.
+
+    Returns:
+        Exit code (0 success, 1 error).
+    """
+    from deep_worker_cli.process.agent_stop import stop_agent
+    from deep_worker_cli.process.registry import ProcessRegistry
+
+    name = args.name
+    if not name:
+        print("Error: Agent name is required with --restart", file=sys.stderr)
+        return 1
+
+    # 1. Load saved config
+    saved = load_launch_config(name)
+    if saved is None:
+        print(
+            f"Error: Cannot restart agent '{name}' — no previous launch configuration found.\n"
+            f"Start the agent normally first:  deep-worker {name} --provider ... --model ...",
+            file=sys.stderr,
+        )
+        return 1
+
+    # 2. Merge with CLI overrides
+    effective = merge_restart_config(saved, args)
+
+    # 3. Stop running agent if needed
+    registry = ProcessRegistry()
+    existing = registry.lookup(name)
+    if existing:
+        try:
+            data_dir = _get_agent_data_dir(name)
+            await stop_agent(name, registry, data_dir=data_dir)
+        except RuntimeError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 1
+        except TimeoutError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 1
+
+    # 4. Handle --clean flag (if explicitly passed)
+    if effective.clean:
+        from deep_worker_cli.sessions import clean_agent_history
+        try:
+            await clean_agent_history(name)
+        except Exception as e:
+            print(f"Error cleaning agent history: {e}", file=sys.stderr)
+            return 1
+
+    # 5. Apply effective args and delegate to run_agent
+    # Copy effective values back into args for run_agent()
+    args.provider = effective.provider
+    args.model = effective.model
+    args.dir = effective.dir
+    args.skip_permissions = effective.skip_permissions
+    args.task_manager = effective.task_manager
+    args.memory_only = effective.memory_only
+    args.use_sqlite = effective.use_sqlite
+    args.clean = False  # Already handled above if needed
+
+    return await run_agent(args)
+
+
 def create_parser() -> argparse.ArgumentParser:
     """Create argument parser for deep-worker command.
 
@@ -75,6 +273,14 @@ def create_parser() -> argparse.ArgumentParser:
         "--clean",
         action="store_true",
         help="Clean all history and state before starting (agent must not be running)",
+    )
+
+    parser.add_argument(
+        "--restart",
+        action="store_true",
+        help="Restart agent with parameters from previous launch. "
+             "Additional options override saved values. "
+             "--clean is NOT inherited; pass it explicitly if needed.",
     )
 
     parser.add_argument(
@@ -197,6 +403,23 @@ async def run_agent(args: argparse.Namespace) -> int:
                 provider=args.provider,
             )
 
+        # Build launch_config for persistent storage
+        # This dict is saved to ~/.deep_worker/{name}/session_metadata.json
+        # so that launch parameters survive process termination.
+        launch_config = {
+            "provider": config.provider,
+            "model": config.resolved_model,
+            "working_dir": str(config.working_dir),
+            "skip_permissions": args.skip_permissions,
+            "task_manager": args.task_manager,
+            "memory_only": args.memory_only,
+            "use_sqlite": args.use_sqlite,
+            "clean": getattr(args, "clean", False),
+            "started_at": datetime.now().isoformat(),
+            "pid": os.getpid(),
+            "cli_args": " ".join(sys.argv[1:]),
+        }
+
         # Create and start agent
         agent = AgentProcess(
             name=args.name,
@@ -205,6 +428,7 @@ async def run_agent(args: argparse.Namespace) -> int:
             enable_task_manager=args.task_manager,
             memory_only=args.memory_only,
             use_sqlite=args.use_sqlite,
+            launch_config=launch_config,
         )
 
         try:
@@ -237,7 +461,7 @@ def daemonize(name: str, log_dir: Path | None = None) -> None:
     """
     # Set up log directory
     if log_dir is None:
-        log_dir = Path("~/.deep_worker/logs").expanduser()
+        log_dir = Path("~/.deep_worker").expanduser() / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
 
     # Log file paths
@@ -512,6 +736,56 @@ def main() -> int:
             file=sys.stderr
         )
         return 1
+
+    # Handle --restart option
+    if getattr(args, "restart", False):
+        # Pre-flight checks BEFORE daemonize (so errors are visible in terminal)
+        saved = load_launch_config(args.name)
+        if saved is None:
+            print(
+                f"Error: Cannot restart agent '{args.name}' — no previous launch configuration found.\n"
+                f"Start the agent normally first:  deep-worker {args.name} --provider ... --model ...",
+                file=sys.stderr,
+            )
+            return 1
+
+        # Check if running agent can be stopped
+        from deep_worker_cli.process.registry import ProcessRegistry
+        from deep_worker_cli.process.agent_stop import stop_agent as _stop_agent, _read_agent_status
+
+        registry = ProcessRegistry()
+        existing = registry.lookup(args.name)
+        if existing:
+            data_dir = _get_agent_data_dir(args.name)
+            status = _read_agent_status(data_dir)
+            if status == "running":
+                print(
+                    f"Error: Cannot restart agent '{args.name}' — it is actively running (status: running).\n"
+                    f"Wait for it to finish or interrupt it first.",
+                    file=sys.stderr,
+                )
+                return 1
+
+        # Validate registry writable
+        validation = registry.validate_writable()
+        if not validation["writable"]:
+            print(f"ERROR: Cannot start agent - registry file is not writable", file=sys.stderr)
+            print(f"  {validation['error']}", file=sys.stderr)
+            return 1
+        if validation.get("fixed"):
+            print(f"✓ Fixed registry file ownership")
+
+        # Save CWD before daemonize changes it
+        effective = merge_restart_config(saved, args)
+        if effective.dir:
+            os.environ["DEEP_WORKER_ORIGINAL_CWD"] = str(Path(effective.dir).resolve())
+        elif "DEEP_WORKER_ORIGINAL_CWD" not in os.environ:
+            os.environ["DEEP_WORKER_ORIGINAL_CWD"] = os.getcwd()
+
+        daemonize(args.name)
+
+        # After daemonize: stop running agent (if any), then launch
+        return asyncio.run(restart_agent(args))
 
     # Handle --clean flag BEFORE daemonization
     if args.clean:

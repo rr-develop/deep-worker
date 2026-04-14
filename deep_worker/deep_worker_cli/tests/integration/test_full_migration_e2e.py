@@ -15,6 +15,12 @@ from pathlib import Path
 
 import pytest
 
+# Add the local rpyc_async source checkout to path
+_rpyc_async_path = Path("rpyc_async")
+if str(_rpyc_async_path) not in sys.path:
+    sys.path.insert(0, str(_rpyc_async_path))
+
+
 @pytest.mark.asyncio
 async def test_full_migration_agent_to_client():
     """Test full cycle: AgentProcess (AsyncioServer) → AgentClient (native rpyc)."""
@@ -74,6 +80,7 @@ async def test_full_migration_agent_to_client():
             # Shutdown agent
             await agent.shutdown()
 
+
 @pytest.mark.asyncio
 async def test_migration_performance_simple():
     """Simple performance test to verify AsyncioServer is faster."""
@@ -112,7 +119,7 @@ async def test_migration_performance_simple():
                 elapsed = time.perf_counter() - start
 
                 # AsyncioServer should be fast (< 1 second for 10 calls)
-                # Previously with ThreadedServer + arpyc: ~3+ seconds
+                # Previously with ThreadedServer: ~3+ seconds
                 assert elapsed < 5.0, f"Too slow: {elapsed:.2f}s for 10 calls"
 
                 print(f"✅ 10 get_status calls: {elapsed:.2f}s ({elapsed*100:.0f}ms avg)")

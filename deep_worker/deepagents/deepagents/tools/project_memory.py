@@ -30,6 +30,7 @@ def project_memory(
     query: str,
     top_k: int = 5,
     runtime: Any = None,
+    working_dir: str | None = None,
 ) -> str:
     """Recall relevant knowledge from the project's codebase.
 
@@ -50,7 +51,9 @@ def project_memory(
                - "Where is the HTTP client configured?"
                - "Find async database query examples"
         top_k: Number of results to return (default: 5, max: 20).
-        runtime: Tool runtime context (injected automatically).
+        runtime: Tool runtime context (injected automatically by LangGraph).
+        working_dir: Working directory override (used by MCP direct execution
+                     when runtime is not available).
 
     Returns:
         Formatted search results with file paths and code excerpts,
@@ -69,17 +72,15 @@ def project_memory(
             config: IndexConfig | None = None,
             ...
     """
-    if runtime is None:
-        return "Error: project_memory tool requires runtime context"
-
-    # Determine working directory from runtime state
-    # ProjectMemoryMiddleware sets this when registering the tool
-    working_dir_value = runtime.state.get("working_dir")
-    if working_dir_value is None:
-        # Fallback to Path.cwd() if not in state
-        working_dir = Path.cwd()
+    # Determine working directory: runtime state > working_dir kwarg > cwd
+    resolved_dir: Path
+    if runtime is not None:
+        working_dir_value = runtime.state.get("working_dir")
+        resolved_dir = Path(working_dir_value) if working_dir_value else Path.cwd()
+    elif working_dir is not None:
+        resolved_dir = Path(working_dir)
     else:
-        working_dir = Path(working_dir_value)
+        resolved_dir = Path.cwd()
 
     # Validate top_k
     if not 1 <= top_k <= 20:
@@ -87,11 +88,11 @@ def project_memory(
 
     # Execute search
     try:
-        results = search(query, repo_path=working_dir, top_k=top_k)
+        results = search(query, repo_path=resolved_dir, top_k=top_k)
     except IndexNotFoundError:
         return (
             f"Error: Project memory not available.\n"
-            f"The directory '{working_dir}' does not have a semantic search index.\n"
+            f"The directory '{resolved_dir}' does not have a semantic search index.\n"
             f"This usually means the index was not created or is corrupted."
         )
     except Exception as exc:  # noqa: BLE001

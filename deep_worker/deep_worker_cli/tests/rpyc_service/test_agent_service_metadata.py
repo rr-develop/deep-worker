@@ -79,6 +79,81 @@ class TestAgentServiceMetadata:
         assert result["metadata"]["rpyc_port"] == 18861
 
 
+class TestAgentServiceMetadataProvider:
+    """Tests for provider field in exposed_get_metadata()."""
+
+    @pytest.mark.asyncio
+    async def test_metadata_includes_provider(self):
+        """Test that metadata includes provider from config."""
+        import json
+
+        service = AgentService()
+        mock_agent = Mock()
+        mock_agent.started_at = datetime(2024, 1, 15, 10, 30, 0)
+        mock_agent.rpyc_port = 18861
+
+        mock_config = Mock()
+        mock_config.model = "deepseek-chat"
+        mock_config.provider = "deepseek"
+        mock_config.resolved_model = "deepseek-chat"
+        mock_config.working_dir = "/test/dir"
+        mock_agent.config = mock_config
+
+        service._agent_process = mock_agent
+
+        result_str = await service.exposed_get_metadata()
+        result = json.loads(result_str)
+
+        assert result["success"] is True
+        assert result["metadata"]["provider"] == "deepseek"
+        assert result["metadata"]["model"] == "deepseek-chat"
+
+    @pytest.mark.asyncio
+    async def test_metadata_provider_none_when_no_config(self):
+        """Test that provider is None when config is absent."""
+        import json
+
+        service = AgentService()
+        mock_agent = Mock()
+        mock_agent.started_at = datetime(2024, 1, 15, 10, 30, 0)
+        mock_agent.rpyc_port = 18861
+        mock_agent.config = None
+
+        service._agent_process = mock_agent
+
+        result_str = await service.exposed_get_metadata()
+        result = json.loads(result_str)
+
+        assert result["success"] is True
+        assert result["metadata"]["provider"] is None
+
+    @pytest.mark.asyncio
+    async def test_metadata_returns_resolved_model_when_none(self):
+        """When config.model is None, metadata should return the provider default."""
+        import json
+
+        service = AgentService()
+        mock_agent = Mock()
+        mock_agent.started_at = datetime(2024, 1, 15, 10, 30, 0)
+        mock_agent.rpyc_port = 18861
+
+        mock_config = Mock()
+        mock_config.model = None
+        mock_config.provider = "deepseek"
+        mock_config.working_dir = "/test/dir"
+        # resolved_model property should return "deepseek-chat"
+        mock_config.resolved_model = "deepseek-chat"
+        mock_agent.config = mock_config
+
+        service._agent_process = mock_agent
+
+        result_str = await service.exposed_get_metadata()
+        result = json.loads(result_str)
+
+        assert result["success"] is True
+        assert result["metadata"]["model"] == "deepseek-chat"
+
+
 class TestAgentServiceShutdown:
     """Tests for exposed_shutdown() method."""
 

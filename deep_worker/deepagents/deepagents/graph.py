@@ -280,4 +280,7 @@ def create_deep_agent(
         debug=debug,
         name=name,
         cache=cache,
-    ).with_config({"recursion_limit": 1000})
+    )
+    # NOTE: No recursion_limit. Agents must run without any step limits.
+    # recursion_limit is STRICTLY FORBIDDEN — causes GraphRecursionError
+    # on long-running tasks with many tool calls.

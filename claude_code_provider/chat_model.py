@@ -102,6 +102,9 @@ class ClaudeCodeChatModel(BaseChatModel):
     _base_options: Any = PrivateAttr(default=None)
     _client_manager: Any = PrivateAttr(default=None)
     _tools_metadata: list[ToolMetadata] = PrivateAttr(default_factory=list)
+    # ⚠️ NO _tool_executors! Tools execute via LangGraph ToolNode.
+    # See ProxyMCPServer module docstring for architecture explanation.
+    _working_dir: str | None = PrivateAttr(default=None)
 
     # Properties for backward compatibility with existing code
     @property
@@ -279,21 +282,56 @@ class ClaudeCodeChatModel(BaseChatModel):
 
             tool: BaseTool = tool_item
 
-            # Get schema using Pydantic V2 method if available
-            # Wrap in try/except to handle tools with callable fields
+            # Get schema — try Pydantic first, fallback to function signature
             schema = {}
             if tool.args_schema:
                 try:
-                    if hasattr(tool.args_schema, "model_json_schema") and callable(
-                        getattr(tool.args_schema, "model_json_schema")
-                    ):
-                        schema = tool.args_schema.model_json_schema()  # type: ignore[attr-defined]
-                    elif hasattr(tool.args_schema, "schema") and callable(getattr(tool.args_schema, "schema")):
-                        schema = tool.args_schema.schema()  # type: ignore[attr-defined]
+                    if hasattr(tool.args_schema, "model_json_schema"):
+                        schema = tool.args_schema.model_json_schema()
+                    elif hasattr(tool.args_schema, "schema"):
+                        schema = tool.args_schema.schema()
                 except Exception:
-                    # If schema generation fails (e.g., due to callable fields),
-                    # use empty schema. Claude will infer the tool signature.
                     schema = {}
+
+            # If Pydantic schema failed (empty properties or missing), build
+            # from function signature. This handles StructuredTool.from_function
+            # tools that use ToolRuntime (causes CallableSchema error).
+            if not schema.get("properties"):
+                import inspect
+                func = getattr(tool, 'coroutine', None) or getattr(tool, 'func', None)
+                if func:
+                    try:
+                        sig = inspect.signature(func)
+                        props = {}
+                        required = []
+                        for pname, param in sig.parameters.items():
+                            if pname in ('runtime', 'self', 'kwargs'):
+                                continue
+                            ann = param.annotation
+                            if ann == int:
+                                ptype = "integer"
+                            elif ann == bool:
+                                ptype = "boolean"
+                            elif ann == float:
+                                ptype = "number"
+                            else:
+                                ptype = "string"
+                            p: dict[str, Any] = {"type": ptype, "title": pname.replace('_', ' ').title()}
+                            # Extract description from Annotated metadata
+                            if hasattr(ann, '__metadata__'):
+                                for meta in ann.__metadata__:
+                                    if isinstance(meta, str):
+                                        p["description"] = meta
+                                        break
+                            if param.default != inspect.Parameter.empty:
+                                p["default"] = param.default
+                            else:
+                                required.append(pname)
+                            props[pname] = p
+                        if props:
+                            schema = {"type": "object", "properties": props, "required": required}
+                    except (ValueError, TypeError):
+                        pass
 
             metadata: ToolMetadata = {
                 "name": tool.name,
@@ -302,11 +340,23 @@ class ClaudeCodeChatModel(BaseChatModel):
             }
             tools_metadata.append(metadata)
 
+        # ⚠️ NO tool_executors! Tools execute via LangGraph ToolNode, not MCP handler.
+        # ProxyMCPServer uses Future-based proxy — handler blocks until LangGraph
+        # executes tool and calls resolve_call(). This keeps tool calls visible
+        # in result.messages for dwcli broadcast, checkpointing, and HITL.
+
         # Create new instance with tools
         new_model = ClaudeCodeChatModel(base_options=self._base_options)
         new_model._tools_metadata = tools_metadata
+        new_model._working_dir = self._working_dir
 
         return new_model
+
+    # ⚠️ No executor factory methods here!
+    # Tools execute via LangGraph ToolNode (which handles ToolRuntime injection,
+    # InjectedToolCallId, working_dir, etc. automatically).
+    # ProxyMCPServer Future-based proxy returns tool calls to LangGraph.
+    # See DESIGN_restore_proxy_architecture.md for architecture details.
 
     async def ainvoke(
         self,
@@ -348,13 +398,38 @@ class ClaudeCodeChatModel(BaseChatModel):
             messages = list(input)  # type: ignore[arg-type]
 
         # 2. Extract thread_id from config
-        thread_id = "default"
-        if config and "configurable" in config:
-            thread_id = config["configurable"].get("thread_id", "default")
+        # First, pull config from LangGraph context variable if available.
+        # When LangGraph calls model.ainvoke(messages) from within a graph node,
+        # it sets var_child_runnable_config with the parent's config (including thread_id).
+        from langchain_core.runnables.config import ensure_config
+        config = ensure_config(config)
+
+        # ⚠️ MANDATORY: thread_id MUST be explicitly provided in every call.
+        # ClaudeCodeChatModel is STATEFUL — each thread_id maps to a separate
+        # Claude SDK session with its own sent_count and message history.
+        #
+        # DO NOT add a fallback to "default" or any other hardcoded value!
+        # A shared thread_id between main agent and subagent causes:
+        #   1. sent_count corruption (subagent overwrites main agent's count)
+        #   2. Message re-sending (main agent resends already-seen messages)
+        #   3. Claude SDK deadlock (inconsistent session state → hang)
+        #
+        # Every caller MUST explicitly provide its own thread_id.
+        # If thread_id is missing, the caller has a configuration bug — fail loudly.
+        if "configurable" not in config or "thread_id" not in config.get("configurable", {}):
+            raise ValueError(
+                "ClaudeCodeChatModel requires explicit thread_id in config. "
+                "Pass config={'configurable': {'thread_id': '...'}}. "
+                "Each caller (main agent, subagent, TaskManager) must have its own thread_id. "
+                "Implicit defaults are forbidden to prevent session state corruption."
+            )
+        thread_id = config["configurable"]["thread_id"]
 
         # 3. Get or create client for this thread
         client, proxy_mcp = await self._client_manager.get_or_create_client(
-            thread_id=thread_id, tools_metadata=self._tools_metadata
+            thread_id=thread_id,
+            tools_metadata=self._tools_metadata,
+            working_dir=self._working_dir,
         )
 
         # 4. Determine how many messages have already been sent
@@ -427,11 +502,16 @@ class ClaudeCodeChatModel(BaseChatModel):
                 user_message_sent = True
 
             elif isinstance(msg, ToolMessage):
-                # Resolve pending tool call with result
+                # ⚠️ PROXY ARCHITECTURE: resolve pending MCP Future with tool result.
+                # LangGraph executed the tool via ToolNode and returned ToolMessage.
+                # We resolve the Future so the MCP handler returns result to Claude CLI.
+                # DO NOT use client.query() here — that sends result as user message,
+                # bypassing the MCP protocol and breaking the proxy.
+                from claude_code_provider.custom_types import MCPResult
                 mcp_result: MCPResult = {
                     "content": [{"type": "text", "text": str(msg.content)}],
-                    "is_error": False,
                 }
+                print(f"[DEBUG ainvoke] resolve_call for tool_call_id={msg.tool_call_id}", file=sys.stderr)
                 proxy_mcp.resolve_call(msg.tool_call_id, mcp_result)
                 tool_resolved = True
 
@@ -448,72 +528,85 @@ class ClaudeCodeChatModel(BaseChatModel):
 
         # 8. Receive response from Claude (if user message sent OR tool was resolved)
         response_text = ""
+        got_tool_use = False
 
         print(f"[DEBUG ainvoke] user_message_sent={user_message_sent}, tool_resolved={tool_resolved}", file=sys.stderr)
 
         if user_message_sent or tool_resolved:
-            # User message was sent or tool result provided, Claude will respond
-            print(f"[DEBUG ainvoke] Calling client.receive_response()...", file=sys.stderr)
+            print(f"[DEBUG ainvoke] Calling client.receive_response() [EVENT-BASED]...", file=sys.stderr)
 
-            # CRITICAL: receive_response() blocks when Claude calls MCP tools!
-            # We need to poll for pending_calls in parallel to detect tool invocations
-            async def collect_response_events():
-                """Collect events from receive_response()."""
-                events = []
-                async for event in client.receive_response():
-                    events.append(event)
-                    if isinstance(event, ClaudeAssistantMessage):
-                        # Extract text from AssistantMessage content blocks
-                        from claude_agent_sdk import TextBlock
+            # ═══════════════════════════════════════════════════════════════
+            # PROXY ARCHITECTURE: receive_response with ToolUseBlock break
+            # ═══════════════════════════════════════════════════════════════
+            # Claude SDK sends AssistantMessage(ToolUseBlock) BEFORE tool
+            # execution. We break on ToolUseBlock to return tool_calls to
+            # LangGraph. LangGraph executes tools via ToolNode, sends
+            # ToolMessage back, and we resolve the MCP Future.
+            #
+            # DO NOT wait for ResultMessage when ToolUseBlock is present!
+            # Claude CLI waits for MCP handler to return result before
+            # sending ResultMessage. If we wait → circular dependency:
+            #   receive_response waits for ResultMessage
+            #   → Claude waits for tool result
+            #   → MCP handler waits for resolve_call
+            #   → resolve_call happens after receive_response
+            #   → DEADLOCK
+            # ═══════════════════════════════════════════════════════════════
+            from claude_agent_sdk import TextBlock, ToolUseBlock
 
-                        for block in event.content:
-                            if isinstance(block, TextBlock):
-                                print(f"[DEBUG ainvoke] Received TextBlock: '{block.text[:80]}'", file=sys.stderr)
+            got_tool_use = False
 
-                    elif isinstance(event, ResultMessage):
-                        print(f"[DEBUG ainvoke] Received ResultMessage", file=sys.stderr)
-                        break
-                return events
+            async for event in client.receive_response():
+                if isinstance(event, ClaudeAssistantMessage):
+                    for block in event.content:
+                        if isinstance(block, TextBlock):
+                            response_text += block.text
+                            print(f"[DEBUG ainvoke] Received TextBlock: '{block.text[:80]}'", file=sys.stderr)
+                        elif isinstance(block, ToolUseBlock):
+                            got_tool_use = True
+                            print(f"[DEBUG ainvoke] Received ToolUseBlock: {block.name}", file=sys.stderr)
 
-            async def poll_for_tool_calls():
-                """Poll for pending tool calls."""
-                while True:
-                    await asyncio.sleep(0.05)  # Poll every 50ms
-                    if proxy_mcp.has_pending_calls():
-                        print(f"[DEBUG ainvoke] Detected pending tool call!", file=sys.stderr)
-                        return True
+                    if got_tool_use:
+                        # ToolUseBlock detected. Need to determine if this is:
+                        # A) MCP tool (our proxy) — must break for LangGraph
+                        # B) Built-in Claude tool — Claude handles internally
+                        #
+                        # Check: yield control multiple times so MCP handler task
+                        # (spawned by Claude SDK via asyncio.create_task) can
+                        # receive the control_request and populate pending_calls.
+                        # The control_request may arrive AFTER ToolUseBlock in
+                        # the message stream because they go through different
+                        # channels (messages vs control protocol).
+                        import asyncio
+                        for _ in range(10):  # Up to 10ms
+                            await asyncio.sleep(0.001)
+                            if proxy_mcp.has_pending_calls():
+                                break
 
-            # Race between receiving response and detecting tool calls
-            collect_task = asyncio.create_task(collect_response_events())
-            poll_task = asyncio.create_task(poll_for_tool_calls())
+                        if proxy_mcp.has_pending_calls():
+                            # ⚠️ MCP tool — break to return tool_calls to LangGraph!
+                            # Claude CLI waits for MCP handler to return result.
+                            # We MUST break here to avoid circular dependency.
+                            print(f"[DEBUG ainvoke] MCP tool detected — breaking for LangGraph", file=sys.stderr)
+                            break
+                        else:
+                            # Built-in Claude tool (ToolSearch, WebSearch, etc.) —
+                            # Claude CLI handles execution internally.
+                            # Continue receiving — ResultMessage will come.
+                            print(f"[DEBUG ainvoke] Built-in tool — continuing receive_response", file=sys.stderr)
+                            got_tool_use = False  # Reset for next potential tool
 
-            done, pending = await asyncio.wait(
-                {collect_task, poll_task},
-                return_when=asyncio.FIRST_COMPLETED
-            )
+                elif isinstance(event, ResultMessage):
+                    print(f"[DEBUG ainvoke] Received ResultMessage", file=sys.stderr)
+                    break
 
-            # Cancel pending tasks
-            for task in pending:
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-
-            # If polling detected tool calls first, we have pending calls
-            if poll_task in done:
-                print(f"[DEBUG ainvoke] Tool call detected first, breaking out", file=sys.stderr)
-            else:
-                # Response completed normally, extract text
-                events = await collect_task
-                from claude_agent_sdk import TextBlock
-                for event in events:
-                    if isinstance(event, ClaudeAssistantMessage):
-                        for block in event.content:
-                            if isinstance(block, TextBlock):
-                                response_text += block.text
-
-        # 9. Check for pending tool calls
+        # 9. Check for pending tool calls from MCP proxy.
+        # After breaking on ToolUseBlock, the MCP handler task (spawned by
+        # Claude SDK via asyncio.create_task) may not have populated
+        # pending_calls yet. Yield control to let the task run.
+        import asyncio
+        if not proxy_mcp.has_pending_calls() and got_tool_use:
+            await asyncio.sleep(0)  # Yield to let MCP handler task create Future
         if proxy_mcp.has_pending_calls():
             pending = proxy_mcp.get_pending_calls()
             # Convert to LangChain tool_calls format
@@ -530,7 +623,9 @@ class ClaudeCodeChatModel(BaseChatModel):
             sys.stderr.write(msg)
             sys.stderr.flush()
 
-            return AIMessage(content="", tool_calls=tool_calls)
+            # IMPORTANT: Include response_text with tool_calls
+            # This ensures Claude's explanation/reasoning is not lost
+            return AIMessage(content=response_text, tool_calls=tool_calls)
 
         # 10. Return final answer
         print(f"[DEBUG ainvoke] Returning AIMessage with content: '{response_text[:80]}'", file=sys.stderr)

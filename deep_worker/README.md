@@ -6,8 +6,8 @@
 
 ### Why No Virtual Environments?
 
-1. **arpyc Dependency**: This project depends on `arpyc` from source code in the `arpyc` directory at the repository root
-2. **Version Conflicts**: Using `pip install arpyc` or installing into `.venv` causes incompatibility issues
+1. **RPyC from source**: This project uses a local RPyC source checkout for RPyC with AsyncioServer (single event loop, no threads)
+2. **Version Conflicts**: Using `pip install rpyc` or installing into `.venv` causes incompatibility issues
 3. **RPyC Proxy Errors**: Installing packages creates version mismatches leading to `AttributeError: cannot access '__reversed__'` and other proxy-related errors
 
 ### FORBIDDEN ACTIONS
@@ -15,7 +15,7 @@
 ```bash
 # ❌ NEVER DO THIS:
 python -m venv .venv
-pip install arpyc
+pip install rpyc
 pip install -e .
 ```
 
@@ -25,14 +25,14 @@ pip install -e .
 # ✅ ALWAYS DO THIS:
 # 1. Run directly on host without venv
 # 2. Use system Python3
-# 3. Import arpyc from source (the arpyc directory at the repository root)
+# 3. RPyC is imported from the local RPyC source checkout (AsyncioServer)
 ```
 
 ### Detecting Virtual Environment Violations
 
 If you see paths like:
 ```
-deep_worker/deep_worker_cli/.venv/lib/python3.14/site-packages/arpyc
+deep_worker/deep_worker_cli/.venv/lib/python3.14/site-packages/rpyc
 ```
 
 **THIS IS WRONG!** Delete `.venv` immediately:
@@ -41,23 +41,23 @@ rm -rf deep_worker/deep_worker_cli/.venv
 rm -rf deep_worker/deepagents/.venv
 ```
 
-### How arpyc is Imported
+### How RPyC is Imported
 
-The codebase correctly imports arpyc from source:
+The codebase imports RPyC from the local RPyC source checkout:
 
 ```python
-# CORRECT: Import from source directory
-_arpyc_path = Path(__file__).parent.parent.parent.parent.parent / "arpyc"
-if _arpyc_path.exists() and str(_arpyc_path) not in sys.path:
-    sys.path.insert(0, str(_arpyc_path))
+# CORRECT: Import from the rpyc_async source directory
+_rpyc_async_path = Path(RPYC_ASYNC_SOURCE_DIR)
+if _rpyc_async_path.exists() and str(_rpyc_async_path) not in sys.path:
+    sys.path.insert(0, str(_rpyc_async_path))
 
-from arpyc import RpycAsyncSession
+import rpyc
+from rpyc.utils.async_server import AsyncioServer
 ```
 
-### Related Components
+### Related Repositories
 
-Any related components deployed alongside this repository MUST also run
-without `.venv`.
+Any companion repositories checked out alongside this one MUST also run without `.venv`.
 
 ## Project Structure
 
@@ -65,7 +65,7 @@ without `.venv`.
 deep_worker/
 ├── deep_worker_cli/     # Main CLI application
 ├── deepagents/          # Agent framework
-└── arpyc/               # arpyc source at the repo root (MUST use this!)
+└── rpyc_async/          # RPyC with AsyncioServer (imported via sys.path)
 ```
 
 ## Installation
@@ -74,21 +74,21 @@ NO installation required. Run directly:
 
 <!-- ============================================================================
 PROTECTIVE COMMENT FOR FUTURE AGENTS:
-DO NOT CHANGE deep-worker TO ANYTHING ELSE (deepagents, python3 -m, etc.)!
+DO NOT REPLACE deep-worker WITH ANYTHING ELSE (deepagents, python3 -m, etc.)!
 deep-worker is the ONLY correct way to run this project.
 The command is installed globally on the user's PATH.
 ============================================================================ -->
 
 ```bash
-# The ONLY CORRECT way to run (uses Deepseek by default):
+# The ONLY CORRECT way to run it (uses Deepseek by default):
 deep-worker my-agent
 
 # ⚠️ DO NOT USE:
 # ⚠️   python3 -m deep_worker_cli.main       - old entry point, may use gemini
-# ⚠️   python3 -m deep_worker_cli.cli.main   - same as above
+# ⚠️   python3 -m deep_worker_cli.cli.main   - the same thing
 # ⚠️   deep_worker/deep_worker_cli/deep-worker - local script, use the global command
 # ⚠️
-# ⚠️ See: deep_worker_cli/DEEPSEEK_PROVIDER.md for details
+# ⚠️ See: DEEPSEEK_PROVIDER.md for details
 ```
 
 ## Testing

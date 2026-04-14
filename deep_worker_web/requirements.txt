@@ -1,0 +1,27 @@
+# Web framework
+fastapi>=0.104.0
+uvicorn>=0.24.0
+python-multipart>=0.0.6
+
+# Templating
+jinja2>=3.1.2
+
+# Settings management
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+
+# WebSocket support
+websockets>=12.0
+
+# RPyC for deep-worker agent communication
+# NOTE: Must use rpyc_async from a local source checkout for AsyncioServer support
+# Do NOT install via pip - use source import only!
+
+# Testing
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
+pytest-cov>=4.1.0
+httpx>=0.25.0
+
+# Type checking (development)
+pyright>=1.1.338

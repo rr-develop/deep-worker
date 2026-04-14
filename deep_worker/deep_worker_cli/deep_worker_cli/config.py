@@ -286,8 +286,17 @@ COMMANDS = {
 # Maximum argument length for display
 MAX_ARG_LENGTH = 150
 
-# Agent configuration
-config: RunnableConfig = {"recursion_limit": 1000}
+# ============================================================================
+# CRITICAL: NO RECURSION LIMIT ON AGENTS!
+# ============================================================================
+# recursion_limit is STRICTLY FORBIDDEN. Agents must be able to perform
+# unlimited tool calls. Any limit causes GraphRecursionError crashes on
+# long-running tasks (e.g. mass file edits across hundreds of files).
+#
+# DO NOT add recursion_limit back. DO NOT set it to any value.
+# If LangGraph requires a value, it defaults to a safe internal default.
+# ============================================================================
+config: RunnableConfig = {}
 
 # Rich console instance
 console = Console(highlight=False)
@@ -395,7 +404,11 @@ def parse_shell_allow_list(allow_list_str: str | None) -> list[str] | None:
 # Sources: Official documentation from Anthropic, DeepSeek, OpenAI, Google
 
 PROVIDER_CONTEXT_LIMITS: dict[str, int] = {
-    # Anthropic Claude models
+    # Claude Code short names (used by claude-code provider)
+    "opus": 1_000_000,
+    "sonnet": 200_000,
+    "haiku": 200_000,
+    # Anthropic Claude models (full names)
     "claude-opus-4.6": 1_000_000,  # Requires anthropic-beta header
     "claude-sonnet-4.6": 1_000_000,  # Requires anthropic-beta header
     "claude-sonnet-4.5": 200_000,
@@ -1355,6 +1368,39 @@ def _detect_provider(model_name: str) -> str | None:
     return None
 
 
+# Provider → (env_var, hardcoded_default) mapping.
+# Single source of truth for default model names.
+_PROVIDER_DEFAULT_MODELS: dict[str, tuple[str | None, str]] = {
+    "deepseek": ("DEEPSEEK_MODEL", "deepseek-chat"),
+    "openai": ("OPENAI_MODEL", "gpt-5.2"),
+    "anthropic": ("ANTHROPIC_MODEL", "claude-sonnet-4-5-20250929"),
+    "google": ("GOOGLE_MODEL", "gemini-3-pro-preview"),
+    "vertexai": ("VERTEX_AI_MODEL", "gemini-3-pro-preview"),
+    "claude-code": (None, "sonnet"),
+}
+
+
+def get_default_model_name(provider: str) -> str | None:
+    """Get the default model name for a provider.
+
+    Checks environment variable first, then falls back to hardcoded default.
+    Returns None for unknown providers.
+
+    Args:
+        provider: Provider name (e.g. "deepseek", "openai", "anthropic")
+
+    Returns:
+        Default model name string, or None if provider is unknown.
+    """
+    entry = _PROVIDER_DEFAULT_MODELS.get(provider)
+    if entry is None:
+        return None
+    env_var, fallback = entry
+    if env_var:
+        return os.environ.get(env_var, fallback)
+    return fallback
+
+
 def create_model(
     model_name_override: str | None = None,
     *,
@@ -1409,18 +1455,7 @@ def create_model(
         # Provider is valid and has credentials (or doesn't need them)
         # If model_name is None, get from environment or use provider default
         if not model_name:
-            if provider == "deepseek":
-                model_name = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
-            elif provider == "openai":
-                model_name = os.environ.get("OPENAI_MODEL", "gpt-5.2")
-            elif provider == "anthropic":
-                model_name = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-5-20250929")
-            elif provider == "google":
-                model_name = os.environ.get("GOOGLE_MODEL", "gemini-3-pro-preview")
-            elif provider == "vertexai":
-                model_name = os.environ.get("VERTEX_AI_MODEL", "gemini-3-pro-preview")
-            elif provider == "claude-code":
-                model_name = "sonnet"  # Default Claude Code model
+            model_name = get_default_model_name(provider)
         # Continue with this provider and model_name
 
     # CASE 2: Only model_name provided (old behavior) - auto-detect provider
@@ -1487,13 +1522,13 @@ def create_model(
     # DO NOT CHANGE THE PROVIDER PRIORITY ORDER!
     # DO NOT REMOVE THE has_deepseek CHECK!
     #
-    # This code is used by the OLD main.py entry point (python3 -m deep_worker_cli.main)
+    # This code is used by the OLD entry point main.py (python3 -m deep_worker_cli.main)
     # which must NOT be used for testing or production!
     #
-    # The ONLY CORRECT way to start it:
-    # ✅ deep-worker [agent-name]  - the command is installed in ~/.local/bin/deep-worker
+    # The ONLY CORRECT way to run it:
+    # ✅ deep-worker [agent-name]  - the command is installed on the user's PATH
     #
-    # WRONG (DO NOT USE):
+    # INCORRECT (DO NOT USE):
     # ❌ python3 -m deep_worker_cli.main
     # ❌ python3 -m deep_worker_cli.cli.main
     #
@@ -1506,19 +1541,19 @@ def create_model(
     else:
         if settings.has_deepseek:
             provider = "deepseek"
-            model_name = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
+            model_name = get_default_model_name("deepseek")
         elif settings.has_openai:
             provider = "openai"
-            model_name = os.environ.get("OPENAI_MODEL", "gpt-5.2")
+            model_name = get_default_model_name("openai")
         elif settings.has_anthropic:
             provider = "anthropic"
-            model_name = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-5-20250929")
+            model_name = get_default_model_name("anthropic")
         elif settings.has_google:
             provider = "google"
-            model_name = os.environ.get("GOOGLE_MODEL", "gemini-3-pro-preview")
+            model_name = get_default_model_name("google")
         elif settings.has_vertex_ai:
             provider = "vertexai"
-            model_name = os.environ.get("VERTEX_AI_MODEL", "gemini-3-pro-preview")
+            model_name = get_default_model_name("vertexai")
         else:
             console.print("[bold red]Error:[/bold red] No credentials configured.")
             console.print("\nPlease set one of the following environment variables:")

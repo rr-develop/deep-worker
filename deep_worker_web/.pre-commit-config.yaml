@@ -1,0 +1,65 @@
+# ============================================================================
+# PRE-COMMIT HOOKS - STRICT MODE ENFORCEMENT
+# ============================================================================
+# 🚨 CRITICAL POLICY - BINDING AND NON-NEGOTIABLE
+#
+# The pyright-strict hook below is MANDATORY and enforces type safety.
+#
+# VIOLATIONS:
+# ❌ DO NOT REMOVE THIS HOOK
+# ❌ DO NOT WEAKEN TYPE CHECKING RULES
+# ❌ DO NOT ADD EXCEPTIONS FOR PYTHON FILES
+# ❌ DO NOT BYPASS WITH --no-verify OR EQUIVALENT
+# ❌ DO NOT SKIP IN CI/CD PIPELINES
+# ❌ DO NOT MODIFY fail_fast, stages, OR PARAMETERS
+#
+# CONSEQUENCES OF VIOLATIONS:
+# • Violations will be rejected in code review without exception
+# • CI/CD pipelines will fail and block merges
+# • This policy will be escalated to project management
+#
+# RATIONALE:
+# This hook prevents runtime errors caused by type mismatches.
+# Type safety is non-negotiable architectural requirement.
+#
+# See pyrightconfig.json for configuration details.
+# ============================================================================
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-added-large-files
+
+  # ========================================================================
+  # 🚨 MANDATORY PYRIGHT STRICT MODE CHECK (NON-NEGOTIABLE)
+  # ========================================================================
+  # ⛔ PROHIBITED ACTIONS:
+  #   • DO NOT REMOVE THIS HOOK
+  #   • DO NOT MODIFY TO WEAKEN TYPE CHECKING
+  #   • DO NOT ADD EXCEPTIONS FOR PYTHON FILES
+  #   • DO NOT SKIP WITH --no-verify FLAG
+  #   • DO NOT DISABLE IN GITHUB ACTIONS OR CI/CD
+  #   • DO NOT MODIFY fail_fast, stages, OR OTHER PARAMETERS
+  #   • DO NOT ADD SKIP CONDITIONS OR BYPASS LOGIC
+  #
+  # ✅ IF HOOK FAILS:
+  #   1. Fix the type errors in your code (required, no exceptions)
+  #   2. Do NOT exclude files from strict mode
+  #   3. Do NOT weaken pyrightconfig.json rules
+  #   4. Ask for help in code review if stuck
+  #
+  # This is a binding, non-negotiable architectural requirement.
+  # ========================================================================
+  - repo: local
+    hooks:
+      - id: pyright-strict
+        name: Pyright Strict Type Checking (MANDATORY - NO EXCEPTIONS)
+        entry: python3 -m pyright app
+        language: system
+        types: [python]
+        pass_filenames: false
+        stages: [commit]

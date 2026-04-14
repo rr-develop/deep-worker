@@ -17,13 +17,22 @@ class SessionManager:
     - Count messages
     - Persist metadata to disk
     - Track last activity timestamp
+    - Store launch_config (CLI args, provider, model, etc.) for post-mortem inspection
     """
 
-    def __init__(self, data_dir: Path):
+    def __init__(
+        self,
+        data_dir: Path,
+        launch_config: dict | None = None,
+    ):
         """Initialize the session manager.
 
         Args:
             data_dir: Directory for storing session data
+            launch_config: Optional dict with CLI launch parameters (provider, model,
+                working_dir, skip_permissions, task_manager, etc.). When provided,
+                it is persisted to session_metadata.json so that launch parameters
+                survive process termination and can be inspected later.
         """
         self.data_dir = data_dir
         self.metadata_file = data_dir / "session_metadata.json"
@@ -40,6 +49,15 @@ class SessionManager:
             self.message_count = 0
             self.error_message: str | None = None
             self.last_activity = datetime.now()
+            self.launch_config: dict | None = None
+
+        # If a new launch_config is provided, overwrite whatever was loaded
+        # (agent restarted with new parameters)
+        if launch_config is not None:
+            self.launch_config = launch_config
+
+        # Persist (writes launch_config if present)
+        if not self.metadata_file.exists() or launch_config is not None:
             self._persist_sync()
 
     async def set_status(self, status: AgentStatus) -> None:
@@ -80,8 +98,12 @@ class SessionManager:
         self.last_activity = datetime.now()
         await self._persist()
 
-    def _persist_sync(self) -> None:
-        """Persist metadata to disk synchronously (for initialization only)."""
+    def _build_metadata_dict(self) -> dict:
+        """Build the metadata dict for persistence.
+
+        Returns:
+            Dict with all session metadata including launch_config if present.
+        """
         metadata = {
             "status": self.status.value,
             "tasks_completed": self.tasks_completed,
@@ -89,6 +111,13 @@ class SessionManager:
             "error_message": self.error_message,
             "last_activity": self.last_activity.isoformat(),
         }
+        if self.launch_config is not None:
+            metadata["launch_config"] = self.launch_config
+        return metadata
+
+    def _persist_sync(self) -> None:
+        """Persist metadata to disk synchronously (for initialization only)."""
+        metadata = self._build_metadata_dict()
 
         # Write atomically using temp file
         temp_file = self.metadata_file.with_suffix(".tmp")
@@ -102,13 +131,7 @@ class SessionManager:
 
     async def _persist(self) -> None:
         """Persist metadata to disk asynchronously to avoid blocking event loop."""
-        metadata = {
-            "status": self.status.value,
-            "tasks_completed": self.tasks_completed,
-            "message_count": self.message_count,
-            "error_message": self.error_message,
-            "last_activity": self.last_activity.isoformat(),
-        }
+        metadata = self._build_metadata_dict()
 
         # Write atomically using temp file (run in thread pool to avoid blocking)
         temp_file = self.metadata_file.with_suffix(".tmp")
@@ -137,6 +160,8 @@ class SessionManager:
             self.last_activity = datetime.fromisoformat(
                 data.get("last_activity", datetime.now().isoformat())
             )
+            # Load launch_config if present (backward compatible — old files won't have it)
+            self.launch_config = data.get("launch_config")
         except (json.JSONDecodeError, OSError, ValueError):
             # If metadata is corrupted, start fresh
             self.status = AgentStatus.IDLE
@@ -144,4 +169,5 @@ class SessionManager:
             self.message_count = 0
             self.error_message = None
             self.last_activity = datetime.now()
+            self.launch_config = None
             self._persist_sync()

@@ -121,6 +121,7 @@ def tm_agent():
             "--dir", "/tmp",
             "--skip-permissions",
             "-tm",
+            "--use-sqlite",  # Force SQLite — pytest sets PYTEST_CURRENT_TEST → InMemorySaver
             "--model", "deepseek-chat",  # Use less capable model to trigger TM corrective prompts
         ],
         stdout=subprocess.PIPE,
@@ -445,7 +446,7 @@ def test_taskmanager_no_duplicate_messages():
 
     # Start agent with TaskManager in non-memory mode (writes to database)
     agent_process = subprocess.Popen(
-        ["deep-worker", agent_name, "--clean", "-sp", "-tm", "--dir", "/tmp"],
+        ["deep-worker", agent_name, "--clean", "-sp", "-tm", "--use-sqlite", "--dir", "/tmp"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )

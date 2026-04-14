@@ -1,0 +1,1131 @@
+// Deep-Worker-Web - Main JavaScript
+
+// State
+let ws = null;
+let selectedAgent = null;
+let agents = {};
+let selectedAgents = new Set(); // Multi-select for batch operations
+let pendingRequests = new Map(); // Request correlation for fire-and-forget
+let currentApprovalId = null;
+let autoApproveEnabled = false;
+
+// Generate UUID for request correlation
+function generateUUID() {
+    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+        const r = Math.random() * 16 | 0;
+        const v = c == 'x' ? r : (r & 0x3 | 0x8);
+        return v.toString(16);
+    });
+}
+
+// Initialize on page load
+document.addEventListener('DOMContentLoaded', () => {
+    console.log('Deep-Worker-Web starting...');
+    loadAgents();
+    connectWebSocket();
+    setupEventListeners();
+});
+
+// Load agents from API
+async function loadAgents() {
+    try {
+        const response = await fetch('/api/agents');
+        if (!response.ok) throw new Error('Failed to load agents');
+        
+        const agentList = await response.json();
+        console.log(`Loaded ${agentList.length} agents`);
+        
+        // Store in state
+        agentList.forEach(agent => {
+            agents[agent.name] = agent;
+        });
+        
+        renderAgentList();
+    } catch (error) {
+        console.error('Error loading agents:', error);
+        showError('Failed to load agents. Make sure agents are running.');
+    }
+}
+
+// Render agent list in UI
+function renderAgentList() {
+    const container = document.getElementById('agent-list');
+    
+    if (Object.keys(agents).length === 0) {
+        container.innerHTML = '<p class="loading">No agents running</p>';
+        return;
+    }
+    
+    container.innerHTML = '';
+    
+    for (const [name, agent] of Object.entries(agents)) {
+        const item = document.createElement('div');
+        item.className = 'agent-item';
+        if (selectedAgent === name) {
+            item.classList.add('selected');
+        }
+        
+        const statusClass = getStatusDotClass(agent.status);
+        const textClass = getStatusTextClass(agent.status);
+        const checked = selectedAgents.has(name) ? 'checked' : '';
+        item.innerHTML = `
+            <div class="agent-item-row">
+                <input type="checkbox" class="agent-checkbox" data-agent="${name}" ${checked}
+                       onclick="event.stopPropagation(); toggleAgentSelection('${name}', this.checked)">
+                <div class="agent-item-info" onclick="selectAgent('${name}')">
+                    <div class="agent-item-name">
+                        <span class="status-indicator ${statusClass}"></span>
+                        <strong>${name}</strong>
+                        <span class="${textClass}">[${agent.status}]</span>
+                    </div>
+                    <div class="agent-item-status">${agent.provider} / ${agent.model}</div>
+                </div>
+            </div>
+        `;
+        
+        container.appendChild(item);
+    }
+    updateBatchToolbar();
+}
+
+// Get CSS class for status indicator dot
+function getStatusDotClass(status) {
+    if (status === 'ready' || status === 'idle') return 'status-ready';
+    if (status === 'working' || status === 'running') return 'status-working';
+    if (status === 'error') return 'status-error';
+    if (status.includes('waiting')) return 'status-waiting';
+    return '';
+}
+
+// Get CSS class for status text
+function getStatusTextClass(status) {
+    if (status === 'ready' || status === 'idle') return 'status-text-ready';
+    if (status === 'working' || status === 'running') return 'status-text-working';
+    if (status === 'error') return 'status-text-error';
+    if (status.includes('waiting')) return 'status-text-waiting_input';
+    return 'status-text-unknown';
+}
+
+// Select an agent
+function selectAgent(name) {
+    console.log(`Selecting agent: ${name}`);
+    selectedAgent = name;
+
+    // Update UI
+    renderAgentList();
+
+    const agent = agents[name];
+    if (!agent) return;
+
+    // Show selected agent panel
+    document.getElementById('no-agent-selected').style.display = 'none';
+    document.getElementById('agent-selected').style.display = 'flex';
+
+    // Update agent info
+    document.getElementById('selected-agent-name').textContent = name;
+    document.getElementById('agent-provider').textContent = agent.provider;
+    document.getElementById('agent-model').textContent = agent.model;
+
+    // Update Stop TaskManager button state
+    updateStopTaskManagerButton(agent);
+
+    // Load last assistant response
+    loadLastResponse(name);
+}
+
+// Setup event listeners
+function setupEventListeners() {
+    // Send message button
+    document.getElementById('send-btn').onclick = sendMessage;
+    
+    // Enter key in textarea
+    document.getElementById('message-input').addEventListener('keydown', (e) => {
+        if (e.ctrlKey && e.key === 'Enter') {
+            sendMessage();
+        }
+    });
+    
+    // Full dialog button
+    document.getElementById('full-dialog-btn').onclick = openFullDialog;
+    
+    // Stop TaskManager button
+    document.getElementById('stop-taskmanager-btn').onclick = stopTaskManager;
+}
+
+// Send message to agent
+async function sendMessage() {
+    if (!selectedAgent) {
+        alert('Please select an agent first');
+        return;
+    }
+    
+    const messageInput = document.getElementById('message-input');
+    const message = messageInput.value.trim();
+    
+    if (!message) {
+        alert('Please enter a message');
+        return;
+    }
+    
+    console.log(`Sending message to ${selectedAgent}: ${message}`);
+    
+    try {
+        const response = await fetch(`/api/agents/${selectedAgent}/message`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ message }),
+        });
+        
+        if (!response.ok) throw new Error('Failed to send message');
+        
+        // Clear input
+        messageInput.value = '';
+        
+        // Show success
+        console.log('Message sent successfully');
+    } catch (error) {
+        console.error('Error sending message:', error);
+        alert('Failed to send message. Please try again.');
+    }
+}
+
+// Copy last response to clipboard
+async function copyLastResponse(event) {
+    const content = document.getElementById('last-response-content');
+    const text = content.textContent;
+
+    if (!text || text === 'No response yet') {
+        return;
+    }
+
+    try {
+        await navigator.clipboard.writeText(text);
+
+        const btn = event.target;
+        const originalText = btn.textContent;
+        btn.textContent = '✅ Copied!';
+        btn.style.background = '#2a5a2a';
+
+        setTimeout(() => {
+            btn.textContent = originalText;
+            btn.style.background = '';
+        }, 2000);
+    } catch (err) {
+        console.error('Copy error:', err);
+    }
+}
+
+// Open full dialog in new tab (plain text format)
+function openFullDialog() {
+    if (!selectedAgent) return;
+
+    // Open dialog text endpoint directly (plain text)
+    const url = `/api/agents/${selectedAgent}/dialog-text`;
+    window.open(url, '_blank');
+}
+
+// Load agent history using fire-and-forget with request correlation
+async function loadAgentHistory(name) {
+    const requestId = generateUUID();
+
+    try {
+        // Create promise for this request
+        const historyPromise = new Promise((resolve, reject) => {
+            pendingRequests.set(requestId, {
+                type: 'history',
+                agentName: name,
+                resolve,
+                reject,
+                timeout: setTimeout(() => {
+                    pendingRequests.delete(requestId);
+                    reject(new Error('History request timed out'));
+                }, 20000), // 20s frontend timeout
+            });
+        });
+
+        // Send fire-and-forget request
+        const response = await fetch(`/api/agents/${name}/history?request_id=${requestId}`);
+        if (!response.ok) {
+            pendingRequests.delete(requestId);
+            console.error('Failed to request agent history');
+            return;
+        }
+
+        const result = await response.json();
+        console.log(`History request sent for ${name}, request_id: ${requestId}`);
+
+        // Wait for WebSocket response
+        const history = await historyPromise;
+
+        // Process and display history
+        displayHistory(history, name);
+
+    } catch (error) {
+        console.error('Error loading agent history:', error);
+        showNotification(`Failed to load history: ${error.message}`, 'error');
+    }
+}
+
+// Display history (extracted from loadAgentHistory)
+function displayHistory(history, name) {
+    console.log(`Processing ${history.length} messages for ${name}`);
+
+    // Find last assistant message (final response)
+    let lastMessage = null;
+    for (let i = history.length - 1; i >= 0; i--) {
+        const msg = history[i];
+        if (msg.type === 'AIMessage' && msg.content && msg.content.trim().length > 0) {
+            lastMessage = msg;
+            break;
+        }
+    }
+
+    // Update last response display
+    const responseContent = document.getElementById('last-response-content');
+    if (lastMessage && lastMessage.content) {
+        responseContent.textContent = lastMessage.content;
+        console.log(`Updated last response: ${lastMessage.content.substring(0, 100)}...`);
+    } else {
+        responseContent.textContent = 'No response yet';
+        console.log('No substantial messages found in history');
+    }
+}
+
+// Load last assistant response using fire-and-forget with request correlation
+async function loadLastResponse(name) {
+    const requestId = generateUUID();
+
+    try {
+        const responsePromise = new Promise((resolve, reject) => {
+            pendingRequests.set(requestId, {
+                type: 'last_response',
+                agentName: name,
+                resolve,
+                reject,
+                timeout: setTimeout(() => {
+                    pendingRequests.delete(requestId);
+                    reject(new Error('Last response request timed out'));
+                }, 10000),
+            });
+        });
+
+        const response = await fetch(`/api/agents/${name}/last-response?request_id=${requestId}`);
+        if (!response.ok) {
+            pendingRequests.delete(requestId);
+            console.error('Failed to request last response');
+            return;
+        }
+
+        console.log(`Last response request sent for ${name}, request_id: ${requestId}`);
+
+        const lastResponse = await responsePromise;
+
+        // Update UI
+        const responseContent = document.getElementById('last-response-content');
+        if (lastResponse && lastResponse.content) {
+            responseContent.textContent = lastResponse.content;
+            console.log(`Updated last response: ${lastResponse.content.substring(0, 100)}...`);
+        } else {
+            responseContent.textContent = 'No response yet';
+        }
+    } catch (error) {
+        console.error('Error loading last response:', error);
+    }
+}
+
+// Handle last response result (fire-and-forget success callback)
+function handleLastResponseResult(data) {
+    const { request_id, agent_name, last_response } = data;
+    console.log(`Last response result for ${agent_name}, request_id: ${request_id}`);
+
+    const pending = pendingRequests.get(request_id);
+    if (pending) {
+        clearTimeout(pending.timeout);
+        pending.resolve(last_response);
+        pendingRequests.delete(request_id);
+    } else if (agent_name === selectedAgent) {
+        // No pending request — direct UI update
+        const responseContent = document.getElementById('last-response-content');
+        if (last_response && last_response.content) {
+            responseContent.textContent = last_response.content;
+        }
+    }
+}
+
+// Handle last response error (fire-and-forget error callback)
+function handleLastResponseError(data) {
+    const { request_id, agent_name, error } = data;
+    console.error(`Last response error for ${agent_name}:`, error);
+
+    const pending = pendingRequests.get(request_id);
+    if (pending) {
+        clearTimeout(pending.timeout);
+        pending.reject(new Error(error));
+        pendingRequests.delete(request_id);
+    }
+}
+
+// Handle approval request from agent
+function handleApprovalRequest(data) {
+    const { agent_name, approval_id, actions } = data;
+    console.log(`Approval request for ${agent_name}:`, actions);
+
+    if (agent_name !== selectedAgent) return;
+
+    // If auto-approve is enabled, send approve immediately
+    if (autoApproveEnabled) {
+        sendApprovalDecision(agent_name, approval_id, 'approve');
+        return;
+    }
+
+    // Show approval panel
+    currentApprovalId = approval_id;
+    const panel = document.getElementById('approval-panel');
+    const details = document.getElementById('approval-details');
+
+    // Format action details
+    let html = '';
+    for (const action of actions) {
+        const name = action.name || 'unknown';
+        const args = action.args || {};
+        const desc = action.description || '';
+        html += `<strong>${name}</strong>`;
+        if (desc) html += `\n${desc}`;
+        else html += `\n${JSON.stringify(args, null, 2)}`;
+        html += '\n';
+    }
+    details.textContent = html.trim();
+
+    panel.style.display = 'block';
+}
+
+// Handle approval result
+function handleApprovalResult(data) {
+    const { agent_name, approval_id, decision } = data;
+    console.log(`Approval result for ${agent_name}: ${decision}`);
+
+    // Hide panel
+    const panel = document.getElementById('approval-panel');
+    if (panel) panel.style.display = 'none';
+    currentApprovalId = null;
+}
+
+// Send approval decision to backend
+async function sendApprovalDecision(agentName, approvalId, decision) {
+    try {
+        const response = await fetch(`/api/agents/${agentName}/approve`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ approval_id: approvalId, decision }),
+        });
+        if (!response.ok) console.error('Failed to send approval');
+    } catch (error) {
+        console.error('Error sending approval:', error);
+    }
+}
+
+// Approve button handler
+function approveAction() {
+    if (!selectedAgent || !currentApprovalId) return;
+    sendApprovalDecision(selectedAgent, currentApprovalId, 'approve');
+    document.getElementById('approval-panel').style.display = 'none';
+    currentApprovalId = null;
+}
+
+// Reject button handler
+function rejectAction() {
+    if (!selectedAgent || !currentApprovalId) return;
+    sendApprovalDecision(selectedAgent, currentApprovalId, 'reject');
+    document.getElementById('approval-panel').style.display = 'none';
+    currentApprovalId = null;
+}
+
+// Auto-approve all button handler
+function autoApproveAll() {
+    if (!selectedAgent || !currentApprovalId) return;
+    autoApproveEnabled = true;
+    sendApprovalDecision(selectedAgent, currentApprovalId, 'auto_approve_all');
+    document.getElementById('approval-panel').style.display = 'none';
+    currentApprovalId = null;
+    showNotification('Auto-approve enabled for this session', 'success');
+}
+
+// Update Stop TaskManager button state based on agent status
+function updateStopTaskManagerButton(agent) {
+    const stopBtn = document.getElementById('stop-taskmanager-btn');
+    if (!stopBtn) return;
+
+    // Enable button only if TaskManager is active
+    const taskManagerActive = agent.task_manager_active === true;
+    stopBtn.disabled = !taskManagerActive;
+
+    // Update button text to show state
+    if (taskManagerActive) {
+        stopBtn.textContent = '⏹️ Stop TaskManager';
+        stopBtn.title = 'Stop the running TaskManager';
+    } else {
+        stopBtn.textContent = '⏹️ Stop TaskManager';
+        stopBtn.title = 'TaskManager is not active';
+    }
+}
+
+// Stop TaskManager
+async function stopTaskManager() {
+    if (!selectedAgent) return;
+
+    if (!confirm('Stop TaskManager for this agent?')) return;
+
+    try {
+        const response = await fetch(`/api/agents/${selectedAgent}/stop_task_manager`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ force: false }),
+        });
+
+        if (!response.ok) throw new Error('Failed to stop TaskManager');
+
+        console.log('TaskManager stop requested');
+        alert('TaskManager stop requested');
+    } catch (error) {
+        console.error('Error stopping TaskManager:', error);
+        alert('Failed to stop TaskManager');
+    }
+}
+
+// Toggle TaskManager enabled/disabled
+async function toggleTaskManager(enabled) {
+    if (!selectedAgent) return;
+    try {
+        await fetch(`/api/agents/${selectedAgent}/task-manager/toggle`, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({enabled}),
+        });
+        showNotification(`TaskManager ${enabled ? 'enabled' : 'disabled'}`, 'success');
+    } catch (error) {
+        console.error('Error toggling TaskManager:', error);
+    }
+}
+
+// Reset TaskManager to initial state
+async function resetTaskManager() {
+    if (!selectedAgent) return;
+    if (!confirm('Reset TaskManager? This clears all evaluation history.')) return;
+    try {
+        const response = await fetch(`/api/agents/${selectedAgent}/task-manager/reset`, {
+            method: 'POST',
+        });
+        if (response.ok) {
+            showNotification('TaskManager reset to initial state', 'success');
+        }
+    } catch (error) {
+        console.error('Error resetting TaskManager:', error);
+    }
+}
+
+// WebSocket connection
+function connectWebSocket() {
+    // Use current host for WebSocket connection
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsUrl = `${protocol}//${window.location.host}/ws/agents`;
+    console.log(`Connecting to WebSocket: ${wsUrl}`);
+    ws = new WebSocket(wsUrl);
+    
+    ws.onopen = () => {
+        console.log('WebSocket connected');
+        // Start ping interval
+        setInterval(() => {
+            if (ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: 'ping' }));
+            }
+        }, 30000);
+    };
+    
+    ws.onmessage = (event) => {
+        try {
+            const data = JSON.parse(event.data);
+            handleWebSocketMessage(data);
+        } catch (error) {
+            console.error('Error parsing WebSocket message:', error);
+        }
+    };
+    
+    ws.onerror = (error) => {
+        console.error('WebSocket error:', error);
+    };
+    
+    ws.onclose = () => {
+        console.log('WebSocket closed, reconnecting...');
+        setTimeout(connectWebSocket, 3000);
+    };
+}
+
+// Handle WebSocket messages
+function handleWebSocketMessage(data) {
+    console.log('WebSocket message:', data);
+
+    // Update uptime from any message that includes it
+    if (data.uptime) {
+        updateUptimeDisplay(data.uptime);
+    }
+
+    switch (data.type) {
+        case 'agent_message':
+            handleAgentMessage(data);
+            break;
+        case 'agent_response':
+            handleAgentResponse(data);
+            break;
+        case 'agent_error':
+            handleAgentError(data);
+            break;
+        case 'history_response':
+            handleHistoryResponse(data);
+            break;
+        case 'history_error':
+            handleHistoryError(data);
+            break;
+        case 'agent_metadata':
+            handleAgentMetadata(data);
+            break;
+        case 'approval_request':
+            handleApprovalRequest(data);
+            break;
+        case 'approval_result':
+            handleApprovalResult(data);
+            break;
+        case 'last_response_result':
+            handleLastResponseResult(data);
+            break;
+        case 'last_response_error':
+            handleLastResponseError(data);
+            break;
+        case 'detailed_status_response':
+            handleDetailedStatusResponse(data);
+            break;
+        case 'detailed_status_error':
+            handleDetailedStatusError(data);
+            break;
+        case 'agent_status':
+            handleAgentStatus(data);
+            break;
+        case 'agent_discovered':
+            handleAgentDiscovered(data);
+            break;
+        case 'agent_terminated':
+            handleAgentTerminated(data);
+            break;
+        case 'pong':
+            // Ping response, ignore
+            break;
+        default:
+            console.warn('Unknown message type:', data.type);
+    }
+}
+
+// Handle agent message
+function handleAgentMessage(data) {
+    const { agent_name, message } = data;
+
+    // Only update if this is the selected agent (as per design decision Q2)
+    if (agent_name !== selectedAgent) {
+        return;
+    }
+
+    // ========================================================================
+    // Update Last Response for ASSISTANT TEXT messages only
+    // ========================================================================
+    //
+    // INCLUDE (show in Last Response):
+    //   - type: "assistant" (final response in non-streaming mode)
+    //   - type: "assistant_chunk" (progressive response in streaming mode)
+    //
+    // EXCLUDE (do NOT show in Last Response):
+    //   - type: "tool_call" (even though role="assistant", this is a tool invocation)
+    //   - type: "tool_result" (role="tool", this is tool output)
+    //   - type: "user" (user messages)
+    //   - type: "system" (system messages)
+    //   - type: "error" (errors)
+    //   - type: "token_update" (metadata)
+    //
+    // This ensures Last Response shows ONLY the agent's textual response,
+    // not tool invocations or their outputs.
+    //
+    const isAssistantText = (
+        message.role === 'assistant' &&                        // Must be from assistant
+        (message.type === 'assistant' ||                       // Final response OR
+         message.type === 'assistant_chunk') &&                // Streaming chunk
+        message.content &&                                     // Must have content
+        typeof message.content === 'string' &&                 // Content must be string
+        message.content.trim().length > 0                      // Not empty/whitespace
+    );
+
+    if (isAssistantText) {
+        const responseContent = document.getElementById('last-response-content');
+
+        // Update with the latest content
+        // In streaming mode, chunks arrive with accumulated content
+        // In non-streaming mode, we get the final complete response
+        responseContent.textContent = message.content;
+
+        // Log for debugging
+        console.log(`[Last Response] Updated (${message.type}): ${message.content.length} chars`);
+    }
+}
+
+// Handle agent response (fire-and-forget callback)
+function handleAgentResponse(data) {
+    const { agent_name, response } = data;
+    console.log(`Agent ${agent_name} responded:`, response);
+
+    // This handler is for the fire-and-forget callback from send_message()
+    // It indicates that the agent FINISHED processing, but the actual response
+    // should have already arrived via the subscription (handleAgentMessage).
+    //
+    // We keep this handler ONLY for:
+    // 1. Success notification
+    // 2. History reload
+    //
+    // We DO NOT update Last Response here - that's done via handleAgentMessage()
+    // from the real-time WebSocket subscription.
+
+    // Only update if this is the selected agent
+    if (agent_name !== selectedAgent) {
+        return;
+    }
+
+    // Display success notification
+    showNotification(`Message processed successfully`, 'success');
+
+    // NOTE: Last Response update removed - handled by handleAgentMessage()
+    // The response should have already been displayed via WebSocket subscription
+
+    // Reload last response
+    loadLastResponse(agent_name);
+}
+
+// Handle agent error (fire-and-forget error callback)
+function handleAgentError(data) {
+    const { agent_name, error, error_type } = data;
+    console.error(`Agent ${agent_name} error:`, error);
+
+    // Show error notification to user
+    let errorMessage = `Agent error: ${error}`;
+    if (error_type === 'TimeoutError') {
+        errorMessage = `Agent not responding (timeout)`;
+    } else if (error_type === 'ConnectionError' || error_type === 'EOFError') {
+        errorMessage = `Connection to agent lost`;
+    }
+
+    showNotification(errorMessage, 'error');
+
+    // If it's the selected agent, reload last response
+    if (agent_name === selectedAgent) {
+        setTimeout(() => loadLastResponse(agent_name), 1000);
+    }
+}
+
+// Handle history response (fire-and-forget success callback)
+function handleHistoryResponse(data) {
+    const { request_id, agent_name, history } = data;
+    console.log(`History response for ${agent_name}, request_id: ${request_id}, ${history.length} messages`);
+
+    // Find pending request
+    const pending = pendingRequests.get(request_id);
+    if (pending) {
+        clearTimeout(pending.timeout);
+        pending.resolve(history);
+        pendingRequests.delete(request_id);
+    } else {
+        // No pending request - might be auto-refresh
+        if (agent_name === selectedAgent) {
+            displayHistory(history, agent_name);
+        }
+    }
+}
+
+// Handle history error (fire-and-forget error callback)
+function handleHistoryError(data) {
+    const { request_id, agent_name, error } = data;
+    console.error(`History error for ${agent_name}:`, error);
+
+    // Find pending request
+    const pending = pendingRequests.get(request_id);
+    if (pending) {
+        clearTimeout(pending.timeout);
+        pending.reject(new Error(error));
+        pendingRequests.delete(request_id);
+    }
+
+    showNotification(`Failed to load history: ${error}`, 'error');
+}
+
+// Handle detailed status response (fire-and-forget success callback)
+function handleDetailedStatusResponse(data) {
+    const { request_id, agent_name, status } = data;
+    console.log(`Detailed status response for ${agent_name}, request_id: ${request_id}`);
+
+    // Find pending request
+    const pending = pendingRequests.get(request_id);
+    if (pending) {
+        clearTimeout(pending.timeout);
+        pending.resolve(status);
+        pendingRequests.delete(request_id);
+    }
+
+    // Update UI if this is the selected agent
+    if (agent_name === selectedAgent && status) {
+        document.getElementById('agent-provider').textContent = status.provider;
+        document.getElementById('agent-model').textContent = status.model;
+
+        // Update TaskManager button
+        const agent = agents[agent_name];
+        if (agent) {
+            agent.task_manager_active = status.task_manager_active;
+            updateStopTaskManagerButton(agent);
+        }
+    }
+}
+
+// Handle detailed status error (fire-and-forget error callback)
+function handleDetailedStatusError(data) {
+    const { request_id, agent_name, error } = data;
+    console.error(`Detailed status error for ${agent_name}:`, error);
+
+    // Find pending request
+    const pending = pendingRequests.get(request_id);
+    if (pending) {
+        clearTimeout(pending.timeout);
+        pending.reject(new Error(error));
+        pendingRequests.delete(request_id);
+    }
+
+    showNotification(`Failed to get status: ${error}`, 'error');
+}
+
+// Handle agent status change
+// Handle agent metadata update (provider/model fetched after connect)
+function handleAgentMetadata(data) {
+    const { agent_name, provider, model } = data;
+    if (agents[agent_name]) {
+        if (provider) agents[agent_name].provider = provider;
+        if (model) agents[agent_name].model = model;
+
+        if (agent_name === selectedAgent) {
+            document.getElementById('agent-provider').textContent = agents[agent_name].provider;
+            document.getElementById('agent-model').textContent = agents[agent_name].model;
+        }
+    }
+}
+
+function handleAgentStatus(data) {
+    const { agent_name, status, task_manager_active, task_manager_disabled } = data;
+
+    if (agents[agent_name]) {
+        agents[agent_name].status = status;
+        if (task_manager_active !== undefined) {
+            agents[agent_name].task_manager_active = task_manager_active;
+            agents[agent_name].has_task_manager = true;
+        }
+        if (task_manager_disabled !== undefined) {
+            agents[agent_name].task_manager_disabled = task_manager_disabled;
+        }
+
+        // Update UI if this is the selected agent
+        if (agent_name === selectedAgent) {
+            updateStopTaskManagerButton(agents[agent_name]);
+            updateTmControls(agents[agent_name]);
+        }
+
+        renderAgentList();
+    }
+}
+
+// Update TaskManager controls visibility and state
+function updateTmControls(agent) {
+    const toggle = document.getElementById('tm-toggle-label');
+    const resetBtn = document.getElementById('reset-tm-btn');
+    const stopBtn = document.getElementById('stop-taskmanager-btn');
+    if (!toggle || !resetBtn || !stopBtn) return;
+
+    if (agent.has_task_manager) {
+        toggle.style.display = 'flex';
+        resetBtn.style.display = '';
+        stopBtn.style.display = '';
+        const checkbox = document.getElementById('tm-enabled-checkbox');
+        if (checkbox) {
+            checkbox.checked = !agent.task_manager_disabled;
+        }
+    } else {
+        toggle.style.display = 'none';
+        resetBtn.style.display = 'none';
+        stopBtn.style.display = 'none';
+    }
+}
+
+// Handle agent discovered
+function handleAgentDiscovered(data) {
+    const agent = data.agent;
+    console.log('Agent discovered:', agent.name);
+    
+    agents[agent.name] = agent;
+    renderAgentList();
+}
+
+// Handle agent terminated
+function handleAgentTerminated(data) {
+    const { agent_name } = data;
+    console.log('Agent terminated:', agent_name);
+    
+    delete agents[agent_name];
+    
+    // Deselect if it was the selected agent
+    if (selectedAgent === agent_name) {
+        selectedAgent = null;
+        document.getElementById('no-agent-selected').style.display = 'flex';
+        document.getElementById('agent-selected').style.display = 'none';
+    }
+    
+    renderAgentList();
+}
+
+// Show error message
+function showError(message) {
+    const container = document.getElementById('agent-list');
+    container.innerHTML = `<p class="loading" style="color: red;">${message}</p>`;
+}
+
+// Show notification to user
+function showNotification(message, type = 'info') {
+    // Create notification element
+    const notification = document.createElement('div');
+    notification.className = `notification notification-${type}`;
+    notification.textContent = message;
+
+    // Add to page (create container if needed)
+    let container = document.getElementById('notification-container');
+    if (!container) {
+        container = document.createElement('div');
+        container.id = 'notification-container';
+        container.style.cssText = `
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            z-index: 1000;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        `;
+        document.body.appendChild(container);
+    }
+
+    container.appendChild(notification);
+
+    // Style notification
+    notification.style.cssText = `
+        padding: 15px 20px;
+        border-radius: 4px;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+        max-width: 400px;
+        animation: slideIn 0.3s ease-out;
+        font-size: 14px;
+    `;
+
+    if (type === 'success') {
+        notification.style.backgroundColor = '#4CAF50';
+        notification.style.color = 'white';
+    } else if (type === 'error') {
+        notification.style.backgroundColor = '#f44336';
+        notification.style.color = 'white';
+    } else {
+        notification.style.backgroundColor = '#2196F3';
+        notification.style.color = 'white';
+    }
+
+    // Auto-remove after 5 seconds
+    setTimeout(() => {
+        notification.style.animation = 'slideOut 0.3s ease-in';
+        setTimeout(() => notification.remove(), 300);
+    }, 5000);
+}
+
+// ==============================================================================
+// SERVER RESTART FUNCTIONALITY
+// ==============================================================================
+
+async function restartServer() {
+    if (!confirm('Are you sure you want to restart deep-worker-web server?\n\nAll agent connections will be re-established after restart.')) {
+        return;
+    }
+
+    try {
+        // Send restart request
+        await fetch('/api/server/restart', {
+            method: 'POST',
+            signal: AbortSignal.timeout(3000)  // Don't wait forever
+        }).catch(() => {
+            // Ignore errors - server might die before responding
+        });
+
+        showNotification('Server restart initiated...', 'info');
+
+        // Wait for server to restart and reconnect
+        setTimeout(() => {
+            showNotification('Reconnecting to server...', 'info');
+            connectWebSocket();  // Reconnect WebSocket
+        }, 3000);
+
+    } catch (error) {
+        console.error('Error restarting server:', error);
+        showNotification('Error initiating server restart', 'error');
+    }
+}
+
+// ==============================================================================
+// UPTIME DISPLAY
+// ==============================================================================
+
+function updateUptimeDisplay(uptimeData) {
+    const uptimeEl = document.getElementById('server-uptime');
+    if (uptimeEl && uptimeData && uptimeData.uptime_formatted) {
+        uptimeEl.textContent = `Uptime: ${uptimeData.uptime_formatted}`;
+    }
+}
+
+// ==============================================================================
+// AGENT SELECTION & BATCH OPERATIONS
+// ==============================================================================
+
+function toggleAgentSelection(name, checked) {
+    if (checked) {
+        selectedAgents.add(name);
+    } else {
+        selectedAgents.delete(name);
+    }
+    updateBatchToolbar();
+    // Update "select all" checkbox state
+    const selectAllEl = document.getElementById('select-all-checkbox');
+    if (selectAllEl) {
+        const totalAgents = Object.keys(agents).length;
+        selectAllEl.checked = selectedAgents.size === totalAgents && totalAgents > 0;
+        selectAllEl.indeterminate = selectedAgents.size > 0 && selectedAgents.size < totalAgents;
+    }
+}
+
+function toggleSelectAll(checked) {
+    if (checked) {
+        Object.keys(agents).forEach(name => selectedAgents.add(name));
+    } else {
+        selectedAgents.clear();
+    }
+    renderAgentList();
+}
+
+function updateBatchToolbar() {
+    const toolbar = document.getElementById('batch-toolbar');
+    const countEl = document.getElementById('selection-count');
+    if (!toolbar || !countEl) return;
+
+    if (selectedAgents.size > 0) {
+        toolbar.style.display = 'flex';
+        countEl.textContent = `${selectedAgents.size} selected`;
+    } else {
+        toolbar.style.display = 'none';
+    }
+}
+
+async function batchStop() {
+    if (selectedAgents.size === 0) return;
+    const names = Array.from(selectedAgents);
+    const btn = document.getElementById('batch-stop-btn');
+    btn.disabled = true;
+    btn.textContent = '⏳ Stopping...';
+
+    try {
+        const response = await fetch('/api/agents/batch', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action: 'stop', agent_names: names }),
+        });
+        const data = await response.json();
+        let ok = 0, fail = 0;
+        for (const [name, result] of Object.entries(data.results || {})) {
+            if (result.success) { ok++; } else { fail++; }
+        }
+        showNotification(`Stopped ${ok} agent(s)${fail ? `, ${fail} failed` : ''}`, fail ? 'error' : 'success');
+        selectedAgents.clear();
+        renderAgentList();
+    } catch (error) {
+        showNotification('Error stopping agents: ' + error.message, 'error');
+    } finally {
+        btn.disabled = false;
+        btn.textContent = '⏹ Stop';
+    }
+}
+
+async function batchRestart() {
+    if (selectedAgents.size === 0) return;
+    const names = Array.from(selectedAgents);
+    const btn = document.getElementById('batch-restart-btn');
+    btn.disabled = true;
+    btn.textContent = '⏳ Restarting...';
+
+    try {
+        const response = await fetch('/api/agents/batch', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action: 'restart', agent_names: names }),
+        });
+        const data = await response.json();
+        let ok = 0, fail = 0;
+        for (const [name, result] of Object.entries(data.results || {})) {
+            if (result.success) { ok++; } else { fail++; }
+        }
+        showNotification(`Restarted ${ok} agent(s)${fail ? `, ${fail} failed` : ''}`, fail ? 'error' : 'success');
+        selectedAgents.clear();
+        renderAgentList();
+    } catch (error) {
+        showNotification('Error restarting agents: ' + error.message, 'error');
+    } finally {
+        btn.disabled = false;
+        btn.textContent = '🔄 Restart';
+    }
+}
+
+async function stopCurrentAgent() {
+    if (!selectedAgent) return;
+    try {
+        const response = await fetch(`/api/agents/${selectedAgent}/stop`, { method: 'POST' });
+        const data = await response.json();
+        if (response.ok) {
+            showNotification(data.message || `Agent '${selectedAgent}' stopped`, 'success');
+        } else {
+            showNotification(data.detail || 'Failed to stop agent', 'error');
+        }
+    } catch (error) {
+        showNotification('Error stopping agent: ' + error.message, 'error');
+    }
+}
+
+async function restartCurrentAgent() {
+    if (!selectedAgent) return;
+    try {
+        const response = await fetch(`/api/agents/${selectedAgent}/restart`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({}),
+        });
+        const data = await response.json();
+        if (response.ok) {
+            showNotification(data.message || `Agent '${selectedAgent}' restarted`, 'success');
+        } else {
+            showNotification(data.detail || 'Failed to restart agent', 'error');
+        }
+    } catch (error) {
+        showNotification('Error restarting agent: ' + error.message, 'error');
+    }
+}

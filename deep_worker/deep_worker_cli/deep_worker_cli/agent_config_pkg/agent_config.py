@@ -90,6 +90,19 @@ class AgentConfig:
         if self.max_tokens <= 0:
             raise ValueError(f"max_tokens must be positive, got {self.max_tokens}")
 
+    @property
+    def resolved_model(self) -> str:
+        """Return the actual model name, resolving provider default if needed.
+
+        If self.model is set, returns it directly.
+        Otherwise, uses get_default_model_name() to resolve the provider default
+        (checking env vars first, then hardcoded fallback).
+        """
+        if self.model:
+            return self.model
+        from deep_worker_cli.config import get_default_model_name
+        return get_default_model_name(self.provider) or "unknown"
+
     @classmethod
     def from_file(cls, config_path: Path) -> "AgentConfig":
         """Load configuration from a YAML file.

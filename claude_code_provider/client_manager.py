@@ -8,6 +8,7 @@ import asyncio
 import sys
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 # ============================================================================
 # CRITICAL: CLAUDE_SDK MUST BE IMPORTED FROM SOURCE CODE, NOT FROM PIP/VENV!
@@ -100,7 +101,10 @@ class ClientManager:
         self._sent_count: dict[str, int] = {}
 
     async def get_or_create_client(
-        self, thread_id: str, tools_metadata: list[ToolMetadata]
+        self,
+        thread_id: str,
+        tools_metadata: list[ToolMetadata],
+        working_dir: str | None = None,
     ) -> tuple[ClaudeSDKClient, ProxyMCPServer]:
         """Get or create ClaudeSDKClient for a thread_id.
 
@@ -130,8 +134,14 @@ class ClientManager:
             if thread_id in self.clients:
                 return self.clients[thread_id]
 
-            # Create ProxyMCPServer for this thread
-            proxy_mcp = ProxyMCPServer(tools_metadata)
+            # Create ProxyMCPServer for this thread.
+            # ⚠️ ProxyMCPServer uses Future-based proxy — NO direct execution.
+            # Tools are executed by LangGraph ToolNode, not by MCP handler.
+            proxy_mcp = ProxyMCPServer(
+                tools_metadata,
+                working_dir=working_dir,
+                agent_name=thread_id,
+            )
 
             # Build options for this client
             # ⚠️ CRITICAL: Permission delegation architecture

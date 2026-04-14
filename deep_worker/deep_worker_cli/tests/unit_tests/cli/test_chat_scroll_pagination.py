@@ -25,9 +25,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-# Add arpyc to path (same pattern as other test files)
-sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent.parent.parent / "arpyc"))
-
 from textual.containers import VerticalScroll
 
 from deep_worker_cli.cli.interactive import ChatScroll, InteractiveApp

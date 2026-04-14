@@ -91,8 +91,9 @@ class TaskManager:
         # Callback for sending corrective prompts to subordinate
         self.send_to_subordinate_callback = None
 
-        # Running flag for lifecycle management
+        # Runtime control flags
         self._running = False
+        self.disabled = False
 
     async def start(self) -> None:
         """
@@ -114,6 +115,70 @@ class TaskManager:
         self._running = True
         logger.info(f"[TaskManager] Started successfully (manager_id: {self.agent_name}:tm)")
 
+    def disable(self) -> None:
+        """Temporarily disable TaskManager evaluation."""
+        self.disabled = True
+        logger.info(f"[TaskManager] Disabled for '{self.agent_name}'")
+
+    def enable(self) -> None:
+        """Re-enable TaskManager evaluation."""
+        self.disabled = False
+        logger.info(f"[TaskManager] Enabled for '{self.agent_name}'")
+
+    async def reset(self) -> None:
+        """Reset TaskManager to initial state.
+
+        Clears evaluation history, reinitializes manager agent.
+        After reset, TM behaves as if just started.
+        The disabled flag is preserved.
+        """
+        import contextlib
+
+        logger.info(f"[TaskManager] Resetting...")
+
+        # 1. Reset task state
+        self.state = 'inactive'
+        self.initial_request = None
+        self.project_path = None
+        self.session_file_path = None
+        self.is_first_evaluation = True
+        self.evaluation_count = 0
+
+        # 2. Clear checkpoint history for TM thread
+        if self.checkpointer is not None:
+            thread_id = f"{self.agent_name}:tm"
+            await self._clear_thread_history(thread_id)
+
+        # 3. Cleanup old backend
+        if self.manager_backend and hasattr(self.manager_backend, 'cleanup'):
+            with contextlib.suppress(Exception):
+                cleanup_method = getattr(self.manager_backend, 'cleanup')
+                if callable(cleanup_method):
+                    await cleanup_method()
+
+        # 4. Reinitialize manager agent (fresh instance)
+        self.manager_agent = None
+        self.manager_backend = None
+        await self._initialize_manager()
+
+        logger.info(f"[TaskManager] Reset complete")
+
+    async def _clear_thread_history(self, thread_id: str) -> None:
+        """Clear all checkpoint data for a specific thread."""
+        from typing import Any
+        conn: Any = getattr(self.checkpointer, 'conn', None)
+        if conn is not None:
+            # AsyncSqliteSaver — clear via SQL
+            await conn.execute(
+                "DELETE FROM checkpoints WHERE thread_id = ?", (thread_id,)
+            )
+            await conn.execute(
+                "DELETE FROM writes WHERE thread_id = ?", (thread_id,)
+            )
+            await conn.commit()
+            logger.info(f"[TaskManager] Cleared checkpoint history for thread '{thread_id}'")
+        # InMemorySaver — reinitializing manager_agent is sufficient
+
     async def _initialize_manager(self) -> None:
         """
         Initialize manager LangGraph agent.
@@ -128,8 +193,20 @@ class TaskManager:
 
             logger.info(f"[TaskManager] Initializing manager agent...")
 
-            # Create model using same configuration as subordinate
-            model = create_model()
+            # Create model using same provider and model as subordinate agent.
+            # This ensures TaskManager uses the same AI backend (e.g. claude-code)
+            # as the main agent, not auto-detected DeepSeek.
+            model = create_model(
+                provider=self.config.provider,
+                model_name=self.config.model,
+            )
+
+            # Set working_dir on model for providers that need it (e.g. claude-code
+            # uses it for MCP tool execution with project_memory)
+            # Uses setattr() because create_model() returns BaseChatModel
+            # but only ClaudeCodeChatModel has _working_dir attribute.
+            if hasattr(model, '_working_dir'):
+                setattr(model, '_working_dir', str(self.config.working_dir))
 
             # Get project_memory_dir from config (required by create_cli_agent)
             project_memory_dir = Path(self.config.working_dir)
@@ -169,6 +246,9 @@ class TaskManager:
             project_path: Optional project directory path
             session_file_path: Optional path to subordinate's session file
         """
+        if self.disabled:
+            return
+
         logger.info(f"[TaskManager] Initializing task: {initial_request[:100]}...")
 
         self.initial_request = initial_request
@@ -198,8 +278,7 @@ class TaskManager:
         Returns:
             Corrective prompt if needed, None if task is done/unable
         """
-        if self.state == 'inactive':
-            # No active task, ignore
+        if self.disabled or self.state == 'inactive':
             return None
 
         if self.state == 'evaluating':

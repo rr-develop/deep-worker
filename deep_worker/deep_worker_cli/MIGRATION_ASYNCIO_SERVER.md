@@ -2,7 +2,7 @@
 
 ## 📊 Migration Summary
 
-**Status:** ✅ COMPLETED
+**Status:** ✅ COMPLETED — arpyc library fully removed from repository
 
 **Date:** 2026-03-22
 
@@ -13,7 +13,7 @@
 ## 🎯 What Was Accomplished
 
 ### Phase 1: Source Integration ✅
-- Modified `pyproject.toml` to use rpyc from a local `rpyc_async` source checkout
+- Modified `pyproject.toml` to use rpyc from the local rpyc_async source checkout
 - Created integration verification tests (7/9 passing)
 - Verified AsyncioServer availability
 
@@ -276,7 +276,7 @@ async def connect(self):
 import sys
 from pathlib import Path
 
-_rpyc_async_path = Path("/path/to/rpyc_async")
+_rpyc_async_path = Path(RPYC_ASYNC_SOURCE_DIR)
 if str(_rpyc_async_path) not in sys.path:
     sys.path.insert(0, str(_rpyc_async_path))
 
@@ -311,7 +311,7 @@ Migration is complete! The system now uses:
 ## 📚 References
 
 - RPyC async documentation: [rpyc_async GitHub]
-- Migration plan: an internal migration planning document (not included here)
+- Migration plan: the rpyc_async project's migration plan document (not included here)
 - AsyncioServer performance analysis: `ARPYC_ASYNC_RECURSION_GUIDE.md`
 
 ---

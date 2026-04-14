@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import subprocess  # S404: subprocess required for user-initiated shell commands via ! prefix
 import sys
 import uuid
@@ -15,6 +16,16 @@ from textual.containers import Container, VerticalScroll
 from textual.css.query import NoMatches
 from textual.message import Message
 from textual.widgets import Static
+
+# ============================================================================
+# CRITICAL: RPYC MUST BE IMPORTED FROM SOURCE CODE, NOT FROM PIP!
+# ============================================================================
+# ALWAYS import rpyc from the local rpyc_async source checkout.
+# This ensures we use rpyc_async with AsyncioServer support.
+# ============================================================================
+_rpyc_async_path = Path("rpyc_async")
+if _rpyc_async_path.exists() and str(_rpyc_async_path) not in sys.path:
+    sys.path.insert(0, str(_rpyc_async_path))
 
 import rpyc
 from deep_worker_cli.process.registry import ProcessRegistry
@@ -34,6 +45,7 @@ from deep_worker_cli.widgets.welcome import WelcomeBanner
 if TYPE_CHECKING:
     from textual.app import ComposeResult
     from textual.events import Resize
+
 
 class ChatScroll(VerticalScroll):
     """Scrollable chat container that posts ScrolledUp on upward user scroll.
@@ -93,6 +105,7 @@ class ChatScroll(VerticalScroll):
         if new_value < old_value:
             # Scrolled toward the top → post message that bubbles to App
             self.post_message(self.ScrolledUp())
+
 
 class InteractiveApp(App):
     """Textual TUI app for interacting with a running deep-worker agent.
@@ -355,7 +368,7 @@ class InteractiveApp(App):
         # where all callbacks are async (await adapter._mount_message, etc.)
         #
         # This ensures deep-worker/dwcli follows the SAME async patterns as
-        # the original deepagents implementation.
+        # the original upstream deepagents implementation.
         #
         # ARCHITECTURE: Single-thread, single event loop
         # ================================================
@@ -921,7 +934,9 @@ class InteractiveApp(App):
 
         try:
             # Request recent history via RPyC
-            response = await self._rpyc_root.get_history(limit=50, offset=0)
+            # Server returns JSON string (per RPYC_SERIALIZATION_DESIGN.md optimization)
+            response_json_str = await self._rpyc_root.get_history(limit=50, offset=0)
+            response = json.loads(response_json_str)
 
             if not response.get("success"):
                 # Don't show error to user - just log it
@@ -1055,7 +1070,9 @@ class InteractiveApp(App):
             old_max_y = chat_scroll.max_scroll_y
 
             # Load next page of older messages via RPyC
-            response = await self._rpyc_root.get_history(limit=20, offset=self._history_offset)
+            # Server returns JSON string (per RPYC_SERIALIZATION_DESIGN.md optimization)
+            response_json_str = await self._rpyc_root.get_history(limit=20, offset=self._history_offset)
+            response = json.loads(response_json_str)
 
             if not response.get("success"):
                 return
@@ -1336,7 +1353,9 @@ class InteractiveApp(App):
 
         # Send to agent via RPyC
         try:
-            response = await self._rpyc_root.handle_command(command)
+            # Server returns JSON string (per RPYC_SERIALIZATION_DESIGN.md optimization)
+            response_json_str = await self._rpyc_root.handle_command(command)
+            response = json.loads(response_json_str)
 
             if not response.get("success"):
                 error_msg = response.get("response", "Unknown error")
@@ -1459,7 +1478,9 @@ class InteractiveApp(App):
             return
 
         try:
-            response = await self._rpyc_root.respond_to_approval(approval_id, decision)
+            # Server returns JSON string (per RPYC_SERIALIZATION_DESIGN.md optimization)
+            response_json_str = await self._rpyc_root.respond_to_approval(approval_id, decision)
+            response = json.loads(response_json_str)
 
             if not response.get("success"):
                 await self._mount_message(
@@ -1543,7 +1564,9 @@ class InteractiveApp(App):
             return
 
         try:
-            response = await self._rpyc_root.interrupt_agent()
+            # Server returns JSON string (per RPYC_SERIALIZATION_DESIGN.md optimization)
+            response_json_str = await self._rpyc_root.interrupt_agent()
+            response = json.loads(response_json_str)
 
             if response.get("success"):
                 self._update_status("Interrupted")

@@ -5,6 +5,7 @@ All communication is done via native rpyc with AsyncioServer.
 """
 
 import asyncio
+import json
 import sys
 import uuid
 from pathlib import Path
@@ -13,10 +14,23 @@ from typing import TYPE_CHECKING, Any
 from deep_worker_cli.exceptions import AgentNotFoundError, IPCConnectionError
 from deep_worker_cli.process.registry import ProcessRegistry
 
+# ============================================================================
+# CRITICAL: RPYC MUST BE IMPORTED FROM SOURCE CODE, NOT FROM PIP!
+# ============================================================================
+# ALWAYS import rpyc from the local rpyc_async source checkout.
+# This ensures we use rpyc_async with AsyncioServer support.
+# ============================================================================
+_rpyc_async_path = Path("rpyc_async")
+if _rpyc_async_path.exists() and str(_rpyc_async_path) not in sys.path:
+    sys.path.insert(0, str(_rpyc_async_path))
+
 import rpyc
+from rpyc.core.async_connect import async_connect  # type: ignore[import-untyped]
+from rpyc.utils.classic import obtain
 
 if TYPE_CHECKING:
     from deep_worker_cli.basesession.protocol_types import SessionInfo
+
 
 class AgentClient:
     """
@@ -79,27 +93,43 @@ class AgentClient:
 
         # Connect via RPyC (ONLY method)
         try:
-            # SECURITY: Connect only to localhost (127.0.0.1)
-            self._conn = rpyc.connect(
+            # Get event loop
+            loop = asyncio.get_running_loop()
+
+            # FULLY ASYNC connection - NO blocking, NO threads!
+            # Uses asyncio.sock_connect() under the hood for non-blocking socket I/O
+            self._conn = await async_connect(
                 "127.0.0.1",
                 agent_info.rpyc_port,
-                config={"allow_public_attrs": True}
+                config={"allow_public_attrs": True},
+                timeout=10.0,
+                loop=loop
             )
 
-            # CRITICAL: Enable asyncio serving BEFORE accessing root!
-            # With AsyncioServer, we must enable asyncio serving first,
-            # otherwise conn.root will hang/timeout.
-            # See: rpyc_async tests/test_asyncio_server_bidirectional.py:180-183
-            loop = asyncio.get_running_loop()
-            self._conn.enable_asyncio_serving(loop=loop)
+            # NOTE: async_connect() already enables asyncio serving internally,
+            # so we don't need to call enable_asyncio_serving() again!
 
-            # Now safe to get root (after asyncio serving is enabled)
-            self._root = self._conn.root
+            # CRITICAL: DO NOT access self._conn.root here!
+            # Accessing .root triggers RPC handshake which BLOCKS in async context.
+            # Instead, use lazy access via _ensure_root() (accessed on first use).
+            # self._root stays None until first RPC call.
 
             self.connected = True
 
+        except asyncio.TimeoutError as e:
+            raise IPCConnectionError(f"Connection timeout after 10s") from e
         except Exception as e:
             raise IPCConnectionError(f"Failed to connect via RPyC: {e}") from e
+
+    def _ensure_root(self) -> None:
+        """Lazy initialization of _root.
+
+        CRITICAL: This MUST be called before any RPC method that uses self._root.
+        First call will access self._conn.root which triggers RPC handshake (may block once).
+        Subsequent calls use cached self._root (fast).
+        """
+        if self._root is None and self._conn is not None:
+            self._root = self._conn.root
 
     async def disconnect(self) -> None:
         """Disconnect from the agent (closes RPyC session)."""
@@ -121,6 +151,14 @@ class AgentClient:
     async def _send_command(self, command: dict[str, Any]) -> dict[str, Any]:
         """Send a command via RPyC.
 
+        OPTIMIZATION: Uses low-level HANDLE_ASYNC_CALLATTR to eliminate extra
+        RPyC messages. Instead of:
+          1. SEND getattr(root, 'method') -> RECV method_netref -> SEND call() -> RECV result
+        We do:
+          1. SEND callattr(root, 'method', args) -> RECV result
+
+        This reduces RPyC protocol messages from 6 to 2 per call (see docs/RPYC_SERIALIZATION_DESIGN.md).
+
         Args:
             command: Command dictionary to send
 
@@ -130,32 +168,69 @@ class AgentClient:
         Raises:
             IPCConnectionError: If not connected or communication fails
         """
-        if not self.connected or not self._root:
+        if not self.connected or not self._conn:
             raise IPCConnectionError("Not connected to agent")
+
+        # Lazy root initialization (first call triggers RPC handshake)
+        self._ensure_root()
 
         try:
             command_type = command.get("command")
 
-            # Map commands to RPyC service methods
+            # Import RPyC consts for low-level protocol handlers
+            from rpyc.core import consts
+
+            # Map commands to RPyC service methods using low-level HANDLE_ASYNC_CALLATTR
+            # This bypasses Python's attribute access (which creates intermediate netrefs)
+            # and directly calls the remote method in a single RPC roundtrip.
+
             if command_type == "status":
-                import logging
-                logger = logging.getLogger(__name__)
-                logger.info("[CLIENT] About to call await root.get_status()...")
-                response = await self._root.get_status()
-                logger.info(f"[CLIENT] await root.get_status() returned: {response}")
-                # Server already returns {"success": True, "session_info": {...}}, no need to wrap again
+                # Use low-level async_request with HANDLE_ASYNC_CALLATTR
+                # NOTE: Must use "exposed_" prefix for actual method name
+                # Format: (handler, root_netref, method_name, args_tuple, kwargs_list)
+                async_result = self._conn.async_request(
+                    consts.HANDLE_ASYNC_CALLATTR,
+                    self._root,              # root object
+                    "exposed_get_status",    # method name (with exposed_ prefix!)
+                    (),                      # args tuple (empty for get_status)
+                    ()                       # kwargs list (empty)
+                )
+                # Wait for result (still JSON string from server)
+                response_json_str = await async_result
+                # Deserialize JSON string to local dict (no RPC overhead for field access)
+                response = json.loads(response_json_str)
                 return response
 
             elif command_type == "invoke":
                 message = command.get("message", "")
                 stream = command.get("stream", False)
-                response = await self._root.invoke_agent(message, stream)
+                # Use low-level async_request with HANDLE_ASYNC_CALLATTR
+                async_result = self._conn.async_request(
+                    consts.HANDLE_ASYNC_CALLATTR,
+                    self._root,
+                    "exposed_invoke_agent",  # method name (with exposed_ prefix!)
+                    (message, stream),       # args tuple
+                    ()                       # kwargs list (empty)
+                )
+                response_json_str = await async_result
+                # Deserialize JSON string to local dict
+                response = json.loads(response_json_str)
                 return response
 
             elif command_type == "get_history":
                 limit = command.get("limit", 50)
                 offset = command.get("offset", 0)
-                response = await self._root.get_history(limit, offset)
+                # Use low-level async_request with HANDLE_ASYNC_CALLATTR
+                async_result = self._conn.async_request(
+                    consts.HANDLE_ASYNC_CALLATTR,
+                    self._root,
+                    "exposed_get_history",   # method name (with exposed_ prefix!)
+                    (limit, offset),         # args tuple
+                    ()                       # kwargs list (empty)
+                )
+                response_json_str = await async_result
+                # Deserialize JSON string to local dict
+                response = json.loads(response_json_str)
                 return response
 
             elif command_type in ("attach", "detach"):
@@ -174,6 +249,9 @@ class AgentClient:
         This method queries the agent's status and returns a SessionInfo object
         compatible with the BaseSession protocol.
 
+        OPTIMIZATION: Agent now returns minimal status response (status + error only)
+        to reduce serialization overhead. We reconstruct minimal SessionInfo locally.
+
         Returns:
             SessionInfo with current agent state
 
@@ -189,18 +267,37 @@ class AgentClient:
 
         # Import here to avoid circular dependency
         from deep_worker_cli.basesession.protocol_types import SessionInfo
+        from datetime import datetime
 
-        # Parse session_info from response
+        # OPTIMIZATION: Handle both old format (session_info) and new format (minimal)
         session_data = response.get("session_info")
-        if not session_data:
-            raise IPCConnectionError("No session_info in status response")
 
-        import logging
-        logger = logging.getLogger(__name__)
-        logger.info(f"[CLIENT] About to call SessionInfo.model_validate()...")
-        result = SessionInfo.model_validate(session_data)
-        logger.info(f"[CLIENT] model_validate() completed, returning SessionInfo")
-        return result
+        if session_data:
+            # Old format - full SessionInfo (backward compatibility)
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.info(f"[CLIENT] Using old session_info format")
+            result = SessionInfo.model_validate(session_data)
+            logger.info(f"[CLIENT] model_validate() completed, returning SessionInfo")
+            return result
+        else:
+            # New format - minimal status response
+            # Reconstruct minimal SessionInfo with only status field populated
+            status_str = response.get("status", "unknown")
+            error = response.get("error")
+
+            return SessionInfo(
+                name=self.agent_name,
+                session_type="langchain",
+                status=status_str,
+                working_dir="/tmp",  # Placeholder (not used)
+                created_at=datetime.now(),  # Placeholder (not used)
+                last_activity=None,
+                tasks_completed=0,
+                error_message=error,
+                data=None,
+                metadata=None,
+            )
 
     async def invoke_agent(
         self, message: str, stream: bool = False

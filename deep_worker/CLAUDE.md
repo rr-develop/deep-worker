@@ -12,15 +12,15 @@ pip install -e .
 pip install --break-system-packages -e .
 pip install deep-worker
 pip install deep-worker-cli
-pip install arpyc
+pip install deepagents
 python setup.py install
 python setup.py develop
 ```
 
 **IF YOU INSTALLED ANYTHING - UNINSTALL IT IMMEDIATELY:**
 ```bash
-pip uninstall --break-system-packages -y deep-worker deep-worker-cli arpyc
-rm -f ~/.local/bin/dwcli ~/.local/bin/deep-worker
+pip uninstall --break-system-packages -y deep-worker deep-worker-cli deepagents
+rm -f "$(command -v dwcli)" "$(command -v deep-worker)"
 ```
 
 ### 2. NEVER CREATE OR USE VIRTUAL ENVIRONMENTS
@@ -42,28 +42,42 @@ find . -name ".venv" -type d
 rm -rf <path>/.venv
 ```
 
-### 3. ARPYC MUST ALWAYS BE FROM SOURCE
+### 3. RPyC: USE THE LOCAL rpyc_async SOURCE CHECKOUT ONLY
 
-**CORRECT:**
+The project uses a local `rpyc_async` source checkout for all RPyC communication.
+This provides `AsyncioServer` — single event loop, no threads.
+
+**CORRECT (production code already does this):**
 ```python
-# Add arpyc from source to sys.path
-_arpyc_path = Path(__file__).parent.parent.parent.parent.parent / "arpyc"
-if _arpyc_path.exists() and str(_arpyc_path) not in sys.path:
-    sys.path.insert(0, str(_arpyc_path))
+# In agent_process.py:
+_rpyc_async_path = Path(RPYC_ASYNC_SOURCE_DIR)
+if _rpyc_async_path.exists() and str(_rpyc_async_path) not in sys.path:
+    sys.path.insert(0, str(_rpyc_async_path))
 
-from arpyc import RpycAsyncSession
+import rpyc
+from rpyc.utils.async_server import AsyncioServer
 ```
 
-**WRONG:**
+**FORBIDDEN:**
+- `pip install rpyc` — NEVER install rpyc from pip
+- `import arpyc` — the arpyc library has been REMOVED from the repository
+- `ThreadedServer` — NEVER use ThreadedServer, only AsyncioServer
+- `BgServingThread` — NEVER use background serving threads
+
+### 4. NEVER USE --no-verify ON GIT COMMITS
+
 ```bash
-pip install arpyc  # ❌ NEVER DO THIS
+git commit --no-verify  # ❌ ABSOLUTELY FORBIDDEN
 ```
 
-### 4. Why This Matters
+Pre-commit hooks enforce type checking, .venv detection, and pip installation
+guards. If a commit is blocked, FIX THE ISSUE — do not bypass the check.
+
+### 5. Why This Matters
 
 Using installed packages instead of source code causes:
 - RPyC proxy errors: `AttributeError: cannot access '__reversed__'`
-- Version conflicts between installed arpyc and source arpyc
+- Version conflicts between installed and source packages
 - Hours of debugging incompatibility issues
 - Test failures that don't reflect real bugs
 
@@ -73,7 +87,6 @@ Using installed packages instead of source code causes:
 
 1. **Check for .venv:**
    ```bash
-   # Check this repository and any related project directories:
    find . -name ".venv" -type d
    ```
 
@@ -81,33 +94,6 @@ Using installed packages instead of source code causes:
    ```bash
    rm -rf <path>/.venv
    ```
-
-3. **Verify arpyc is from source:**
-   ```bash
-   python3 -c "import sys; import arpyc; print(arpyc.__file__)"
-   # Should show: the in-repo arpyc source directory, e.g. .../arpyc/...
-   # NOT: .venv/lib/python.../site-packages/arpyc/...
-   ```
-
-### When Adding arpyc Import
-
-Always use this pattern with CRITICAL warning comment:
-
-```python
-# ============================================================================
-# CRITICAL: ARPYC MUST BE IMPORTED FROM SOURCE CODE, NOT FROM PIP/VENV!
-# ============================================================================
-# DO NOT use 'pip install arpyc' or ANY virtual environment (.venv)!
-# ALWAYS import arpyc from the in-repo arpyc source directory.
-# Using installed packages causes version conflicts and compatibility issues.
-# This project MUST run globally without venv to ensure correct arpyc version.
-# ============================================================================
-_arpyc_path = Path(__file__).parent.parent.parent.parent.parent / "arpyc"
-if _arpyc_path.exists() and str(_arpyc_path) not in sys.path:
-    sys.path.insert(0, str(_arpyc_path))
-
-from arpyc import RpycAsyncSession
-```
 
 ### Testing
 
@@ -119,11 +105,11 @@ python3 -m pytest tests/
 
 ## Common Mistakes to Avoid
 
-### ❌ WRONG: Creating setup.py with arpyc dependency
+### ❌ WRONG: Creating setup.py with package dependencies
 ```python
 # setup.py
 install_requires=[
-    'arpyc',  # ❌ NEVER LIST THIS AS DEPENDENCY
+    'rpyc',  # ❌ NEVER LIST THIS AS DEPENDENCY
 ]
 ```
 
@@ -139,7 +125,7 @@ python3 -m deep_worker_cli.cli.main
 
 ### ✅ CORRECT: Running globally with source imports
 ```
-"This project runs globally. Verify arpyc is imported from the in-repo arpyc source"
+"This project runs globally with source imports from the local rpyc_async checkout"
 ```
 
 ## When User Reports RPyC Errors
@@ -162,11 +148,10 @@ This is likely the root cause!
 
 1. **NEVER** install packages from this repository (`pip install -e .`, `pip install deep-worker`, etc.)
 2. **NEVER** suggest creating virtual environments
-3. **NEVER** suggest `pip install arpyc`
+3. **NEVER** use `--no-verify` on git commits
 4. **ALWAYS** run everything from source code directly
-5. **ALWAYS** import arpyc from the in-repo `arpyc` source
+5. **ALWAYS** use the local `rpyc_async` source checkout for RPyC (AsyncioServer, single event loop)
 6. **ALWAYS** check for and delete `.venv` directories when encountered
-7. **ALWAYS** add the CRITICAL warning comment block when importing arpyc
-8. **IF YOU INSTALLED ANYTHING** - uninstall it immediately using the commands in section 1
+7. **IF YOU INSTALLED ANYTHING** - uninstall it immediately using the commands in section 1
 
 Remember: The user spent hours debugging issues caused by `.venv` and installed packages. Everything MUST run from source code ONLY!

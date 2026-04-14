@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>UI Test - Deep-Worker-Web</title>
+    <link rel="stylesheet" href="static/css/style.css">
+    <style>
+        /* Test styles to verify visibility */
+        .test-result {
+            position: fixed;
+            top: 10px;
+            right: 10px;
+            background: #4ade80;
+            color: #000;
+            padding: 10px 20px;
+            border-radius: 4px;
+            font-weight: bold;
+            z-index: 9999;
+        }
+        .test-result.fail {
+            background: #ef4444;
+            color: #fff;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Deep-Worker-Web - UI TEST</h1>
+        </header>
+
+        <div class="main-content">
+            <!-- Agent List Panel -->
+            <div class="agent-list-panel">
+                <h2>Active Agents</h2>
+                <div id="agent-list" class="agent-list">
+                    <div class="agent-item">
+                        <div class="agent-item-name">Test Agent 1</div>
+                        <div class="agent-item-status">Status: idle</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Agent Interaction Panel -->
+            <div class="agent-interaction-panel">
+                <div id="agent-selected" class="agent-selected">
+                    <div class="agent-header">
+                        <h2 id="selected-agent-name">Test Agent</h2>
+                        <div class="agent-controls">
+                            <button id="full-dialog-btn" class="btn btn-secondary">📜 Full Dialog</button>
+                            <button id="stop-taskmanager-btn" class="btn btn-danger">⏹️ Stop TaskManager</button>
+                            <button id="stop-taskmanager-disabled" class="btn btn-danger" disabled>⏹️ Stop (Disabled)</button>
+                        </div>
+                    </div>
+
+                    <div class="agent-status">
+                        <span class="status-label">Status:</span>
+                        <span id="agent-status" class="status-badge">idle</span>
+                        <span class="status-label">Provider:</span>
+                        <span id="agent-provider">deepseek</span>
+                        <span class="status-label">Model:</span>
+                        <span id="agent-model">deepseek-chat</span>
+                    </div>
+
+                    <!-- Last Response Panel -->
+                    <div class="last-response-panel">
+                        <h3>Last Response</h3>
+                        <div id="last-response-content" class="response-content">
+                            This is a test response to verify visibility.
+                        </div>
+                    </div>
+
+                    <!-- Message Input -->
+                    <div class="message-input-panel">
+                        <h3>Send Message</h3>
+                        <textarea id="message-input" placeholder="Enter your message here..." rows="4">Test message</textarea>
+                        <button id="send-btn" class="btn btn-primary">Send Message</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <footer>
+            <p>Deep-Worker-Web | Running on <strong>127.0.0.1:7887</strong> (localhost only)</p>
+        </footer>
+    </div>
+
+    <script>
+        // Test that buttons are visible
+        window.addEventListener('load', () => {
+            const buttons = document.querySelectorAll('.btn');
+            let allVisible = true;
+            let results = [];
+
+            buttons.forEach(btn => {
+                const rect = btn.getBoundingClientRect();
+                const isVisible = rect.width > 0 && rect.height > 0 &&
+                                  window.getComputedStyle(btn).display !== 'none' &&
+                                  window.getComputedStyle(btn).visibility !== 'hidden';
+
+                results.push({
+                    id: btn.id || btn.textContent.substring(0, 20),
+                    visible: isVisible,
+                    width: rect.width,
+                    height: rect.height,
+                    display: window.getComputedStyle(btn).display
+                });
+
+                if (!isVisible) allVisible = false;
+            });
+
+            // Show result
+            const resultDiv = document.createElement('div');
+            resultDiv.className = 'test-result' + (allVisible ? '' : ' fail');
+            resultDiv.innerHTML = allVisible
+                ? `✅ All ${buttons.length} buttons visible!`
+                : `❌ Some buttons NOT visible!`;
+            document.body.appendChild(resultDiv);
+
+            console.log('Button visibility test results:', results);
+
+            // Test layout fills viewport
+            const body = document.body;
+            const bodyHeight = body.getBoundingClientRect().height;
+            const viewportHeight = window.innerHeight;
+            const fillsViewport = Math.abs(bodyHeight - viewportHeight) < 5;
+
+            setTimeout(() => {
+                const layoutDiv = document.createElement('div');
+                layoutDiv.className = 'test-result' + (fillsViewport ? '' : ' fail');
+                layoutDiv.style.top = '50px';
+                layoutDiv.innerHTML = fillsViewport
+                    ? `✅ Layout fills viewport (${Math.round(bodyHeight)}px = ${viewportHeight}px)`
+                    : `❌ Layout does NOT fill viewport (${Math.round(bodyHeight)}px ≠ ${viewportHeight}px)`;
+                document.body.appendChild(layoutDiv);
+            }, 100);
+        });
+    </script>
+</body>
+</html>

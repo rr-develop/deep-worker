@@ -135,7 +135,7 @@ class TestDeepAgents:
         agent = create_deep_agent(tools=[sample_tool], subagents=subagents, middleware=[ResearchMiddleware()])
         assert_all_deepagent_qualities(agent)
         assert "research" in agent.stream_channels
-        result = agent.invoke({"messages": [HumanMessage(content="Get surface level info on lebron james")]}, config={"recursion_limit": 100})
+        result = agent.invoke({"messages": [HumanMessage(content="Get surface level info on lebron james")]}, )
         agent_messages = [msg for msg in result.get("messages", []) if msg.type == "ai"]
         tool_calls = [tool_call for msg in agent_messages for tool_call in msg.tool_calls]
         assert any([tool_call["name"] == "task" and tool_call["args"].get("subagent_type") == "basketball_info_agent" for tool_call in tool_calls])
@@ -152,7 +152,7 @@ class TestDeepAgents:
         agent = create_deep_agent(tools=[sample_tool], subagents=subagents)
         assert_all_deepagent_qualities(agent)
         result = agent.invoke(
-            {"messages": [HumanMessage(content="Use the basketball info subagent to call the sample tool")]}, config={"recursion_limit": 100}
+            {"messages": [HumanMessage(content="Use the basketball info subagent to call the sample tool")]}
         )
         agent_messages = [msg for msg in result.get("messages", []) if msg.type == "ai"]
         tool_calls = [tool_call for msg in agent_messages for tool_call in msg.tool_calls]

@@ -10,6 +10,17 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+# ============================================================================
+# CRITICAL: RPYC_ASYNC MUST BE IMPORTED FROM SOURCE, NOT FROM PIP!
+# ============================================================================
+# Add rpyc_async to sys.path to use AsyncioServer from the local rpyc_async checkout
+# This enables true bidirectional async communication (156x faster!)
+# DO NOT use 'pip install rpyc' - it will use classic RPyC 5.0 without AsyncioServer
+# ============================================================================
+_rpyc_async_path = Path("rpyc_async")
+if _rpyc_async_path.exists() and str(_rpyc_async_path) not in sys.path:
+    sys.path.insert(0, str(_rpyc_async_path))
+
 import rpyc
 from rpyc.core.protocol import DEFAULT_CONFIG
 from rpyc.utils.async_server import AsyncioServer  # AsyncioServer from rpyc_async!
@@ -18,6 +29,7 @@ from deep_worker_cli.agent_config_pkg.agent_config import AgentConfig
 from deep_worker_cli.process.registry import ProcessRegistry
 from deep_worker_cli.session.session_manager import SessionManager
 from deep_worker_cli.types import AgentProcessInfo, AgentStatus
+
 
 def _find_free_port(start_port: int = 0, max_attempts: int = 100) -> int:
     """Find a free port dynamically.
@@ -73,6 +85,7 @@ def _find_free_port(start_port: int = 0, max_attempts: int = 100) -> int:
         f"No free ports available in range {start_port}-{start_port + max_attempts - 1}"
     )
 
+
 class AgentProcess:
     """
     Main class for a deep-worker agent process.
@@ -98,6 +111,7 @@ class AgentProcess:
         rpyc_port: int | bool | None = True,
         memory_only: bool = False,
         use_sqlite: bool = False,
+        launch_config: dict | None = None,
     ):
         """Initialize the agent process.
 
@@ -129,6 +143,7 @@ class AgentProcess:
         self.enable_task_manager = enable_task_manager
         self.memory_only = memory_only
         self.use_sqlite = use_sqlite
+        self.launch_config = launch_config
         self._checkpointer_ctx = None  # For lifecycle management
 
         # Auto-assign RPyC port if enabled
@@ -154,7 +169,7 @@ class AgentProcess:
         self.task_manager = None  # Will be initialized in start() if enabled
 
         # RPyC components
-        self.rpyc_server: ThreadedServer | None = None
+        self.rpyc_server: AsyncioServer | None = None
         self.rpyc_service_instance: Any = None
         self._agent_event_loop: Any = None  # Event loop for RPyC callbacks
 
@@ -183,6 +198,13 @@ class AgentProcess:
         # Maps approval_id -> decision dict (with "type" field: "approve", "reject", etc.)
         self._approval_decisions: dict[str, dict[str, Any]] = {}
 
+        # Message subscribers (shared across ALL RPyC connections)
+        # Each connection (TUI, headless, web UI) gets its own AgentService instance,
+        # but they all share this set of subscribers to ensure ALL clients receive
+        # messages regardless of which connection triggered the agent invocation.
+        # This upholds the "agent is single source of truth" architecture principle.
+        self._message_subscribers: set[Any] = set()
+
     async def start(self) -> None:
         """Start the agent process.
 
@@ -198,8 +220,11 @@ class AgentProcess:
             # 2. Setup signal handlers
             self._setup_signal_handlers()
 
-            # 3. Initialize session manager
-            self.session_manager = SessionManager(data_dir=self.data_dir)
+            # 3. Initialize session manager (with launch_config for post-mortem inspection)
+            self.session_manager = SessionManager(
+                data_dir=self.data_dir,
+                launch_config=self.launch_config,
+            )
 
             # 4. Initialize agent with create_cli_agent
             try:
@@ -222,12 +247,20 @@ class AgentProcess:
                     sys.stdout.flush()
                     print(msg, file=sys.stderr)
 
-                # deepagents is installed as a sibling package (see
-                # pyproject.toml `[tool.uv.sources]` / packaging config).
-                # Now import AFTER environment is loaded
+                # ================================================================
+                # CRITICAL: Add deepagents to sys.path BEFORE imports
+                # ================================================================
+                # deepagents must be imported from source, not from pip/venv
+                # This ensures correct version and avoids compatibility issues
+                # ================================================================
+                deepagents_path = PathLib(__file__).resolve().parents[3] / "deepagents"
+                if deepagents_path.exists() and str(deepagents_path) not in sys.path:
+                    sys.path.insert(0, str(deepagents_path))
+
+                # Now import AFTER environment is loaded and deepagents is in path
                 from deep_worker_cli.agent import create_cli_agent
                 from deep_worker_cli.config import create_model
-                from deep_worker_cli.tools import http_request, fetch_url, web_search_delegation_tool
+                from deep_worker_cli.tools import http_request, fetch_url, web_search_delegation_tool, read_image
 
                 # Create model using configuration from AgentConfig
                 # Pass provider and model explicitly from config
@@ -236,10 +269,17 @@ class AgentProcess:
                     model_name=self.config.model
                 )
 
+                # Set working_dir on model for MCP direct tool execution
+                # (e.g. project_memory needs to know the project root)
+                # Uses setattr() because create_model() returns BaseChatModel
+                # but only ClaudeCodeChatModel has _working_dir attribute.
+                if hasattr(model, '_working_dir'):
+                    setattr(model, '_working_dir', str(self.config.working_dir))
+
                 # Prepare web tools
                 # - http_request and fetch_url work without API keys
                 # - web_search_delegation_tool uses Claude Code SDK for universal web search
-                web_tools = [http_request, fetch_url, web_search_delegation_tool]
+                web_tools = [http_request, fetch_url, web_search_delegation_tool, read_image]
 
                 # Determine checkpointer based on flags and environment
                 # Priority order:
@@ -767,11 +807,105 @@ class AgentProcess:
                 "error": f"Failed to retrieve history: {str(e)}",
             }
 
+    async def _handle_get_last_response(self) -> dict[str, Any]:
+        """Get the last assistant (AIMessage) response from conversation history.
+
+        Returns only the last AIMessage with non-empty text content,
+        skipping tool-only messages. This is much more efficient than
+        loading full history when only the latest response is needed.
+
+        Returns:
+            Response dictionary:
+            {
+                "success": True,
+                "last_response": {
+                    "type": "AIMessage",
+                    "id": "...",
+                    "content": "...",
+                    "tool_calls": [...]  # optional
+                }
+            }
+            Or {"success": True, "last_response": None} if no AIMessage found.
+        """
+        import logging
+        logger = logging.getLogger(__name__)
+
+        if not self.agent:
+            return {"success": False, "error": "Agent not initialized"}
+
+        try:
+            from langchain_core.messages import AIMessage
+            from langchain_core.runnables import RunnableConfig
+
+            config: RunnableConfig = {
+                "configurable": {"thread_id": self.name},
+                "metadata": {
+                    "assistant_id": self.name,
+                    "agent_name": self.name,
+                    "updated_at": datetime.now(UTC).isoformat(),
+                },
+            }
+
+            state = await self.agent.aget_state(config)
+            if not state or not state.values:
+                return {"success": True, "last_response": None}
+
+            messages = state.values.get("messages", [])
+
+            # Walk backwards to find last AIMessage with text content
+            for msg in reversed(messages):
+                if not isinstance(msg, AIMessage):
+                    continue
+
+                # Extract text content
+                content = msg.content
+                if isinstance(content, str):
+                    text = content
+                elif isinstance(content, list):
+                    text = ""
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            text += block.get("text", "")
+                        elif isinstance(block, str):
+                            text += block
+                else:
+                    text = str(content)
+
+                # Skip AIMessages with empty text (tool-call-only messages)
+                if not text.strip():
+                    continue
+
+                msg_dict: dict[str, Any] = {
+                    "type": "AIMessage",
+                    "id": getattr(msg, "id", None),
+                    "content": text,
+                }
+
+                tool_calls = getattr(msg, "tool_calls", [])
+                if tool_calls:
+                    msg_dict["tool_calls"] = [
+                        {
+                            "id": tc.get("id"),
+                            "name": tc.get("name"),
+                            "args": tc.get("args", {}),
+                        }
+                        for tc in tool_calls
+                    ]
+
+                return {"success": True, "last_response": msg_dict}
+
+            return {"success": True, "last_response": None}
+
+        except Exception as e:
+            logger.error(f"Error getting last response: {e}")
+            return {"success": False, "error": f"Failed to get last response: {str(e)}"}
+
     async def _handle_invoke(
         self,
         command: dict[str, Any],
         connection: Any = None,
         notify_callback: Any = None,
+        approval_callback: Any = None,
     ) -> dict[str, Any]:
         """Handle agent invocation command.
 
@@ -867,15 +1001,15 @@ class AgentProcess:
                         )
 
                     # TaskManager evaluation loop or single iteration
-                    max_iterations = 10 if self.task_manager else 1
+                    # TaskManager has NO iteration limit — it runs until done/unable.
                     iteration = 0
                     current_message = message
                     full_response = ""
 
-                    while iteration < max_iterations:
+                    while True:
                         iteration += 1
                         if self.task_manager:
-                            print(f"[STREAM] TaskManager iteration {iteration}/{max_iterations}", file=sys.stderr)
+                            print(f"[STREAM] TaskManager iteration {iteration}", file=sys.stderr)
 
                         # Notify user message at start (agent as source of truth)
                         # For TaskManager: only send on first iteration, subsequent corrective
@@ -903,7 +1037,7 @@ class AgentProcess:
                                 f.write(f"\n{'='*80}\n")
                                 f.write(f"[{time_mod.time():.3f}] STARTING astream loop\n")
                                 if self.task_manager:
-                                    f.write(f"  TaskManager iteration: {iteration}/{max_iterations}\n")
+                                    f.write(f"  TaskManager iteration: {iteration}\n")
                                 f.write(f"  stream_mode=['messages', 'updates']\n")
                                 f.write(f"  durability='exit'\n")
                                 f.write(f"  Env DWCLI_DEBUG_ASTREAM={os.environ.get('DWCLI_DEBUG_ASTREAM')}\n")
@@ -1058,13 +1192,13 @@ class AgentProcess:
                         )
 
                         # TaskManager evaluation loop
-                        max_iterations = 10  # Prevent infinite loops
+                        # NO iteration limit — TaskManager runs until done/unable.
                         iteration = 0
                         current_message = message
 
-                        while iteration < max_iterations:
+                        while True:
                             iteration += 1
-                            print(f"[INVOKE] TaskManager iteration {iteration}/{max_iterations}", file=sys.stderr)
+                            print(f"[INVOKE] TaskManager iteration {iteration}", file=sys.stderr)
 
                             # Invoke agent
                             result = await self.agent.ainvoke(
@@ -1162,14 +1296,15 @@ class AgentProcess:
                         iteration = 0
                         final_content = ""
 
+                        # Initial ainvoke with user message
+                        result = await self.agent.ainvoke(
+                            {"messages": [{"role": "user", "content": message}]},
+                            config
+                        )
+                        print(f"[INVOKE] Initial ainvoke: Got result with {len(result.get('messages', []))} messages", file=sys.stderr)
+
                         while iteration < max_iterations:
                             iteration += 1
-
-                            result = await self.agent.ainvoke(
-                                {"messages": [{"role": "user", "content": message}]},
-                                config
-                            )
-                            print(f"[INVOKE] Iteration {iteration}: Got result with {len(result.get('messages', []))} messages", file=sys.stderr)
 
                             messages = result.get("messages", [])
                             if not messages:
@@ -1281,24 +1416,43 @@ class AgentProcess:
                                 print(f"[INVOKE] Got final response: {content[:100]}...", file=sys.stderr)
                                 break
 
-                            # If there's an interrupt, we need to handle it
-                            # In non-interactive mode with skip_permissions, it should auto-approve
-                            # But if we're here with an interrupt, something is wrong
+                            # If there's an interrupt, handle it properly:
+                            # 1. Get approval decision (via callback or auto-approve)
+                            # 2. Resume with Command(resume=...) — do NOT re-send HumanMessage
                             if has_interrupt:
-                                print(f"[INVOKE] WARNING: Interrupt detected in iteration {iteration}, but agent should auto-approve with skip_permissions", file=sys.stderr)
-                                # The interrupt should be auto-approved on next iteration
-                                # Continue to next iteration which will process the approved tool call
+                                interrupts = result["__interrupt__"]
+                                print(f"[INVOKE] Interrupt detected: {len(interrupts)} pending approvals", file=sys.stderr)
+
+                                # NOTE: Do NOT broadcast here — exposed_request_approval()
+                                # handles broadcasting with its own approval_id.
+
+                                # Get decisions: either from callback or auto-approve
+                                if approval_callback is not None:
+                                    hitl_response = await approval_callback(interrupts)
+                                else:
+                                    # Auto-approve all (no callback = headless/web without approval UI)
+                                    hitl_response = {}
+                                    for intr in interrupts:
+                                        actions = intr.value.get("action_requests", [])
+                                        hitl_response[intr.id] = {
+                                            "decisions": [{"type": "approve"} for _ in actions]
+                                        }
+                                    print(f"[INVOKE] Auto-approving {len(interrupts)} interrupts (no approval callback)", file=sys.stderr)
+
+                                # Resume graph with decisions (NOT with HumanMessage!)
+                                from langgraph.types import Command
+                                resume_input = Command(resume=hitl_response)
+                                result = await self.agent.ainvoke(resume_input, config)
+                                print(f"[INVOKE] Resumed after interrupt, got {len(result.get('messages', []))} messages", file=sys.stderr)
+
+                                # Re-evaluate the new result (loop continues from evaluation)
                                 continue
 
-                            # If we have tool calls but no interrupt, they're being executed
-                            # Continue to next iteration to get the result
+                            # If we have tool calls but no interrupt, they should have been
+                            # executed by ainvoke already. Break to avoid re-sending.
                             if has_tool_calls:
-                                print(f"[INVOKE] Tool calls detected, continuing to next iteration...", file=sys.stderr)
-                                # In this case, the tool is executed but we haven't gotten response yet
-                                # This shouldn't happen with ainvoke - it should wait
-                                # But let's handle it gracefully
-                                await asyncio.sleep(0.1)  # Brief pause
-                                continue
+                                print(f"[INVOKE] Tool calls detected without interrupt — ainvoke should have handled them", file=sys.stderr)
+                                break
 
                             # If we got here with empty content and no tool calls,
                             # the agent finished but has nothing to say (shouldn't happen normally)
@@ -1320,11 +1474,20 @@ class AgentProcess:
                                 "error": "Agent did not produce a response"
                             }
 
-                        # ✨ NO FINAL MESSAGE IN STREAMING MODE!
-                        # In streaming mode, all content was already sent via process_message_chunk
-                        # Sending a final message would cause duplication (e.g., "44" instead of "4")
-                        # This matches deepagents architecture which only calls _set_active_message(None)
-                        # after streaming completes - no final message notification!
+                        # ============================================================
+                        # ARCHITECTURE PRINCIPLE: AGENT IS THE SINGLE SOURCE OF TRUTH
+                        # ============================================================
+                        # In non-streaming mode WITHOUT TaskManager, we must explicitly
+                        # broadcast the final assistant response to ensure ALL connected
+                        # clients (TUI, web UI, etc.) see it via real-time callbacks.
+                        # This is critical for maintaining consistency across all subscribers.
+                        # ============================================================
+                        if notify_callback is not None:
+                            await notify_callback({
+                                "type": "assistant",
+                                "role": "assistant",
+                                "content": final_content,
+                            })
 
                         # Set status back to IDLE after successful completion
                         if self.session_manager:

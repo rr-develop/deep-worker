@@ -22,7 +22,10 @@ if TYPE_CHECKING:
     from deepagents.backends import CompositeBackend
     from deepagents.backends.filesystem import FilesystemBackend
     from deepagents.backends.sandbox import SandboxBackendProtocol
-    from deepagents.middleware import MemoryMiddleware, SkillsMiddleware
+    from deepagents.middleware import (
+        MemoryMiddleware,
+        SkillsMiddleware,
+    )
     from deepagents.middleware.subagents import CompiledSubAgent, SubAgent
 
 from deep_worker_cli.backends import CLIShellBackend, patch_filesystem_middleware
@@ -497,7 +500,11 @@ def create_cli_agent(
     from deepagents import create_deep_agent
     from deepagents.backends import CompositeBackend
     from deepagents.backends.filesystem import FilesystemBackend
-    from deepagents.middleware import MemoryMiddleware, SkillsMiddleware
+    from deepagents.middleware import (
+        MemoryMiddleware,
+        SkillsMiddleware,
+        SummarizationMiddleware,
+    )
     from deepagents.middleware.subagents import CompiledSubAgent, SubAgent
 
     # Import ProjectMemoryMiddleware from local deepagents if available

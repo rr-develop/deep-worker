@@ -1,5 +1,6 @@
 """Middleware for providing subagents to an agent via a `task` tool."""
 
+import uuid
 import warnings
 from collections.abc import Awaitable, Callable, Sequence
 from typing import Annotated, Any, NotRequired, TypedDict, Unpack, cast
@@ -439,7 +440,19 @@ def _build_task_tool(
             allowed_types = ", ".join([f"`{k}`" for k in subagent_graphs])
             return f"We cannot invoke subagent {subagent_type} because it does not exist, the only allowed types are {allowed_types}"
         subagent, subagent_state = _validate_and_prepare_state(subagent_type, description, runtime)
-        result = subagent.invoke(subagent_state)
+
+        # Generate unique thread_id for subagent isolation.
+        # Format: <parent_agent>:sub_<uuid> — ensures:
+        # 1. Unique Claude SDK session per subagent call (no sent_count corruption)
+        # 2. Traceability — prefix shows which parent agent spawned it
+        parent_thread_id = runtime.config.get("configurable", {}).get("thread_id", "agent")
+        agent_name = parent_thread_id.split(":")[0]
+        sub_thread_id = f"{agent_name}:sub_{uuid.uuid4().hex[:8]}"
+
+        result = subagent.invoke(
+            subagent_state,
+            config={"configurable": {"thread_id": sub_thread_id}},
+        )
         if not runtime.tool_call_id:
             value_error_msg = "Tool call ID is required for subagent invocation"
             raise ValueError(value_error_msg)
@@ -457,7 +470,16 @@ def _build_task_tool(
             allowed_types = ", ".join([f"`{k}`" for k in subagent_graphs])
             return f"We cannot invoke subagent {subagent_type} because it does not exist, the only allowed types are {allowed_types}"
         subagent, subagent_state = _validate_and_prepare_state(subagent_type, description, runtime)
-        result = await subagent.ainvoke(subagent_state)
+
+        # Generate unique thread_id for subagent isolation (see sync task() above)
+        parent_thread_id = runtime.config.get("configurable", {}).get("thread_id", "agent")
+        agent_name = parent_thread_id.split(":")[0]
+        sub_thread_id = f"{agent_name}:sub_{uuid.uuid4().hex[:8]}"
+
+        result = await subagent.ainvoke(
+            subagent_state,
+            config={"configurable": {"thread_id": sub_thread_id}},
+        )
         if not runtime.tool_call_id:
             value_error_msg = "Tool call ID is required for subagent invocation"
             raise ValueError(value_error_msg)

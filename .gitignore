@@ -20,7 +20,7 @@ secrets/
 # ============================================================
 # SENSITIVE DATA
 # ============================================================
-# Google API keys (must not be in git)
+# Google API keys (must never be in git)
 *service-account*.json
 *-key.json
 *.service-account*
@@ -81,6 +81,9 @@ Thumbs.db
 # Test outputs
 test_output/
 *.test
+
+# Test screenshots (auto-generated, do not commit)
+tests/screenshots/
 
 # Backup files
 *.backup

@@ -21,7 +21,7 @@ from deep_worker_cli.config import settings
 # CRITICAL: CLAUDE_CODE_PROVIDER MUST BE IMPORTED FROM SOURCE CODE, NOT FROM PIP/VENV!
 # ============================================================================
 # Path calculation: __file__ is at deep_worker/deep_worker_cli/deep_worker_cli/tools.py
-# .parent x4 = repository root
+# .parent x4 = the repository root
 _repo_root = Path(__file__).parent.parent.parent.parent
 _claude_code_provider_path = _repo_root / "claude_code_provider"
 if not _claude_code_provider_path.exists():
@@ -53,7 +53,7 @@ tavily_client = (
 # - See web_search_delegation.py:_extract_results() for critical implementation
 # - Always test with: pytest tests/integration_ai/test_websearch_delegation_deepseek.py
 # ============================================================================
-web_search_delegation_tool = WebSearchDelegationTool(verbose=False, timeout=30.0)
+web_search_delegation_tool = WebSearchDelegationTool(verbose=False, timeout=120.0)
 
 
 def http_request(
@@ -229,4 +229,78 @@ def fetch_url(url: str, timeout: int = 30) -> dict[str, Any]:
         }
     except requests.exceptions.RequestException as e:
         return {"error": f"Fetch URL error: {e!s}", "url": url}
-# Test comment
+
+
+# ===========================================================================
+# IMAGE ANALYSIS TOOL
+# ===========================================================================
+
+# Supported image formats and their MIME types
+_IMAGE_MIME_TYPES: dict[str, str] = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+}
+
+# Anthropic API limit
+_MAX_IMAGE_SIZE_BYTES = 20 * 1024 * 1024  # 20 MB
+
+
+def read_image(file_path: str) -> list[dict[str, Any]] | str:
+    """Read an image file and return it for visual analysis by the model.
+
+    The image is base64-encoded and returned as multimodal content blocks
+    that Claude can analyze visually.
+
+    Supports PNG, JPEG, GIF, WebP formats. Maximum file size: 20 MB.
+
+    Args:
+        file_path: Absolute path to the image file.
+
+    Returns:
+        List of content blocks [text_metadata, image_data] on success,
+        or error string on failure.
+    """
+    import base64
+
+    path = Path(file_path)
+
+    # Validate file exists
+    if not path.exists():
+        return f"Error: File not found: {file_path}"
+
+    # Validate format
+    ext = path.suffix.lower()
+    if ext not in _IMAGE_MIME_TYPES:
+        supported = ", ".join(sorted(_IMAGE_MIME_TYPES.keys()))
+        return f"Error: Unsupported image format: {ext}. Supported: {supported}"
+
+    # Validate size
+    file_size = path.stat().st_size
+    if file_size > _MAX_IMAGE_SIZE_BYTES:
+        size_mb = file_size / (1024 * 1024)
+        return f"Error: Image too large: {size_mb:.1f} MB. Maximum: 20 MB"
+
+    # Read and encode
+    try:
+        image_data = path.read_bytes()
+        b64_data = base64.b64encode(image_data).decode("ascii")
+        mime_type = _IMAGE_MIME_TYPES[ext]
+
+        # Try to get dimensions
+        dimensions = ""
+        try:
+            from PIL import Image as PILImage
+            with PILImage.open(path) as img:
+                dimensions = f" ({img.width}x{img.height})"
+        except Exception:
+            pass
+
+        return [
+            {"type": "text", "text": f"Image: {path.name}{dimensions}, {mime_type}, {file_size} bytes"},
+            {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64_data}"}},
+        ]
+    except Exception as e:
+        return f"Error: Failed to read image: {e}"

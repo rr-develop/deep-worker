@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Full Dialog - Deep-Worker-Web</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+    <style>
+        /* Using a Material3 dark theme */
+        body {
+            padding: 20px;
+            background: #0F1417; /* material_background */
+            color: #DFE3E7; /* material_on_background */
+        }
+
+        .dialog-container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: #171C1F; /* material_surface_container_low */
+            border-radius: 8px;
+            padding: 30px;
+            border: 1px solid #40484C; /* material_outline_variant */
+        }
+
+        .dialog-header {
+            margin-bottom: 20px;
+            border-bottom: 1px solid #40484C; /* material_outline_variant */
+            padding-bottom: 15px;
+        }
+
+        .dialog-header h2 {
+            margin: 0 0 10px 0;
+            color: #DFE3E7; /* material_on_background */
+        }
+
+        .dialog-meta {
+            color: #C0C8CD; /* material_on_surface_variant */
+            font-size: 14px;
+        }
+
+        .dialog-messages {
+            max-height: 600px;
+            overflow-y: auto;
+            margin-bottom: 20px;
+            padding: 20px;
+            background: #1B2023; /* material_surface_container */
+            border-radius: 4px;
+            border: 1px solid #40484C; /* material_outline_variant */
+        }
+
+        .message {
+            margin-bottom: 20px;
+            padding: 15px;
+            border-radius: 8px;
+            animation: fadeIn 0.3s ease-in;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        .message-user {
+            background: #004D64; /* material_primary_container */
+            border-left: 4px solid #8BD0EF; /* material_primary */
+        }
+
+        .message-assistant {
+            background: #354A53; /* material_secondary_container */
+            border-left: 4px solid #B4CAD6; /* material_secondary */
+        }
+
+        .message-tool_call {
+            background: #454364; /* material_tertiary_container */
+            border-left: 4px solid #C6C2EA; /* material_tertiary */
+        }
+
+        .message-tool_result {
+            background: #262B2D; /* material_surface_container_high */
+            border-left: 4px solid #8A9297; /* material_outline */
+        }
+
+        .message-header {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 10px;
+            font-size: 12px;
+            color: #666;
+        }
+
+        .message-role {
+            font-weight: bold;
+            text-transform: uppercase;
+        }
+
+        .message-time {
+            color: #999;
+        }
+
+        .message-content {
+            color: #DFE3E7; /* material_on_background */
+            line-height: 1.6;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+        }
+
+        .dialog-actions {
+            display: flex;
+            gap: 10px;
+            justify-content: flex-end;
+        }
+
+        .loading-indicator {
+            text-align: center;
+            padding: 40px;
+            color: #C0C8CD; /* material_on_surface_variant */
+            font-style: italic;
+        }
+
+        .error-message {
+            background: #93000A; /* material_error_container */
+            color: #FFDAD6; /* material_on_error_container */
+            padding: 20px;
+            border-radius: 4px;
+            text-align: center;
+        }
+
+        .empty-state {
+            text-align: center;
+            padding: 60px 20px;
+            color: #C0C8CD; /* material_on_surface_variant */
+        }
+
+        .empty-state .icon {
+            font-size: 48px;
+            margin-bottom: 15px;
+        }
+    </style>
+</head>
+<body>
+    <div class="dialog-container">
+        <div class="dialog-header">
+            <h2>Full Dialog: <span id="agent-name">Loading...</span></h2>
+            <div class="dialog-meta">
+                Thread: <span id="thread-id">-</span> |
+                Messages: <span id="message-count">0</span> |
+                Status: <span id="agent-status">-</span>
+            </div>
+        </div>
+
+        <div id="dialog-messages" class="dialog-messages">
+            <div class="loading-indicator">
+                ⏳ Loading conversation history...
+            </div>
+        </div>
+
+        <div class="dialog-actions">
+            <button onclick="refreshDialog()" class="btn btn-secondary">🔄 Refresh</button>
+            <button onclick="exportDialog()" class="btn btn-secondary">💾 Export</button>
+            <button onclick="window.close()" class="btn btn-danger">✕ Close</button>
+        </div>
+    </div>
+
+    <script>
+        // Get agent name from URL query parameter
+        const urlParams = new URLSearchParams(window.location.search);
+        const agentName = urlParams.get('agent');
+
+        if (!agentName) {
+            document.getElementById('dialog-messages').innerHTML =
+                '<div class="error-message">❌ No agent specified in URL</div>';
+        } else {
+            document.getElementById('agent-name').textContent = agentName;
+            loadDialog();
+        }
+
+        async function loadDialog() {
+            try {
+                // Get agent status
+                const statusResponse = await fetch(`/api/agents/${agentName}`);
+                if (statusResponse.ok) {
+                    const statusData = await statusResponse.json();
+                    document.getElementById('agent-status').textContent = statusData.status;
+                    document.getElementById('thread-id').textContent =
+                        statusData.current_thread_id || 'default';
+                }
+
+                // Get conversation history
+                const historyResponse = await fetch(`/api/agents/${agentName}/history`);
+                if (!historyResponse.ok) {
+                    throw new Error(`Failed to fetch history: ${historyResponse.statusText}`);
+                }
+
+                const historyData = await historyResponse.json();
+                displayMessages(historyData.messages || []);
+
+            } catch (error) {
+                console.error('Error loading dialog:', error);
+                document.getElementById('dialog-messages').innerHTML =
+                    `<div class="error-message">❌ Error: ${error.message}</div>`;
+            }
+        }
+
+        function displayMessages(messages) {
+            const container = document.getElementById('dialog-messages');
+
+            if (messages.length === 0) {
+                container.innerHTML = `
+                    <div class="empty-state">
+                        <div class="icon">💬</div>
+                        <p>No messages in conversation history</p>
+                    </div>
+                `;
+                document.getElementById('message-count').textContent = '0';
+                return;
+            }
+
+            // Update message count
+            document.getElementById('message-count').textContent = messages.length;
+
+            // Render messages
+            container.innerHTML = '';
+            messages.forEach(msg => {
+                const messageDiv = document.createElement('div');
+                messageDiv.className = `message message-${msg.role}`;
+
+                const timestamp = new Date(msg.timestamp);
+                const timeStr = timestamp.toLocaleTimeString();
+
+                messageDiv.innerHTML = `
+                    <div class="message-header">
+                        <span class="message-role">${msg.role}</span>
+                        <span class="message-time">${timeStr}</span>
+                    </div>
+                    <div class="message-content">${escapeHtml(msg.content)}</div>
+                `;
+
+                container.appendChild(messageDiv);
+            });
+
+            // Scroll to bottom
+            container.scrollTop = container.scrollHeight;
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        function refreshDialog() {
+            document.getElementById('dialog-messages').innerHTML =
+                '<div class="loading-indicator">⏳ Refreshing...</div>';
+            loadDialog();
+        }
+
+        function exportDialog() {
+            // Export conversation as JSON
+            const agentNameEl = document.getElementById('agent-name');
+            const messagesEl = document.querySelectorAll('.message');
+
+            const messages = Array.from(messagesEl).map(msg => {
+                const role = msg.querySelector('.message-role').textContent.toLowerCase();
+                const content = msg.querySelector('.message-content').textContent;
+                const time = msg.querySelector('.message-time').textContent;
+                return { role, content, time };
+            });
+
+            const data = {
+                agent: agentNameEl.textContent,
+                exported_at: new Date().toISOString(),
+                message_count: messages.length,
+                messages: messages
+            };
+
+            const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `dialog_${agentNameEl.textContent}_${new Date().toISOString()}.json`;
+            a.click();
+            URL.revokeObjectURL(url);
+        }
+    </script>
+</body>
+</html>

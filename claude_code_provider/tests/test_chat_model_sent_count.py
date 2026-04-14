@@ -17,6 +17,11 @@ class TestSentCountTracking:
         """Should track sent messages and send only new ones."""
         model = ClaudeCodeChatModel()
 
+        # Reset sent_count for this test (global singleton may have state from other tests)
+        test_thread_id = "test"
+        if test_thread_id in model.client_manager._sent_count:
+            del model.client_manager._sent_count[test_thread_id]
+
         # Mock client
         mock_client = Mock()
         mock_client.query = AsyncMock()
@@ -228,10 +233,8 @@ class TestSentCountTracking:
                 config={"configurable": {"thread_id": "test"}}
             )
 
-        # Should NOT call query (no HumanMessage in new messages)
-        assert mock_client.query.call_count == 0
-
-        # Should call resolve_call for ToolMessage
+        # ⚠️ PROXY: ToolMessage resolved via resolve_call, NOT query
+        assert mock_client.query.call_count == 0, "ToolMessage should NOT use query!"
         mock_proxy.resolve_call.assert_called_once()
 
         # Should update sent_count

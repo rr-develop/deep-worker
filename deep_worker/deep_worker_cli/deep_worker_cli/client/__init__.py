@@ -1,7 +1,7 @@
 """Client SDK for connecting to deep_worker agents via RPyC.
 
 This module provides a high-level SDK for connecting to and communicating
-with deep-worker agent processes ONLY via RPyC (arpyc).
+with deep-worker agent processes via RPyC (AsyncioServer from the local rpyc_async checkout).
 
 IMPORTANT: Only RPyC connections are supported. Unix sockets are NOT supported.
 

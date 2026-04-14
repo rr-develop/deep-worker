@@ -39,6 +39,7 @@ with open("/tmp/dwcli_agent_service_IMPORT.log", "a") as _f:
     _f.write(f"\n[{_log_time.time():.3f}] agent_service.py MODULE IMPORTED\n")
 
 import asyncio
+import json
 import logging
 from typing import TYPE_CHECKING, Any
 
@@ -182,13 +183,13 @@ class AgentService(rpyc.Service):
 
         CRITICAL: This is a SYNC method called by RPyC!
         NEVER create asyncio.Lock() or other async primitives here.
-        Each connection gets its own service instance, so no shared state.
+        Each connection gets its own service instance, but message subscribers
+        are shared via AgentProcess to ensure ALL connections receive messages.
         """
         # Initialize instance attributes (each connection = new instance)
         self._agent_process: AgentProcess | None = None
         self._event_loop: Any = None  # asyncio.AbstractEventLoop
-        self._message_subscribers: set[Any] = set()
-        # NO asyncio.Lock() - we don't need it since each connection has own instance
+        # NO _message_subscribers here! They're stored in AgentProcess (shared state)
 
         logger.info(f"RPyC client connected: {conn}")
 
@@ -200,10 +201,9 @@ class AgentService(rpyc.Service):
         """
         logger.info(f"RPyC client disconnected: {conn}")
 
-        # Clear subscribers for this connection
-        # NOTE: We can't use async lock here because on_disconnect is called sync.
-        # Since each connection gets its own service instance, there's no race condition.
-        self._message_subscribers.clear()
+        # NOTE: We don't clear _message_subscribers here anymore because they're
+        # stored in AgentProcess (shared across all connections). Each subscriber
+        # is responsible for unsubscribing via exposed_unsubscribe_messages().
 
     def set_agent_process(self, agent_process: AgentProcess) -> None:
         """Set reference to agent process."""
@@ -221,49 +221,83 @@ class AgentService(rpyc.Service):
         """Get service name (async override for AsyncioServer)."""
         return "AGENT_SERVICE"
 
-    async def exposed_get_service_aliases(self) -> list[str]:
-        """Get service aliases (async override for AsyncioServer)."""
-        return []
+    async def exposed_get_service_aliases(self) -> str:
+        """Get service aliases (async override for AsyncioServer).
+
+        IMPORTANT: Returns JSON-serialized string to eliminate RPyC netref overhead.
+        Client must json.loads() the response.
+        """
+        return json.dumps([])
 
     # ========================================================================
     # AgentService exposed methods
     # ========================================================================
 
-    async def exposed_get_status(self) -> dict[str, Any]:
-        """Get agent status (async for AsyncioServer)."""
+    async def exposed_get_status(self) -> str:
+        """Get agent status (async for AsyncioServer).
+
+        Returns minimal status response for high-frequency polling.
+        Only includes status + optional error message.
+
+        IMPORTANT: Returns JSON-serialized string to eliminate RPyC netref overhead.
+        Client must json.loads() the response. This reduces RPyC messages from 24 to 2
+        per get_status() call (see docs/RPYC_SERIALIZATION_DESIGN.md).
+
+        This optimization reduces response size from 10-100 KB to < 200 bytes,
+        eliminating unnecessary serialization overhead on every status check.
+        """
         if not self._agent_process:
-            return {"success": False, "error": "Agent not initialized"}
+            result = {"success": False, "error": "Agent not initialized"}
+            return json.dumps(result)
 
         try:
             if not self._agent_process.session_manager:
-                return {"success": False, "error": "Session manager not initialized"}
+                result = {"success": False, "error": "Session manager not initialized"}
+                return json.dumps(result)
 
-            from deep_worker_cli.basesession.session_adapter import get_session_info
+            from deep_worker_cli.basesession.session_adapter import map_agent_status
 
-            session_info = get_session_info(self._agent_process)
-            return {
+            # Get status directly from session manager (no full SessionInfo needed)
+            status = map_agent_status(self._agent_process.session_manager.status)
+            error_message = self._agent_process.session_manager.error_message
+
+            result: dict[str, Any] = {
                 "success": True,
-                "session_info": session_info.model_dump(mode="json"),
+                "status": status.value,  # SessionStatus enum value
+                "error": error_message,  # Only if status == "error"
             }
+
+            # Include task_manager fields only if TaskManager is configured
+            if self._agent_process.task_manager is not None:
+                result["task_manager_active"] = (
+                    self._agent_process.task_manager.state != "inactive"
+                )
+                result["task_manager_disabled"] = self._agent_process.task_manager.disabled
+
+            return json.dumps(result)
         except Exception as e:
             logger.exception("Error getting status: %s", e)
-            return {"success": False, "error": str(e)}
+            result = {"success": False, "error": str(e)}
+            return json.dumps(result)
 
     async def exposed_invoke_agent(
         self, message: str, stream: bool = False
-    ) -> dict[str, Any]:
+    ) -> str:
         """
         Invoke agent with message (async for AsyncioServer!).
 
         MIGRATION NOTE: With AsyncioServer, we're already in the event loop!
         No need for run_coroutine_threadsafe - just await directly.
 
+        IMPORTANT: Returns JSON-serialized string to eliminate RPyC netref overhead.
+        Client must json.loads() the response.
+
         Args:
             message: User message
             stream: Whether to stream response
 
         Returns:
-            Response dict with success status and agent response
+            JSON string with success status and agent response
         """
         # DEBUG: Log entry
         import time as time_mod
@@ -273,7 +307,8 @@ class AgentService(rpyc.Service):
             f.write(f"  message={message[:80] if message else 'None'}...\n")
 
         if not self._agent_process:
-            return {"success": False, "error": "Agent not initialized"}
+            result = {"success": False, "error": "Agent not initialized"}
+            return json.dumps(result)
 
         try:
             # ====================================================================
@@ -292,10 +327,42 @@ class AgentService(rpyc.Service):
             # Pass _notify_subscribers as callback so the TaskManager evaluation
             # loop can broadcast ALL messages (user, assistant, tool_call, tool_result)
             # to all connected dwcli subscribers in real time.
+            # Approval callback for HITL interrupts in non-streaming mode.
+            # Bridges _handle_invoke's interrupt handling with the approval system.
+            async def _approval_callback(interrupts: tuple) -> dict:
+                """Handle interrupts by broadcasting and waiting for decisions."""
+                hitl_response = {}
+                for intr in interrupts:
+                    actions = intr.value.get("action_requests", [])
+                    decision = await self.exposed_request_approval(
+                        action_requests=actions,
+                        assistant_id=self._agent_process.name if self._agent_process else "unknown",
+                    )
+                    # Convert single decision to per-action decisions list
+                    if decision.get("type") == "approve":
+                        hitl_response[intr.id] = {
+                            "decisions": [{"type": "approve"} for _ in actions]
+                        }
+                    elif decision.get("type") == "reject":
+                        hitl_response[intr.id] = {
+                            "decisions": [{"type": "reject", "message": decision.get("message", "Rejected by user")} for _ in actions]
+                        }
+                    elif decision.get("type") == "auto_approve_all":
+                        hitl_response[intr.id] = {
+                            "decisions": [{"type": "approve"} for _ in actions]
+                        }
+                    else:
+                        # Default: approve
+                        hitl_response[intr.id] = {
+                            "decisions": [{"type": "approve"} for _ in actions]
+                        }
+                return hitl_response
+
             response = await self._agent_process._handle_invoke(
                 {"command": "invoke", "message": message, "stream": stream},
                 connection=None,
                 notify_callback=self._notify_subscribers,
+                approval_callback=_approval_callback,
             )
 
             # DEBUG: Log after getting response
@@ -303,36 +370,96 @@ class AgentService(rpyc.Service):
                 f.write(f"[{time_mod.time():.3f}] Got response (async await)\n")
                 f.write(f"  success={response.get('success')}\n")
 
-            return response
+            return json.dumps(response)
 
         except asyncio.TimeoutError:
             logger.error("Agent invocation timed out")
-            return {"success": False, "error": "Agent invocation timed out"}
+            result = {"success": False, "error": "Agent invocation timed out"}
+            return json.dumps(result)
         except Exception as e:
             logger.exception("Error invoking agent: %s", e)
-            return {"success": False, "error": str(e)}
+            result = {"success": False, "error": str(e)}
+            return json.dumps(result)
 
     async def exposed_get_history(
         self, limit: int = 50, offset: int = 0
-    ) -> dict[str, Any]:
+    ) -> str:
         """Get conversation history (async for AsyncioServer!).
 
         MIGRATION NOTE: With AsyncioServer, we're already in the event loop!
         No need for run_coroutine_threadsafe - just await directly.
+
+        IMPORTANT: Returns JSON-serialized string to eliminate RPyC netref overhead.
+        Client must json.loads() the response.
         """
         if not self._agent_process:
-            return {"success": False, "error": "Agent not initialized"}
+            result = {"success": False, "error": "Agent not initialized"}
+            return json.dumps(result)
 
         try:
             # ✨ ASYNC MAGIC: With AsyncioServer, we're already in the event loop!
             # Just await directly - no threading needed!
-            return await self._agent_process._handle_get_history(
+            response = await self._agent_process._handle_get_history(
                 {"command": "get_history", "limit": limit, "offset": offset},
                 connection=None,
             )
+            return json.dumps(response)
         except Exception as e:
             logger.exception("Error getting history: %s", e)
-            return {"success": False, "error": str(e)}
+            result = {"success": False, "error": str(e)}
+            return json.dumps(result)
+
+    async def exposed_get_last_response(self) -> str:
+        """Get the last assistant response (async for AsyncioServer!).
+
+        Returns only the last AIMessage with non-empty text content.
+        More efficient than get_history when only the latest response is needed.
+
+        IMPORTANT: Returns JSON-serialized string to eliminate RPyC netref overhead.
+        Client must json.loads() the response.
+        """
+        if not self._agent_process:
+            result = {"success": False, "error": "Agent not initialized"}
+            return json.dumps(result)
+
+        try:
+            response = await self._agent_process._handle_get_last_response()
+            return json.dumps(response)
+        except Exception as e:
+            logger.exception("Error getting last response: %s", e)
+            result = {"success": False, "error": str(e)}
+            return json.dumps(result)
+
+    async def exposed_set_task_manager_enabled(self, enabled: bool) -> str:
+        """Enable or disable TaskManager at runtime.
+
+        Returns JSON string: {"success": true, "enabled": bool}
+        """
+        if not self._agent_process or not self._agent_process.task_manager:
+            return json.dumps({"success": False, "error": "TaskManager not configured"})
+
+        if enabled:
+            self._agent_process.task_manager.enable()
+        else:
+            self._agent_process.task_manager.disable()
+
+        return json.dumps({"success": True, "enabled": enabled})
+
+    async def exposed_reset_task_manager(self) -> str:
+        """Reset TaskManager to initial state.
+
+        Clears evaluation history, reinitializes manager agent.
+        Returns JSON string: {"success": true}
+        """
+        if not self._agent_process or not self._agent_process.task_manager:
+            return json.dumps({"success": False, "error": "TaskManager not configured"})
+
+        try:
+            await self._agent_process.task_manager.reset()
+            return json.dumps({"success": True, "message": "TaskManager reset to initial state"})
+        except Exception as e:
+            logger.exception("Error resetting TaskManager: %s", e)
+            return json.dumps({"success": False, "error": str(e)})
 
     async def exposed_subscribe_messages(self, callback: Any) -> bool:
         """
@@ -345,9 +472,14 @@ class AgentService(rpyc.Service):
             True if subscription successful
         """
         try:
-            # No lock needed - each connection has its own service instance
-            self._message_subscribers.add(callback)
-            logger.info(f"Client subscribed to messages: {callback}")
+            # Add to SHARED subscribers set in AgentProcess
+            # This ensures ALL connections see messages from ANY connection
+            if self._agent_process:
+                self._agent_process._message_subscribers.add(callback)
+                logger.info(f"Client subscribed to messages: {callback} (total subscribers: {len(self._agent_process._message_subscribers)})")
+            else:
+                logger.error("Cannot subscribe: agent_process not set")
+                return False
             return True
         except Exception as e:
             logger.exception("Error subscribing: %s", e)
@@ -364,26 +496,34 @@ class AgentService(rpyc.Service):
             True if unsubscription successful
         """
         try:
-            # No lock needed - each connection has its own service instance
-            self._message_subscribers.discard(callback)
-            logger.info(f"Client unsubscribed from messages: {callback}")
+            # Remove from SHARED subscribers set in AgentProcess
+            if self._agent_process:
+                self._agent_process._message_subscribers.discard(callback)
+                logger.info(f"Client unsubscribed from messages: {callback} (remaining: {len(self._agent_process._message_subscribers)})")
+            else:
+                logger.error("Cannot unsubscribe: agent_process not set")
+                return False
             return True
         except Exception as e:
             logger.exception("Error unsubscribing: %s", e)
             return False
 
-    async def exposed_get_metadata(self) -> dict[str, Any]:
+    async def exposed_get_metadata(self) -> str:
         """
         Get session metadata.
 
         Returns metadata including working_dir, pid, started_at, rpyc_port, model.
         Needed for DwSession compatibility.
 
+        IMPORTANT: Returns JSON-serialized string to eliminate RPyC netref overhead.
+        Client must json.loads() the response.
+
         Returns:
-            Response dict with metadata
+            JSON string with metadata
         """
         if not self._agent_process:
-            return {"success": False, "error": "Agent not initialized"}
+            result = {"success": False, "error": "Agent not initialized"}
+            return json.dumps(result)
 
         try:
             import os
@@ -406,19 +546,26 @@ class AgentService(rpyc.Service):
                 "rpyc_port": self._agent_process.rpyc_port,
                 "agent_type": "deep-worker",
                 "model": (
-                    self._agent_process.config.model
+                    self._agent_process.config.resolved_model
+                    if self._agent_process.config
+                    else None
+                ),
+                "provider": (
+                    self._agent_process.config.provider
                     if self._agent_process.config
                     else None
                 ),
             }
 
-            return {"success": True, "metadata": metadata}
+            result = {"success": True, "metadata": metadata}
+            return json.dumps(result)
 
         except Exception as e:
             logger.exception("Error getting metadata: %s", e)
-            return {"success": False, "error": str(e)}
+            result = {"success": False, "error": str(e)}
+            return json.dumps(result)
 
-    async def exposed_handle_command(self, command: str) -> dict[str, Any]:
+    async def exposed_handle_command(self, command: str) -> str:
         """
         Handle agent-side slash commands.
 
@@ -428,10 +575,14 @@ class AgentService(rpyc.Service):
         - /tokens - Display current token count
         - /threads - Display current thread ID
 
+        IMPORTANT: Returns JSON-serialized string to eliminate RPyC netref overhead.
+        Client must json.loads() the response.
+
         Args:
             command: Full command string (e.g., "/clear", "/remember foo", etc.)
 
         Returns:
+            JSON string with:
             {
                 "success": bool,
                 "response": str,  # Response message to display
@@ -440,7 +591,8 @@ class AgentService(rpyc.Service):
             }
         """
         if not self._agent_process:
-            return {"success": False, "error": "Agent not initialized"}
+            result = {"success": False, "error": "Agent not initialized"}
+            return json.dumps(result)
 
         cmd = command.lower().strip()
 
@@ -464,7 +616,7 @@ class AgentService(rpyc.Service):
                     "new_thread_id": new_thread_id,
                 })
 
-                return {
+                result = {
                     "success": True,
                     "response": f"Started new thread: {new_thread_id}",
                     "action": "clear_thread",
@@ -473,16 +625,18 @@ class AgentService(rpyc.Service):
                         "new_thread_id": new_thread_id,
                     }
                 }
+                return json.dumps(result)
 
             elif cmd == "/threads":
                 # Display current thread ID
                 thread_id = getattr(self._agent_process, 'current_thread_id', 'unknown')
-                return {
+                result = {
                     "success": True,
                     "response": f"Current thread: {thread_id}",
                     "action": "display_info",
                     "data": {"thread_id": thread_id}
                 }
+                return json.dumps(result)
 
             elif cmd == "/tokens":
                 # Get token count from last response metadata
@@ -492,12 +646,13 @@ class AgentService(rpyc.Service):
                 else:
                     formatted = str(token_count)
 
-                return {
+                result = {
                     "success": True,
                     "response": f"Current context: {formatted} tokens",
                     "action": "display_info",
                     "data": {"token_count": token_count}
                 }
+                return json.dumps(result)
 
             elif cmd == "/remember" or cmd.startswith("/remember "):
                 # Extract additional context after /remember
@@ -512,28 +667,31 @@ class AgentService(rpyc.Service):
                     remember_prompt += f"\n\n**Additional context from user:** {additional_context}"
 
                 # Return action to send this as user message to agent
-                return {
+                result = {
                     "success": True,
                     "response": "",  # No immediate response, agent will process
                     "action": "send_to_agent",
                     "data": {"message": remember_prompt}
                 }
+                return json.dumps(result)
 
             else:
                 # Unknown command
-                return {
+                result = {
                     "success": False,
                     "response": f"Unknown command: {cmd}",
                     "action": "error",
                 }
+                return json.dumps(result)
 
         except Exception as e:
             logger.exception("Error handling command: %s", e)
-            return {
+            result = {
                 "success": False,
                 "error": str(e),
                 "action": "error"
             }
+            return json.dumps(result)
 
     async def exposed_respond_to_approval(
         self,
@@ -602,31 +760,37 @@ class AgentService(rpyc.Service):
 
         return {"success": True, "message": "Decision received"}
 
-    async def exposed_interrupt_agent(self) -> dict[str, Any]:
+    async def exposed_interrupt_agent(self) -> str:
         """
         Interrupt currently running agent execution.
 
         Cancels the current agent worker task if running, broadcasting
         an "agent_interrupted" message to all connected clients.
 
+        IMPORTANT: Returns JSON-serialized string to eliminate RPyC netref overhead.
+        Client must json.loads() the response.
+
         Returns:
+            JSON string with:
             {
                 "success": bool,
                 "message": str  # Status message
             }
         """
         if not self._agent_process:
-            return {"success": False, "message": "Agent not initialized"}
+            result = {"success": False, "message": "Agent not initialized"}
+            return json.dumps(result)
 
         # Check if agent is currently executing
         is_running = getattr(self._agent_process, 'is_running', False)
         current_task = getattr(self._agent_process, 'current_worker_task', None)
 
         if not is_running or current_task is None:
-            return {
+            result = {
                 "success": False,
                 "message": "No agent execution in progress"
             }
+            return json.dumps(result)
 
         # Cancel the worker task
         try:
@@ -640,30 +804,36 @@ class AgentService(rpyc.Service):
                 "content": "Agent interrupted by user",
             })
 
-            return {
+            result = {
                 "success": True,
                 "message": "Agent interrupted"
             }
+            return json.dumps(result)
 
         except Exception as e:
             logger.exception("Error interrupting agent: %s", e)
-            return {
+            result = {
                 "success": False,
                 "message": f"Error interrupting: {e}"
             }
+            return json.dumps(result)
 
-    async def exposed_shutdown(self) -> dict[str, Any]:
+    async def exposed_shutdown(self) -> str:
         """
         Request graceful shutdown of agent process.
 
         Returns immediately with success status. Actual shutdown happens asynchronously.
         The RPyC server will be closed after a short delay to allow the response to be sent.
 
+        IMPORTANT: Returns JSON-serialized string to eliminate RPyC netref overhead.
+        Client must json.loads() the response.
+
         Returns:
-            Response dict with success status
+            JSON string with success status
         """
         if not self._agent_process:
-            return {"success": False, "error": "Agent not initialized"}
+            result = {"success": False, "error": "Agent not initialized"}
+            return json.dumps(result)
 
         try:
             # Signal agent to shutdown gracefully
@@ -684,11 +854,13 @@ class AgentService(rpyc.Service):
             # Schedule the async close in the event loop
             asyncio.create_task(delayed_close_async())
 
-            return {"success": True, "message": "Shutdown initiated"}
+            result = {"success": True, "message": "Shutdown initiated"}
+            return json.dumps(result)
 
         except Exception as e:
             logger.exception("Error during shutdown: %s", e)
-            return {"success": False, "error": str(e)}
+            result = {"success": False, "error": str(e)}
+            return json.dumps(result)
 
     # ========================================================================
     # NEW METHODS - Renamed to match DeepAgents naming conventions
@@ -712,18 +884,21 @@ class AgentService(rpyc.Service):
 
     async def exposed_load_thread_history(
         self, limit: int = 50, offset: int = 0
-    ) -> dict[str, Any]:
+    ) -> str:
         """Load conversation history (matching DeepAgents name).
 
         This method replaces exposed_get_history() to match the naming
         convention from the original DeepAgents codebase.
+
+        IMPORTANT: Returns JSON-serialized string to eliminate RPyC netref overhead.
+        Client must json.loads() the response (see docs/RPYC_SERIALIZATION_DESIGN.md).
 
         Args:
             limit: Maximum number of messages to retrieve (default: 50)
             offset: Number of recent messages to skip for pagination (default: 0)
 
         Returns:
-            Response dict with format:
+            JSON string with format:
             {
                 "success": bool,
                 "history": [list of message dicts],
@@ -842,8 +1017,13 @@ class AgentService(rpyc.Service):
                 for line in traceback.format_stack()[:-1]:
                     f.write(f"    {line.strip()}\n")
 
-        # No lock needed - each connection has its own service instance
-        subscribers = list(self._message_subscribers)
+        # Get subscribers from SHARED set in AgentProcess
+        # This ensures ALL connections (TUI, headless, web UI) receive messages
+        if not self._agent_process:
+            logger.error("Cannot notify subscribers: agent_process not set")
+            return
+
+        subscribers = list(self._agent_process._message_subscribers)
 
         if debug_enabled:
             with open("/tmp/dwcli_callback_debug.log", "a") as f:

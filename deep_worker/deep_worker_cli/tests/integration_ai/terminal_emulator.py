@@ -564,10 +564,10 @@ class DeepAgentsTerminalSession(TerminalSession):
         if agent_name:
             command.append(agent_name)
 
-        # CRITICAL: Add --skip-permissions by default for integration tests
+        # CRITICAL: Add --auto-approve by default for integration tests
         # Without this, approval menus will block test execution
         if skip_permissions:
-            command.append("--skip-permissions")
+            command.append("--auto-approve")
 
         super().__init__(
             command=command,
