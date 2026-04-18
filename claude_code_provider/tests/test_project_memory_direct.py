@@ -5,14 +5,10 @@ TDD: Verifies that project_memory works when called with runtime=None
 instead of crashing.
 """
 
-from pathlib import Path
-from typing import Any
+from typing import Any  # type: ignore[reportUnusedImport]
 from unittest.mock import MagicMock
 
-import pytest
-
-import sys
-sys.path.insert(0, str(Path(__file__).parent.parent.parent / "deep_worker" / "deepagents"))
+import pytest  # type: ignore[reportUnusedImport]
 
 from deepagents.tools.project_memory import project_memory
 
@@ -34,14 +30,14 @@ class TestProjectMemoryWithoutRuntime:
         result = project_memory.invoke({
             "query": "test",
             "runtime": None,
-            "working_dir": "/tmp/test_project",
+            "working_dir": "/tmp/example_project",
         })
         assert "requires runtime context" not in result
 
     def test_mock_runtime_with_state(self):
         """Tool should work with a simple mock runtime that has state."""
         mock_runtime = MagicMock()
-        mock_runtime.state = {"working_dir": "/tmp/test_project"}
+        mock_runtime.state = {"working_dir": "/tmp/example_project"}
 
         result = project_memory.invoke({
             "query": "test",

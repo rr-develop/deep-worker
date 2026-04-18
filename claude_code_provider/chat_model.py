@@ -8,7 +8,7 @@ This module provides a LangChain BaseChatModel implementation that uses Claude C
 - Async message streaming from Claude
 """
 
-import asyncio
+import asyncio  # type: ignore[reportUnusedImport] — used in async methods
 import sys
 from pathlib import Path
 from typing import Any, Callable
@@ -45,6 +45,43 @@ from pydantic import ConfigDict, PrivateAttr  # noqa: E402
 
 from claude_code_provider.client_manager import get_global_client_manager  # noqa: E402
 from claude_code_provider.custom_types import MCPResult, ToolMetadata  # noqa: E402
+
+
+def _build_mcp_content(content: Any) -> list[dict[str, Any]]:
+    """Convert LangChain ToolMessage content to MCP content blocks.
+
+    Handles both simple string content and multimodal content (text + images).
+    Converts LangChain ``image_url`` blocks to MCP ``image`` blocks.
+
+    Args:
+        content: ToolMessage.content — either a string or a list of content blocks.
+
+    Returns:
+        List of MCP-compatible content blocks.
+    """
+    if not isinstance(content, list):
+        return [{"type": "text", "text": str(content)}]
+
+    mcp_blocks: list[dict[str, Any]] = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "image_url":
+            # Convert LangChain image_url → MCP image block
+            # data URL format: "data:image/png;base64,iVBOR..."
+            url = block.get("image_url", {}).get("url", "")
+            if url.startswith("data:"):
+                parts = url.split(",", 1)
+                mime = parts[0].split(";")[0].split(":")[1] if ":" in parts[0] else "image/png"
+                data = parts[1] if len(parts) > 1 else ""
+                mcp_blocks.append({"type": "image", "data": data, "mimeType": mime})
+            else:
+                # Non-data URL — pass as text fallback
+                mcp_blocks.append({"type": "text", "text": f"[Image: {url}]"})
+        elif isinstance(block, dict) and block.get("type") == "text":
+            mcp_blocks.append(block)
+        else:
+            mcp_blocks.append({"type": "text", "text": str(block)})
+
+    return mcp_blocks
 
 
 class ClaudeCodeChatModel(BaseChatModel):
@@ -287,9 +324,9 @@ class ClaudeCodeChatModel(BaseChatModel):
             if tool.args_schema:
                 try:
                     if hasattr(tool.args_schema, "model_json_schema"):
-                        schema = tool.args_schema.model_json_schema()
+                        schema = tool.args_schema.model_json_schema()  # type: ignore[union-attr]
                     elif hasattr(tool.args_schema, "schema"):
-                        schema = tool.args_schema.schema()
+                        schema = tool.args_schema.schema()  # type: ignore[union-attr,deprecated]
                 except Exception:
                     schema = {}
 
@@ -425,11 +462,23 @@ class ClaudeCodeChatModel(BaseChatModel):
             )
         thread_id = config["configurable"]["thread_id"]
 
-        # 3. Get or create client for this thread
+        # 3. Extract system prompt from SystemMessage (if present)
+        # ⚠️ CRITICAL: SystemMessage contains cognitive hints from middleware
+        # (e.g. ProjectMemoryMiddleware injects project_memory usage instructions).
+        # If this is dropped, agents lose awareness of critical tools.
+        # DO NOT remove this extraction — it is NOT redundant.
+        system_prompt_content: str | None = None
+        for msg in messages:
+            if isinstance(msg, SystemMessage):
+                system_prompt_content = str(msg.content)
+                break
+
+        # 4. Get or create client for this thread
         client, proxy_mcp = await self._client_manager.get_or_create_client(
             thread_id=thread_id,
             tools_metadata=self._tools_metadata,
             working_dir=self._working_dir,
+            system_prompt=system_prompt_content,
         )
 
         # 4. Determine how many messages have already been sent
@@ -472,11 +521,21 @@ class ClaudeCodeChatModel(BaseChatModel):
             content_preview = str(msg.content)[:80] if hasattr(msg, 'content') else 'no content'
             print(f"[DEBUG ainvoke]   messages[{i}]: {type(msg).__name__} - {content_preview}", file=sys.stderr)
 
-        # Edge case: if history was truncated/reset (rare)
+        # ⚠️ CRITICAL: Detect LangGraph summarization (message history reset).
+        # When SummarizationMiddleware replaces N messages with a summary,
+        # sent_count (from the old history) exceeds len(messages) (new, shorter).
+        # We MUST rotate to a new Claude CLI session_id — otherwise the CLI
+        # session still holds the full old history and will eventually hit
+        # "Prompt is too long" (observed in practice after ~1255 turns).
+        # DO NOT remove this rotation — it is the ONLY mechanism that prevents
+        # Claude CLI session overflow for long-running agents.
         if sent_count > len(messages):
-            # History was reset, start from beginning
-            # TODO: Ideally should also reset Claude session, but SDK doesn't support this
-            # For now, rely on session_id uniqueness to avoid conflicts
+            new_session_id = self._client_manager.rotate_session(thread_id)
+            print(
+                f"[DEBUG ainvoke] SESSION ROTATED: {thread_id} → {new_session_id} "
+                f"(old sent_count={sent_count}, new messages={len(messages)})",
+                file=sys.stderr,
+            )
             sent_count = 0
 
         # 5. Extract ONLY new messages (not yet sent to Claude)
@@ -495,10 +554,13 @@ class ClaudeCodeChatModel(BaseChatModel):
             if isinstance(msg, HumanMessage):
                 # Send user message to Claude
                 content = msg.content if isinstance(msg.content, str) else str(msg.content)
+                # ⚠️ Use effective_session_id (rotated after summarization),
+                # NOT raw thread_id. See rotate_session() for details.
+                effective_sid = self._client_manager.get_effective_session_id(thread_id)
                 print(f"[DEBUG ainvoke] Sending HumanMessage to Claude:", file=sys.stderr)
                 print(f"[DEBUG ainvoke]   content='{content}'", file=sys.stderr)
-                print(f"[DEBUG ainvoke]   session_id='{thread_id}'", file=sys.stderr)
-                await client.query(content, session_id=thread_id)
+                print(f"[DEBUG ainvoke]   session_id='{effective_sid}'", file=sys.stderr)
+                await client.query(content, session_id=effective_sid)
                 user_message_sent = True
 
             elif isinstance(msg, ToolMessage):
@@ -507,13 +569,22 @@ class ClaudeCodeChatModel(BaseChatModel):
                 # We resolve the Future so the MCP handler returns result to Claude CLI.
                 # DO NOT use client.query() here — that sends result as user message,
                 # bypassing the MCP protocol and breaking the proxy.
-                from claude_code_provider.custom_types import MCPResult
                 mcp_result: MCPResult = {
-                    "content": [{"type": "text", "text": str(msg.content)}],
+                    "content": _build_mcp_content(msg.content),
                 }
                 print(f"[DEBUG ainvoke] resolve_call for tool_call_id={msg.tool_call_id}", file=sys.stderr)
                 proxy_mcp.resolve_call(msg.tool_call_id, mcp_result)
                 tool_resolved = True
+
+            elif isinstance(msg, SystemMessage):
+                # ⚠️ CRITICAL: DO NOT REMOVE THIS BRANCH!
+                # SystemMessage contains middleware cognitive hints (e.g. project_memory
+                # instructions from ProjectMemoryMiddleware). The content is already
+                # forwarded to Claude SDK via system_prompt in get_or_create_client().
+                # We skip it here to avoid sending it as a user message.
+                # If this branch is removed, SystemMessage falls through to the
+                # default case and could be sent incorrectly.
+                pass
 
             elif isinstance(msg, AIMessage):
                 # AIMessage is already in Claude's history

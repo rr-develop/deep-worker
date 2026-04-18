@@ -8,7 +8,7 @@ import asyncio
 import sys
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any  # type: ignore[reportUnusedImport]
 
 # ============================================================================
 # CRITICAL: CLAUDE_SDK MUST BE IMPORTED FROM SOURCE CODE, NOT FROM PIP/VENV!
@@ -99,12 +99,19 @@ class ClientManager:
         # This is stored in ClientManager (not ClaudeCodeChatModel) because
         # LangGraph may create new model instances, but ClientManager is stable
         self._sent_count: dict[str, int] = {}
+        # ⚠️ CRITICAL: Session epoch for Claude CLI session rotation.
+        # When SummarizationMiddleware resets LangGraph message history,
+        # we MUST rotate to a new Claude CLI session_id. Otherwise the CLI
+        # session accumulates unbounded history and eventually hits
+        # "Prompt is too long". DO NOT remove this mechanism.
+        self._session_epoch: dict[str, int] = {}
 
     async def get_or_create_client(
         self,
         thread_id: str,
         tools_metadata: list[ToolMetadata],
         working_dir: str | None = None,
+        system_prompt: str | None = None,
     ) -> tuple[ClaudeSDKClient, ProxyMCPServer]:
         """Get or create ClaudeSDKClient for a thread_id.
 
@@ -117,6 +124,10 @@ class ClientManager:
         Args:
             thread_id: Unique identifier for this thread/session
             tools_metadata: Metadata for tools to expose through ProxyMCPServer
+            working_dir: Working directory for the agent
+            system_prompt: System prompt from LangGraph middleware (e.g.
+                ProjectMemoryMiddleware cognitive hints). Passed to Claude SDK
+                session via ClaudeAgentOptions.system_prompt.
 
         Returns:
             Tuple of (ClaudeSDKClient, ProxyMCPServer)
@@ -157,6 +168,10 @@ class ClientManager:
                     mcp_servers={"deepworker": proxy_mcp.mcp_server_config},
                     disallowed_tools=BUILT_IN_TOOLS,
                     permission_mode="bypassPermissions",  # Delegate all approval to deep-worker
+                    # ⚠️ CRITICAL: Forward system prompt from LangGraph middleware.
+                    # This carries cognitive hints (e.g. project_memory instructions).
+                    # DO NOT remove — agents lose tool awareness without it.
+                    system_prompt=system_prompt,
                 )
             else:
                 # Create default options
@@ -164,6 +179,7 @@ class ClientManager:
                     mcp_servers={"deepworker": proxy_mcp.mcp_server_config},
                     disallowed_tools=BUILT_IN_TOOLS,
                     permission_mode="bypassPermissions",  # Delegate all approval to deep-worker
+                    system_prompt=system_prompt,
                 )
 
             # Create and connect client
@@ -195,6 +211,55 @@ class ClientManager:
         """
         self._sent_count[thread_id] = count
 
+    def get_session_epoch(self, thread_id: str) -> int:
+        """Get current session epoch for a thread.
+
+        Args:
+            thread_id: Thread ID to check.
+
+        Returns:
+            Current epoch number (0 = original session).
+        """
+        return self._session_epoch.get(thread_id, 0)
+
+    def get_effective_session_id(self, thread_id: str) -> str:
+        """Get the effective session_id for Claude CLI queries.
+
+        Epoch 0 returns the plain thread_id for backward compatibility.
+        Epoch N>0 returns ``"{thread_id}__epoch_{N}"``.
+
+        Args:
+            thread_id: LangGraph thread ID.
+
+        Returns:
+            Session ID string to pass to ``client.query(session_id=...)``.
+        """
+        epoch = self._session_epoch.get(thread_id, 0)
+        if epoch == 0:
+            return thread_id
+        return f"{thread_id}__epoch_{epoch}"
+
+    def rotate_session(self, thread_id: str) -> str:
+        """Rotate to a new Claude CLI session for this thread.
+
+        Called when LangGraph summarization resets the message history
+        (detected by ``sent_count > len(messages)`` in ainvoke).
+        Increments epoch, resets sent_count, and returns the new session_id.
+
+        The old Claude CLI session is simply abandoned — Claude CLI
+        handles its own garbage collection.
+
+        Args:
+            thread_id: Thread ID to rotate.
+
+        Returns:
+            New effective session_id.
+        """
+        current = self._session_epoch.get(thread_id, 0)
+        self._session_epoch[thread_id] = current + 1
+        self._sent_count[thread_id] = 0
+        return self.get_effective_session_id(thread_id)
+
     async def cleanup_client(self, thread_id: str) -> None:
         """Cleanup client for a thread_id.
 
@@ -213,8 +278,9 @@ class ClientManager:
             if thread_id in self._creation_locks:
                 del self._creation_locks[thread_id]
 
-        # Remove sent_count tracking
+        # Remove sent_count and epoch tracking
         self._sent_count.pop(thread_id, None)
+        self._session_epoch.pop(thread_id, None)
 
 
 def get_global_client_manager() -> ClientManager:

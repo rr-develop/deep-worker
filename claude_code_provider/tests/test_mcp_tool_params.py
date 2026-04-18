@@ -1,3 +1,4 @@
+# pyright: reportPrivateUsage=false, reportUnusedImport=false
 """Tests for MCP tool schema generation.
 
 Verifies that bind_tools generates correct JSON schemas from tool signatures,
@@ -5,14 +6,9 @@ especially for StructuredTool functions using ToolRuntime (which causes
 CallableSchema error in Pydantic — fallback to inspect.signature).
 """
 
-import sys
-from pathlib import Path
-
 import pytest
 
 from claude_code_provider.custom_types import ToolMetadata
-
-_REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 class TestSchemaGeneration:
@@ -20,9 +16,6 @@ class TestSchemaGeneration:
 
     def test_schema_from_structuredtool_signature(self):
         """bind_tools should generate schema from inspect.signature fallback."""
-        sys.path.insert(0, str(_REPO_ROOT / 'deep_worker' / 'deepagents'))
-        sys.path.insert(0, str(_REPO_ROOT))
-
         from claude_code_provider.chat_model import ClaudeCodeChatModel
         from deepagents.backends.local_shell import LocalShellBackend
         from deepagents.middleware.filesystem import FilesystemMiddleware
@@ -46,9 +39,6 @@ class TestSchemaGeneration:
 
     def test_ls_schema_has_path(self):
         """ls schema must have 'path' parameter."""
-        sys.path.insert(0, str(_REPO_ROOT / 'deep_worker' / 'deepagents'))
-        sys.path.insert(0, str(_REPO_ROOT))
-
         from claude_code_provider.chat_model import ClaudeCodeChatModel
         from deepagents.backends.local_shell import LocalShellBackend
         from deepagents.middleware.filesystem import FilesystemMiddleware
@@ -66,9 +56,6 @@ class TestSchemaGeneration:
 
     def test_execute_schema_has_command(self):
         """execute schema must have 'command' parameter."""
-        sys.path.insert(0, str(_REPO_ROOT / 'deep_worker' / 'deepagents'))
-        sys.path.insert(0, str(_REPO_ROOT))
-
         from claude_code_provider.chat_model import ClaudeCodeChatModel
         from deepagents.backends.local_shell import LocalShellBackend
         from deepagents.middleware.filesystem import FilesystemMiddleware
@@ -86,9 +73,6 @@ class TestSchemaGeneration:
 
     def test_glob_schema_has_pattern(self):
         """glob schema must have 'pattern' parameter."""
-        sys.path.insert(0, str(_REPO_ROOT / 'deep_worker' / 'deepagents'))
-        sys.path.insert(0, str(_REPO_ROOT))
-
         from claude_code_provider.chat_model import ClaudeCodeChatModel
         from deepagents.backends.local_shell import LocalShellBackend
         from deepagents.middleware.filesystem import FilesystemMiddleware

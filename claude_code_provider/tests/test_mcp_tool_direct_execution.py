@@ -1,3 +1,4 @@
+# pyright: reportPrivateUsage=false, reportUnusedImport=false, reportAttributeAccessIssue=false
 """Tests for ProxyMCPServer Future-based proxy architecture.
 
 ⚠️ ARCHITECTURAL INVARIANT: Tool calls MUST go through LangGraph ToolNode.

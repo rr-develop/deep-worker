@@ -384,6 +384,37 @@ def _format_execute_description(
     return f"Execute Command: {command}"
 
 
+def _format_send_message_to_agent_description(
+    tool_call: ToolCall, _state: AgentState[Any], _runtime: Runtime[Any]
+) -> str:
+    """Format send_message_to_agent tool call for approval prompt.
+
+    The agent is trying to deliver a message to another running
+    deep-worker agent. Show the target and a preview of the message so
+    the user can decide whether to approve.
+
+    Returns:
+        Formatted description string for the send_message_to_agent tool call.
+    """
+    args = tool_call["args"]
+    target = args.get("agent_name", "unknown")
+    text = args.get("message", "")
+
+    preview = text if len(text) <= 500 else text[:500] + "..."
+
+    glyphs = get_glyphs()
+    separator = glyphs.box_horizontal * 40
+    warning_msg = (
+        "The message will be prefixed with 'agent:<your-name>:> ' and "
+        "delivered to the target agent as a user-role message."
+    )
+    return (
+        f"Target Agent: {target}\n\n"
+        f"Message:\n{separator}\n{preview}\n{separator}\n\n"
+        f"{glyphs.warning}  {warning_msg}"
+    )
+
+
 def _add_interrupt_on() -> dict[str, InterruptOnConfig]:
     """Configure human-in-the-loop interrupt settings for all gated tools.
 
@@ -425,6 +456,11 @@ def _add_interrupt_on() -> dict[str, InterruptOnConfig]:
         "description": _format_task_description,
     }
 
+    send_message_to_agent_interrupt_config: InterruptOnConfig = {
+        "allowed_decisions": ["approve", "reject"],
+        "description": _format_send_message_to_agent_description,
+    }
+
     return {
         "execute": execute_interrupt_config,
         "write_file": write_file_interrupt_config,
@@ -432,6 +468,7 @@ def _add_interrupt_on() -> dict[str, InterruptOnConfig]:
         "web_search": web_search_interrupt_config,
         "fetch_url": fetch_url_interrupt_config,
         "task": task_interrupt_config,
+        "send_message_to_agent": send_message_to_agent_interrupt_config,
     }
 
 

@@ -387,10 +387,10 @@ Example:
                             text_preview = block.text[:200] + "..." if len(block.text) > 200 else block.text
                             print(f"[WebSearchDelegation] Claude text: {text_preview}")
 
-            elif hasattr(message, "content") and isinstance(message.content, list):
+            elif hasattr(message, "content") and isinstance(message.content, list):  # type: ignore[union-attr]
                 # Check ANY message type that has content blocks
                 # This includes UserMessage which contains ToolResultBlock
-                for block in message.content:
+                for block in message.content:  # type: ignore[union-attr]
                     if isinstance(block, ToolResultBlock):
                         # This is the result from WebSearch tool
                         websearch_tool_result = block.content
@@ -457,7 +457,7 @@ Example:
         if isinstance(tool_result, list):
             normalized: list[dict[str, str]] = []
             for item in tool_result:
-                if isinstance(item, dict):
+                if isinstance(item, dict):  # type: ignore[reportUnnecessaryIsInstance]
                     # Check if it's a text block from MCP
                     if item.get("type") == "text":
                         text = item.get("text", "")
@@ -481,7 +481,7 @@ Example:
             return normalized
 
         # Case 2: String - try to parse as JSON
-        if isinstance(tool_result, str):
+        if isinstance(tool_result, str):  # type: ignore[reportUnnecessaryIsInstance]
             try:
                 parsed = json.loads(tool_result)
                 if isinstance(parsed, list):

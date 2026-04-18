@@ -13,13 +13,16 @@ from typing import Any
 # ============================================================================
 # CRITICAL: RPYC_ASYNC MUST BE IMPORTED FROM SOURCE, NOT FROM PIP!
 # ============================================================================
-# Add rpyc_async to sys.path to use AsyncioServer from the local rpyc_async checkout
+# Add rpyc_async to sys.path to use AsyncioServer from a local rpyc_async checkout
 # This enables true bidirectional async communication (156x faster!)
 # DO NOT use 'pip install rpyc' - it will use classic RPyC 5.0 without AsyncioServer
+# Set RPYC_ASYNC_PATH to point at the local rpyc_async source tree.
 # ============================================================================
-_rpyc_async_path = Path("rpyc_async")
-if _rpyc_async_path.exists() and str(_rpyc_async_path) not in sys.path:
-    sys.path.insert(0, str(_rpyc_async_path))
+_rpyc_async_env = os.environ.get("RPYC_ASYNC_PATH")
+if _rpyc_async_env:
+    _rpyc_async_path = Path(_rpyc_async_env)
+    if _rpyc_async_path.exists() and str(_rpyc_async_path) not in sys.path:
+        sys.path.insert(0, str(_rpyc_async_path))
 
 import rpyc
 from rpyc.core.protocol import DEFAULT_CONFIG
@@ -252,15 +255,24 @@ class AgentProcess:
                 # ================================================================
                 # deepagents must be imported from source, not from pip/venv
                 # This ensures correct version and avoids compatibility issues
+                # Set DEEPAGENTS_PATH to point at the local deepagents source tree.
                 # ================================================================
-                deepagents_path = PathLib(__file__).resolve().parents[3] / "deepagents"
-                if deepagents_path.exists() and str(deepagents_path) not in sys.path:
-                    sys.path.insert(0, str(deepagents_path))
+                deepagents_env_path = os.environ.get("DEEPAGENTS_PATH")
+                if deepagents_env_path:
+                    deepagents_path = PathLib(deepagents_env_path)
+                    if deepagents_path.exists() and str(deepagents_path) not in sys.path:
+                        sys.path.insert(0, str(deepagents_path))
 
                 # Now import AFTER environment is loaded and deepagents is in path
                 from deep_worker_cli.agent import create_cli_agent
                 from deep_worker_cli.config import create_model
-                from deep_worker_cli.tools import http_request, fetch_url, web_search_delegation_tool, read_image
+                from deep_worker_cli.tools import (
+                    http_request,
+                    fetch_url,
+                    make_send_message_to_agent_tool,
+                    web_search_delegation_tool,
+                    read_image,
+                )
 
                 # Create model using configuration from AgentConfig
                 # Pass provider and model explicitly from config
@@ -279,7 +291,16 @@ class AgentProcess:
                 # Prepare web tools
                 # - http_request and fetch_url work without API keys
                 # - web_search_delegation_tool uses Claude Code SDK for universal web search
-                web_tools = [http_request, fetch_url, web_search_delegation_tool, read_image]
+                # - send_message_to_agent: inter-agent messaging; sender name
+                #   is baked into the factory from self.name so the LLM
+                #   cannot forge it. See docs/DESIGN_SEND_MESSAGE_TO_AGENT_TOOL.md
+                web_tools = [
+                    http_request,
+                    fetch_url,
+                    web_search_delegation_tool,
+                    read_image,
+                    make_send_message_to_agent_tool(self.name),
+                ]
 
                 # Determine checkpointer based on flags and environment
                 # Priority order:

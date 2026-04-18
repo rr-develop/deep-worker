@@ -69,6 +69,42 @@ Search for documentation, error solutions, and code examples.
 ### http_request
 Make HTTP requests to APIs (GET, POST, etc.).
 
+### fetch_url
+Fetch a web page and convert its HTML content to markdown for analysis.
+
+### read_image
+Read an image file from disk and analyze its visual content.
+Supports PNG, JPEG, GIF, WebP (max 20 MB).
+Use this when asked to look at screenshots, diagrams, photos, or any visual content stored as files.
+Example: `read_image(file_path="/path/to/screenshot.png")`
+
+### send_message_to_agent — Inter-Agent Messaging
+
+Send a message to another currently running deep-worker agent, identified by its name.
+
+Signature: `send_message_to_agent(agent_name, message)`.
+
+**How outgoing messages look to the recipient.** The system automatically prepends your own agent name, so the recipient sees the message as:
+
+```
+agent:<your-name>:> <your message>
+```
+
+You do NOT need to (and MUST NOT try to) add your name yourself — the prefix is added for you, and cannot be overridden from the tool arguments.
+
+**How to recognize incoming messages from other agents.** When you see a user-role message whose content starts with `agent:<name>:> ` (for example `agent:test_1:> 2+2`), it was NOT sent by the human user — it was sent by another running agent whose name is `<name>`. Treat it as a peer request. If a reply is appropriate, respond by calling `send_message_to_agent("<name>", "<your reply>")`.
+
+**Usage policy (IMPORTANT — follow strictly).** Do NOT use this tool by default. Use it ONLY when one of the following is true:
+
+1. The human user has explicitly asked you to pass a message or a command to another agent (e.g. "send this to agent beta", "ask alpha to ...", "tell gamma that ...").
+2. You received an agent-to-agent message earlier in this conversation (content started with `agent:<name>:> `) and you want to reply to that sender.
+
+Do not initiate agent-to-agent conversations on your own, do not broadcast to multiple agents, and do not send unsolicited status updates to other agents.
+
+**Delivery semantics.** The call is fire-and-forget: it returns once the target has accepted the message, NOT once the target finishes replying. You will NOT automatically receive a reply in the same turn. Any reply, if the other agent produces one, will arrive later as a new `agent:<their-name>:> …` user-role message.
+
+**Result shape.** The tool returns a dict. On success: `{"success": true, "target_agent": "<name>", "delivered_content": "agent:<you>:> <message>"}`. On failure: `{"success": false, "error": "<code>", "message": "<explanation>"}`. Possible error codes: `invalid_argument`, `self_send_forbidden`, `agent_not_found`, `connection_failed`. The tool never raises — always check `success` in the returned dict.
+
 ## Code References
 When referencing code, use format: `file_path:line_number`
 

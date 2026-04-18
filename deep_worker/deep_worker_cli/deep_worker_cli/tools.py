@@ -1,11 +1,14 @@
 """Custom tools for the CLI agent."""
 
+import logging
 import sys
 from pathlib import Path
 from typing import Any, Literal
 
 import requests
+from langchain_core.tools import BaseTool, tool
 from markdownify import markdownify
+from pydantic import BaseModel, Field
 from tavily import (
     BadRequestError,
     InvalidAPIKeyError,
@@ -16,6 +19,9 @@ from tavily import (
 from tavily.errors import ForbiddenError, TimeoutError as TavilyTimeoutError
 
 from deep_worker_cli.config import settings
+from deep_worker_cli.exceptions import AgentNotFoundError, IPCConnectionError
+
+logger = logging.getLogger(__name__)
 
 # ============================================================================
 # CRITICAL: CLAUDE_CODE_PROVIDER MUST BE IMPORTED FROM SOURCE CODE, NOT FROM PIP/VENV!
@@ -304,3 +310,254 @@ def read_image(file_path: str) -> list[dict[str, Any]] | str:
         ]
     except Exception as e:
         return f"Error: Failed to read image: {e}"
+
+
+# ===========================================================================
+# INTER-AGENT MESSAGING TOOL
+# ===========================================================================
+#
+# Tool: send_message_to_agent(agent_name, message)
+#
+# Lets one running deep-worker agent deliver a user-role message to another
+# running deep-worker agent. The sending agent's name is injected by the
+# factory (make_send_message_to_agent_tool) from AgentProcess.name, so the
+# LLM cannot forge it.
+#
+# The delivered message always has the shape:
+#     agent:<sender>:> <original text>
+# mirroring the existing TaskManager:> convention used for corrective
+# prompts (task_manager.py:345).
+#
+# Full design: docs/DESIGN_SEND_MESSAGE_TO_AGENT_TOOL.md
+# ===========================================================================
+
+# Importing AgentClient at module import time would create a circular import
+# path in some test scenarios. It's imported lazily at call time below, and
+# it's also re-exported as a module-level attribute (AgentClient) so that
+# tests can monkeypatch "deep_worker_cli.tools.AgentClient" with a fake.
+# Note: we MUST NOT set AgentClient=None at module top level — that would
+# cause `from deep_worker_cli.tools import AgentClient` to succeed but
+# return None. Instead, we populate the attribute the first time it is
+# needed, and unit tests can pre-populate it via monkeypatch.
+try:  # pragma: no cover - import fallback exercised only in test setups
+    from deep_worker_cli.client.agent_client import AgentClient  # noqa: F401
+except Exception:  # pragma: no cover
+    # Keep the attribute available for monkeypatch even if the eager
+    # import fails (e.g. during unrelated unit tests that don't need it).
+    AgentClient = None  # type: ignore[assignment,misc]
+
+
+class _SendMessageToAgentArgs(BaseModel):
+    """Schema for the send_message_to_agent tool.
+
+    CRITICAL: this schema MUST NOT contain a 'sender' field. The sender
+    name is bound by the factory from the running agent's own identity
+    and is not controllable by the LLM.
+    """
+
+    agent_name: str = Field(
+        ...,
+        description=(
+            "Registry name of the target (receiving) agent. The target "
+            "agent MUST be currently running (registered in the deep-worker "
+            "process registry)."
+        ),
+    )
+    message: str = Field(
+        ...,
+        description=(
+            "The message text to deliver. It will be delivered to the "
+            "target agent as a user-role message whose content is "
+            "automatically prefixed with 'agent:<your-name>:> '."
+        ),
+    )
+
+
+def make_send_message_to_agent_tool(sender_name: str) -> BaseTool:
+    """Create a LangChain tool that lets the current agent send a message
+    to another running deep-worker agent.
+
+    The sender name is baked into the tool via this closure and cannot be
+    overridden from tool arguments. This prevents the LLM from forging
+    the sender field.
+
+    Args:
+        sender_name: The registry name of the agent that will use this
+            tool. Typically `AgentProcess.name`.
+
+    Returns:
+        A LangChain BaseTool named "send_message_to_agent" with the
+        signature (agent_name: str, message: str) -> dict[str, Any].
+    """
+
+    @tool(
+        "send_message_to_agent",
+        args_schema=_SendMessageToAgentArgs,
+    )
+    async def send_message_to_agent(
+        agent_name: str,
+        message: str,
+    ) -> dict[str, Any]:
+        """Send a message to another running deep-worker agent.
+
+        The name of the CURRENT (sending) agent is automatically prepended to
+        the message in the form:
+
+            agent:<sender_name>:> <message>
+
+        The target agent will see this as an incoming user-role message.
+        It is delivered fire-and-forget: this call returns once the target
+        has accepted the message, NOT once the target finishes replying.
+
+        Usage policy:
+
+        - Do NOT use this tool by default. Only use it when:
+          1. The human user explicitly asks you to pass a message or
+             command to another agent (e.g. "tell beta to ...", "send
+             this to agent alpha"), OR
+          2. You previously received an `agent:<name>:> ...` message from
+             another agent and want to reply to that sender.
+
+        - Do not initiate agent-to-agent conversations on your own, do not
+          broadcast, and do not send unsolicited status updates.
+
+        Args:
+            agent_name: Registry name of the target agent. Must refer to a
+                currently running agent.
+            message: The text to deliver. Must be non-empty.
+
+        Returns:
+            A dict describing the outcome. On success:
+
+                {"success": True,
+                 "target_agent": "<agent_name>",
+                 "delivered_content": "agent:<sender>:> <message>"}
+
+            On failure (NEVER raises — always returns a dict):
+
+                {"success": False,
+                 "error": "<code>",
+                 "message": "<human-readable explanation>"}
+
+            Possible error codes:
+                invalid_argument, self_send_forbidden, agent_not_found,
+                connection_failed.
+        """
+        # --- validation ------------------------------------------------
+        if not isinstance(agent_name, str) or not agent_name.strip():
+            return {
+                "success": False,
+                "error": "invalid_argument",
+                "message": "agent_name must be a non-empty string",
+            }
+        if not isinstance(message, str) or not message.strip():
+            return {
+                "success": False,
+                "error": "invalid_argument",
+                "message": "message must be a non-empty string",
+            }
+
+        target = agent_name.strip()
+
+        # --- policy: reject self-send ---------------------------------
+        if target == sender_name:
+            return {
+                "success": False,
+                "error": "self_send_forbidden",
+                "message": (
+                    f"Agents cannot send messages to themselves "
+                    f"(agent_name='{target}' == sender='{sender_name}')."
+                ),
+            }
+
+        # --- prefixing ------------------------------------------------
+        # Exact shape: "agent:<sender>:> <message>"
+        # Mirrors the existing TaskManager:> convention.
+        prefixed = f"agent:{sender_name}:> {message}"
+
+        # --- delivery -------------------------------------------------
+        # Resolve AgentClient at call time so tests can monkeypatch the
+        # module-level attribute with a fake.
+        client_cls = globals().get("AgentClient")
+        if client_cls is None:
+            # Late import fallback (unit tests always pre-populate it).
+            try:
+                from deep_worker_cli.client.agent_client import AgentClient as _AC
+                client_cls = _AC
+            except Exception as e:  # pragma: no cover
+                return {
+                    "success": False,
+                    "error": "connection_failed",
+                    "message": f"AgentClient unavailable: {e!r}",
+                }
+
+        client = client_cls(target)
+        try:
+            await client.connect()
+        except AgentNotFoundError as e:
+            return {
+                "success": False,
+                "error": "agent_not_found",
+                "message": (
+                    f"Agent '{target}' is not running or not registered: {e}"
+                ),
+            }
+        except IPCConnectionError as e:
+            return {
+                "success": False,
+                "error": "connection_failed",
+                "message": f"Could not connect to agent '{target}': {e}",
+            }
+        except Exception as e:  # pragma: no cover - defensive
+            return {
+                "success": False,
+                "error": "connection_failed",
+                "message": f"Unexpected error connecting to '{target}': {e!r}",
+            }
+
+        try:
+            try:
+                # stream=True matches how dwcli and TaskManager feed
+                # messages so the target broadcasts per-chunk to its
+                # subscribers normally. We do NOT interpret the return
+                # value as "the reply" — see fire-and-forget note in the
+                # design doc.
+                await client.invoke_agent(prefixed, stream=True)
+            except AgentNotFoundError as e:
+                return {
+                    "success": False,
+                    "error": "agent_not_found",
+                    "message": (
+                        f"Agent '{target}' disappeared during delivery: {e}"
+                    ),
+                }
+            except IPCConnectionError as e:
+                return {
+                    "success": False,
+                    "error": "connection_failed",
+                    "message": f"Delivery to '{target}' failed: {e}",
+                }
+            except Exception as e:
+                return {
+                    "success": False,
+                    "error": "connection_failed",
+                    "message": f"Unexpected delivery error to '{target}': {e}",
+                }
+
+            return {
+                "success": True,
+                "target_agent": target,
+                "delivered_content": prefixed,
+            }
+        finally:
+            # Always disconnect. Swallow errors during teardown so we
+            # don't mask a successful delivery with a cleanup failure.
+            try:
+                await client.disconnect()
+            except Exception as e:  # pragma: no cover - defensive
+                logger.warning(
+                    "send_message_to_agent: disconnect from '%s' failed: %r",
+                    target, e,
+                )
+
+    return send_message_to_agent
