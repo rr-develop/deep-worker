@@ -52,15 +52,81 @@ def _format_timestamp(iso_timestamp: str | None) -> str:
         return ""
 
 
-def get_db_path() -> Path:
-    """Get path to global database.
+def get_db_path(agent_name: str | None = None) -> Path:
+    """Get path to SQLite database file.
+
+    When ``agent_name`` is provided, returns a per-agent database file
+    (``sessions_{agent_name}.db``). This avoids SQLite "database is locked"
+    errors when multiple agents write concurrently.
+
+    When ``agent_name`` is ``None``, returns the legacy global
+    ``sessions.db`` for backward compatibility (e.g. ``--list`` command
+    that queries all agents).
+
+    Args:
+        agent_name: Agent name for per-agent isolation. ``None`` for global DB.
 
     Returns:
         Path to the SQLite database file.
     """
     db_dir = Path.home() / ".deepagents"
     db_dir.mkdir(parents=True, exist_ok=True)
+    if agent_name is not None:
+        return db_dir / f"sessions_{agent_name}.db"
     return db_dir / "sessions.db"
+
+
+def _agent_name_from_thread_id(thread_id: str) -> str:
+    """Derive an agent name from a thread_id.
+
+    Convention used throughout the codebase:
+
+    - Main agent thread:      thread_id == agent_name
+    - TaskManager thread:     thread_id == f"{agent_name}:tm"
+
+    See ``_migrate_from_global_db`` (same mapping).
+    """
+    return thread_id.split(":", 1)[0]
+
+
+def iter_all_db_paths() -> list[Path]:
+    """Return all session DB files that may contain checkpoint data.
+
+    Includes every ``sessions_<agent>.db`` file in the same directory as
+    the legacy global ``sessions.db`` plus the legacy global itself (if it
+    exists).  Used by offline commands that operate across all agents
+    (``--list``, ``--remove-before``, ...).
+
+    The directory is derived from ``get_db_path(None)`` so tests that
+    monkey-patch ``get_db_path`` to point into ``tmp_path`` transparently
+    restrict discovery to that directory.
+    """
+    legacy = get_db_path(None)
+    db_dir = legacy.parent
+    if not db_dir.exists():
+        return []
+    paths: list[Path] = sorted(db_dir.glob("sessions_*.db"))
+    if legacy.exists() and legacy not in paths:
+        paths.append(legacy)
+    return paths
+
+
+def _resolve_db_path_for_thread(thread_id: str) -> Path | None:
+    """Pick the DB file most likely to hold ``thread_id``.
+
+    1. ``sessions_<agent>.db`` where agent is derived from thread_id.
+    2. Legacy global ``sessions.db`` (only if the per-agent file does
+       not exist – keeps pre-migration installs working).
+    3. ``None`` if neither exists.
+    """
+    agent = _agent_name_from_thread_id(thread_id)
+    per_agent = get_db_path(agent)
+    if per_agent.exists():
+        return per_agent
+    legacy = get_db_path(None)
+    if legacy.exists():
+        return legacy
+    return None
 
 
 def generate_thread_id() -> str:
@@ -90,61 +156,100 @@ async def list_threads(
 ) -> list[dict]:
     """List threads from checkpoints table.
 
+    Iterates across every ``sessions_*.db`` file in ``~/.deepagents``
+    plus the legacy global ``sessions.db`` and merges results, so offline
+    threads of all agents are visible (not only those in the legacy
+    global DB).
+
     Args:
-        agent_name: Optional filter by agent name.
-        limit: Maximum number of threads to return.
+        agent_name: Optional filter by agent name.  When provided, only
+            the matching ``sessions_<agent>.db`` is read (+ the legacy
+            global as a fallback for pre-migration data).
+        limit: Maximum number of threads to return (applied after merge).
         include_message_count: Whether to include message counts.
 
     Returns:
         List of thread dicts with `thread_id`, `agent_name`, `updated_at`,
-            and optionally `message_count`.
+            and optionally `message_count`, sorted by ``updated_at`` desc.
     """
-    db_path = str(get_db_path())
-    async with aiosqlite.connect(db_path, timeout=30.0) as conn:
-        # Return empty if table doesn't exist yet (fresh install)
-        if not await _table_exists(conn, "checkpoints"):
-            return []
+    # Decide which DB files to read.
+    if agent_name is not None:
+        db_paths: list[Path] = []
+        per_agent = get_db_path(agent_name)
+        if per_agent.exists():
+            db_paths.append(per_agent)
+        legacy = get_db_path(None)
+        if legacy.exists():
+            db_paths.append(legacy)
+    else:
+        db_paths = iter_all_db_paths()
 
-        if agent_name:
-            query = """
-                SELECT thread_id,
-                       json_extract(metadata, '$.agent_name') as agent_name,
-                       MAX(json_extract(metadata, '$.updated_at')) as updated_at
-                FROM checkpoints
-                WHERE json_extract(metadata, '$.agent_name') = ?
-                GROUP BY thread_id
-                ORDER BY updated_at DESC
-                LIMIT ?
-            """
-            params: tuple = (agent_name, limit)
-        else:
-            query = """
-                SELECT thread_id,
-                       json_extract(metadata, '$.agent_name') as agent_name,
-                       MAX(json_extract(metadata, '$.updated_at')) as updated_at
-                FROM checkpoints
-                GROUP BY thread_id
-                ORDER BY updated_at DESC
-                LIMIT ?
-            """
-            params = (limit,)
+    threads: list[dict] = []
+    seen_thread_ids: set[str] = set()
 
-        async with conn.execute(query, params) as cursor:
-            rows = await cursor.fetchall()
-            threads = [
-                {"thread_id": r[0], "agent_name": r[1], "updated_at": r[2]}
-                for r in rows
-            ]
+    for db_path in db_paths:
+        try:
+            async with aiosqlite.connect(str(db_path), timeout=30.0) as conn:
+                if not await _table_exists(conn, "checkpoints"):
+                    continue
 
-        # Fetch message counts if requested
-        if include_message_count and threads:
-            serde = JsonPlusSerializer()
-            for thread in threads:
-                thread["message_count"] = await _count_messages_from_checkpoint(
-                    conn, thread["thread_id"], serde
-                )
+                if agent_name:
+                    query = """
+                        SELECT thread_id,
+                               json_extract(metadata, '$.agent_name') as agent_name,
+                               MAX(json_extract(metadata, '$.updated_at')) as updated_at
+                        FROM checkpoints
+                        WHERE json_extract(metadata, '$.agent_name') = ?
+                        GROUP BY thread_id
+                    """
+                    params: tuple = (agent_name,)
+                else:
+                    query = """
+                        SELECT thread_id,
+                               json_extract(metadata, '$.agent_name') as agent_name,
+                               MAX(json_extract(metadata, '$.updated_at')) as updated_at
+                        FROM checkpoints
+                        GROUP BY thread_id
+                    """
+                    params = ()
 
-        return threads
+                async with conn.execute(query, params) as cursor:
+                    rows = await cursor.fetchall()
+
+                file_threads: list[dict] = []
+                for r in rows:
+                    tid = r[0]
+                    if tid in seen_thread_ids:
+                        # Same thread_id may appear in both per-agent and
+                        # legacy global DB right after migration — keep the
+                        # first (per-agent, sorted first).
+                        continue
+                    file_threads.append(
+                        {
+                            "thread_id": tid,
+                            "agent_name": r[1],
+                            "updated_at": r[2],
+                        }
+                    )
+                    seen_thread_ids.add(tid)
+
+                if include_message_count and file_threads:
+                    serde = JsonPlusSerializer()
+                    for thread in file_threads:
+                        thread["message_count"] = (
+                            await _count_messages_from_checkpoint(
+                                conn, thread["thread_id"], serde
+                            )
+                        )
+
+                threads.extend(file_threads)
+        except aiosqlite.OperationalError:
+            # Skip corrupt / locked files — best-effort listing.
+            continue
+
+    # Sort by updated_at DESC (newest first), then apply limit.
+    threads.sort(key=lambda t: t.get("updated_at") or "", reverse=True)
+    return threads[:limit]
 
 
 async def list_all_threads(
@@ -155,11 +260,15 @@ async def list_all_threads(
 ) -> list[dict]:
     """List ALL threads without pagination.
 
+    Iterates across per-agent ``sessions_<name>.db`` files and the legacy
+    global ``sessions.db``, merging results so nothing is missed after the
+    per-agent storage migration.
+
     Args:
         agent_name: Optional filter by agent name.
         sort_by: Sort field: 'thread_id' (default), 'agent', 'updated'.
         reverse: Reverse sort order (default: False).
-        include_message_count: Include message counts (slow operation, default: False).
+        include_message_count: Include message counts (slow, default: False).
 
     Returns:
         List of thread dicts with:
@@ -168,55 +277,84 @@ async def list_all_threads(
         - updated_at: str (ISO timestamp)
         - message_count: int (only if include_message_count=True)
     """
-    db_path = str(get_db_path())
-    async with aiosqlite.connect(db_path, timeout=30.0) as conn:
-        # Return empty if table doesn't exist yet (fresh install)
-        if not await _table_exists(conn, "checkpoints"):
-            return []
+    if agent_name is not None:
+        db_paths: list[Path] = []
+        per_agent = get_db_path(agent_name)
+        if per_agent.exists():
+            db_paths.append(per_agent)
+        legacy = get_db_path(None)
+        if legacy.exists():
+            db_paths.append(legacy)
+    else:
+        db_paths = iter_all_db_paths()
 
-        if agent_name:
-            query = """
-                SELECT thread_id,
-                       json_extract(metadata, '$.agent_name') as agent_name,
-                       MAX(json_extract(metadata, '$.updated_at')) as updated_at
-                FROM checkpoints
-                WHERE json_extract(metadata, '$.agent_name') = ?
-                GROUP BY thread_id
-            """
-            params: tuple = (agent_name,)
-        else:
-            query = """
-                SELECT thread_id,
-                       json_extract(metadata, '$.agent_name') as agent_name,
-                       MAX(json_extract(metadata, '$.updated_at')) as updated_at
-                FROM checkpoints
-                GROUP BY thread_id
-            """
-            params = ()
+    threads: list[dict] = []
+    seen: set[str] = set()
 
-        async with conn.execute(query, params) as cursor:
-            rows = await cursor.fetchall()
-            threads = [
-                {"thread_id": r[0], "agent_name": r[1], "updated_at": r[2]}
-                for r in rows
-            ]
+    for db_path in db_paths:
+        try:
+            async with aiosqlite.connect(str(db_path), timeout=30.0) as conn:
+                if not await _table_exists(conn, "checkpoints"):
+                    continue
 
-        # Fetch message counts if requested
-        if include_message_count and threads:
-            serde = JsonPlusSerializer()
-            for thread in threads:
-                thread["message_count"] = await _count_messages_from_checkpoint(
-                    conn, thread["thread_id"], serde
-                )
+                if agent_name:
+                    query = """
+                        SELECT thread_id,
+                               json_extract(metadata, '$.agent_name') as agent_name,
+                               MAX(json_extract(metadata, '$.updated_at')) as updated_at
+                        FROM checkpoints
+                        WHERE json_extract(metadata, '$.agent_name') = ?
+                        GROUP BY thread_id
+                    """
+                    params: tuple = (agent_name,)
+                else:
+                    query = """
+                        SELECT thread_id,
+                               json_extract(metadata, '$.agent_name') as agent_name,
+                               MAX(json_extract(metadata, '$.updated_at')) as updated_at
+                        FROM checkpoints
+                        GROUP BY thread_id
+                    """
+                    params = ()
+
+                async with conn.execute(query, params) as cursor:
+                    rows = await cursor.fetchall()
+
+                file_threads: list[dict] = []
+                for r in rows:
+                    tid = r[0]
+                    if tid in seen:
+                        continue
+                    file_threads.append(
+                        {
+                            "thread_id": tid,
+                            "agent_name": r[1],
+                            "updated_at": r[2],
+                        }
+                    )
+                    seen.add(tid)
+
+                if include_message_count and file_threads:
+                    serde = JsonPlusSerializer()
+                    for thread in file_threads:
+                        thread["message_count"] = (
+                            await _count_messages_from_checkpoint(
+                                conn, thread["thread_id"], serde
+                            )
+                        )
+
+                threads.extend(file_threads)
+        except aiosqlite.OperationalError:
+            continue
 
     # Sort threads in Python (allows complex sort logic)
     if sort_by == "thread_id":
         threads.sort(key=lambda t: t["thread_id"].lower(), reverse=reverse)
     elif sort_by == "agent":
-        # NULL agent_names first, then sorted alphabetically with secondary sort by thread_id
+        # NULL agent_names first, then alphabetical with secondary sort by thread_id.
         threads.sort(
             key=lambda t: ((t["agent_name"] or "").lower(), t["thread_id"].lower()),
-            reverse=reverse
+            reverse=reverse,
         )
     elif sort_by == "updated":
         # Most recent first by default (descending)
@@ -385,14 +523,92 @@ async def delete_thread(thread_id: str) -> bool:
         return deleted
 
 
+def _migrate_from_global_db(agent_name: str, agent_db_path: Path) -> None:
+    """Migrate agent data from legacy global sessions.db to per-agent DB.
+
+    Called once when a per-agent DB is first created. Copies checkpoints and
+    writes for the agent (including :tm thread) from the global file.
+
+    This is a one-time migration — subsequent runs skip it because the
+    per-agent DB already has data.
+
+    Args:
+        agent_name: Agent name to migrate.
+        agent_db_path: Path to the per-agent DB file.
+    """
+    import sqlite3
+
+    global_path = get_db_path()  # Legacy sessions.db
+    if not global_path.exists():
+        return
+
+    # Skip if per-agent DB already has data (migration already done)
+    if agent_db_path.exists() and agent_db_path.stat().st_size > 8192:
+        return
+
+    try:
+        src = sqlite3.connect(str(global_path))
+        dst = sqlite3.connect(str(agent_db_path))
+
+        # Create tables from source schema
+        for row in src.execute("SELECT sql FROM sqlite_master WHERE type='table'").fetchall():
+            if row[0]:
+                dst.execute(row[0].replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS"))
+
+        tids = [agent_name, f"{agent_name}:tm"]
+        migrated_any = False
+
+        for table in ["checkpoints", "writes"]:
+            try:
+                rows = src.execute(
+                    f"SELECT * FROM {table} WHERE thread_id IN (?,?)", tids
+                ).fetchall()
+            except sqlite3.OperationalError:
+                continue
+            if rows:
+                ph = ",".join(["?"] * len(rows[0]))
+                dst.executemany(f"INSERT OR REPLACE INTO {table} VALUES ({ph})", rows)
+                migrated_any = True
+
+        if migrated_any:
+            dst.commit()
+
+        dst.close()
+        src.close()
+    except Exception:
+        # Migration is best-effort — don't crash the agent
+        pass
+
+
 @asynccontextmanager
-async def get_checkpointer() -> AsyncIterator[AsyncSqliteSaver]:
-    """Get AsyncSqliteSaver for the global database.
+async def get_checkpointer(agent_name: str | None = None) -> AsyncIterator["DeltaSqliteCheckpointer"]:
+    """Get DeltaSqliteCheckpointer for a database.
+
+    Uses delta-based checkpointing: stores only changed channel values
+    in each checkpoint, not full state copies. Backward compatible with
+    existing v1 (full snapshot) data from AsyncSqliteSaver.
+
+    When ``agent_name`` is provided, uses a per-agent database file to avoid
+    SQLite lock contention between concurrent agents. On first use, migrates
+    existing data from the legacy global ``sessions.db``.
+
+    When ``None``, uses the legacy global ``sessions.db``.
+
+    Args:
+        agent_name: Agent name for per-agent DB isolation.
 
     Yields:
-        AsyncSqliteSaver instance for checkpoint persistence.
+        DeltaSqliteCheckpointer instance for checkpoint persistence.
     """
-    async with AsyncSqliteSaver.from_conn_string(str(get_db_path())) as checkpointer:
+    from deep_worker_cli.delta_checkpointer import DeltaSqliteCheckpointer
+
+    db_path = get_db_path(agent_name)
+
+    # One-time migration from global DB to per-agent DB
+    if agent_name is not None:
+        _migrate_from_global_db(agent_name, db_path)
+
+    async with DeltaSqliteCheckpointer.from_conn_string(str(db_path)) as checkpointer:
         yield checkpointer
 
 
@@ -460,6 +676,108 @@ async def delete_thread_command(thread_id: str) -> None:
         console.print(f"[red]Thread '{thread_id}' not found.[/red]")
 
 
+async def clean_agent_history_db_only(
+    agent_name: str,
+) -> tuple[int, int]:
+    """Delete only DB rows (checkpoints + writes) for this agent.
+
+    Does NOT touch agent data directory or logs. Intended to be called
+    from the daemonized grandchild during ``deep-worker --clean`` startup.
+
+    After the per-agent DB migration the primary storage is
+    ``sessions_<agent>.db``; that file is removed entirely.  For backward
+    compatibility we also scrub any stale rows from the legacy global
+    ``sessions.db`` (from pre-migration installs).
+
+    Args:
+        agent_name: Name of the agent whose DB rows to remove.
+
+    Returns:
+        Tuple ``(checkpoints_deleted, writes_deleted)`` – counts from
+        both the per-agent file and the legacy global are summed.
+    """
+    import os
+
+    checkpoints_deleted = 0
+    writes_deleted = 0
+
+    per_agent_path = get_db_path(agent_name)
+    legacy_path = get_db_path(None)
+
+    # 1. Per-agent DB: count then delete the file entirely (atomic, no lock
+    # contention, exactly what the user expects from --clean).  Skip when
+    # the per-agent and legacy paths collapse to the same file (happens
+    # only in monkey-patched test setups).
+    if per_agent_path.exists() and per_agent_path != legacy_path:
+        try:
+            async with aiosqlite.connect(
+                str(per_agent_path), timeout=30.0
+            ) as conn:
+                if await _table_exists(conn, "checkpoints"):
+                    async with conn.execute(
+                        "SELECT COUNT(*) FROM checkpoints"
+                    ) as cursor:
+                        row = await cursor.fetchone()
+                        checkpoints_deleted += row[0] if row else 0
+                if await _table_exists(conn, "writes"):
+                    async with conn.execute(
+                        "SELECT COUNT(*) FROM writes"
+                    ) as cursor:
+                        row = await cursor.fetchone()
+                        writes_deleted += row[0] if row else 0
+        except aiosqlite.OperationalError:
+            # File unreadable – best-effort clean-up, unlink anyway below.
+            pass
+
+        try:
+            os.unlink(per_agent_path)
+        except OSError:
+            # Best-effort; continue to legacy scrub.
+            pass
+
+    # 2. Legacy global DB: remove any rows still tagged for this agent.
+    if legacy_path.exists():
+        try:
+            thread_ids: list[str] = []
+            async with aiosqlite.connect(
+                str(legacy_path), timeout=30.0
+            ) as conn:
+                if await _table_exists(conn, "checkpoints"):
+                    async with conn.execute(
+                        """
+                        SELECT DISTINCT thread_id
+                        FROM checkpoints
+                        WHERE json_extract(metadata, '$.agent_name') = ?
+                        """,
+                        (agent_name,),
+                    ) as cursor:
+                        rows = await cursor.fetchall()
+                        thread_ids = [row[0] for row in rows]
+
+            async with aiosqlite.connect(
+                str(legacy_path), timeout=30.0
+            ) as conn:
+                if await _table_exists(conn, "checkpoints"):
+                    cursor = await conn.execute(
+                        "DELETE FROM checkpoints "
+                        "WHERE json_extract(metadata, '$.agent_name') = ?",
+                        (agent_name,),
+                    )
+                    checkpoints_deleted += cursor.rowcount or 0
+                if await _table_exists(conn, "writes") and thread_ids:
+                    placeholders = ",".join("?" * len(thread_ids))
+                    cursor = await conn.execute(
+                        f"DELETE FROM writes WHERE thread_id IN ({placeholders})",
+                        thread_ids,
+                    )
+                    writes_deleted += cursor.rowcount or 0
+                await conn.commit()
+        except aiosqlite.OperationalError:
+            pass
+
+    return checkpoints_deleted, writes_deleted
+
+
 async def clean_agent_history(
     agent_name: str,
     *,
@@ -485,52 +803,110 @@ async def clean_agent_history(
     Note:
         This function is idempotent and handles non-existent data gracefully.
     """
+    import os
     import shutil
 
     # Root the runtime paths under ~/.deep_worker/ (project convention);
     # `_home_dir` is a test hook that redirects that root inside a tmpdir.
     _RUNTIME_SUBDIR = Path("~/.deep_worker").expanduser().name
+    home_dir = _home_dir if _home_dir is not None else Path.home()
     if _home_dir is None:
         runtime_root = Path("~/.deep_worker").expanduser()
     else:
         runtime_root = _home_dir / _RUNTIME_SUBDIR
 
-    # 1. Get all thread_ids for this agent before deleting
-    # We need this to clean up writes table
-    thread_ids: list[str] = []
-    db_path = str(get_db_path())
-    async with aiosqlite.connect(db_path, timeout=30.0) as conn:
-        if await _table_exists(conn, "checkpoints"):
-            query = """
-                SELECT DISTINCT thread_id
-                FROM checkpoints
-                WHERE json_extract(metadata, '$.agent_name') = ?
-            """
-            async with conn.execute(query, (agent_name,)) as cursor:
-                rows = await cursor.fetchall()
-                thread_ids = [row[0] for row in rows]
-
-    # 2. Delete all checkpoints and writes from database
     checkpoints_deleted = 0
     writes_deleted = 0
 
-    async with aiosqlite.connect(db_path, timeout=30.0) as conn:
-        # Delete checkpoints for this agent
-        if await _table_exists(conn, "checkpoints"):
-            cursor = await conn.execute(
-                "DELETE FROM checkpoints WHERE json_extract(metadata, '$.agent_name') = ?",
-                (agent_name,),
-            )
-            checkpoints_deleted = cursor.rowcount
+    # Resolve DB paths.  In the common runtime case both paths come from
+    # ``get_db_path`` and point at ``home_dir/.deepagents/sessions_<agent>.db``
+    # and ``home_dir/.deepagents/sessions.db`` respectively.  Two special
+    # situations:
+    #   - Unit tests that pass ``_home_dir`` without patching ``get_db_path``:
+    #     use the home_dir-relative paths so the fake home is honoured.
+    #   - Unit tests that patch ``get_db_path`` to return one specific file
+    #     regardless of arg: both resolve to the same path, the guard
+    #     ``per_agent_path != legacy_path`` below skips the per-agent
+    #     unlink step and the legacy scrub cleans the rows.
+    if _home_dir is not None:
+        # Prefer the monkey-patched ``get_db_path`` if the patch collapses
+        # both paths onto a single file outside home_dir (legacy tests).
+        patched_per_agent = get_db_path(agent_name)
+        patched_legacy = get_db_path(None)
+        if patched_per_agent == patched_legacy:
+            per_agent_path = patched_per_agent
+            legacy_path = patched_legacy
+        else:
+            per_agent_path = home_dir / ".deepagents" / f"sessions_{agent_name}.db"
+            legacy_path = home_dir / ".deepagents" / "sessions.db"
+    else:
+        per_agent_path = get_db_path(agent_name)
+        legacy_path = get_db_path(None)
 
-        # Delete writes for all thread_ids of this agent
-        if await _table_exists(conn, "writes") and thread_ids:
-            placeholders = ",".join("?" * len(thread_ids))
-            query = f"DELETE FROM writes WHERE thread_id IN ({placeholders})"
-            cursor = await conn.execute(query, thread_ids)
-            writes_deleted = cursor.rowcount
+    # 1. Per-agent DB: count rows then remove the file.  Skip when
+    # per-agent and legacy point at the same file (monkey-patched tests).
+    if per_agent_path.exists() and per_agent_path != legacy_path:
+        try:
+            async with aiosqlite.connect(
+                str(per_agent_path), timeout=30.0
+            ) as conn:
+                if await _table_exists(conn, "checkpoints"):
+                    async with conn.execute(
+                        "SELECT COUNT(*) FROM checkpoints"
+                    ) as cursor:
+                        row = await cursor.fetchone()
+                        checkpoints_deleted += row[0] if row else 0
+                if await _table_exists(conn, "writes"):
+                    async with conn.execute(
+                        "SELECT COUNT(*) FROM writes"
+                    ) as cursor:
+                        row = await cursor.fetchone()
+                        writes_deleted += row[0] if row else 0
+        except aiosqlite.OperationalError:
+            pass
+        try:
+            os.unlink(per_agent_path)
+        except OSError:
+            pass
 
-        await conn.commit()
+    # 2. Legacy global DB: scrub any rows tagged with this agent's name
+    # (pre-migration data that may still be lying around).
+    if legacy_path.exists():
+        try:
+            thread_ids: list[str] = []
+            async with aiosqlite.connect(
+                str(legacy_path), timeout=30.0
+            ) as conn:
+                if await _table_exists(conn, "checkpoints"):
+                    query = """
+                        SELECT DISTINCT thread_id
+                        FROM checkpoints
+                        WHERE json_extract(metadata, '$.agent_name') = ?
+                    """
+                    async with conn.execute(query, (agent_name,)) as cursor:
+                        rows = await cursor.fetchall()
+                        thread_ids = [row[0] for row in rows]
+
+            async with aiosqlite.connect(
+                str(legacy_path), timeout=30.0
+            ) as conn:
+                if await _table_exists(conn, "checkpoints"):
+                    cursor = await conn.execute(
+                        "DELETE FROM checkpoints "
+                        "WHERE json_extract(metadata, '$.agent_name') = ?",
+                        (agent_name,),
+                    )
+                    checkpoints_deleted += cursor.rowcount or 0
+
+                if await _table_exists(conn, "writes") and thread_ids:
+                    placeholders = ",".join("?" * len(thread_ids))
+                    query = f"DELETE FROM writes WHERE thread_id IN ({placeholders})"
+                    cursor = await conn.execute(query, thread_ids)
+                    writes_deleted += cursor.rowcount or 0
+
+                await conn.commit()
+        except aiosqlite.OperationalError:
+            pass
 
     # 3. Remove agent data directory
     data_dir = runtime_root / agent_name
@@ -626,9 +1002,16 @@ async def remove_thread(
 ) -> dict:
     """Remove a thread from the database.
 
+    DB resolution order (when ``db_path`` is not given) follows the same
+    rule as :func:`get_thread_history`:
+
+    1. ``sessions_<agent>.db`` where agent is derived from ``thread_id``
+       (``thread_id.split(':')[0]``), if it exists.
+    2. Legacy global ``sessions.db`` (pre-migration data).
+
     Args:
         thread_id: Thread ID to remove
-        db_path: Optional custom database path (defaults to global DB)
+        db_path: Optional explicit database path (bypasses auto-resolution)
         dry_run: If True, only show what would be deleted without deleting
 
     Returns:
@@ -643,10 +1026,23 @@ async def remove_thread(
     import aiosqlite
 
     if db_path is None:
-        db_path = str(get_db_path())
+        resolved = _resolve_db_path_for_thread(thread_id)
+        if resolved is None:
+            return {
+                "success": False,
+                "thread_id": thread_id,
+                "error": f"Thread '{thread_id}' not found in database",
+            }
+        db_path = str(resolved)
 
     try:
         async with aiosqlite.connect(db_path) as conn:
+            if not await _table_exists(conn, "checkpoints"):
+                return {
+                    "success": False,
+                    "thread_id": thread_id,
+                    "error": f"Thread '{thread_id}' not found in database",
+                }
             # Check if thread exists
             async with conn.execute(
                 "SELECT COUNT(*) FROM checkpoints WHERE thread_id = ?",
@@ -718,14 +1114,29 @@ async def remove_thread(
 async def get_thread_history(
     thread_id: str,
     db_path: str | None = None,
-    format: str = "text"
+    format: str = "text",
+    agent_name: str | None = None,
 ) -> dict:
     """Get message history for a thread.
 
+    DB resolution order (when ``db_path`` is not given):
+
+    1. ``agent_name`` → ``sessions_<agent_name>.db`` (if exists).
+    2. Else derive ``agent`` from ``thread_id`` (``thread_id.split(':')[0]``)
+       and use ``sessions_<agent>.db`` if it exists.
+    3. Else fall back to the legacy global ``sessions.db`` if it exists.
+    4. Else report "not found".
+
+    This matches where checkpoints actually live after the per-agent DB
+    migration – fixes ``deep-worker --history <agent>`` failing with
+    "no such table: checkpoints" because the legacy global file is empty.
+
     Args:
-        thread_id: Thread ID to retrieve history for
-        db_path: Optional custom database path (defaults to global DB)
-        format: Output format - "text" (default) or "json"
+        thread_id: Thread ID to retrieve history for.
+        db_path: Optional explicit database path (bypasses auto-resolution).
+        format: Output format - "text" (default) or "json".
+        agent_name: Optional explicit agent name override.  Normally
+            derived from ``thread_id``.
 
     Returns:
         Dictionary with operation results:
@@ -740,103 +1151,78 @@ async def get_thread_history(
     import json
 
     if db_path is None:
-        db_path = str(get_db_path())
+        # Priority 1: explicit agent_name.
+        resolved: Path | None = None
+        if agent_name is not None:
+            candidate = get_db_path(agent_name)
+            if candidate.exists():
+                resolved = candidate
+        # Priority 2: derive from thread_id.
+        if resolved is None:
+            derived_agent = _agent_name_from_thread_id(thread_id)
+            candidate = get_db_path(derived_agent)
+            if candidate.exists():
+                resolved = candidate
+        # Priority 3: legacy global.
+        if resolved is None:
+            legacy = get_db_path(None)
+            if legacy.exists():
+                resolved = legacy
+
+        if resolved is None:
+            return {
+                "success": False,
+                "thread_id": thread_id,
+                "error": (
+                    f"Thread '{thread_id}' not found: no session database "
+                    f"exists (looked for sessions_<agent>.db and "
+                    f"legacy sessions.db under ~/.deepagents)."
+                ),
+            }
+        db_path = str(resolved)
 
     try:
-        async with aiosqlite.connect(db_path) as conn:
-            # Check if thread exists
-            async with conn.execute(
-                "SELECT COUNT(*) FROM checkpoints WHERE thread_id = ?",
-                (thread_id,)
-            ) as cursor:
-                row = await cursor.fetchone()
-                count = row[0] if row else 0
+        # Use DeltaSqliteCheckpointer for delta-aware state reconstruction.
+        # This handles both v1 (full snapshot) and v2 (delta) checkpoints.
+        from deep_worker_cli.delta_checkpointer import DeltaSqliteCheckpointer
 
-            if count == 0:
+        async with DeltaSqliteCheckpointer.from_conn_string(db_path) as checkpointer:
+            # Get latest checkpoint with full state reconstruction
+            config = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
+            cp_tuple = await checkpointer.aget_tuple(config)
+
+            if not cp_tuple:
                 return {
                     "success": False,
                     "thread_id": thread_id,
-                    "error": f"Thread '{thread_id}' not found in database"
+                    "error": f"Thread '{thread_id}' not found in database",
                 }
 
-            # Retrieve all checkpoints for this thread
-            async with conn.execute("""
-                SELECT checkpoint_id, type, checkpoint, metadata, parent_checkpoint_id
-                FROM checkpoints
-                WHERE thread_id = ?
-                ORDER BY checkpoint_id
-            """, (thread_id,)) as cursor:
-                rows = await cursor.fetchall()
+            # Extract messages from reconstructed state
+            channel_values = cp_tuple.checkpoint.get("channel_values", {})
+            all_messages = channel_values.get("messages", [])
 
-            # Initialize serializer for decoding checkpoint blobs
-            from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
-            serde = JsonPlusSerializer()
+            # Add timestamps from checkpoint
+            checkpoint_ts = cp_tuple.checkpoint.get("ts")
+            for msg in all_messages:
+                if isinstance(msg, dict):
+                    msg["timestamp"] = checkpoint_ts
+                elif hasattr(msg, "__dict__"):
+                    msg.timestamp = checkpoint_ts  # type: ignore[attr-defined]
 
-            checkpoints = []
-            all_messages = []
-            seen_message_count = 0  # Track number of messages we've already seen
+            # Get checkpoint count
+            async with checkpointer.conn.execute(
+                "SELECT COUNT(*) FROM checkpoints WHERE thread_id = ?",
+                (thread_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+                cp_count = row[0] if row else 0
 
-            for row in rows:
-                checkpoint_id, type_str, checkpoint_blob, metadata_str, parent_id = row
-
-                checkpoint_data = {}
-                if checkpoint_blob and type_str:
-                    try:
-                        # Use LangGraph serializer to decode checkpoint
-                        checkpoint_data = serde.loads_typed((type_str, checkpoint_blob))
-                    except (ValueError, TypeError) as e:
-                        checkpoint_data = {"error": f"Failed to deserialize: {str(e)}"}
-                elif checkpoint_blob:
-                    # Fallback: try JSON if no type
-                    try:
-                        checkpoint_data = json.loads(checkpoint_blob)
-                    except (json.JSONDecodeError, UnicodeDecodeError):
-                        checkpoint_data = {"raw": "binary data"}
-
-                metadata = {}
-                if metadata_str:
-                    try:
-                        metadata = json.loads(metadata_str)
-                    except json.JSONDecodeError:
-                        pass
-
-                checkpoint_info = {
-                    "checkpoint_id": checkpoint_id,
-                    "parent_checkpoint_id": parent_id,
-                    "metadata": metadata,
-                    "data": checkpoint_data
-                }
-
-                checkpoints.append(checkpoint_info)
-
-                # Extract NEW messages only (not duplicates from accumulation)
-                if isinstance(checkpoint_data, dict) and "channel_values" in checkpoint_data:
-                    channel_values = checkpoint_data["channel_values"]
-                    if "messages" in channel_values:
-                        messages = channel_values["messages"]
-                        if isinstance(messages, list):
-                            # Get checkpoint timestamp
-                            checkpoint_ts = checkpoint_data.get("ts")
-
-                            # Only add messages we haven't seen yet
-                            new_messages = messages[seen_message_count:]
-                            for msg in new_messages:
-                                # Add timestamp to message
-                                if isinstance(msg, dict):
-                                    msg["timestamp"] = checkpoint_ts
-                                elif hasattr(msg, "__dict__"):
-                                    # For LangChain Message objects, add timestamp attribute
-                                    msg.timestamp = checkpoint_ts
-                                all_messages.append(msg)
-
-                            # Update seen count
-                            seen_message_count = len(messages)
-
-            result = {
+            result: dict[str, Any] = {
                 "success": True,
                 "thread_id": thread_id,
-                "checkpoints": checkpoints,
-                "messages": all_messages
+                "checkpoints": [{"checkpoint_id": cp_tuple.config["configurable"]["checkpoint_id"]}],
+                "messages": all_messages,
             }
 
             if format == "json":
@@ -848,7 +1234,7 @@ async def get_thread_history(
         return {
             "success": False,
             "thread_id": thread_id,
-            "error": f"Error retrieving thread history: {str(e)}"
+            "error": f"Error retrieving thread history: {str(e)}",
         }
 
 
@@ -859,9 +1245,14 @@ async def remove_threads_before(
 ) -> dict:
     """Remove all threads older than the specified date.
 
+    When ``db_path`` is not provided, the operation is applied to every
+    per-agent ``sessions_<name>.db`` file in ``~/.deepagents`` **and** the
+    legacy global ``sessions.db``.  Counts are summed across all files.
+
     Args:
         date_str: Date string (ISO 8601 or relative like "30d", "1y")
-        db_path: Optional custom database path (defaults to global DB)
+        db_path: Optional explicit DB path (single file, bypasses
+            per-agent iteration; useful for tests and targeted cleanup).
         dry_run: If True, only show what would be deleted without deleting
 
     Returns:
@@ -875,99 +1266,113 @@ async def remove_threads_before(
         - error: str - Error message (if success=False)
     """
     import aiosqlite
-    import json
-
-    if db_path is None:
-        db_path = str(get_db_path())
 
     try:
-        # Parse the date string
         cutoff_date = parse_date(date_str)
-        cutoff_iso = cutoff_date.isoformat()
-
-        async with aiosqlite.connect(db_path) as conn:
-            # Find all threads with updated_at before cutoff date
-            # Group by thread_id to get unique threads
-            async with conn.execute("""
-                SELECT DISTINCT thread_id
-                FROM checkpoints
-                WHERE json_extract(metadata, '$.updated_at') < ?
-            """, (cutoff_iso,)) as cursor:
-                thread_ids = [row[0] for row in await cursor.fetchall()]
-
-            if not thread_ids:
-                return {
-                    "success": True,
-                    "dry_run": dry_run,
-                    "cutoff_date": cutoff_iso,
-                    "threads_deleted": 0,
-                    "checkpoints_deleted": 0,
-                    "writes_deleted": 0
-                }
-
-            # Count checkpoints for these threads
-            placeholders = ','.join('?' * len(thread_ids))
-            async with conn.execute(
-                f"SELECT COUNT(*) FROM checkpoints WHERE thread_id IN ({placeholders})",
-                thread_ids
-            ) as cursor:
-                row = await cursor.fetchone()
-                checkpoint_count = row[0] if row else 0
-
-            # Count writes if table exists
-            writes_count = 0
-            try:
-                async with conn.execute(
-                    f"SELECT COUNT(*) FROM checkpoint_writes WHERE thread_id IN ({placeholders})",
-                    thread_ids
-                ) as cursor:
-                    row = await cursor.fetchone()
-                    writes_count = row[0] if row else 0
-            except aiosqlite.OperationalError:
-                # checkpoint_writes table doesn't exist
-                pass
-
-            if dry_run:
-                return {
-                    "success": True,
-                    "dry_run": True,
-                    "cutoff_date": cutoff_iso,
-                    "threads_found": len(thread_ids),
-                    "checkpoints_found": checkpoint_count,
-                    "writes_found": writes_count
-                }
-
-            # Delete checkpoints for these threads
-            await conn.execute(
-                f"DELETE FROM checkpoints WHERE thread_id IN ({placeholders})",
-                thread_ids
-            )
-
-            # Delete writes if they exist
-            if writes_count > 0:
-                await conn.execute(
-                    f"DELETE FROM checkpoint_writes WHERE thread_id IN ({placeholders})",
-                    thread_ids
-                )
-
-            await conn.commit()
-
-            return {
-                "success": True,
-                "dry_run": False,
-                "cutoff_date": cutoff_iso,
-                "threads_deleted": len(thread_ids),
-                "checkpoints_deleted": checkpoint_count,
-                "writes_deleted": writes_count
-            }
-
     except ValueError as e:
         return {
             "success": False,
-            "error": f"Invalid date format: {str(e)}"
+            "error": f"Invalid date format: {str(e)}",
         }
-    except Exception as e:
+    cutoff_iso = cutoff_date.isoformat()
+
+    # Decide which DB files to process.
+    if db_path is not None:
+        db_paths: list[str] = [db_path]
+    else:
+        db_paths = [str(p) for p in iter_all_db_paths()]
+
+    threads_total = 0
+    checkpoints_total = 0
+    writes_total = 0
+    any_error: str | None = None
+
+    for current_db in db_paths:
+        try:
+            async with aiosqlite.connect(current_db) as conn:
+                if not await _table_exists(conn, "checkpoints"):
+                    continue
+
+                async with conn.execute(
+                    """
+                    SELECT DISTINCT thread_id
+                    FROM checkpoints
+                    WHERE json_extract(metadata, '$.updated_at') < ?
+                    """,
+                    (cutoff_iso,),
+                ) as cursor:
+                    thread_ids = [row[0] for row in await cursor.fetchall()]
+
+                if not thread_ids:
+                    continue
+
+                placeholders = ",".join("?" * len(thread_ids))
+                async with conn.execute(
+                    f"SELECT COUNT(*) FROM checkpoints WHERE thread_id IN ({placeholders})",
+                    thread_ids,
+                ) as cursor:
+                    row = await cursor.fetchone()
+                    checkpoint_count = row[0] if row else 0
+
+                writes_count = 0
+                try:
+                    async with conn.execute(
+                        f"SELECT COUNT(*) FROM checkpoint_writes "
+                        f"WHERE thread_id IN ({placeholders})",
+                        thread_ids,
+                    ) as cursor:
+                        row = await cursor.fetchone()
+                        writes_count = row[0] if row else 0
+                except aiosqlite.OperationalError:
+                    pass
+
+                threads_total += len(thread_ids)
+                checkpoints_total += checkpoint_count
+                writes_total += writes_count
+
+                if dry_run:
+                    continue
+
+                await conn.execute(
+                    f"DELETE FROM checkpoints WHERE thread_id IN ({placeholders})",
+                    thread_ids,
+                )
+                if writes_count > 0:
+                    try:
+                        await conn.execute(
+                            f"DELETE FROM checkpoint_writes "
+                            f"WHERE thread_id IN ({placeholders})",
+                            thread_ids,
+                        )
+                    except aiosqlite.OperationalError:
+                        pass
+
+                await conn.commit()
+        except Exception as e:  # noqa: BLE001
+            any_error = f"Error removing threads from '{current_db}': {str(e)}"
+            continue
+
+    if any_error is not None and threads_total == 0:
         return {
             "success": False,
-            "error": f"Error removing threads: {str(e)}"
+            "error": any_error,
         }
+
+    if dry_run:
+        return {
+            "success": True,
+            "dry_run": True,
+            "cutoff_date": cutoff_iso,
+            "threads_found": threads_total,
+            "checkpoints_found": checkpoints_total,
+            "writes_found": writes_total,
+        }
+
+    return {
+        "success": True,
+        "dry_run": False,
+        "cutoff_date": cutoff_iso,
+        "threads_deleted": threads_total,
+        "checkpoints_deleted": checkpoints_total,
+        "writes_deleted": writes_total,
+    }

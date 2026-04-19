@@ -17,16 +17,6 @@ from textual.css.query import NoMatches
 from textual.message import Message
 from textual.widgets import Static
 
-# ============================================================================
-# CRITICAL: RPYC MUST BE IMPORTED FROM SOURCE CODE, NOT FROM PIP!
-# ============================================================================
-# ALWAYS import rpyc from the local rpyc_async source checkout.
-# This ensures we use rpyc_async with AsyncioServer support.
-# ============================================================================
-_rpyc_async_path = Path("rpyc_async")
-if _rpyc_async_path.exists() and str(_rpyc_async_path) not in sys.path:
-    sys.path.insert(0, str(_rpyc_async_path))
-
 import rpyc
 from deep_worker_cli.process.registry import ProcessRegistry
 from deep_worker_cli.widgets.chat_input import ChatInput
@@ -45,7 +35,6 @@ from deep_worker_cli.widgets.welcome import WelcomeBanner
 if TYPE_CHECKING:
     from textual.app import ComposeResult
     from textual.events import Resize
-
 
 class ChatScroll(VerticalScroll):
     """Scrollable chat container that posts ScrolledUp on upward user scroll.
@@ -105,7 +94,6 @@ class ChatScroll(VerticalScroll):
         if new_value < old_value:
             # Scrolled toward the top → post message that bubbles to App
             self.post_message(self.ScrolledUp())
-
 
 class InteractiveApp(App):
     """Textual TUI app for interacting with a running deep-worker agent.

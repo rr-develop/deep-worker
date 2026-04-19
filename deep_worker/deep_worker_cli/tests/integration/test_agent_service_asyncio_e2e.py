@@ -15,13 +15,7 @@ from pathlib import Path
 
 import pytest
 
-# Add the local rpyc_async source checkout to path BEFORE importing rpyc
-_rpyc_async_path = Path("rpyc_async")
-if str(_rpyc_async_path) not in sys.path:
-    sys.path.insert(0, str(_rpyc_async_path))
-
 import rpyc
-
 
 @pytest.mark.asyncio
 async def test_agent_service_with_asyncio_server():
@@ -86,7 +80,6 @@ async def test_agent_service_with_asyncio_server():
     finally:
         await server.close()
 
-
 @pytest.mark.asyncio
 async def test_agent_service_overridden_base_methods():
     """Test that base RPyC Service methods are properly async."""
@@ -130,7 +123,6 @@ async def test_agent_service_overridden_base_methods():
 
     finally:
         await server.close()
-
 
 @pytest.mark.asyncio
 async def test_server_handles_multiple_clients_sequentially():
@@ -184,7 +176,6 @@ async def test_server_handles_multiple_clients_sequentially():
 
     finally:
         await server.close()
-
 
 @pytest.mark.asyncio
 async def test_asyncio_server_graceful_shutdown():

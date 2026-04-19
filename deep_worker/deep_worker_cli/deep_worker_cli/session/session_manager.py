@@ -51,12 +51,17 @@ class SessionManager:
             self.last_activity = datetime.now()
             self.launch_config: dict | None = None
 
-        # If a new launch_config is provided, overwrite whatever was loaded
-        # (agent restarted with new parameters)
+        # If a new launch_config is provided, this is a fresh agent start/restart.
+        # ⚠️ CRITICAL: MUST reset status to IDLE and clear error_message!
+        # Without this, a previous crash (status=error) persists across restarts
+        # and the agent appears stuck in error state even though it's functional.
+        # DO NOT remove this reset — it prevents the "restart doesn't clear error" bug.
         if launch_config is not None:
             self.launch_config = launch_config
+            self.status = AgentStatus.IDLE
+            self.error_message = None
 
-        # Persist (writes launch_config if present)
+        # Persist (writes launch_config + reset status if present)
         if not self.metadata_file.exists() or launch_config is not None:
             self._persist_sync()
 

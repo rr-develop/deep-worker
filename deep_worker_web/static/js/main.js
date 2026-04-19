@@ -145,11 +145,56 @@ function setupEventListeners() {
         }
     });
     
-    // Full dialog button
+    // Full dialog button + verbosity dropdown
     document.getElementById('full-dialog-btn').onclick = openFullDialog;
-    
+    restoreFullDialogVerbosity();
+
+    // Interrupt button — cancels the current agent invocation
+    // (process keeps running, ready for next user message)
+    const interruptBtn = document.getElementById('interrupt-btn');
+    if (interruptBtn) {
+        interruptBtn.onclick = interruptAgent;
+    }
+
     // Stop TaskManager button
     document.getElementById('stop-taskmanager-btn').onclick = stopTaskManager;
+}
+
+// Interrupt currently running agent invocation.
+// The agent process keeps running; only the in-flight task is cancelled.
+async function interruptAgent() {
+    if (!selectedAgent) return;
+
+    const btn = document.getElementById('interrupt-btn');
+    const original = btn ? btn.textContent : null;
+    if (btn) {
+        btn.disabled = true;
+        btn.textContent = '⏸ Interrupting…';
+    }
+
+    try {
+        const response = await fetch(`/api/agents/${selectedAgent}/interrupt`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+        });
+
+        if (!response.ok) {
+            const detail = await response.text();
+            throw new Error(`HTTP ${response.status}: ${detail}`);
+        }
+
+        // The actual confirmation arrives via WebSocket (agent_interrupted /
+        // agent_interrupt_result). We just acknowledge the dispatch here.
+        showNotification(`Interrupt sent to ${selectedAgent}`, 'success');
+    } catch (error) {
+        console.error('Error interrupting agent:', error);
+        showNotification(`Failed to interrupt: ${error.message}`, 'error');
+    } finally {
+        if (btn) {
+            btn.disabled = false;
+            btn.textContent = original || '⏸ Interrupt';
+        }
+    }
 }
 
 // Send message to agent
@@ -217,12 +262,41 @@ async function copyLastResponse(event) {
     }
 }
 
-// Open full dialog in new tab (plain text format)
+// localStorage key for the persisted verbosity choice (per design §3.6 UI).
+const FULL_DIALOG_VERBOSITY_KEY = 'deep_worker_web.dialog_verbosity';
+
+// Read verbosity from the dropdown; fall back to 'final'.
+function getFullDialogVerbosity() {
+    const sel = document.getElementById('full-dialog-verbosity');
+    const v = sel ? sel.value : 'final';
+    return (v === 'text' || v === 'full') ? v : 'final';
+}
+
+// Restore persisted verbosity choice into the dropdown on page load.
+function restoreFullDialogVerbosity() {
+    const sel = document.getElementById('full-dialog-verbosity');
+    if (!sel) return;
+    try {
+        const saved = localStorage.getItem(FULL_DIALOG_VERBOSITY_KEY);
+        if (saved && ['final', 'text', 'full'].includes(saved)) {
+            sel.value = saved;
+        }
+    } catch (e) {
+        // localStorage unavailable — ignore
+    }
+    sel.addEventListener('change', () => {
+        try {
+            localStorage.setItem(FULL_DIALOG_VERBOSITY_KEY, sel.value);
+        } catch (e) { /* ignore */ }
+    });
+}
+
+// Open full dialog in new tab. Verbosity comes from the dropdown.
 function openFullDialog() {
     if (!selectedAgent) return;
 
-    // Open dialog text endpoint directly (plain text)
-    const url = `/api/agents/${selectedAgent}/dialog-text`;
+    const verbosity = getFullDialogVerbosity();
+    const url = `/api/agents/${selectedAgent}/dialog-text?verbosity=${encodeURIComponent(verbosity)}`;
     window.open(url, '_blank');
 }
 
@@ -619,6 +693,12 @@ function handleWebSocketMessage(data) {
         case 'agent_terminated':
             handleAgentTerminated(data);
             break;
+        case 'agent_interrupted':
+            handleAgentInterrupted(data);
+            break;
+        case 'agent_interrupt_result':
+            handleAgentInterruptResult(data);
+            break;
         case 'pong':
             // Ping response, ignore
             break;
@@ -891,6 +971,47 @@ function handleAgentTerminated(data) {
     }
     
     renderAgentList();
+}
+
+// Handle agent_interrupted broadcast (sent by agent itself when its
+// current invocation is cancelled — also fires when interrupt comes from
+// another client like dwcli).
+function handleAgentInterrupted(data) {
+    const agentName = data.agent_name || (data.message && data.message.agent_name);
+    console.log('[Interrupt] agent_interrupted received:', data);
+
+    // Optimistically reflect the new state in the local agent map so the UI
+    // shows the agent as waiting for user input until the next status poll.
+    const target = agentName || selectedAgent;
+    if (target && agents[target]) {
+        agents[target].status = 'waiting_input';
+        agents[target].interrupted = true;
+        renderAgentList();
+    }
+
+    if (target === selectedAgent) {
+        showNotification(
+            `Agent ${target} interrupted — awaiting your input`,
+            'info',
+        );
+    }
+}
+
+// Handle agent_interrupt_result — service-level acknowledgment that the
+// interrupt RPC dispatched (success or failure on transport).
+function handleAgentInterruptResult(data) {
+    const { agent_name, success, message, error } = data;
+    if (success) {
+        console.log(`[Interrupt] dispatched for ${agent_name}: ${message || 'ok'}`);
+    } else {
+        console.warn(`[Interrupt] failed for ${agent_name}: ${error || 'unknown'}`);
+        if (agent_name === selectedAgent) {
+            showNotification(
+                `Interrupt failed: ${error || 'unknown error'}`,
+                'error',
+            );
+        }
+    }
 }
 
 // Show error message

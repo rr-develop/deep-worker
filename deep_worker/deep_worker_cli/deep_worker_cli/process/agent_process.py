@@ -10,20 +10,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-# ============================================================================
-# CRITICAL: RPYC_ASYNC MUST BE IMPORTED FROM SOURCE, NOT FROM PIP!
-# ============================================================================
-# Add rpyc_async to sys.path to use AsyncioServer from a local rpyc_async checkout
-# This enables true bidirectional async communication (156x faster!)
-# DO NOT use 'pip install rpyc' - it will use classic RPyC 5.0 without AsyncioServer
-# Set RPYC_ASYNC_PATH to point at the local rpyc_async source tree.
-# ============================================================================
-_rpyc_async_env = os.environ.get("RPYC_ASYNC_PATH")
-if _rpyc_async_env:
-    _rpyc_async_path = Path(_rpyc_async_env)
-    if _rpyc_async_path.exists() and str(_rpyc_async_path) not in sys.path:
-        sys.path.insert(0, str(_rpyc_async_path))
-
 import rpyc
 from rpyc.core.protocol import DEFAULT_CONFIG
 from rpyc.utils.async_server import AsyncioServer  # AsyncioServer from rpyc_async!
@@ -32,7 +18,6 @@ from deep_worker_cli.agent_config_pkg.agent_config import AgentConfig
 from deep_worker_cli.process.registry import ProcessRegistry
 from deep_worker_cli.session.session_manager import SessionManager
 from deep_worker_cli.types import AgentProcessInfo, AgentStatus
-
 
 def _find_free_port(start_port: int = 0, max_attempts: int = 100) -> int:
     """Find a free port dynamically.
@@ -88,7 +73,6 @@ def _find_free_port(start_port: int = 0, max_attempts: int = 100) -> int:
         f"No free ports available in range {start_port}-{start_port + max_attempts - 1}"
     )
 
-
 class AgentProcess:
     """
     Main class for a deep-worker agent process.
@@ -101,6 +85,30 @@ class AgentProcess:
     - Handle signals
     - Manage lifecycle
     """
+
+    @staticmethod
+    def _is_outgoing_inter_agent_echo(agent_name: str, response: Any) -> bool:
+        """Return True iff ``response`` is this agent's own outgoing
+        inter-agent echo (produced by ``SendMessageCompletionMiddleware``).
+
+        An outgoing echo has the exact shape ``"agent:<self.name>:> ..."``
+        at the very start of the string — it's not a reply to the user
+        but a message addressed to a peer agent. TaskManager must skip
+        evaluation of such turns because they aren't task responses.
+
+        Args:
+            agent_name: This agent's own name (typically ``self.name``).
+            response: The ``full_response`` captured from the agent's
+                stream / ainvoke output. Non-string inputs (``None``,
+                tool-block lists, etc.) return False safely.
+
+        Returns:
+            True iff the string starts with the exact outgoing marker.
+        """
+        if not isinstance(response, str):
+            return False
+        marker = f"agent:{agent_name}:> "
+        return response.startswith(marker)
 
     def __init__(
         self,
@@ -115,6 +123,7 @@ class AgentProcess:
         memory_only: bool = False,
         use_sqlite: bool = False,
         launch_config: dict | None = None,
+        auto_approve_send_message: bool = False,
     ):
         """Initialize the agent process.
 
@@ -132,6 +141,13 @@ class AgentProcess:
                 - False/None: Disable RPyC server (NOT RECOMMENDED)
             memory_only: Use in-memory storage only (no persistence to database)
             use_sqlite: Force SQLite persistence (even in test environment)
+            launch_config: Optional launch config dict persisted to
+                session_metadata.json for --restart.
+            auto_approve_send_message: If True, auto-approve
+                `send_message_to_agent` tool calls without prompting,
+                while keeping HITL gates for all other side-effect tools.
+                Has no effect when ``skip_permissions`` is True
+                (everything is already auto-approved).
 
         Raises:
             ValueError: If both memory_only and use_sqlite are True
@@ -143,6 +159,7 @@ class AgentProcess:
         self.name = name
         self.config = config
         self.skip_permissions = skip_permissions
+        self.auto_approve_send_message = auto_approve_send_message
         self.enable_task_manager = enable_task_manager
         self.memory_only = memory_only
         self.use_sqlite = use_sqlite
@@ -250,20 +267,9 @@ class AgentProcess:
                     sys.stdout.flush()
                     print(msg, file=sys.stderr)
 
-                # ================================================================
-                # CRITICAL: Add deepagents to sys.path BEFORE imports
-                # ================================================================
-                # deepagents must be imported from source, not from pip/venv
-                # This ensures correct version and avoids compatibility issues
-                # Set DEEPAGENTS_PATH to point at the local deepagents source tree.
-                # ================================================================
-                deepagents_env_path = os.environ.get("DEEPAGENTS_PATH")
-                if deepagents_env_path:
-                    deepagents_path = PathLib(deepagents_env_path)
-                    if deepagents_path.exists() and str(deepagents_path) not in sys.path:
-                        sys.path.insert(0, str(deepagents_path))
-
-                # Now import AFTER environment is loaded and deepagents is in path
+                # deepagents is installed as a sibling package (see
+                # pyproject.toml `[tool.uv.sources]` / packaging config).
+                # Now import AFTER environment is loaded
                 from deep_worker_cli.agent import create_cli_agent
                 from deep_worker_cli.config import create_model
                 from deep_worker_cli.tools import (
@@ -314,7 +320,8 @@ class AgentProcess:
                 checkpointer = None
                 if self.use_sqlite:
                     # Explicit --use-sqlite flag: force SQLite even in tests
-                    self._checkpointer_ctx = get_checkpointer()
+                    # Per-agent DB to avoid "database is locked" with concurrent agents
+                    self._checkpointer_ctx = get_checkpointer(agent_name=self.name)
                     checkpointer = await self._checkpointer_ctx.__aenter__()
                 elif self.memory_only:
                     # Explicit --memory-only flag: force memory even in production
@@ -323,8 +330,10 @@ class AgentProcess:
                     # Test environment: default to memory (unless --use-sqlite specified)
                     checkpointer = None  # Will fall back to InMemorySaver
                 else:
-                    # Normal production run: use SQLite
-                    self._checkpointer_ctx = get_checkpointer()
+                    # Normal production run: use per-agent SQLite DB
+                    # Each agent gets its own file (sessions_{name}.db) to avoid
+                    # "database is locked" errors from concurrent writes.
+                    self._checkpointer_ctx = get_checkpointer(agent_name=self.name)
                     checkpointer = await self._checkpointer_ctx.__aenter__()
 
                 # Create the agent with auto-approve for testing
@@ -334,6 +343,7 @@ class AgentProcess:
                     assistant_id=self.name,
                     tools=web_tools,
                     auto_approve=self.skip_permissions,
+                    auto_approve_send_message=self.auto_approve_send_message,
                     enable_memory=True,
                     enable_skills=True,
                     enable_shell=True,
@@ -712,7 +722,19 @@ class AgentProcess:
         import logging
         logger = logging.getLogger(__name__)
 
-        limit = command.get("limit", 50)
+        # ⚠️ NO ARTIFICIAL LIMITS POLICY (per design doc
+        # DESIGN_FULL_DIALOG_FINAL_RESPONSE_PAIRS.md §6).
+        # The default is "return everything" — the only ceiling is the
+        # agent's own context window. ``limit`` may be:
+        #   - absent / None / 0 / negative → return all messages
+        #   - positive int N → return last N messages (legacy contract)
+        raw_limit = command.get("limit", None)
+        try:
+            int_limit = int(raw_limit) if raw_limit is not None else 0
+        except (TypeError, ValueError):
+            int_limit = 0
+        # 0 or negative ⇒ no cap
+        limit: int | None = int_limit if int_limit > 0 else None
         offset = command.get("offset", 0)
 
         logger.info(f"[GET_HISTORY] Starting get_history (limit={limit}, offset={offset})")
@@ -756,9 +778,13 @@ class AgentProcess:
             messages = state.values.get("messages", [])
             total_count = len(messages)
 
-            # Apply offset and limit for pagination
-            start_idx = max(0, total_count - limit - offset)
+            # Apply offset and limit for pagination.
+            # ``limit is None`` ⇒ return everything (no cap).
             end_idx = total_count - offset if offset > 0 else total_count
+            if limit is None:
+                start_idx = 0
+            else:
+                start_idx = max(0, end_idx - limit)
             selected_messages = messages[start_idx:end_idx]
 
             # Convert LangChain messages to JSON-serializable format
@@ -1158,6 +1184,19 @@ class AgentProcess:
                             # NOTE: In streaming mode, assistant response is already broadcast
                             # via stream_processor chunks. No need to send it again here.
 
+                            # Skip TaskManager for outgoing inter-agent echoes:
+                            # the turn's "final response" is a message addressed to another
+                            # agent (produced by SendMessageCompletionMiddleware), not a
+                            # reply to the user's task. Evaluating it would make the manager
+                            # LLM complain that the subordinate didn't do the work.
+                            # See docs/DESIGN_SEND_MESSAGE_COMPLETION_MIDDLEWARE.md §5.4.
+                            if self._is_outgoing_inter_agent_echo(self.name, full_response):
+                                print(
+                                    f"[STREAM] Skipping TaskManager: outgoing inter-agent message",
+                                    file=sys.stderr,
+                                )
+                                break
+
                             corrective_prompt = await self.task_manager.on_subordinate_response(
                                 response=full_response,
                                 send_to_subordinate_callback=None
@@ -1248,6 +1287,18 @@ class AgentProcess:
                                 await notify_callback(
                                     {"type": "assistant", "content": content, "role": "assistant"}
                                 )
+
+                            # Skip TaskManager for outgoing inter-agent echoes:
+                            # the turn's "final response" is a message addressed to another
+                            # agent (produced by SendMessageCompletionMiddleware), not a
+                            # reply to the user's task.
+                            # See docs/DESIGN_SEND_MESSAGE_COMPLETION_MIDDLEWARE.md §5.4.
+                            if self._is_outgoing_inter_agent_echo(self.name, content):
+                                print(
+                                    f"[INVOKE] Skipping TaskManager: outgoing inter-agent message",
+                                    file=sys.stderr,
+                                )
+                                break
 
                             # Send to TaskManager for evaluation
                             corrective_prompt = await self.task_manager.on_subordinate_response(
@@ -1537,7 +1588,14 @@ class AgentProcess:
                 raise RuntimeError(error_msg)
 
         except asyncio.CancelledError:
-            # Task was cancelled (interrupted)
+            # Task was cancelled (interrupted) — this is a NORMAL state
+            # transition initiated by the user, not an error. The agent
+            # process is fully alive and ready to accept the next user
+            # message, so we land in WAITING_INPUT (not ERROR).
+            #
+            # Putting the agent in ERROR here was a bug: clients refuse
+            # to send new messages to an agent in error state, requiring
+            # a manual restart after every interrupt.
             print("[INVOKE] Agent task cancelled (interrupted)", file=sys.stderr)
 
             # Notify cancellation via callback (if provided)
@@ -1548,9 +1606,9 @@ class AgentProcess:
                     "content": "Interrupted",
                 })
 
-            # Set error status for cancelled task
+            # Transition to WAITING_INPUT — interrupted, awaiting user input
             if self.session_manager:
-                await self.session_manager.set_error("Agent interrupted")
+                await self.session_manager.set_status(AgentStatus.WAITING_INPUT)
 
             # Re-raise to properly handle cancellation
             raise

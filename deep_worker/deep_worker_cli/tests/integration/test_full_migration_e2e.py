@@ -15,12 +15,6 @@ from pathlib import Path
 
 import pytest
 
-# Add the local rpyc_async source checkout to path
-_rpyc_async_path = Path("rpyc_async")
-if str(_rpyc_async_path) not in sys.path:
-    sys.path.insert(0, str(_rpyc_async_path))
-
-
 @pytest.mark.asyncio
 async def test_full_migration_agent_to_client():
     """Test full cycle: AgentProcess (AsyncioServer) → AgentClient (native rpyc)."""
@@ -79,7 +73,6 @@ async def test_full_migration_agent_to_client():
         finally:
             # Shutdown agent
             await agent.shutdown()
-
 
 @pytest.mark.asyncio
 async def test_migration_performance_simple():

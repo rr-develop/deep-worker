@@ -23,15 +23,6 @@ from typing import Any
 
 from app.schemas.agent_schemas import AgentInfo, AgentStatus, AgentStatusInfo
 
-# ============================================================================
-# CRITICAL: RPYC MUST BE IMPORTED FROM SOURCE CODE, NOT FROM PIP!
-# ============================================================================
-# Import rpyc from a local rpyc_async source checkout to ensure AsyncioServer support
-# ============================================================================
-_rpyc_async_path = Path("rpyc_async")
-if _rpyc_async_path.exists() and str(_rpyc_async_path) not in sys.path:
-    sys.path.insert(0, str(_rpyc_async_path))
-
 import rpyc  # type: ignore[import-not-found]
 
 logger = logging.getLogger(__name__)
@@ -66,11 +57,9 @@ class AgentService:
             import sys
             from pathlib import Path
 
-            # Add the CLI package to path if not already there
-            dw_cli_source_path = (
-                Path(__file__).resolve().parents[3]
-                / "deep_worker" / "deep_worker_cli"
-            )
+            # Locate the sibling deep_worker_cli package relative to this file
+            # so a checkout under any host path resolves without hard-coded roots.
+            dw_cli_source_path = Path(__file__).resolve().parents[3] / "deep_worker" / "deep_worker_cli"
             if str(dw_cli_source_path) not in sys.path:
                 sys.path.insert(0, str(dw_cli_source_path))
 
@@ -789,6 +778,77 @@ class AgentService:
 
         return {"success": True, "message": "TaskManager reset requested"}
 
+    async def interrupt_agent(self, agent_name: str) -> dict[str, Any]:
+        """Interrupt currently running agent execution.
+
+        Cancels the agent's current worker task via RPyC. The agent then
+        broadcasts ``agent_interrupted`` to all subscribers, which clients
+        receive via WebSocket and use to update UI state.
+
+        Returns immediately (fire-and-forget). The actual interrupt result
+        arrives via WebSocket as ``agent_interrupt_result`` (success or error).
+
+        Args:
+            agent_name: Name of the agent to interrupt.
+
+        Returns:
+            Dict with ``success`` and ``message`` (or ``error``) keys.
+        """
+        if not await self.is_connected(agent_name):
+            if not await self.connect_to_agent(agent_name):
+                return {"success": False, "error": "Failed to connect to agent"}
+
+        root = self._roots[agent_name]
+        try:
+            from rpyc.utils.helpers import fire_and_forget_async
+
+            async def on_success(response_str: str) -> None:
+                """Handle successful interrupt RPC.
+
+                Note: the agent itself broadcasts ``agent_interrupted`` to all
+                subscribers. We additionally broadcast a service-level
+                ``agent_interrupt_result`` so the originating client receives
+                an explicit acknowledgment regardless of subscription state.
+                """
+                import json as _json
+                try:
+                    parsed = _json.loads(response_str) if isinstance(response_str, str) else {}
+                except (ValueError, TypeError):
+                    parsed = {"success": True, "message": str(response_str)}
+                logger.info(
+                    f"Interrupt requested for {agent_name}: {parsed}"
+                )
+                await self._broadcast_message({
+                    "type": "agent_interrupt_result",
+                    "agent_name": agent_name,
+                    "success": bool(parsed.get("success", True)),
+                    "message": parsed.get("message", ""),
+                })
+
+            async def on_error(exc: BaseException) -> None:
+                logger.error(f"Error interrupting agent {agent_name}: {exc}")
+                await self._broadcast_message({
+                    "type": "agent_interrupt_result",
+                    "agent_name": agent_name,
+                    "success": False,
+                    "error": str(exc),
+                })
+
+            fire_and_forget_async(
+                root.interrupt_agent(),
+                timeout=5.0,
+                success_callback=on_success,
+                error_callback=on_error,
+                name=f"interrupt_agent_{agent_name}",
+            )
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+        return {
+            "success": True,
+            "message": "Interrupt requested (result will arrive via WebSocket)",
+        }
+
     async def get_agent_history(
         self,
         agent_name: str,
@@ -1018,15 +1078,22 @@ class AgentService:
                 "status": status_info,
             })
 
-    async def get_agent_dialog_formatted(self, agent_name: str) -> str:
-        """Get formatted dialog text for an agent.
+    async def get_agent_dialog_formatted(
+        self,
+        agent_name: str,
+        verbosity: str = "final",
+    ) -> str:
+        """Get formatted dialog text for an agent at the requested verbosity.
 
-        This method retrieves the conversation history and formats it as plain text
-        for display in the Full Dialog view, similar to the general-purpose web
-        application's DwSession implementation.
+        Returns the entire conversation (no artificial limit). Three sources of
+        user-side messages are all rendered as first-class turns
+        (User / TaskManager / agent:<name>). See
+        ``app.services.dialog_formatter`` for the rendering rules and
+        ``docs/DESIGN_FULL_DIALOG_FINAL_RESPONSE_PAIRS.md`` for the design.
 
         Args:
             agent_name: Name of the agent.
+            verbosity: ``"final"`` (default) | ``"text"`` | ``"full"``.
 
         Returns:
             Formatted dialog text as plain string in format:
@@ -1049,61 +1116,73 @@ class AgentService:
         import asyncio
         import json
 
+        from app.services.dialog_formatter import (
+            render_dialog,
+            split_into_turns,
+        )
+
+        # Marker for legacy agents that crash on ``limit=None``. Pre-fix
+        # ``_handle_get_history`` does ``total - limit - offset``, which
+        # raises ``unsupported operand type(s) for -: 'int' and 'NoneType'``.
+        # We retry with a huge positive int so Full Dialog stays reliable
+        # even if the running agent process predates the no-limit fix.
+        LEGACY_NONE_MARKER = "unsupported operand type(s) for -:"
+        # 1 billion is "everything" in practice — far above any context
+        # window. Still a positive int that legacy agents accept.
+        LEGACY_HUGE_LIMIT = 1_000_000_000
+
+        async def _fetch_history_payload(limit_arg: Any) -> dict[str, Any]:
+            """Single RPyC round-trip with the given ``limit``.
+
+            Returns the parsed payload dict (success/history/...).
+            """
+            history_call = root.get_history(limit=limit_arg, offset=0)
+            raw = await asyncio.wait_for(history_call, timeout=30.0)
+            if isinstance(raw, str):
+                return json.loads(raw)
+            return raw
+
         try:
-            # Get full history via RPyC (use large limit to get complete dialog)
-            # This follows the DwSession.get_history_formatted_async() pattern
-            history_call = root.get_history(limit=1000, offset=0)
+            # Preferred path: ask for the ENTIRE history. No artificial
+            # limit — per design, the only ceiling is the agent's own
+            # context window. (DESIGN_FULL_DIALOG_FINAL_RESPONSE_PAIRS.md §6)
+            payload = await _fetch_history_payload(None)
 
-            # Await the RPyC AsyncResult with timeout
-            result = await asyncio.wait_for(history_call, timeout=10.0)
+            if not payload.get('success'):
+                error_msg = str(payload.get('error', 'Unknown error'))
 
-            # If result is a string, parse it as JSON
-            if isinstance(result, str):
-                result = json.loads(result)
+                # Legacy-agent compatibility: if the running agent process
+                # predates the no-limit fix, it returns the arithmetic
+                # error above. Retry once with a huge positive int so the
+                # endpoint stays usable WITHOUT requiring a restart of
+                # every long-running agent.
+                if LEGACY_NONE_MARKER in error_msg:
+                    logger.warning(
+                        f"Agent '{agent_name}' uses legacy get_history "
+                        f"contract; retrying with limit={LEGACY_HUGE_LIMIT}"
+                    )
+                    payload = await _fetch_history_payload(LEGACY_HUGE_LIMIT)
+                    if not payload.get('success'):
+                        error_msg2 = str(payload.get('error', 'Unknown error'))
+                        logger.error(
+                            f"Legacy fallback for '{agent_name}' also failed: {error_msg2}"
+                        )
+                        raise ValueError(f"Agent returned error: {error_msg2}")
+                else:
+                    logger.error(f"Failed to get history for '{agent_name}': {error_msg}")
+                    raise ValueError(f"Agent returned error: {error_msg}")
 
-            if not result.get('success'):
-                error_msg = result.get('error', 'Unknown error')
-                logger.error(f"Failed to get history for '{agent_name}': {error_msg}")
-                raise ValueError(f"Agent returned error: {error_msg}")
-
-            history = result.get('history', [])
-
-            # Build dialog pairs (user_query, assistant_response)
-            # This follows the same logic as DwSession
-            dialog_pairs = []
-            current_user_query = None
-
-            for message in history:
-                msg_type = message.get('type')
-                content = message.get('content', '')
-
-                if msg_type == 'HumanMessage':
-                    # New user query - start new pair
-                    current_user_query = content
-
-                elif msg_type == 'AIMessage' and current_user_query is not None:
-                    # Assistant response - complete the pair
-                    # Skip if content is empty (tool-only response)
-                    if content and content.strip():
-                        dialog_pairs.append((current_user_query, content))
-                        current_user_query = None  # Reset for next pair
-
-                # Skip ToolMessage - don't show in dialog
-
-            # Format dialog text (same format as DwSession)
-            if not dialog_pairs:
-                return "No conversation history yet."
-
-            parts = []
-            for user_query, assistant_response in dialog_pairs:
-                parts.append(f"--- User ---\n{user_query}\n")
-                parts.append(f"--- Assistant ---\n{assistant_response}\n")
-
-            return '\n'.join(parts)
+            history = payload.get('history', [])
+            turns = split_into_turns(history)
+            return render_dialog(turns, verbosity)
 
         except asyncio.TimeoutError:
-            logger.error(f"Timeout getting history for '{agent_name}' after 10s")
-            raise asyncio.TimeoutError(f"Agent '{agent_name}' did not respond within 10s")
+            logger.error(f"Timeout getting history for '{agent_name}' after 30s")
+            raise asyncio.TimeoutError(f"Agent '{agent_name}' did not respond within 30s")
+
+        except ValueError:
+            # Already wrapped above — preserve the message as-is.
+            raise
 
         except Exception as e:
             logger.error(f"Error getting formatted history for '{agent_name}': {e}", exc_info=True)

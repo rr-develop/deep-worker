@@ -44,6 +44,12 @@
                         <h2 id="selected-agent-name">Agent Name</h2>
                         <div class="agent-controls">
                             <button id="full-dialog-btn" class="btn btn-secondary btn-sm">📜 Full Dialog</button>
+                            <select id="full-dialog-verbosity" class="btn btn-secondary btn-sm" title="Verbosity level for Full Dialog">
+                                <option value="final">Final answers only</option>
+                                <option value="text">All assistant text</option>
+                                <option value="full">Full (with tool calls)</option>
+                            </select>
+                            <button id="interrupt-btn" class="btn btn-warning btn-sm" title="Interrupt current agent invocation (process keeps running)">⏸ Interrupt</button>
                             <button id="stop-agent-btn" class="btn btn-danger btn-sm" onclick="stopCurrentAgent()">⏹ Stop</button>
                             <button id="restart-agent-btn" class="btn btn-primary btn-sm" onclick="restartCurrentAgent()">🔄 Restart</button>
                             <button id="stop-taskmanager-btn" class="btn btn-danger btn-sm">⏹️ Stop TM</button>

@@ -27,6 +27,7 @@ _PARSER_DEFAULTS = {
     "clean": False,
     "memory_only": False,
     "use_sqlite": False,
+    "auto_approve_send_message": False,
 }
 
 
@@ -82,6 +83,9 @@ def merge_restart_config(
     effective.task_manager = saved.get("task_manager", False)
     effective.memory_only = saved.get("memory_only", False)
     effective.use_sqlite = saved.get("use_sqlite", False)
+    effective.auto_approve_send_message = saved.get(
+        "auto_approve_send_message", False
+    )
     effective.clean = False  # NEVER inherit --clean
 
     # Override with explicitly provided CLI args
@@ -101,6 +105,12 @@ def merge_restart_config(
         effective.memory_only = args.memory_only
     if args.use_sqlite != _PARSER_DEFAULTS["use_sqlite"]:
         effective.use_sqlite = args.use_sqlite
+    if (
+        getattr(args, "auto_approve_send_message",
+                _PARSER_DEFAULTS["auto_approve_send_message"])
+        != _PARSER_DEFAULTS["auto_approve_send_message"]
+    ):
+        effective.auto_approve_send_message = args.auto_approve_send_message
 
     return effective
 
@@ -134,6 +144,9 @@ def build_launch_config(args: argparse.Namespace) -> dict:
         "memory_only": args.memory_only,
         "use_sqlite": args.use_sqlite,
         "clean": args.clean,
+        "auto_approve_send_message": getattr(
+            args, "auto_approve_send_message", False
+        ),
         "started_at": datetime.now().isoformat(),
         "pid": os.getpid(),
         "cli_args": " ".join(sys.argv[1:]),
@@ -205,6 +218,7 @@ async def restart_agent(args: argparse.Namespace) -> int:
     args.task_manager = effective.task_manager
     args.memory_only = effective.memory_only
     args.use_sqlite = effective.use_sqlite
+    args.auto_approve_send_message = effective.auto_approve_send_message
     args.clean = False  # Already handled above if needed
 
     return await run_agent(args)
@@ -261,6 +275,21 @@ def create_parser() -> argparse.ArgumentParser:
         action="store_true",
         dest="task_manager",
         help="Enable TaskManager for AI-powered task evaluation and correction",
+    )
+
+    parser.add_argument(
+        "-asm",
+        "--auto-approve-send-message",
+        action="store_true",
+        dest="auto_approve_send_message",
+        help=(
+            "Auto-approve calls to the send_message_to_agent "
+            "inter-agent messaging tool, while keeping HITL approvals "
+            "active for all other side-effect tools (execute, edit_file, "
+            "write_file, web_search, fetch_url, task). Has no effect "
+            "when -sp / --skip-permissions is also set (everything is "
+            "already auto-approved in that case)."
+        ),
     )
 
     parser.add_argument(
@@ -415,6 +444,9 @@ async def run_agent(args: argparse.Namespace) -> int:
             "memory_only": args.memory_only,
             "use_sqlite": args.use_sqlite,
             "clean": getattr(args, "clean", False),
+            "auto_approve_send_message": getattr(
+                args, "auto_approve_send_message", False
+            ),
             "started_at": datetime.now().isoformat(),
             "pid": os.getpid(),
             "cli_args": " ".join(sys.argv[1:]),
@@ -429,6 +461,9 @@ async def run_agent(args: argparse.Namespace) -> int:
             memory_only=args.memory_only,
             use_sqlite=args.use_sqlite,
             launch_config=launch_config,
+            auto_approve_send_message=getattr(
+                args, "auto_approve_send_message", False
+            ),
         )
 
         try:
@@ -468,6 +503,13 @@ def daemonize(name: str, log_dir: Path | None = None) -> None:
     stdout_log = log_dir / f"{name}.out.log"
     stderr_log = log_dir / f"{name}.err.log"
 
+    # CRITICAL: Flush Python's stdio buffers BEFORE forking. Otherwise any
+    # text that a caller printed before calling daemonize() still sits in
+    # the Python-level buffer and gets duplicated into every forked process
+    # (parent + child #1 + grandchild = same line printed 3 times).
+    sys.stdout.flush()
+    sys.stderr.flush()
+
     # First fork
     try:
         pid = os.fork()
@@ -475,6 +517,7 @@ def daemonize(name: str, log_dir: Path | None = None) -> None:
             # Parent process - print info and exit
             print(f"Agent '{name}' starting in background (PID will be written to /tmp/deep_worker_{name}.pid)")
             print(f"Logs: {stdout_log}")
+            sys.stdout.flush()
             sys.exit(0)
     except OSError as e:
         print(f"Fork #1 failed: {e}", file=sys.stderr)
@@ -787,61 +830,106 @@ def main() -> int:
         # After daemonize: stop running agent (if any), then launch
         return asyncio.run(restart_agent(args))
 
-    # Handle --clean flag BEFORE daemonization
-    if args.clean:
-        from deep_worker_cli.process.registry import ProcessRegistry
-        from deep_worker_cli.sessions import clean_agent_history
-
-        # Check if agent is already running
-        registry = ProcessRegistry()
-        existing = registry.lookup(args.name)
-        if existing:
-            print(
-                f"Error: Agent '{args.name}' is already running (PID {existing.pid})",
-                file=sys.stderr,
-            )
-            print(
-                f"Stop it first with: pkill -f 'deep-worker {args.name}'",
-                file=sys.stderr,
-            )
-            return 1
-
-        # Clean agent history
-        try:
-            asyncio.run(clean_agent_history(args.name))
-        except Exception as e:
-            print(f"Error cleaning agent history: {e}", file=sys.stderr)
-            return 1
-
-    # Save current working directory BEFORE daemonize changes it to /
-    # This allows run_agent() to use the original directory after daemonization
-    # Priority: --dir arg > DEEP_WORKER_ORIGINAL_CWD env var (from bash) > current directory
-    if args.dir:
-        os.environ["DEEP_WORKER_ORIGINAL_CWD"] = str(args.dir.resolve())
-    elif "DEEP_WORKER_ORIGINAL_CWD" not in os.environ:
-        # Only set if not already set by bash wrapper
-        os.environ["DEEP_WORKER_ORIGINAL_CWD"] = os.getcwd()
-
-    # CRITICAL: Validate registry file is writable BEFORE daemonizing
-    # If we daemonize first and then fail, user won't see the error message!
+    # ========================================================================
+    # PRE-DAEMONIZE: ONLY FAST CHECKS (must not block terminal for > ~0.5s)
+    # ========================================================================
+    # The bash user expects:
+    #     $ deep-worker foo -asm --dir /tmp --clean
+    #     Agent 'foo' starting in background (...)
+    #     $                                           ← prompt back in ≤ 1s
+    #
+    # So every heavy thing (SQLite WAL wait for --clean, loading langgraph,
+    # building the LLM, etc.) MUST happen AFTER daemonize(), in the detached
+    # grandchild process. Errors from that phase go to the per-agent log file
+    # that daemonize() prints the path to.
+    #
+    # Only checks that are both (a) fast and (b) produce an error message the
+    # user MUST see on their terminal belong here.
+    # ========================================================================
     from deep_worker_cli.process.registry import ProcessRegistry
     registry = ProcessRegistry()
-    validation = registry.validate_writable()
 
+    # (a) Reject if an agent with this name is already running. This is a
+    #     pure registry lookup (file + fcntl) — sub-millisecond.
+    existing = registry.lookup(args.name)
+    if existing:
+        print(
+            f"Error: Agent '{args.name}' is already running (PID {existing.pid})",
+            file=sys.stderr,
+        )
+        print(
+            f"Stop it first with: pkill -f 'deep-worker {args.name}'",
+            file=sys.stderr,
+        )
+        return 1
+
+    # (b) Validate registry file is writable. Cheap file-stat check.
+    validation = registry.validate_writable()
     if not validation["writable"]:
-        # Registry is not writable - show error and exit
         print(f"ERROR: Cannot start agent - registry file is not writable", file=sys.stderr)
         print(f"  {validation['error']}", file=sys.stderr)
         return 1
-
     if validation.get("fixed"):
-        # Ownership was fixed automatically
         print(f"✓ Fixed registry file ownership")
 
-    # Daemonize before starting agent
+    # Preserve the original CWD so the daemonized child can still resolve
+    # paths the user typed.
+    if args.dir:
+        os.environ["DEEP_WORKER_ORIGINAL_CWD"] = str(args.dir.resolve())
+    elif "DEEP_WORKER_ORIGINAL_CWD" not in os.environ:
+        os.environ["DEEP_WORKER_ORIGINAL_CWD"] = os.getcwd()
+
+    # Hint for the user if --clean was requested: it used to run before
+    # daemonize and could block the terminal for 20+ seconds waiting on
+    # SQLite WAL locks held by other running agents. We moved the SLOW
+    # part (DB cleanup) into the background. The FAST parts (agent data
+    # dir + log files) still run pre-daemonize so they don't race with
+    # daemonize() re-opening the log files under our feet.
+    if args.clean:
+        import shutil
+        # Remove per-agent data directory (contains session_metadata.json).
+        # Fast (a few unlinks); no DB lock involved.
+        data_dir = Path("~/.deep_worker").expanduser() / args.name
+        if data_dir.exists():
+            try:
+                shutil.rmtree(data_dir)
+            except OSError as e:
+                print(
+                    f"Warning: could not remove {data_dir}: {e}", file=sys.stderr
+                )
+        # Remove stale log files BEFORE daemonize re-opens them for
+        # append. If we did this post-daemonize we'd unlink our own
+        # active log-fd from the directory entry and silently lose all
+        # future agent output.
+        log_dir = Path("~/.deep_worker").expanduser() / "logs"
+        if log_dir.exists():
+            for log_file in log_dir.glob(f"{args.name}.*"):
+                try:
+                    log_file.unlink()
+                except OSError:
+                    pass  # best-effort; not worth blocking startup
+        print(f"  [--clean: DB cleanup will run in background]")
+
+    # Daemonize IMMEDIATELY. Everything below here executes in the
+    # detached grandchild; parent already returned to the shell.
     daemonize(args.name)
 
-    # Run agent
+    # --- Post-daemonize (grandchild only) -------------------------------
+    # Output goes to ~/.deep_worker/logs/<name>.{out,err}.log from here on.
+
+    if args.clean:
+        # Database cleanup is the slow part (can wait up to 30s on SQLite
+        # WAL locks held by other running agents). We do it here, in the
+        # daemonized grandchild, so the terminal is already free.
+        try:
+            from deep_worker_cli.sessions import clean_agent_history_db_only
+            asyncio.run(clean_agent_history_db_only(args.name))
+        except Exception as e:
+            # Log but do NOT abort — a clean failure should not prevent
+            # the agent from starting with whatever history is there.
+            print(f"[startup] Warning: --clean DB cleanup failed: {e}", file=sys.stderr)
+
+    # Run agent main loop.
     return asyncio.run(run_agent(args))
 
 

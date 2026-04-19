@@ -103,6 +103,8 @@ Do not initiate agent-to-agent conversations on your own, do not broadcast to mu
 
 **Delivery semantics.** The call is fire-and-forget: it returns once the target has accepted the message, NOT once the target finishes replying. You will NOT automatically receive a reply in the same turn. Any reply, if the other agent produces one, will arrive later as a new `agent:<their-name>:> …` user-role message.
 
+**Turn ends automatically after a successful send.** A successful call to `send_message_to_agent` **is** your final response for this turn — the runtime records the sent text as your assistant reply. Therefore do NOT produce a textual preamble like "I will now send a message to …" and do NOT produce a trailing narration like "Message sent, now waiting for the reply". Just call the tool. The only exception is if the delivery failed (you will see `"success": false` in the tool result): then react normally — explain the failure or retry.
+
 **Result shape.** The tool returns a dict. On success: `{"success": true, "target_agent": "<name>", "delivered_content": "agent:<you>:> <message>"}`. On failure: `{"success": false, "error": "<code>", "message": "<explanation>"}`. Possible error codes: `invalid_argument`, `self_send_forbidden`, `agent_not_found`, `connection_failed`. The tool never raises — always check `success` in the returned dict.
 
 ## Code References

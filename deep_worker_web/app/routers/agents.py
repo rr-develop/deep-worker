@@ -18,7 +18,7 @@ import os
 import subprocess
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import PlainTextResponse
@@ -405,6 +405,48 @@ async def stop_task_manager(
     }
 
 
+@router.post("/{agent_name}/interrupt")
+async def interrupt_agent_endpoint(
+    agent_name: str,
+    service: AgentService = Depends(get_agent_service),
+) -> dict[str, Any]:
+    """Interrupt the agent's currently running execution (fire-and-forget).
+
+    Cancels the agent's current worker task via RPyC. The agent broadcasts
+    ``agent_interrupted`` to all WebSocket subscribers, and we additionally
+    broadcast ``agent_interrupt_result`` for the originating client.
+
+    Unlike ``stop`` (which terminates the process) and ``stop_task_manager``
+    (which shuts down TaskManager), ``interrupt`` only cancels the current
+    in-flight invocation. The agent process keeps running and is then ready
+    to accept the next user message.
+
+    Returns:
+        Immediate JSON ``{"success": true, "message": ...}`` on dispatch.
+        Actual interrupt result arrives via WebSocket later.
+
+    Raises:
+        HTTPException: 404 if agent is not found.
+    """
+    logger.info(f"Interrupting agent: {agent_name}")
+
+    agent = await service.get_agent(agent_name)
+    if agent is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Agent '{agent_name}' not found",
+        )
+
+    response = await service.interrupt_agent(agent_name)
+    if not response.get("success"):
+        # Connection-level failure (couldn't reach RPyC). Surface as 500.
+        raise HTTPException(
+            status_code=500,
+            detail=response.get("error", "Failed to interrupt agent"),
+        )
+    return response
+
+
 @router.get("/{agent_name}/status")
 async def get_status(
     agent_name: str,
@@ -452,28 +494,37 @@ async def get_status(
 @router.get("/{agent_name}/dialog-text", response_class=PlainTextResponse)
 async def get_dialog_text(
     agent_name: str,
+    verbosity: Literal["final", "text", "full"] = "final",
     service: AgentService = Depends(get_agent_service),
 ) -> str:
     """Get full dialog text for an agent as plain text.
 
-    This returns the conversation history formatted as plain text,
-    similar to the general-purpose web application's dialog-text endpoint.
+    Returns ALL messages (no artificial limit). Verbosity controls how
+    each turn renders:
+
+    - ``final`` (default): one assistant block per turn, the LAST text-bearing
+      AIMessage of that turn.
+    - ``text``: every text-bearing AIMessage of the turn.
+    - ``full``: like ``text`` plus compact tool-call summaries.
+
+    Three sources of user-side messages are all rendered as first-class turns
+    at every verbosity:
+
+    - Direct user input → ``--- User ---``
+    - TaskManager prompts → ``--- TaskManager ---``
+    - Inter-agent messages → ``--- From agent:<name> ---``
+
+    Only summarization-time synthetic injections are filtered.
 
     Args:
         agent_name: Name of the agent.
-
-    Returns:
-        Plain text with full dialog in format:
-        --- User ---
-        <user message>
-
-        --- Assistant ---
-        <assistant response>
+        verbosity: Rendering verbosity (validated by FastAPI; unknown
+            values cause HTTP 422).
 
     Raises:
-        HTTPException: If agent is not found or history cannot be retrieved.
+        HTTPException: 404 if agent unknown, 500 if connection fails.
     """
-    logger.debug(f"Getting dialog text for agent: {agent_name}")
+    logger.debug(f"Getting dialog text for agent: {agent_name} (verbosity={verbosity})")
 
     # Check if agent exists
     agent = await service.get_agent(agent_name)
@@ -493,7 +544,9 @@ async def get_dialog_text(
 
     # Get formatted dialog text from agent
     try:
-        dialog_text = await service.get_agent_dialog_formatted(agent_name)
+        dialog_text = await service.get_agent_dialog_formatted(
+            agent_name, verbosity=verbosity
+        )
         return dialog_text
 
     except Exception as e:
@@ -640,11 +693,12 @@ async def spawn_agent_process(
     # The web server may not have deep_worker_cli/deepagents on its path,
     # so we set it explicitly for the subprocess.
     env = os.environ.copy()
-    _checkout_root = Path(__file__).resolve().parents[3]
+    # Locate sibling packages relative to this checkout so the subprocess
+    # can find them without host-specific absolute paths.
+    _repo_root = Path(__file__).resolve().parents[3]
     env["PYTHONPATH"] = ":".join([
-        str(_checkout_root / "deep_worker" / "deep_worker_cli"),
-        str(_checkout_root / "deep_worker" / "deepagents"),
-        str(_checkout_root.parent / "rpyc_async"),
+        str(_repo_root / "deep_worker" / "deep_worker_cli"),
+        str(_repo_root / "deep_worker" / "deepagents"),
     ])
     # Preserve DEEP_WORKER_ORIGINAL_CWD for the working directory
     env["DEEP_WORKER_ORIGINAL_CWD"] = config.get("working_dir", ".")

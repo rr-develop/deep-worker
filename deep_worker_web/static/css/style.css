@@ -1,5 +1,5 @@
 /* Deep-Worker-Web Styles */
-/* Using a Material3 dark theme color scheme */
+/* Material3-style dark theme */
 
 * {
     margin: 0;
@@ -442,6 +442,17 @@ header h1 {
 .btn-danger:hover {
     background: #690005; /* material_on_error */
     border-color: #FFB4AB; /* material_error */
+}
+
+.btn-warning {
+    background: #5D4200; /* amber container */
+    color: #FFDFA8; /* on amber container */
+    border-color: #FFBA1A;
+}
+
+.btn-warning:hover {
+    background: #423000;
+    border-color: #FFBA1A;
 }
 
 .btn:disabled,

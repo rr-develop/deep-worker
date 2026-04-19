@@ -415,13 +415,26 @@ def _format_send_message_to_agent_description(
     )
 
 
-def _add_interrupt_on() -> dict[str, InterruptOnConfig]:
+def _add_interrupt_on(
+    *,
+    auto_approve_send_message: bool = False,
+) -> dict[str, InterruptOnConfig]:
     """Configure human-in-the-loop interrupt settings for all gated tools.
 
     Every tool that can have side effects or access external resources
     (shell execution, file writes/edits, web search, URL fetch, task
     delegation) is gated behind an approval prompt unless auto-approve
     is enabled.
+
+    Args:
+        auto_approve_send_message: When True, the ``send_message_to_agent``
+            tool is NOT included in the returned dict. LangGraph treats
+            absence as "no interrupt needed", so the tool runs without
+            prompting the user even when global ``auto_approve`` (``-sp``)
+            is False. Other side-effect tools remain gated. Intended for
+            agents that are expected to cooperate with other agents
+            frequently but whose file/shell operations should still
+            require confirmation.
 
     Returns:
         Dictionary mapping tool names to their interrupt configuration.
@@ -461,15 +474,22 @@ def _add_interrupt_on() -> dict[str, InterruptOnConfig]:
         "description": _format_send_message_to_agent_description,
     }
 
-    return {
+    result: dict[str, InterruptOnConfig] = {
         "execute": execute_interrupt_config,
         "write_file": write_file_interrupt_config,
         "edit_file": edit_file_interrupt_config,
         "web_search": web_search_interrupt_config,
         "fetch_url": fetch_url_interrupt_config,
         "task": task_interrupt_config,
-        "send_message_to_agent": send_message_to_agent_interrupt_config,
     }
+
+    # Only gate send_message_to_agent when we are NOT explicitly told to
+    # auto-approve inter-agent messages. Omitting the key means LangGraph
+    # will run the tool without asking for approval.
+    if not auto_approve_send_message:
+        result["send_message_to_agent"] = send_message_to_agent_interrupt_config
+
+    return result
 
 
 def create_cli_agent(
@@ -481,6 +501,7 @@ def create_cli_agent(
     sandbox_type: str | None = None,
     system_prompt: str | None = None,
     auto_approve: bool = False,
+    auto_approve_send_message: bool = False,
     enable_memory: bool = True,
     enable_skills: bool = True,
     enable_shell: bool = True,
@@ -512,6 +533,12 @@ def create_cli_agent(
 
             If `False`, tools pause for user confirmation via the approval menu.
             See `_add_interrupt_on` for the full list of gated tools.
+        auto_approve_send_message: If `True` AND `auto_approve` is
+            `False`, the `send_message_to_agent` inter-agent messaging
+            tool is auto-approved while every other side-effect tool
+            still requires confirmation. Has no effect when
+            `auto_approve=True` (everything is already auto-approved).
+            Default: `False` (send_message_to_agent is gated).
         enable_memory: Enable `MemoryMiddleware` for persistent memory
         enable_skills: Enable `SkillsMiddleware` for custom agent skills
         enable_shell: Enable shell execution via `CLIShellBackend`
@@ -610,6 +637,17 @@ def create_cli_agent(
     # Build middleware stack based on enabled features
     agent_middleware = []
 
+    # Treat a successful send_message_to_agent tool call as the agent's
+    # final response for this turn — injects an echo AIMessage (so Full
+    # Dialog and other history clients can see it) and jumps to the end
+    # of the graph, skipping the redundant model call that would
+    # otherwise produce a pointless filler assistant message.
+    # See docs/DESIGN_SEND_MESSAGE_COMPLETION_MIDDLEWARE.md for details.
+    from deep_worker_cli.middleware.send_message_completion import (
+        SendMessageCompletionMiddleware,
+    )
+    agent_middleware.append(SendMessageCompletionMiddleware())
+
     # Add memory middleware
     if enable_memory:
         memory_sources = [str(settings.get_user_agent_md_path(assistant_id))]
@@ -687,14 +725,19 @@ def create_cli_agent(
             project_memory_dir=project_memory_dir,
         )
 
-    # Configure interrupt_on based on auto_approve setting
+    # Configure interrupt_on based on auto_approve / auto_approve_send_message
     interrupt_on: dict[str, bool | InterruptOnConfig] | None = None
     if auto_approve:
-        # No interrupts - all tools run automatically
+        # No interrupts - all tools run automatically. Per-tool overrides
+        # (like auto_approve_send_message) are implied and have no extra
+        # effect here.
         interrupt_on = {}
     else:
-        # Full HITL for destructive operations
-        interrupt_on = _add_interrupt_on()  # type: ignore[assignment]
+        # Full HITL for destructive operations, with optional per-tool
+        # carve-out for send_message_to_agent.
+        interrupt_on = _add_interrupt_on(  # type: ignore[assignment]
+            auto_approve_send_message=auto_approve_send_message,
+        )
 
     # Set up composite backend with routing
     # For local FilesystemBackend, route large tool results to /tmp to avoid polluting

@@ -14,23 +14,12 @@ from typing import TYPE_CHECKING, Any
 from deep_worker_cli.exceptions import AgentNotFoundError, IPCConnectionError
 from deep_worker_cli.process.registry import ProcessRegistry
 
-# ============================================================================
-# CRITICAL: RPYC MUST BE IMPORTED FROM SOURCE CODE, NOT FROM PIP!
-# ============================================================================
-# ALWAYS import rpyc from the local rpyc_async source checkout.
-# This ensures we use rpyc_async with AsyncioServer support.
-# ============================================================================
-_rpyc_async_path = Path("rpyc_async")
-if _rpyc_async_path.exists() and str(_rpyc_async_path) not in sys.path:
-    sys.path.insert(0, str(_rpyc_async_path))
-
 import rpyc
 from rpyc.core.async_connect import async_connect  # type: ignore[import-untyped]
 from rpyc.utils.classic import obtain
 
 if TYPE_CHECKING:
     from deep_worker_cli.basesession.protocol_types import SessionInfo
-
 
 class AgentClient:
     """

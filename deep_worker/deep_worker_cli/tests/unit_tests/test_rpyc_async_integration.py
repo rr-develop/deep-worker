@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import pytest
 
-
 def test_rpyc_distribution_is_rpyc_async():
     """The installed rpyc must come from the rpyc-async distribution."""
     from importlib.metadata import PackageNotFoundError, distribution
