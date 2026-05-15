@@ -248,41 +248,45 @@ class TestGetThreadHistoryFunction:
 
     @pytest.mark.asyncio
     async def test_get_thread_history_success(self, tmp_path):
-        """Test retrieving thread history."""
+        """Test retrieving thread history.
+
+        Uses the real `DeltaSqliteCheckpointer` to populate the DB —
+        the hand-rolled `CREATE TABLE checkpoints (…)` approach used
+        here previously missed columns that the current delta-aware
+        reader (`aget_tuple`) requires (`checkpoint_ns`,
+        `parent_checkpoint_id`, `metadata_blob`, etc.).
+
+        Checkpoint ID uses `empty_checkpoint()["id"]` (UUID7) rather
+        than `uuid4().hex` so it matches the monotonic ordering that
+        `aget_tuple` relies on via `ORDER BY checkpoint_id DESC`.
+        """
         from deep_worker_cli.sessions import get_thread_history
-        import aiosqlite
-        import json
+        from deep_worker_cli.delta_checkpointer import DeltaSqliteCheckpointer
+        from langchain_core.messages import HumanMessage, AIMessage
+        from langgraph.checkpoint.base import empty_checkpoint
 
         db_path = tmp_path / "test.db"
-        async with aiosqlite.connect(str(db_path)) as conn:
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS checkpoints (
-                    thread_id TEXT,
-                    checkpoint_id TEXT,
-                    parent_checkpoint_id TEXT,
-                    checkpoint_ns TEXT,
-                    type TEXT,
-                    checkpoint BLOB,
-                    metadata TEXT
-                )
-            """)
 
-            # Insert checkpoint with message (using JSON type for test simplicity)
-            checkpoint_data = json.dumps({
+        async with DeltaSqliteCheckpointer.from_conn_string(str(db_path)) as cp:
+            cp_id = empty_checkpoint()["id"]
+            checkpoint = {
+                "v": 1,
+                "id": cp_id,
+                "ts": "2026-04-22T12:00:00",
                 "channel_values": {
                     "messages": [
-                        {"type": "human", "content": "Hello"},
-                        {"type": "ai", "content": "Hi there!"}
-                    ]
-                }
-            })
-
-            await conn.execute("""
-                INSERT INTO checkpoints
-                (thread_id, checkpoint_id, type, checkpoint, metadata)
-                VALUES (?, ?, ?, ?, ?)
-            """, ("test_thread", "cp1", "json", checkpoint_data, "{}"))
-            await conn.commit()
+                        HumanMessage(content="Hello"),
+                        AIMessage(content="Hi there!"),
+                    ],
+                    "working_dir": "/tmp",
+                },
+                "channel_versions": {"messages": "00000000000000000000000000000002.0"},
+                "versions_seen": {},
+                "pending_sends": [],
+                "updated_channels": ["messages"],
+            }
+            config = {"configurable": {"thread_id": "test_thread", "checkpoint_ns": ""}}
+            await cp.aput(config, checkpoint, {}, {})
 
         result = await get_thread_history("test_thread", str(db_path))
 
@@ -295,17 +299,12 @@ class TestGetThreadHistoryFunction:
     async def test_get_thread_history_not_found(self, tmp_path):
         """Test retrieving history for non-existent thread."""
         from deep_worker_cli.sessions import get_thread_history
-        import aiosqlite
+        from deep_worker_cli.delta_checkpointer import DeltaSqliteCheckpointer
 
         db_path = tmp_path / "test.db"
-        async with aiosqlite.connect(str(db_path)) as conn:
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS checkpoints (
-                    thread_id TEXT,
-                    checkpoint_id TEXT
-                )
-            """)
-            await conn.commit()
+        # Initialize DB with the real schema but do not put anything.
+        async with DeltaSqliteCheckpointer.from_conn_string(str(db_path)):
+            pass
 
         result = await get_thread_history("nonexistent", str(db_path))
 
@@ -316,33 +315,29 @@ class TestGetThreadHistoryFunction:
     async def test_get_thread_history_format_json(self, tmp_path):
         """Test JSON format output."""
         from deep_worker_cli.sessions import get_thread_history
-        import aiosqlite
+        from deep_worker_cli.delta_checkpointer import DeltaSqliteCheckpointer
+        from langchain_core.messages import HumanMessage
+        from langgraph.checkpoint.base import empty_checkpoint
         import json
 
         db_path = tmp_path / "test.db"
-        async with aiosqlite.connect(str(db_path)) as conn:
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS checkpoints (
-                    thread_id TEXT,
-                    checkpoint_id TEXT,
-                    type TEXT,
-                    checkpoint BLOB,
-                    metadata TEXT,
-                    parent_checkpoint_id TEXT
-                )
-            """)
-
-            checkpoint_data = json.dumps({
+        async with DeltaSqliteCheckpointer.from_conn_string(str(db_path)) as cp:
+            cp_id = empty_checkpoint()["id"]
+            checkpoint = {
+                "v": 1,
+                "id": cp_id,
+                "ts": "2026-04-22T12:00:00",
                 "channel_values": {
-                    "messages": [{"type": "human", "content": "test"}]
-                }
-            })
-
-            await conn.execute("""
-                INSERT INTO checkpoints (thread_id, checkpoint_id, type, checkpoint, metadata)
-                VALUES (?, ?, ?, ?, ?)
-            """, ("test_thread", "cp1", "json", checkpoint_data, "{}"))
-            await conn.commit()
+                    "messages": [HumanMessage(content="test")],
+                    "working_dir": "/tmp",
+                },
+                "channel_versions": {"messages": "00000000000000000000000000000001.0"},
+                "versions_seen": {},
+                "pending_sends": [],
+                "updated_channels": ["messages"],
+            }
+            config = {"configurable": {"thread_id": "test_thread", "checkpoint_ns": ""}}
+            await cp.aput(config, checkpoint, {}, {})
 
         result = await get_thread_history("test_thread", str(db_path), format="json")
 
@@ -612,83 +607,90 @@ class TestHistoryFormatting:
 
     @pytest.mark.asyncio
     async def test_messages_include_timestamps(self, tmp_path):
-        """Test that get_thread_history includes timestamps for each message."""
+        """Test that get_thread_history includes timestamps for each message.
+
+        IMPORTANT about checkpoint IDs: `DeltaSqliteCheckpointer.aget_tuple`
+        resolves the "latest checkpoint" for a thread via
+        ``ORDER BY checkpoint_id DESC LIMIT 1`` (see
+        ``delta_checkpointer.py`` ~line 140-143). That ordering is
+        purely lexicographic on the id column, so tests MUST use
+        monotonically-increasing ids (UUID7 / time-prefixed) — not
+        random UUID4 hex. LangGraph itself uses UUID7 in
+        `empty_checkpoint()`, and that's what gets stored in prod;
+        hand-rolled tests with `uuid.uuid4().hex` produced a real
+        flake (`test_messages_include_timestamps` passed or failed
+        depending on which random id happened to sort first).
+        """
         from deep_worker_cli.sessions import get_thread_history
-        import aiosqlite
-        import json
-        from datetime import datetime, UTC
+        from deep_worker_cli.delta_checkpointer import DeltaSqliteCheckpointer
+        from langchain_core.messages import HumanMessage, AIMessage
+        from langgraph.checkpoint.base import empty_checkpoint
 
         db_path = tmp_path / "test.db"
-        async with aiosqlite.connect(str(db_path)) as conn:
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS checkpoints (
-                    thread_id TEXT,
-                    checkpoint_id TEXT,
-                    parent_checkpoint_id TEXT,
-                    checkpoint_ns TEXT,
-                    type TEXT,
-                    checkpoint BLOB,
-                    metadata TEXT
-                )
-            """)
 
-            # Create checkpoints with timestamps
-            ts1 = "2026-03-29T10:00:00+00:00"
-            ts2 = "2026-03-29T10:01:00+00:00"
+        # Only the MOST RECENT checkpoint's `ts` is propagated to
+        # every message's `.timestamp` by get_thread_history (see
+        # `sessions.py` ~line 1198). The test therefore asserts a
+        # single shared timestamp across all messages in the final
+        # state.
+        ts = "2026-04-22T10:01:00+00:00"
 
-            # Checkpoint 1: first message
-            checkpoint_data1 = json.dumps({
-                "ts": ts1,
+        # Use UUID7 ids (via langgraph.empty_checkpoint) — monotonic,
+        # so DESC-by-id really does pick the most recent write.
+        cp1_id = empty_checkpoint()["id"]
+        cp2_id = empty_checkpoint()["id"]
+        assert cp1_id < cp2_id, (
+            f"UUID7 must be monotonic: cp1_id={cp1_id!r} cp2_id={cp2_id!r}"
+        )
+
+        async with DeltaSqliteCheckpointer.from_conn_string(str(db_path)) as cp:
+            config = {"configurable": {"thread_id": "ts_thread_unique", "checkpoint_ns": ""}}
+
+            # Checkpoint 1: first message only.
+            cp1 = {
+                "v": 1,
+                "id": cp1_id,
+                "ts": "2026-04-22T10:00:00+00:00",
                 "channel_values": {
-                    "messages": [{"type": "human", "content": "Hello"}]
-                }
-            })
+                    "messages": [HumanMessage(content="Hello")],
+                    "working_dir": "/tmp",
+                },
+                "channel_versions": {"messages": "00000000000000000000000000000001.0"},
+                "versions_seen": {},
+                "pending_sends": [],
+                "updated_channels": ["messages"],
+            }
+            config1 = await cp.aput(config, cp1, {}, {})
 
-            # Checkpoint 2: second message added
-            checkpoint_data2 = json.dumps({
-                "ts": ts2,
+            # Checkpoint 2: second message added; this becomes the
+            # LATEST checkpoint whose timestamp is propagated.
+            cp2 = {
+                "v": 1,
+                "id": cp2_id,
+                "ts": ts,
                 "channel_values": {
                     "messages": [
-                        {"type": "human", "content": "Hello"},
-                        {"type": "ai", "content": "Hi there!"}
-                    ]
-                }
-            })
+                        HumanMessage(content="Hello"),
+                        AIMessage(content="Hi there!"),
+                    ],
+                    "working_dir": "/tmp",
+                },
+                "channel_versions": {"messages": "00000000000000000000000000000002.0"},
+                "versions_seen": {},
+                "pending_sends": [],
+                "updated_channels": ["messages"],
+            }
+            await cp.aput(config1, cp2, {}, {})
 
-            await conn.execute("""
-                INSERT INTO checkpoints
-                (thread_id, checkpoint_id, type, checkpoint, metadata)
-                VALUES (?, ?, ?, ?, ?)
-            """, ("test_thread", "cp1", "json", checkpoint_data1, "{}"))
-
-            await conn.execute("""
-                INSERT INTO checkpoints
-                (thread_id, checkpoint_id, type, checkpoint, metadata)
-                VALUES (?, ?, ?, ?, ?)
-            """, ("test_thread", "cp2", "json", checkpoint_data2, "{}"))
-
-            await conn.commit()
-
-        result = await get_thread_history("test_thread", str(db_path))
+        result = await get_thread_history("ts_thread_unique", str(db_path))
 
         assert result["success"] is True
         assert len(result["messages"]) == 2
 
-        # Check that messages have timestamps
-        msg1 = result["messages"][0]
-        msg2 = result["messages"][1]
-
-        # Messages should have timestamp attribute or be in a dict with timestamp
-        assert hasattr(msg1, "timestamp") or isinstance(msg1, dict) and "timestamp" in msg1
-        assert hasattr(msg2, "timestamp") or isinstance(msg2, dict) and "timestamp" in msg2
-
-        # Verify timestamps are correct
-        if hasattr(msg1, "timestamp"):
-            assert msg1.timestamp == ts1
-        else:
-            assert msg1["timestamp"] == ts1
-
-        if hasattr(msg2, "timestamp"):
-            assert msg2.timestamp == ts2
-        else:
-            assert msg2["timestamp"] == ts2
+        # Each message has the LATEST checkpoint's `ts` set as its
+        # `timestamp` by get_thread_history.
+        for msg in result["messages"]:
+            got_ts = getattr(msg, "timestamp", None)
+            if got_ts is None and isinstance(msg, dict):
+                got_ts = msg.get("timestamp")
+            assert got_ts == ts, f"expected timestamp={ts!r}, got {got_ts!r}"

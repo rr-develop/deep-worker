@@ -49,7 +49,7 @@ class MessageRole(str, Enum):
 
 class AgentInfo(BaseModel):
     """Basic information about a deep-worker agent.
-    
+
     This represents the core metadata about an agent process discovered
     from the ProcessRegistry or queried via RPyC.
     """
@@ -62,6 +62,21 @@ class AgentInfo(BaseModel):
     rpyc_port: int = Field(..., description="RPyC server port for this agent")
     working_dir: str = Field(..., description="Working directory of the agent")
     started_at: datetime = Field(..., description="Timestamp when agent was started")
+
+    # TaskManager visibility. Tri-state semantics:
+    #   None  — we have never heard from this agent about TM;
+    #   True  — agent has a TaskManager and reported it;
+    #   False — agent explicitly reported no TaskManager.
+    # The UI shows the TM control row iff ``has_task_manager is True``.
+    has_task_manager: bool | None = Field(
+        default=None, description="Whether the agent is configured with a TaskManager"
+    )
+    task_manager_active: bool | None = Field(
+        default=None, description="TaskManager current state (active vs inactive)"
+    )
+    task_manager_disabled: bool | None = Field(
+        default=None, description="TaskManager disabled flag (user-toggled off)"
+    )
 
 
 class AgentStatusInfo(BaseModel):
@@ -133,12 +148,40 @@ class StopTaskManagerRequest(BaseModel):
     )
 
 
+class StopRequest(BaseModel):
+    """Request to stop an agent process.
+
+    The stop pipeline tries graceful SIGTERM first, escalates to SIGKILL
+    after ``grace_seconds``. ``force=True`` skips SIGTERM entirely and
+    sends SIGKILL immediately (like ``dwcli --stop`` in panic mode).
+    """
+
+    grace_seconds: float = Field(
+        5.0,
+        ge=0.0,
+        description="Seconds to wait after SIGTERM before escalating to SIGKILL",
+    )
+    force: bool = Field(
+        False,
+        description="If True, send SIGKILL immediately (skip graceful SIGTERM)",
+    )
+
+
 class RestartRequest(BaseModel):
     """Request to restart an agent with optional parameter overrides."""
 
     model: str | None = Field(None, description="Override model name")
     provider: str | None = Field(None, description="Override provider")
     clean: bool = Field(False, description="Clean history before restart")
+    grace_seconds: float = Field(
+        5.0,
+        ge=0.0,
+        description="Grace period for the stop phase before SIGKILL",
+    )
+    force: bool = Field(
+        False,
+        description="If True, send SIGKILL immediately in the stop phase",
+    )
 
 
 class BatchRequest(BaseModel):
@@ -146,6 +189,42 @@ class BatchRequest(BaseModel):
 
     action: str = Field(..., description="Action: 'stop' or 'restart'")
     agent_names: list[str] = Field(..., description="List of agent names")
+    grace_seconds: float = Field(
+        5.0,
+        ge=0.0,
+        description="Grace period per agent before SIGKILL",
+    )
+    force: bool = Field(
+        False,
+        description="If True, SIGKILL immediately (skip SIGTERM) for every agent",
+    )
+    model: str | None = Field(None, description="Model override (restart only)")
+    provider: str | None = Field(
+        None, description="Provider override (restart only)"
+    )
+    clean: bool = Field(False, description="Clean history (restart only)")
+
+
+class JobAcceptedResponse(BaseModel):
+    """Common response for fire-and-forget ops."""
+
+    success: bool = Field(True, description="Accepted for execution")
+    request_id: str = Field(..., description="Correlate with WS events")
+    message: str = Field(..., description="Human-readable hint")
+    agent_name: str | None = Field(
+        None, description="Agent affected (if single-agent op)"
+    )
+
+
+class BatchAcceptedResponse(BaseModel):
+    """Batch operation acceptance."""
+
+    success: bool = Field(True)
+    request_id: str = Field(..., description="Aggregate batch request id")
+    action: str = Field(..., description="Action that was requested")
+    jobs: list[JobAcceptedResponse] = Field(
+        ..., description="Per-agent child jobs"
+    )
 
 
 class WebSocketMessage(BaseModel):

@@ -183,11 +183,15 @@ class TestAgentServiceMessageNotification:
         mock_conn = MagicMock()
         service.on_connect(mock_conn)
 
-        # Create mock subscribers
+        # Message subscribers now live on AgentProcess (shared state
+        # across connections) — see agent_service.py ~line 521/1069.
+        # We inject a stub AgentProcess carrying a set.
         mock_sub1 = MagicMock()
         mock_sub2 = MagicMock()
-        service._message_subscribers.add(mock_sub1)
-        service._message_subscribers.add(mock_sub2)
+
+        stub_agent_process = MagicMock()
+        stub_agent_process._message_subscribers = {mock_sub1, mock_sub2}
+        service._agent_process = stub_agent_process
 
         # Notify subscribers
         test_message = {"type": "user", "content": "Test", "role": "user"}

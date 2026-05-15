@@ -546,7 +546,11 @@ class CompositeBackend(BackendProtocol):
                     error=batch_responses[i].error if i < len(batch_responses) else None,
                 )
 
-        return results  # type: ignore[return-value]
+        # All slots are filled in the loop above (one FileUploadResponse /
+        # FileDownloadResponse per input path). The `None` in the type is a
+        # construction artefact of pre-allocating a fixed-size list.
+        assert all(r is not None for r in results), "composite: unfilled slot in results"
+        return cast("list", results)
 
     async def aupload_files(self, files: list[tuple[str, bytes]]) -> list[FileUploadResponse]:
         """Async version of upload_files."""
@@ -576,7 +580,11 @@ class CompositeBackend(BackendProtocol):
                     error=batch_responses[i].error if i < len(batch_responses) else None,
                 )
 
-        return results  # type: ignore[return-value]
+        # All slots are filled in the loop above (one FileUploadResponse /
+        # FileDownloadResponse per input path). The `None` in the type is a
+        # construction artefact of pre-allocating a fixed-size list.
+        assert all(r is not None for r in results), "composite: unfilled slot in results"
+        return cast("list", results)
 
     def download_files(self, paths: list[str]) -> list[FileDownloadResponse]:
         """Download multiple files, batching by backend for efficiency.
@@ -616,7 +624,11 @@ class CompositeBackend(BackendProtocol):
                     error=batch_responses[i].error if i < len(batch_responses) else None,
                 )
 
-        return results  # type: ignore[return-value]
+        # All slots are filled in the loop above (one FileUploadResponse /
+        # FileDownloadResponse per input path). The `None` in the type is a
+        # construction artefact of pre-allocating a fixed-size list.
+        assert all(r is not None for r in results), "composite: unfilled slot in results"
+        return cast("list", results)
 
     async def adownload_files(self, paths: list[str]) -> list[FileDownloadResponse]:
         """Async version of download_files."""
@@ -645,4 +657,8 @@ class CompositeBackend(BackendProtocol):
                     error=batch_responses[i].error if i < len(batch_responses) else None,
                 )
 
-        return results  # type: ignore[return-value]
+        # All slots are filled in the loop above (one FileUploadResponse /
+        # FileDownloadResponse per input path). The `None` in the type is a
+        # construction artefact of pre-allocating a fixed-size list.
+        assert all(r is not None for r in results), "composite: unfilled slot in results"
+        return cast("list", results)

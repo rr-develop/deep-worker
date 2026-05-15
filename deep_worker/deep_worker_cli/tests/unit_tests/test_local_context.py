@@ -29,7 +29,7 @@ class TestLocalContextMiddleware:
         mock_run.side_effect = [mock_branch_result, mock_branches_result]
 
         middleware = LocalContextMiddleware()
-        git_info = middleware._get_git_info()
+        git_info = middleware._get_git_info(Path.cwd())
 
         assert git_info["branch"] == "feature/my-branch"
         assert "main" in git_info["main_branches"]
@@ -45,7 +45,7 @@ class TestLocalContextMiddleware:
         mock_run.return_value = mock_result
 
         middleware = LocalContextMiddleware()
-        git_info = middleware._get_git_info()
+        git_info = middleware._get_git_info(Path.cwd())
 
         assert git_info == {}
 
@@ -63,7 +63,7 @@ class TestLocalContextMiddleware:
         mock_run.side_effect = [mock_branch_result, mock_branches_result]
 
         middleware = LocalContextMiddleware()
-        git_info = middleware._get_git_info()
+        git_info = middleware._get_git_info(Path.cwd())
 
         assert git_info["branch"] == "main"
         assert git_info["main_branches"] == ["main"]
@@ -82,7 +82,7 @@ class TestLocalContextMiddleware:
         mock_run.side_effect = [mock_branch_result, mock_branches_result]
 
         middleware = LocalContextMiddleware()
-        git_info = middleware._get_git_info()
+        git_info = middleware._get_git_info(Path.cwd())
 
         assert git_info["branch"] == "master"
         assert git_info["main_branches"] == ["master"]
@@ -101,7 +101,7 @@ class TestLocalContextMiddleware:
         mock_run.side_effect = [mock_branch_result, mock_branches_result]
 
         middleware = LocalContextMiddleware()
-        git_info = middleware._get_git_info()
+        git_info = middleware._get_git_info(Path.cwd())
 
         assert git_info["branch"] == "develop"
         assert git_info["main_branches"] == []
@@ -144,7 +144,10 @@ class TestLocalContextMiddleware:
         mock_run.side_effect = mock_subprocess_run
 
         middleware = LocalContextMiddleware()
-        state: LocalContextState = {"messages": []}
+        # `before_agent` requires `working_dir` in state — it is
+        # populated by ProjectMemoryMiddleware in production, so tests
+        # must set it explicitly. See local_context.py ~line 528-532.
+        state: LocalContextState = {"messages": [], "working_dir": str(Path.cwd())}
         runtime: Any = Mock()
 
         result = middleware.before_agent(state, runtime)
@@ -176,7 +179,8 @@ class TestLocalContextMiddleware:
         mock_run.return_value = mock_result
 
         middleware = LocalContextMiddleware()
-        state: LocalContextState = {"messages": []}
+        # See note in test_before_agent_with_git_repo re: `working_dir`.
+        state: LocalContextState = {"messages": [], "working_dir": str(tmp_path)}
         runtime: Any = Mock()
 
         result = middleware.before_agent(state, runtime)

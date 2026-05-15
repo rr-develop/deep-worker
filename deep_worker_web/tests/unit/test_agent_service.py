@@ -117,6 +117,101 @@ class TestAgentServiceConnection:
         connected = await agent_service.is_connected("test-agent-1")
         assert connected is False
 
+    async def test_is_connected_returns_false_when_conn_closed(
+        self, agent_service: AgentService
+    ) -> None:
+        """Regression for the earlier AsyncResult-leak incident.
+
+        ``is_connected`` previously checked only the local
+        ``_connections`` dict. After the peer process died and rpyc
+        marked the Connection as ``_closed=True``, ``is_connected``
+        still returned True, so every ``fire_and_forget_async(root.…)``
+        call kept registering AsyncResult chains in
+        ``Connection._request_callbacks`` that no reply would ever
+        clear. With ~115k chains accumulated the live process hit
+        9.4 GB RSS.
+
+        The contract ``is_connected`` must enforce: if rpyc has
+        already flipped ``conn._closed`` (channel torn down,
+        ``aclose`` finished, peer died and was noticed), report
+        not-connected.
+        """
+        await agent_service.initialize()
+
+        dead_conn = MagicMock()
+        dead_conn._closed = True
+        agent_service._connections["test-agent-1"] = dead_conn
+
+        connected = await agent_service.is_connected("test-agent-1")
+
+        assert connected is False, (
+            "is_connected must not lie about a torn-down rpyc Connection"
+        )
+
+    async def test_is_connected_evicts_closed_connection(
+        self, agent_service: AgentService
+    ) -> None:
+        """A torn-down connection must be removed from
+        ``_connections`` so the next caller does not pull the same
+        dead handle out and call ``root.method()`` on it.
+
+        Without this, every subsequent caller would see ``False`` from
+        ``is_connected`` and trigger a reconnect — but if the eviction
+        is missing, the dead handle keeps coming back, every old
+        in-flight ``fire_and_forget_async`` keeps firing on the dead
+        ``root``, and the AsyncResult leak resumes.
+        """
+        await agent_service.initialize()
+
+        dead_conn = MagicMock()
+        dead_conn._closed = True
+        agent_service._connections["test-agent-1"] = dead_conn
+
+        await agent_service.is_connected("test-agent-1")
+
+        assert "test-agent-1" not in agent_service._connections, (
+            "is_connected must evict torn-down connections so "
+            "subsequent callers do not reuse the dead handle"
+        )
+
+    async def test_is_connected_true_for_live_connection(
+        self, agent_service: AgentService
+    ) -> None:
+        """Happy path: ``conn._closed = False`` reports connected.
+
+        This guards against an over-zealous fix that calls
+        ``conn._closed`` something falsy and then evicts every
+        connection on every probe.
+        """
+        await agent_service.initialize()
+
+        live_conn = MagicMock()
+        live_conn._closed = False
+        agent_service._connections["test-agent-1"] = live_conn
+
+        connected = await agent_service.is_connected("test-agent-1")
+
+        assert connected is True
+        assert agent_service._connections["test-agent-1"] is live_conn
+
+    async def test_is_connected_handles_conn_without_closed_attr(
+        self, agent_service: AgentService
+    ) -> None:
+        """A test-double or stub Connection may not expose ``_closed``.
+
+        In that case the existing local-dict semantics must apply
+        (entry present → connected). This keeps existing integration
+        tests using mock connections green.
+        """
+        await agent_service.initialize()
+
+        plain_conn = object()  # no _closed attribute at all
+        agent_service._connections["test-agent-1"] = plain_conn
+
+        connected = await agent_service.is_connected("test-agent-1")
+
+        assert connected is True
+
 
 class TestAgentServiceShutdown:
     """Test service shutdown."""

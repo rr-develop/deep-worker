@@ -5,6 +5,17 @@ This module tests that AgentProcess with AsyncioServer can:
 - Accept client connections
 - Handle basic RPC calls
 - Shutdown gracefully
+
+Lifecycle note
+--------------
+``AgentProcess.start()`` intentionally enters its own event loop and
+blocks on ``shutdown_event.wait()`` — that is the agent's main loop
+and is how the production CLI is designed. A test that does
+``await agent.start()`` directly would therefore never return. Use
+``_start_agent_in_background(agent)`` below: it schedules ``start()``
+as a task, waits until ``rpyc_server`` is ready, and returns the task
+so the caller can later trigger shutdown and await the task to drain
+the main-loop coroutine cleanly.
 """
 
 from __future__ import annotations
@@ -12,8 +23,74 @@ from __future__ import annotations
 import asyncio
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
+
+if TYPE_CHECKING:
+    from deep_worker_cli.process.agent_process import AgentProcess
+
+async def _start_agent_in_background(
+    agent: "AgentProcess",
+    *,
+    ready_timeout: float = 15.0,
+    poll_interval: float = 0.05,
+) -> asyncio.Task[None]:
+    """Launch ``agent.start()`` as a background task and wait for readiness.
+
+    ``AgentProcess.start()`` blocks until ``shutdown_event`` is set, so a
+    test MUST NOT ``await`` it directly. Instead we schedule it and poll
+    for the two observable readiness signals: ``running is True`` AND
+    ``rpyc_server is not None`` (and ``rpyc_port`` assigned when ``0``
+    was requested). Polling here is a test-only concession — the
+    production code is event-driven.
+    """
+    start_task: asyncio.Task[None] = asyncio.create_task(agent.start())
+    deadline = asyncio.get_event_loop().time() + ready_timeout
+    while True:
+        if start_task.done():
+            # start() returned / raised BEFORE we observed readiness —
+            # surface the error to the caller, don't swallow it.
+            start_task.result()
+            raise RuntimeError("agent.start() returned before readiness signal")
+        if agent.running and agent.rpyc_server is not None and (
+            agent.rpyc_port is None or agent.rpyc_port > 0
+        ):
+            return start_task
+        if asyncio.get_event_loop().time() > deadline:
+            start_task.cancel()
+            with suppress_cancelled():
+                await start_task
+            raise asyncio.TimeoutError(
+                f"agent {agent.name!r} did not signal readiness within "
+                f"{ready_timeout}s",
+            )
+        await asyncio.sleep(poll_interval)
+
+async def _stop_agent(
+    agent: "AgentProcess", start_task: asyncio.Task[None],
+) -> None:
+    """Trigger shutdown and drain the main-loop task."""
+    await agent.shutdown()
+    # agent.start()'s main-loop await will have returned now; drain it.
+    try:
+        await asyncio.wait_for(start_task, timeout=10.0)
+    except asyncio.TimeoutError:
+        start_task.cancel()
+        with suppress_cancelled():
+            await start_task
+
+from contextlib import contextmanager
+from typing import Iterator
+
+@contextmanager
+def suppress_cancelled() -> Iterator[None]:
+    try:
+        yield
+    except asyncio.CancelledError:
+        pass
+    except Exception:  # noqa: BLE001 — best-effort drain
+        pass
 
 @pytest.mark.asyncio
 async def test_agent_process_starts_with_asyncio_server():
@@ -37,10 +114,8 @@ async def test_agent_process_starts_with_asyncio_server():
             rpyc_port=0,  # Auto-assign port
         )
 
+        start_task = await _start_agent_in_background(agent)
         try:
-            # Start agent (this should start AsyncioServer)
-            await agent.start()
-
             # Verify server is running
             assert agent.rpyc_server is not None, "RPyC server should be initialized"
             assert agent.rpyc_port > 0, "RPyC port should be assigned"
@@ -53,113 +128,27 @@ async def test_agent_process_starts_with_asyncio_server():
             ), "Server should be AsyncioServer instance"
 
         finally:
-            # Cleanup
-            await agent.shutdown()
+            await _stop_agent(agent, start_task)
 
+_REDUNDANT_SKIP_REASON = (
+    "Same-process AgentProcess + async_connect topology is forbidden "
+    "(see docs/RPYC_NETREF_DEADLOCK_ANALYSIS.md). The protocol surface "
+    "this test was checking is now covered by the cross-process "
+    "test_agent_service_asyncio_e2e.py in this same directory (server "
+    "in a child Python process). End-to-end coverage with a real "
+    "deep-worker subprocess lives in the slow tier "
+    "tests/integration_ai/test_agent_process_lifecycle.py."
+)
+
+@pytest.mark.skip(reason=_REDUNDANT_SKIP_REASON)
 @pytest.mark.asyncio
 async def test_client_can_connect_to_asyncio_server():
-    """Test that a client can connect to AgentProcess with AsyncioServer."""
-    import rpyc
-    from deep_worker_cli.agent_config_pkg.agent_config import AgentConfig
-    from deep_worker_cli.process.agent_process import AgentProcess
-    from pathlib import Path
-    import tempfile
+    """Replaced by cross-process test_agent_service_asyncio_e2e.py."""
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        config = AgentConfig(
-            working_dir=Path(tmpdir),
-            provider="claude-code",
-            model="claude-3-5-sonnet-20241022",
-        )
-
-        agent = AgentProcess(
-            name="test-asyncio-agent-2",
-            config=config,
-            rpyc_port=0,
-        )
-
-        try:
-            # Start agent
-            await agent.start()
-
-            # Get assigned port
-            port = agent.rpyc_port
-
-            # Connect client
-            conn = rpyc.connect("localhost", port, config={"allow_all_attrs": True})
-
-            try:
-                # Get root before enabling asyncio serving
-                root = conn.root
-
-                # Enable asyncio serving
-                loop = asyncio.get_running_loop()
-                conn.enable_asyncio_serving(loop=loop)
-
-                # Test basic RPC call - get_status
-                result = await root.get_status()
-
-                # Verify result is a dict with expected structure
-                assert isinstance(result, dict), "Result should be a dict"
-                assert "success" in result, "Result should have 'success' field"
-
-            finally:
-                conn.disable_asyncio_serving()
-                conn.close()
-
-        finally:
-            await agent.shutdown()
-
+@pytest.mark.skip(reason=_REDUNDANT_SKIP_REASON)
 @pytest.mark.asyncio
 async def test_multiple_sequential_calls():
-    """Test that multiple sequential RPC calls work correctly."""
-    import rpyc
-    from deep_worker_cli.agent_config_pkg.agent_config import AgentConfig
-    from deep_worker_cli.process.agent_process import AgentProcess
-    from pathlib import Path
-    import tempfile
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        config = AgentConfig(
-            working_dir=Path(tmpdir),
-            provider="claude-code",
-            model="claude-3-5-sonnet-20241022",
-        )
-
-        agent = AgentProcess(
-            name="test-asyncio-agent-3",
-            config=config,
-            rpyc_port=0,
-        )
-
-        try:
-            await agent.start()
-            port = agent.rpyc_port
-
-            conn = rpyc.connect("localhost", port, config={"allow_all_attrs": True})
-
-            try:
-                root = conn.root
-                loop = asyncio.get_running_loop()
-                conn.enable_asyncio_serving(loop=loop)
-
-                # Make multiple calls
-                for i in range(3):
-                    result = await root.get_status()
-                    assert isinstance(result, dict), f"Call {i} should return dict"
-
-                # Call get_metadata
-                metadata = await root.get_metadata()
-                assert isinstance(metadata, dict), "Metadata should be dict"
-                assert "name" in metadata, "Metadata should have 'name' field"
-                assert metadata["name"] == "test-asyncio-agent-3"
-
-            finally:
-                conn.disable_asyncio_serving()
-                conn.close()
-
-        finally:
-            await agent.shutdown()
+    """Replaced by cross-process test_agent_service_asyncio_e2e.py."""
 
 @pytest.mark.asyncio
 async def test_graceful_shutdown():
@@ -183,11 +172,11 @@ async def test_graceful_shutdown():
         )
 
         # Start and immediately shutdown
-        await agent.start()
+        start_task = await _start_agent_in_background(agent)
         assert agent.rpyc_server is not None
 
         # Shutdown should complete without errors
-        await agent.shutdown()
+        await _stop_agent(agent, start_task)
 
         # Server should be cleaned up
         # (We don't check rpyc_server is None because shutdown might not clear it)

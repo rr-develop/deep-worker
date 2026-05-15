@@ -3,6 +3,42 @@
 Uses a LanceDB-backed VectorStoreIndex for semantic search.
 Supports both flat structure (single chunk size) and hierarchical structure
 (AutoMergingRetriever with parent/child chunks for context expansion).
+
+Process-wide caching
+====================
+Three things are deliberately cached at module scope so that repeated
+``search()`` calls reuse them instead of paying the per-call price every
+time:
+
+* ``_embedding_cache`` keyed by model name — a ``HuggingFaceEmbedding``
+  loads sentence-transformer weights into a torch storage and ``mmap``-s
+  the model blob (~450 MB virtual / ~128 MB resident for
+  ``multilingual-e5-small``). Reinstantiating it per call adds one
+  fresh ``mmap`` and one fresh weight tensor each time.
+
+* ``_index_cache`` keyed by ``(repo_path, model_name)`` — holds
+  ``(VectorStoreIndex, StorageContext)``. The ``StorageContext`` owns a
+  ``LanceDBVectorStore`` which spawns a tokio thread pool (visible as
+  ``tokio-runtime-w`` threads) and keeps a C++-side handle to the
+  on-disk lance dataset; that handle keeps a Python reference to the
+  embed_model. Without caching, every search creates a new
+  vector_store + new index + new tokio pool, and the previous ones
+  cannot be freed by Python GC alone — the lance C++ retainers (and
+  ``llama_index.core.Settings.embed_model`` global indirection) keep
+  the Python objects alive past the function return.
+
+The original incident (deep_worker_web 2026-04-25) showed RSS growing
+by ~390 MB on every ``project_memory`` call until the agent reached
+multiple GB. The regression test
+``tests/integration/test_search_no_leak_per_call.py`` enforces the
+post-warmup invariant: 5 sequential searches must add < 50 MB total.
+
+The caches are unbounded by design — there are at most a handful of
+``(repo_path, model_name)`` combinations per process, and the working
+agents live for hours. If we ever need bounded eviction we can swap
+the dicts for an LRU; for now the cost-of-eviction (re-creating these
+objects has the very leak we're guarding against) outweighs the
+benefit.
 """
 
 from __future__ import annotations
@@ -20,6 +56,20 @@ from llama_index.vector_stores.lancedb import LanceDBVectorStore  # type: ignore
 
 from .config import IndexConfig, RepoIndex
 from .exceptions import IndexNotFoundError
+
+
+# ---------------------------------------------------------------------------
+# Process-wide caches (see module docstring for rationale)
+# ---------------------------------------------------------------------------
+
+# model_name -> embedding model instance.
+# Holds the torch storage + the mmap of the model blob.
+_embedding_cache: dict[str, Any] = {}
+
+# (repo_path_str, model_name) -> (VectorStoreIndex, StorageContext).
+# StorageContext is kept alongside the index because AutoMergingRetriever
+# needs the docstore reference at retriever-build time.
+_index_cache: dict[tuple[str, str], tuple[VectorStoreIndex, StorageContext]] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -151,21 +201,60 @@ def search(
     if config is None:
         config = IndexConfig()
 
-    # Resolve embedding model
+    # Resolve embedding model.
+    #
+    # When the caller supplies their own ``embedding_model`` (e.g. tests
+    # passing MockEmbedding) we honour it and bypass the cache — we do
+    # NOT poison ``_embedding_cache`` with caller-provided models since
+    # those may have an arbitrary life-cycle.
+    #
+    # When no model is supplied we resolve through ``_embedding_cache``:
+    # the FIRST call for a given model name pays the full cost of
+    # instantiating ``HuggingFaceEmbedding`` (download check + weight
+    # load + mmap of the model blob); subsequent calls return the same
+    # instance, so no extra mmap / no extra torch storage is allocated.
     if embedding_model is None:
-        from llama_index.embeddings.huggingface import HuggingFaceEmbedding  # type: ignore[import-untyped]  # noqa: PLC0415
+        cached_embed = _embedding_cache.get(config.embedding_model)
+        if cached_embed is None:
+            from llama_index.embeddings.huggingface import HuggingFaceEmbedding  # type: ignore[import-untyped]  # noqa: PLC0415
 
-        embedding_model = HuggingFaceEmbedding(model_name=config.embedding_model)
+            cached_embed = HuggingFaceEmbedding(model_name=config.embedding_model)
+            _embedding_cache[config.embedding_model] = cached_embed
+        embedding_model = cached_embed
 
-    Settings.embed_model = embedding_model
+    # ``Settings.embed_model`` is a global llama_index singleton. We
+    # keep updating it so that any code path that reads from
+    # ``Settings`` (instead of receiving an explicit embed_model) sees
+    # a consistent value. This is just a ref reassignment — it does
+    # NOT keep the previous value alive.
+    Settings.embed_model = embedding_model  # type: ignore[assignment]  # cache may hold Any
     Settings.llm = None  # type: ignore[assignment]  # LlamaIndex accepts None at runtime
 
-    storage_context = _load_storage_context(repo_index)
-    index = VectorStoreIndex.from_vector_store(
-        vector_store=storage_context.vector_store,
-        storage_context=storage_context,
-        embed_model=embedding_model,
-    )
+    # Resolve VectorStoreIndex + StorageContext.
+    #
+    # Cache key is (repo_path, model_name) because:
+    #   * Different repos point at different lance datasets — distinct
+    #     ``LanceDBVectorStore`` C++ handles and distinct docstores.
+    #   * Different embedding models produce vectors of different
+    #     dimensionality / semantics, so reusing one index against
+    #     another model would silently return garbage scores.
+    #
+    # When the caller supplies a custom ``embedding_model`` we still
+    # cache by ``config.embedding_model`` (the *name*), not by the
+    # caller's object identity, so a test passing a MockEmbedding doesn't
+    # collide with the production cache entry for the same model name.
+    cache_key = (str(repo_path), config.embedding_model)
+    cached_pair = _index_cache.get(cache_key)
+    if cached_pair is None:
+        storage_context = _load_storage_context(repo_index)
+        index = VectorStoreIndex.from_vector_store(
+            vector_store=storage_context.vector_store,
+            storage_context=storage_context,
+            embed_model=embedding_model,
+        )
+        _index_cache[cache_key] = (index, storage_context)
+    else:
+        index, storage_context = cached_pair
 
     retriever = _build_retriever(index, storage_context, config, top_k)
     raw_results = retriever.retrieve(query)

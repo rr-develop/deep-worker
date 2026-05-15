@@ -480,9 +480,12 @@ class FilesystemMiddleware(AgentMiddleware):
         Returns:
             Resolved backend instance.
         """
-        if callable(self.backend):
-            return self.backend(runtime)
-        return self.backend
+        # `self.backend` is `BackendProtocol | BackendFactory`. ty can't
+        # narrow on `callable(...)`, so use an explicit isinstance check —
+        # factories are plain Callables, not BackendProtocol instances.
+        if isinstance(self.backend, BackendProtocol):
+            return self.backend
+        return self.backend(runtime)
 
     def _create_ls_tool(self) -> BaseTool:
         """Create the ls (list files) tool."""

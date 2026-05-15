@@ -170,26 +170,32 @@ class TestAgentSideCommands:
 
     @pytest.mark.asyncio
     async def test_clear_command_calls_agent_via_rpyc(self):
-        """Test /clear command sends RPC call to agent."""
+        """Test /clear command sends RPC call to agent.
+
+        The current code path: `_handle_agent_command(...)` awaits
+        `self._rpyc_root.handle_command(command)` and `json.loads`-es
+        the reply (see interactive.py ~line 1377). We mock that
+        netref method directly.
+        """
+        import json as _json
+
         app = InteractiveApp(agent_name="test-agent")
 
         async with app.run_test() as pilot:
-            # Mock RPyC session
-            mock_session = MagicMock()
-            mock_session.async_call = AsyncMock(return_value={
-                "success": True,
-                "response": "Started new thread: abc123",
-                "action": "clear_thread",
-                "data": {
-                    "old_thread_id": "old123",
-                    "new_thread_id": "abc123"
-                }
-            })
+            mock_root = MagicMock()
+            mock_root.handle_command = AsyncMock(
+                return_value=_json.dumps({
+                    "success": True,
+                    "response": "Started new thread: abc123",
+                    "action": "clear_thread",
+                    "data": {
+                        "old_thread_id": "old123",
+                        "new_thread_id": "abc123",
+                    },
+                })
+            )
+            app._rpyc_root = mock_root
 
-            app.rpyc_session = mock_session
-            app._connected = True
-
-            # Mock _clear_messages
             clear_called = False
 
             async def mock_clear():
@@ -198,34 +204,29 @@ class TestAgentSideCommands:
 
             app._clear_messages = mock_clear
 
-            # Execute /clear
             await app._handle_agent_command("/clear")
 
-            # Should call RPyC
-            mock_session.async_call.assert_called_once()
-            call_args = mock_session.async_call.call_args
-            assert "handle_command" in str(call_args)
-
-            # Should clear local messages
+            mock_root.handle_command.assert_awaited_once_with("/clear")
             assert clear_called is True
 
     @pytest.mark.asyncio
     async def test_tokens_command_displays_info(self):
         """Test /tokens command displays token info."""
+        import json as _json
+
         app = InteractiveApp(agent_name="test-agent")
 
         async with app.run_test() as pilot:
-            # Mock RPyC session
-            mock_session = MagicMock()
-            mock_session.async_call = AsyncMock(return_value={
-                "success": True,
-                "response": "Current context: 1.5K tokens",
-                "action": "display_info",
-                "data": {"token_count": 1500}
-            })
-
-            app.rpyc_session = mock_session
-            app._connected = True
+            mock_root = MagicMock()
+            mock_root.handle_command = AsyncMock(
+                return_value=_json.dumps({
+                    "success": True,
+                    "response": "Current context: 1.5K tokens",
+                    "action": "display_info",
+                    "data": {"token_count": 1500},
+                })
+            )
+            app._rpyc_root = mock_root
 
             mounted_messages = []
             original_mount = app._mount_message
@@ -236,10 +237,8 @@ class TestAgentSideCommands:
 
             app._mount_message = mock_mount
 
-            # Execute /tokens
             await app._handle_agent_command("/tokens")
 
-            # Should display info
             assert len(mounted_messages) >= 1
             info_msg = None
             for msg in mounted_messages:
@@ -252,22 +251,22 @@ class TestAgentSideCommands:
     @pytest.mark.asyncio
     async def test_remember_command_sends_to_agent(self):
         """Test /remember command sends prompt to agent."""
+        import json as _json
+
         app = InteractiveApp(agent_name="test-agent")
 
         async with app.run_test() as pilot:
-            # Mock RPyC session
-            mock_session = MagicMock()
-            mock_session.async_call = AsyncMock(return_value={
-                "success": True,
-                "response": "",
-                "action": "send_to_agent",
-                "data": {"message": "REMEMBER_PROMPT_TEXT"}
-            })
+            mock_root = MagicMock()
+            mock_root.handle_command = AsyncMock(
+                return_value=_json.dumps({
+                    "success": True,
+                    "response": "",
+                    "action": "send_to_agent",
+                    "data": {"message": "REMEMBER_PROMPT_TEXT"},
+                })
+            )
+            app._rpyc_root = mock_root
 
-            app.rpyc_session = mock_session
-            app._connected = True
-
-            # Mock _handle_user_message
             user_messages_sent = []
 
             async def mock_user_message(msg):
@@ -275,34 +274,32 @@ class TestAgentSideCommands:
 
             app._handle_user_message = mock_user_message
 
-            # Execute /remember
             await app._handle_agent_command("/remember")
 
-            # Should send to agent
             assert len(user_messages_sent) == 1
 
     @pytest.mark.asyncio
     async def test_remember_with_context_appends_context(self):
         """Test /remember with additional context."""
+        import json as _json
+
         app = InteractiveApp(agent_name="test-agent")
 
         async with app.run_test() as pilot:
-            # Mock RPyC session
-            mock_session = MagicMock()
+            commands_received = []
 
-            async def mock_call(method, command):
-                # Verify command includes context
-                assert command == "/remember important stuff"
-                return {
+            async def mock_handle_command(command):
+                commands_received.append(command)
+                return _json.dumps({
                     "success": True,
                     "response": "",
                     "action": "send_to_agent",
-                    "data": {"message": "REMEMBER_PROMPT with context"}
-                }
+                    "data": {"message": "REMEMBER_PROMPT with context"},
+                })
 
-            mock_session.async_call = mock_call
-            app.rpyc_session = mock_session
-            app._connected = True
+            mock_root = MagicMock()
+            mock_root.handle_command = AsyncMock(side_effect=mock_handle_command)
+            app._rpyc_root = mock_root
 
             user_messages_sent = []
 
@@ -311,10 +308,9 @@ class TestAgentSideCommands:
 
             app._handle_user_message = mock_user_message
 
-            # Execute /remember with context
             await app._handle_agent_command("/remember important stuff")
 
-            # Should send to agent
+            assert commands_received == ["/remember important stuff"]
             assert len(user_messages_sent) == 1
 
 

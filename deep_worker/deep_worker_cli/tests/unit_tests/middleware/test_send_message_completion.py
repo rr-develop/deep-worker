@@ -234,7 +234,7 @@ class TestTurnTermination:
         )
 
     def test_json_string_content_success_triggers_echo(self) -> None:
-        delivered = "agent:alpha:> hello beta"
+        delivered = "alpha -> beta :> hello beta"
         msgs = [
             _tool_msg(
                 json.dumps({"success": True, "delivered_content": delivered})
@@ -246,13 +246,13 @@ class TestTurnTermination:
         """Some LangChain code paths serialize dict tool results via str()
         which yields a Python-repr string with single quotes. The
         middleware must fall back to ast.literal_eval for that case."""
-        delivered = "agent:alpha:> hello"
+        delivered = "alpha -> beta :> hello"
         payload = {"success": True, "delivered_content": delivered}
         msgs = [_tool_msg(str(payload))]  # str() gives single-quoted repr
         self._expect_echo(_invoke(self.mw, msgs), delivered)
 
     def test_multiline_delivered_content_preserved(self) -> None:
-        delivered = "agent:alpha:> line1\n\nline2 with spaces  "
+        delivered = "alpha -> beta :> line1\n\nline2 with spaces  "
         msgs = [
             _tool_msg(
                 json.dumps({"success": True, "delivered_content": delivered})
@@ -271,7 +271,7 @@ class TestTurnTermination:
         """Realistic state: AIMessage(tool_calls=...) followed by
         ToolMessage. Only the tail (ToolMessage) matters for the
         middleware; verify the whole message list doesn't confuse it."""
-        delivered = "agent:alpha:> the deed is done"
+        delivered = "alpha -> beta :> the deed is done"
         msgs = [
             HumanMessage(content="send a message to beta"),
             AIMessage(

@@ -8,7 +8,7 @@ import sys
 import tempfile
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 # CRITICAL: Ensure local deepagents is imported instead of pip-installed version
 # This is required for ProjectMemoryMiddleware which is not in official deepagents
@@ -165,6 +165,28 @@ def get_system_prompt(
     base_instructions = get_default_coding_instructions()
     agent_dir_path = f"~/.deepagents/{assistant_id}"
 
+    # Build agent identity section — tells the LLM its OWN registry name.
+    # This is critical for inter-agent messaging: the agent must know
+    # which name appears as the "<sender>" half of an outgoing
+    # "<sender> -> <receiver> :> <msg>" marker (always this agent's
+    # own name) and which name it should look for on the receiver side
+    # of incoming messages from peers.
+    agent_identity_section = f"""### Your Agent Identity
+
+Your agent name is `{assistant_id}`. This is the name by which other
+agents and the process registry refer to you. In inter-agent messages
+of the form `<sender> -> <receiver> :> <text>`:
+
+- When YOU send a message via `send_message_to_agent(<peer>, <text>)`,
+  the delivered content is automatically formatted as
+  `{assistant_id} -> <peer> :> <text>` — your name appears as the
+  sender, so you do NOT need to write it yourself.
+- When you RECEIVE a user-role message whose content starts with
+  `<someone> -> {assistant_id} :> <text>`, it was sent to you by
+  another agent named `<someone>`; treat it as a peer request.
+
+"""
+
     # Build model identity section
     model_identity_section = ""
     if settings.model_name:
@@ -218,6 +240,7 @@ The filesystem backend is currently operating in: `{cwd}`
     return (
         base_instructions
         + "\n\n---\n\n"
+        + agent_identity_section
         + model_identity_section
         + working_dir_section
         + f"""### Skills Directory
@@ -735,8 +758,14 @@ def create_cli_agent(
     else:
         # Full HITL for destructive operations, with optional per-tool
         # carve-out for send_message_to_agent.
-        interrupt_on = _add_interrupt_on(  # type: ignore[assignment]
-            auto_approve_send_message=auto_approve_send_message,
+        # `_add_interrupt_on` returns `dict[str, InterruptOnConfig]` — a
+        # narrower type than the `dict[str, bool | InterruptOnConfig]`
+        # variable annotation. `dict` is invariant in its value type, so a
+        # direct assignment fails ty. Cast widens the value type
+        # explicitly; the runtime dict itself is unchanged.
+        interrupt_on = cast(
+            "dict[str, bool | InterruptOnConfig]",
+            _add_interrupt_on(auto_approve_send_message=auto_approve_send_message),
         )
 
     # Set up composite backend with routing
@@ -748,15 +777,17 @@ def create_cli_agent(
             root_dir=tempfile.mkdtemp(prefix="deepagents_large_results_"),
             virtual_mode=True,
         )
-        conversation_history_backend = FilesystemBackend(
-            root_dir=tempfile.mkdtemp(prefix="deepagents_conversation_history_"),
-            virtual_mode=True,
-        )
+        # NOTE: the previous "/conversation_history/" route to an
+        # ephemeral tempdir was removed in favour of a persistent,
+        # human-inspectable on-disk location — the per-agent summaries
+        # directory under the tool's data directory.
+        # SummarizationMiddleware now writes directly to that absolute
+        # path via the default backend. See
+        # DESIGN_SUMMARIZATION_PERSISTENT_STORAGE.md.
         composite_backend = CompositeBackend(
             default=backend,
             routes={
                 "/large_tool_results/": large_results_backend,
-                "/conversation_history/": conversation_history_backend,
             },
         )
     else:
@@ -774,6 +805,14 @@ def create_cli_agent(
         # shell mode -- remote sandbox backends do not accept the timeout kwarg.
         patch_filesystem_middleware()
     final_checkpointer = checkpointer if checkpointer is not None else InMemorySaver()
+
+    # Per-agent on-disk summaries directory. The path quoted in the
+    # summarization HumanMessage will be this absolute filesystem path
+    # (see DESIGN_SUMMARIZATION_PERSISTENT_STORAGE.md). Created eagerly
+    # so the backend write never races a missing-dir error.
+    summaries_dir = Path("~/.deep_worker").expanduser() / assistant_id / "summaries"
+    summaries_dir.mkdir(parents=True, exist_ok=True)
+
     agent = create_deep_agent(
         model=model,
         system_prompt=system_prompt,
@@ -783,5 +822,6 @@ def create_cli_agent(
         interrupt_on=interrupt_on,
         checkpointer=final_checkpointer,
         subagents=custom_subagents or None,
+        summarization_history_prefix=str(summaries_dir),
     ).with_config(config)
     return agent, composite_backend

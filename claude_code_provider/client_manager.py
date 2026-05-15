@@ -22,8 +22,39 @@ from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient  # noqa: E402
 from claude_code_provider.proxy_mcp_server import ProxyMCPServer  # noqa: E402
 from claude_code_provider.custom_types import ToolMetadata  # noqa: E402
 
-# All built-in Claude Code tools that should be disabled
-# We want all tools to execute in deep-worker, not in Claude CLI
+# All built-in Claude Code tools that should be disabled.
+# We want all tools to execute in deep-worker, not in Claude CLI.
+#
+# ``ToolSearch`` is in this list for a SUBTLER reason than the others:
+# it is a Claude Code beta feature (tool_search_tool_bm25_20251119,
+# rolled out to opus/sonnet in @anthropic-ai/claude-code 2.1.140) that,
+# when active, instructs the CLI to mark every MCP tool with
+# ``defer_loading: true``. Models then see only tool *names* in the
+# initial system prompt; the full schemas have to be fetched on demand
+# via the built-in ``ToolSearch`` tool. That breaks our contract — a
+# deep-worker agent has a small, fixed, LangGraph-mediated tool set
+# and MUST know all of those schemas at turn 1.
+#
+# The Claude Code CLI itself documents the opt-out path (visible as a
+# string in the binary):
+#
+#     "Tool search disabled: ToolSearchTool is not available
+#      (may have been disallowed via disallowedTools)."
+#
+# Putting ``"ToolSearch"`` here makes the CLI's ``isToolSearchEnabled``
+# short-circuit to ``false``, which sets ``deferLoading=false`` on every
+# tool. Schemas come back in the initial prompt. Critically, this
+# entry travels through ``ClaudeAgentOptions.disallowed_tools`` ->
+# ``subprocess_cli.py: cmd.extend(["--disallowedTools", ...])``, so the
+# opt-out is a *local CLI argument of the spawned subprocess* — it does
+# NOT affect any other ``claude`` invocation on this host.
+#
+# If we ever onboard a large set of optional/lazy MCP servers, the
+# right answer is to remove ``"ToolSearch"`` from this list AND mark
+# the deep-worker MCP server itself with ``disable_deferred_loading:
+# true`` so the *base* toolset stays eager while pluggable MCPs go
+# lazy. See docs/DESIGN_DEV_FLAG.md and the bin/claude.exe strings
+# table for the contract.
 BUILT_IN_TOOLS = [
     "Read",
     "Write",
@@ -43,6 +74,69 @@ BUILT_IN_TOOLS = [
     "AskUserQuestion",
     "SlashCommand",
     "LS",
+    "ToolSearch",
+    # ─────────────────────────────────────────────────────────────────────
+    # "Ready while waiting" built-ins.
+    # ─────────────────────────────────────────────────────────────────────
+    # These Claude Code built-ins all schedule work that fires *between
+    # turns*. In interactive ``claude`` that is exactly the design: the
+    # CLI parks the session in IDLE state and re-activates it on the
+    # trigger (cron fire time, new monitor output line, remote routine
+    # callback, push reply). The official docs spell this out:
+    #
+    #   "Tasks only fire while Claude Code is running AND IDLE. A
+    #   scheduled prompt fires BETWEEN your turns, not while Claude
+    #   is mid-response."
+    #   — docs.claude.com/.../scheduled-tasks#how-scheduled-tasks-run
+    #
+    # In deep-worker we have NO such idle-between-turns state. LangGraph
+    # observes a final AIMessage and considers the turn complete, while
+    # the side effect the model promised never reaches the agent. The
+    # symptom is "agent reports ready, but it actually expected to be
+    # resumed later".
+    #
+    # Names from the official tools-reference:
+    #   https://docs.claude.com/en/docs/claude-code/tools-reference
+    #
+    # If/when deep-worker grows its own external-event channel, the
+    # right answer is to bridge it through LangGraph state, NOT to
+    # re-enable these CLI built-ins. The CLI's "park the session" model
+    # is fundamentally incompatible with the LangGraph turn loop.
+    "CronCreate",
+    "CronDelete",
+    "CronList",
+    "Monitor",
+    "PushNotification",
+    "RemoteTrigger",
+    # ─────────────────────────────────────────────────────────────────────
+    # 2026-05-14 audit additions.
+    # ─────────────────────────────────────────────────────────────────────
+    # See docs/CLAUDE_CODE_BUILTIN_TOOLS_AUDIT.md for the full per-tool
+    # rationale. Three categories:
+    #
+    # (A) Modern names for stale entries we already block. The CLI
+    #     renamed several tools between releases; without the new
+    #     names the model can bypass our block by calling the same
+    #     functionality under its current name.
+    "Agent",       # superseded "Task" as the subagent-spawn tool
+    "TaskStop",    # superseded "KillShell"
+    "TaskOutput",  # superseded "BashOutput" (then deprecated in 2.0.64)
+    "PowerShell",  # parallel to Bash on Windows / opt-in on Linux
+    # (B) Task-list family (Claude Code 2.1.20+, 2026-01-27) replacing
+    #     TodoWrite. We block TodoWrite so the model plans via
+    #     LangGraph state; block these for the same reason.
+    "TaskCreate",
+    "TaskGet",
+    "TaskList",
+    "TaskUpdate",
+    # (C) Agent-teams tools (Claude Code 2.1.32+, 2026-02-05). Gated on
+    #     CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 which we never set,
+    #     but we defend in depth: SendMessage parks the session in
+    #     idle waiting for the teammate's reply, TeamCreate spawns
+    #     coordinated peer processes outside LangGraph.
+    "SendMessage",
+    "TeamCreate",
+    "TeamDelete",
 ]
 
 

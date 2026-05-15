@@ -12,20 +12,85 @@ CRITICAL ARCHITECTURAL PRINCIPLES:
 2. DIRECT RPyC: Connect directly to agents (no DwSession abstraction)
 3. AGENT IS SOURCE OF TRUTH: All messages come from agent via callbacks
 4. LOCALHOST ONLY: Only connect to 127.0.0.1 (security requirement)
+5. NO SYNCHRONOUS BLOCKING: ALL RPyC calls MUST use fire_and_forget_async
+   with callbacks. NEVER call rpyc methods synchronously — it blocks the
+   event loop and freezes the entire web UI. Connections are opened via
+   ``await async_connect(host, port, ...)`` (natively non-blocking) and
+   closed via ``await conn.aclose()``. Status queries, message sends, and
+   all other RPyC operations MUST go through fire_and_forget_async.
 """
 
 import asyncio
 import logging
+import os
 import sys
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
 from app.schemas.agent_schemas import AgentInfo, AgentStatus, AgentStatusInfo
+from app.utils.supervisor import supervise
+
+# ============================================================================
+# CRITICAL: RPYC MUST BE IMPORTED FROM SOURCE CODE, NOT FROM PIP!
+# ============================================================================
+# Import rpyc from the rpyc_async source directory to ensure AsyncioServer support
+# ============================================================================
+_rpyc_async_path = Path("rpyc_async")
+if _rpyc_async_path.exists() and str(_rpyc_async_path) not in sys.path:
+    sys.path.insert(0, str(_rpyc_async_path))
 
 import rpyc  # type: ignore[import-not-found]
+from rpyc.core.async_connect import async_connect  # type: ignore[import-not-found]
 
 logger = logging.getLogger(__name__)
+
+
+def _decode_subscriber_payload(msg: Any) -> Any:
+    """Turn a subscriber callback payload into a plain local value.
+
+    The agent is expected to ``json.dumps`` broadcast messages on its
+    side, so the fast path is just ``json.loads``. We accept several
+    shapes for backwards compatibility:
+
+    * ``str``: parsed as JSON; if that fails, returned as-is.
+    * ``dict`` (real local dict): returned unchanged.
+    * ``bytes`` / ``bytearray``: decoded as UTF-8 and parsed as JSON.
+    * anything else (including RPyC netrefs from older agents):
+      stringified. We intentionally do NOT iterate netref items —
+      that would trigger ``sync_request()`` from the async loop that
+      serves the connection and (a) leak remote objects, (b) spam
+      ``RuntimeError`` in the log, (c) drop the broadcast entirely.
+    * ``None``: returned as ``None`` (RPyC can send a null callback).
+
+    Returns a plain Python value ready to be handed to
+    ``_broadcast_message`` (which will still ``json.dumps(default=str)``
+    at the WS edge as today).
+    """
+    import json
+
+    if msg is None:
+        return None
+    if isinstance(msg, dict):
+        # Already local — the happy new-agent path actually returns a
+        # str, so this branch protects ``None``-surrogates from older
+        # code paths that build a dict locally.
+        return msg
+    if isinstance(msg, (bytes, bytearray)):
+        try:
+            msg = msg.decode("utf-8")
+        except UnicodeDecodeError:
+            return str(msg)
+    if isinstance(msg, str):
+        try:
+            return json.loads(msg)
+        except (json.JSONDecodeError, ValueError):
+            # Not JSON — hand the raw text down as a minimal envelope
+            # so downstream code doesn't need to special-case strings.
+            return {"type": "raw", "content": msg}
+    # Foreign object (RPyC netref or anything else) — DO NOT touch
+    # ``.items()`` / ``.keys()`` / subscripting. Just stringify.
+    return {"type": "raw", "content": str(msg)}
 
 
 class AgentService:
@@ -57,11 +122,21 @@ class AgentService:
             import sys
             from pathlib import Path
 
-            # Locate the sibling deep_worker_cli package relative to this file
-            # so a checkout under any host path resolves without hard-coded roots.
-            dw_cli_source_path = Path(__file__).resolve().parents[3] / "deep_worker" / "deep_worker_cli"
-            if str(dw_cli_source_path) not in sys.path:
-                sys.path.insert(0, str(dw_cli_source_path))
+            # Tree-local resolution: import the deep_worker_cli that lives
+            # in the SAME tree as this web server. Hard-coding the prod
+            # path used to make the dev web server load prod-tree
+            # ProcessRegistry, defeating --dev. See
+            # docs/DESIGN_DEV_FLAG.md.
+            #
+            # __file__ here =
+            #   deep_worker_web/app/services/agent_service.py
+            # parent x3 = <TREE>.
+            _tree_root = Path(__file__).resolve().parent.parent.parent.parent
+            deep_worker_path = (
+                _tree_root / "deep_worker" / "deep_worker_cli"
+            )
+            if str(deep_worker_path) not in sys.path:
+                sys.path.insert(0, str(deep_worker_path))
 
             from deep_worker_cli.process.registry import ProcessRegistry  # type: ignore[import-not-found]
 
@@ -97,7 +172,31 @@ class AgentService:
         self._monitor_task: asyncio.Task[None] | None = None
         self._shutdown_event = asyncio.Event()
 
+        # Lazily initialised lifecycle orchestrator (requires a running
+        # event loop to spawn tasks — created on first access via
+        # ``get_lifecycle()``). Routers depend on this to schedule
+        # fire-and-forget stop / restart / batch ops.
+        self._lifecycle: Any = None
+
         logger.info("AgentService initialized")
+
+    def get_lifecycle(self) -> Any:
+        """Return (and lazily create) the AgentLifecycleService.
+
+        Must be called inside an async context (there must be a running
+        asyncio loop). The lifecycle service schedules fire-and-forget
+        tasks that rely on the same loop we run under.
+        """
+        if self._lifecycle is None:
+            # Local import avoids any circulars at module load.
+            from app.services.lifecycle import AgentLifecycleService
+
+            self._lifecycle = AgentLifecycleService(
+                registry=self._registry,
+                broadcast=self._broadcast_message,
+                rpyc_resolver=self.get_root,
+            )
+        return self._lifecycle
 
     async def initialize(self) -> None:
         """Initialize service and discover agents.
@@ -162,13 +261,40 @@ class AgentService:
     async def is_connected(self, agent_name: str) -> bool:
         """Check if we have an active RPyC connection to an agent.
 
+        Defence-in-depth against the AsyncResult leak seen in an earlier
+        internal incident: a Connection whose channel is torn down already
+        has ``conn._closed = True``
+        (rpyc maintains this flag itself — no probe / round-trip /
+        polling needed). Treat such a Connection as not-connected and
+        evict it from ``_connections`` so the next caller triggers a
+        clean reconnect instead of pumping more
+        ``fire_and_forget_async(root.method())`` calls onto a dead
+        channel.
+
+        Eviction is limited to the local dict; we never call
+        ``aclose`` from a probe path because rpyc's own teardown is
+        what set ``_closed`` in the first place.
+
         Args:
             agent_name: Name of the agent.
 
         Returns:
             True if connected, False otherwise.
         """
-        return agent_name in self._connections and self._connections[agent_name] is not None
+        conn = self._connections.get(agent_name)
+        if conn is None:
+            return False
+        # rpyc maintains ``_closed`` as a strict ``bool`` and only
+        # flips it to ``True`` on real teardown (see
+        # ``Connection.close`` / ``aclose`` in rpyc_async). Use an
+        # identity-check against ``True`` so that test doubles
+        # (``MagicMock`` etc.) which auto-generate attribute access
+        # do not get evicted on every probe — only a genuine
+        # ``conn._closed = True`` triggers eviction.
+        if getattr(conn, "_closed", False) is True:
+            self._connections.pop(agent_name, None)
+            return False
+        return True
 
     def get_root(self, agent_name: str) -> Any | None:
         """Get RPyC root proxy for an agent.
@@ -205,20 +331,19 @@ class AgentService:
         
         try:
             logger.info(f"Connecting to agent {agent_name} on port {agent.rpyc_port}")
-            
-            # SECURITY: Connect only to localhost (127.0.0.1)
-            conn = rpyc.connect(
+
+            # ⚠️ MANDATORY: ALL RPyC operations MUST be non-blocking.
+            # async_connect() is natively non-blocking (uses
+            # loop.sock_connect under the hood), auto-enables asyncio
+            # serving, and eager-fetches conn.root — so we don't need
+            # run_in_executor, a separate enable_asyncio_serving call,
+            # or a root access afterwards.
+            conn = await async_connect(
                 "127.0.0.1",
                 agent.rpyc_port,
-                config={"allow_public_attrs": True}
+                config={"allow_public_attrs": True},
+                timeout=5.0,  # 5s max — dead agents fail fast
             )
-            
-            # CRITICAL: Enable asyncio serving BEFORE accessing root
-            # With AsyncioServer, we must enable asyncio serving first
-            loop = asyncio.get_running_loop()
-            conn.enable_asyncio_serving(loop=loop)
-            
-            # Now safe to get root (after asyncio serving is enabled)
             root = conn.root
             
             # Store connection and root
@@ -267,7 +392,25 @@ class AgentService:
                     logger.info(f"Unsubscribed from {agent_name}")
 
                 async def on_error(exc: BaseException) -> None:
-                    logger.warning(f"Error unsubscribing from {agent_name}: {exc}")
+                    # "Stream has been closed" / EOFError is the
+                    # expected outcome after SIGKILL — the agent is
+                    # gone, unsubscribe can't be delivered. Log at
+                    # DEBUG so those cleanup paths don't look like
+                    # real errors in the ops log.
+                    msg = str(exc)
+                    if isinstance(exc, (EOFError, BrokenPipeError)) or (
+                        "stream has been closed" in msg.lower()
+                        or "connection" in msg.lower()
+                        and "closed" in msg.lower()
+                    ):
+                        logger.debug(
+                            "unsubscribe from %s: peer already gone (%s)",
+                            agent_name, exc,
+                        )
+                    else:
+                        logger.warning(
+                            "Error unsubscribing from %s: %s", agent_name, exc
+                        )
                     # Don't fail disconnect on unsubscribe error
 
                 # Fire and forget with short timeout (cleanup)
@@ -281,15 +424,34 @@ class AgentService:
 
                 # Don't wait - continue with disconnect immediately
 
-            # Close connection (do this synchronously)
+            # async close — matches async_connect's non-blocking
+            # contract. sync close() here would hit rpyc_async's
+            # sync_request guard from the running FastAPI loop.
             conn = self._connections[agent_name]
-            conn.disable_asyncio_serving()
-            conn.close()
+            await conn.aclose()
 
             logger.info(f"Disconnected from agent {agent_name}")
 
+        except (EOFError, BrokenPipeError, ConnectionResetError) as e:
+            # Post-SIGKILL aclose: the socket is already torn down,
+            # there is nothing to handshake. Benign.
+            logger.debug(
+                "disconnect_from_agent(%s): peer already gone (%s)",
+                agent_name, e,
+            )
         except Exception as e:
-            logger.error(f"Error disconnecting from {agent_name}: {e}")
+            # Peer-gone paths also surface as a generic Exception with
+            # "stream has been closed" message from rpyc_async. Treat
+            # that as benign — the agent is dead, that is the whole
+            # point of the disconnect.
+            msg = str(e).lower()
+            if "stream has been closed" in msg or "connection closed" in msg:
+                logger.debug(
+                    "disconnect_from_agent(%s): peer already gone (%s)",
+                    agent_name, e,
+                )
+            else:
+                logger.error(f"Error disconnecting from {agent_name}: {e}")
         finally:
             # Cleanup
             if agent_name in self._connections:
@@ -314,96 +476,16 @@ class AgentService:
         class MessageCallbackService(rpyc.Service):  # type: ignore[misc]
             """RPyC service for receiving messages from agent."""
 
-            async def exposed_on_message(self, msg: dict[str, Any]) -> None:
+            async def exposed_on_message(self, msg: Any) -> None:
                 """Receive message from agent (async exposed for RPyC).
 
-                This callback is invoked by the agent for EVERY message:
-                - user messages (type="user")
-                - assistant messages (type="assistant" - final responses)
-                - assistant_chunk messages (type="assistant_chunk" - streaming)
-                - tool_call messages (type="tool_call")
-                - tool_result messages (type="tool_result")
-                - token_update messages (type="token_update")
-
-                CRITICAL ARCHITECTURE:
-                We wrap all messages in "agent_message" type so the frontend
-                handleWebSocketMessage() can route them correctly via switch/case.
-
-                Frontend expects:
-                {
-                    type: "agent_message",      // ← Frontend routing type
-                    agent_name: "test_agent",   // ← Which agent sent this
-                    message: {...}              // ← Original message from agent (nested)
-                }
-
-                Args:
-                    msg: Message dict from agent (raw format from deep_worker_cli).
-                         NOTE: This might be an RPyC NetRef, so we need to convert to plain dict.
+                Delegates to ``AgentService._dispatch_subscriber_payload``
+                so the exact same path is covered by unit tests without
+                having to reach into RPyC internals.
                 """
-                import json
-
-                # ============================================================
-                # Convert RPyC NetRef to plain Python dict
-                # ============================================================
-                # RPyC sends NetRef proxy objects that look like dicts but aren't.
-                # We need to recursively convert them to plain Python types.
-                def convert_netref(obj: Any) -> Any:
-                    """Recursively convert RPyC NetRef objects to plain Python types."""
-                    if isinstance(obj, dict):
-                        return {k: convert_netref(v) for k, v in obj.items()}
-                    elif isinstance(obj, list):
-                        return [convert_netref(item) for item in obj]
-                    elif isinstance(obj, (str, int, float, bool, type(None))):
-                        return obj
-                    else:
-                        # For any other type (including NetRef), convert to string
-                        return str(obj)
-
-                # Convert message to plain Python types
-                plain_msg = convert_netref(msg)
-
-                # ============================================================
-                # Handle approval_request specially
-                # ============================================================
-                if plain_msg.get("type") == "approval_request":
-                    # Auto-approve if enabled for this agent
-                    if agent_name in agent_service._auto_approve_agents:
-                        approval_id = plain_msg.get("approval_id")
-                        if approval_id:
-                            await agent_service.send_approval(
-                                agent_name, approval_id, "approve"
-                            )
-                        return
-
-                    # Broadcast as top-level type (not wrapped in agent_message)
-                    await agent_service._broadcast_message({
-                        "type": "approval_request",
-                        "agent_name": agent_name,
-                        "approval_id": plain_msg.get("approval_id"),
-                        "actions": plain_msg.get("actions", []),
-                    })
-                    return
-
-                if plain_msg.get("type") == "approval_result":
-                    await agent_service._broadcast_message({
-                        "type": "approval_result",
-                        "agent_name": agent_name,
-                        "approval_id": plain_msg.get("approval_id"),
-                        "decision": plain_msg.get("decision"),
-                    })
-                    return
-
-                # ============================================================
-                # WRAP regular messages in standard WebSocket format
-                # ============================================================
-                wrapped_message = {
-                    "type": "agent_message",        # ← Frontend switch/case routing
-                    "agent_name": agent_name,        # ← Which agent sent this
-                    "message": plain_msg,            # ← Original message (nested, converted)
-                }
-
-                # Broadcast wrapped message to all WebSocket clients
-                await agent_service._broadcast_message(wrapped_message)
+                await agent_service._dispatch_subscriber_payload(
+                    agent_name, msg
+                )
 
         # Create and store callback instance
         callback = MessageCallbackService()
@@ -526,7 +608,8 @@ class AgentService:
                 status_str = response.get("status", "idle")
 
                 if agent_name in self._agents:
-                    self._agents[agent_name].status = self._convert_status(status_str)
+                    info = self._agents[agent_name]
+                    info.status = self._convert_status(status_str)
 
                     logger.info(f"Updated status for {agent_name}: {status_str}")
 
@@ -536,11 +619,19 @@ class AgentService:
                         "agent_name": agent_name,
                         "status": status_str,
                     }
-                    # Include task_manager fields only if present in response
+                    # Include task_manager fields only if present in response.
+                    # Also mirror into AgentInfo so ``GET /api/agents`` is
+                    # synced and frontend reconnects see the TM row.
                     if "task_manager_active" in response:
-                        broadcast_msg["task_manager_active"] = response["task_manager_active"]
+                        tm_active = bool(response["task_manager_active"])
+                        broadcast_msg["task_manager_active"] = tm_active
+                        info.task_manager_active = tm_active
+                        info.has_task_manager = True
                     if "task_manager_disabled" in response:
-                        broadcast_msg["task_manager_disabled"] = response["task_manager_disabled"]
+                        tm_disabled = bool(response["task_manager_disabled"])
+                        broadcast_msg["task_manager_disabled"] = tm_disabled
+                        info.task_manager_disabled = tm_disabled
+                        info.has_task_manager = True
                     await self._broadcast_message(broadcast_msg)
 
         async def on_error(exc: BaseException) -> None:
@@ -1078,6 +1169,32 @@ class AgentService:
                 "status": status_info,
             })
 
+        async def on_error(exc: BaseException) -> None:
+            """Handle detailed-status retrieval errors."""
+            logger.error(f"Error getting detailed status from {agent_name}: {exc}")
+            await self._broadcast_message({
+                "type": "detailed_status_error",
+                "agent_name": agent_name,
+                "request_id": req_id,
+                "success": False,
+                "error": str(exc),
+            })
+
+        # Fire-and-forget: actual status arrives via WebSocket in on_success.
+        fire_and_forget_async(
+            root.get_status(),
+            timeout=10.0,
+            success_callback=on_success,
+            error_callback=on_error,
+            name=f"detailed_status_{agent_name}",
+        )
+
+        return {
+            "success": True,
+            "message": "Status request sent (response will arrive via WebSocket)",
+            "request_id": req_id,
+        }
+
     async def get_agent_dialog_formatted(
         self,
         agent_name: str,
@@ -1188,32 +1305,6 @@ class AgentService:
             logger.error(f"Error getting formatted history for '{agent_name}': {e}", exc_info=True)
             raise ValueError(f"Failed to retrieve dialog: {e}")
 
-        async def on_error(exc: BaseException) -> None:
-            """Handle status retrieval errors."""
-            logger.error(f"Error getting detailed status from {agent_name}: {exc}")
-            await self._broadcast_message({
-                "type": "detailed_status_error",
-                "agent_name": agent_name,
-                "request_id": req_id,
-                "success": False,
-                "error": str(exc),
-            })
-
-        # Fire and forget with 10s timeout
-        fire_and_forget_async(
-            root.get_status(),
-            timeout=10.0,
-            success_callback=on_success,
-            error_callback=on_error,
-            name=f"get_detailed_status_{agent_name}",
-        )
-
-        return {
-            "success": True,
-            "message": "Status request sent (response will arrive via WebSocket)",
-            "request_id": req_id,
-        }
-
     def register_message_callback(
         self, callback: Callable[[dict[str, Any]], Awaitable[None]]
     ) -> None:
@@ -1239,6 +1330,114 @@ class AgentService:
         if callback in self._message_callbacks:
             self._message_callbacks.remove(callback)
             logger.debug(f"Unregistered message callback: {callback}")
+
+    async def _dispatch_subscriber_payload(
+        self, agent_name: str, raw: Any
+    ) -> None:
+        """Route a payload received on the subscribe-messages channel.
+
+        This is the single seam that decides what to do with every
+        broadcast coming from an agent. Carved out of the inline
+        ``MessageCallbackService.exposed_on_message`` closure so unit
+        tests can exercise the full routing without touching RPyC
+        machinery.
+
+        Recognised payload ``type`` values:
+
+        * ``status_change`` — translate to a ``agent_status``
+          broadcast and update ``self._agents[agent_name]`` in
+          place. Only fields present in the payload are copied;
+          absent TM fields leave the in-memory mirror at its
+          existing value (honest-unknown preserved).
+        * ``approval_request`` / ``approval_result`` — forwarded as
+          dedicated top-level WS events.
+        * anything else — wrapped in ``agent_message`` for the
+          frontend router.
+        """
+        plain_msg = _decode_subscriber_payload(raw)
+        if not isinstance(plain_msg, dict):
+            return
+
+        msg_type = plain_msg.get("type")
+
+        if msg_type == "status_change":
+            status_str = plain_msg.get("status", "idle")
+            broadcast: dict[str, Any] = {
+                "type": "agent_status",
+                "agent_name": agent_name,
+                "status": status_str,
+            }
+            # Mirror into AgentInfo cache so REST callers see the
+            # new state immediately. ``_convert_status`` maps the
+            # agent's enum to our web enum; unknown values fall
+            # through to IDLE.
+            info = self._agents.get(agent_name)
+            if info is not None:
+                try:
+                    info.status = self._convert_status(status_str)
+                except Exception:
+                    logger.debug(
+                        "could not convert status '%s' for %s",
+                        status_str,
+                        agent_name,
+                        exc_info=True,
+                    )
+
+            # TaskManager fields: only propagate when the agent
+            # actually sent them.
+            if "task_manager_active" in plain_msg:
+                val = bool(plain_msg["task_manager_active"])
+                broadcast["task_manager_active"] = val
+                if info is not None:
+                    info.task_manager_active = val
+                    info.has_task_manager = True
+            if "task_manager_disabled" in plain_msg:
+                val = bool(plain_msg["task_manager_disabled"])
+                broadcast["task_manager_disabled"] = val
+                if info is not None:
+                    info.task_manager_disabled = val
+                    info.has_task_manager = True
+
+            # If the agent told us it has no TM at all (both flags
+            # absent) we deliberately leave ``has_task_manager`` as
+            # ``None`` / existing — we don't invent a False.
+
+            error_message = plain_msg.get("error_message")
+            if error_message is not None:
+                broadcast["error_message"] = error_message
+
+            await self._broadcast_message(broadcast)
+            return
+
+        if msg_type == "approval_request":
+            if agent_name in self._auto_approve_agents:
+                approval_id = plain_msg.get("approval_id")
+                if approval_id:
+                    await self.send_approval(agent_name, approval_id, "approve")
+                return
+            await self._broadcast_message({
+                "type": "approval_request",
+                "agent_name": agent_name,
+                "approval_id": plain_msg.get("approval_id"),
+                "actions": plain_msg.get("actions", []),
+            })
+            return
+
+        if msg_type == "approval_result":
+            await self._broadcast_message({
+                "type": "approval_result",
+                "agent_name": agent_name,
+                "approval_id": plain_msg.get("approval_id"),
+                "decision": plain_msg.get("decision"),
+            })
+            return
+
+        # Default: wrap for the frontend router.
+        await self._broadcast_message({
+            "type": "agent_message",
+            "agent_name": agent_name,
+            "message": plain_msg,
+        })
 
     async def _broadcast_message(self, message: dict[str, Any]) -> None:
         """Broadcast a message to all registered callbacks.
@@ -1275,12 +1474,28 @@ class AgentService:
 
         logger.debug(f"Broadcasting message to {len(self._message_callbacks)} callbacks")
 
-        # Call all callbacks concurrently with serializable message
+        # Call all callbacks concurrently with serializable message.
+        # ``return_exceptions=True`` prevents a single broken
+        # subscriber from killing the others — but historically the
+        # results were discarded, which meant a broken subscriber
+        # stayed invisible until a user noticed missing events.
+        # Log every exception so silent drops leave a trail.
         if self._message_callbacks:
-            await asyncio.gather(
+            results = await asyncio.gather(
                 *[callback(serializable_message) for callback in self._message_callbacks],
-                return_exceptions=True,  # Don't let one failure stop others
+                return_exceptions=True,
             )
+            for callback, result in zip(self._message_callbacks, results):
+                if isinstance(result, BaseException):
+                    cb_name = getattr(callback, "__qualname__", repr(callback))
+                    logger.error(
+                        "message callback %s raised during broadcast "
+                        "(type=%s): %s",
+                        cb_name,
+                        type(result).__name__,
+                        result,
+                        exc_info=(type(result), result, result.__traceback__),
+                    )
 
     def _convert_status(self, status_str: str) -> AgentStatus:
         """Convert string status to AgentStatus enum.
@@ -1306,96 +1521,278 @@ class AgentService:
             logger.warning(f"Unknown agent status: {status_str}, defaulting to IDLE")
             return AgentStatus.IDLE
 
-    async def monitor_agents(self) -> None:
-        """Background task to monitor ProcessRegistry for agent changes.
-        
-        This runs continuously and:
-        - Discovers new agents
-        - Removes terminated agents
-        - Reconnects to restarted agents
+    async def _reconcile_from_registry(self) -> None:
+        """Diff in-memory agent map against the live ProcessRegistry.
+
+        Emits ``agent_discovered`` / ``agent_terminated`` broadcasts for
+        anything that changed. Does NOT poll ``get_status`` — that would
+        bring back the old 5-second polling loop. Status changes come
+        from the subscribe-messages channel, which is already wired by
+        ``_subscribe_to_agent``.
         """
-        logger.info("Starting agent monitoring task")
-        
-        while not self._shutdown_event.is_set():
-            try:
-                # Check for new/changed agents every 5 seconds
-                await asyncio.sleep(5)
-                
-                # Discover current agents from registry
-                loop = asyncio.get_event_loop()
-                current_agents = await loop.run_in_executor(
-                    None, self._registry.list_all
+        loop = asyncio.get_event_loop()
+        current_agents = await loop.run_in_executor(
+            None, self._registry.list_all
+        )
+        current_names = {agent.name for agent in current_agents}
+        known_names = set(self._agents.keys())
+
+        # New agents
+        for name in current_names - known_names:
+            logger.info(f"Discovered new agent: {name}")
+            proc_info = next(a for a in current_agents if a.name == name)
+            agent_info = AgentInfo(
+                name=proc_info.name,
+                pid=proc_info.pid,
+                status=AgentStatus.IDLE,
+                provider="unknown",
+                model="unknown",
+                rpyc_port=proc_info.rpyc_port,
+                working_dir=proc_info.working_dir,
+                started_at=proc_info.started_at,
+            )
+            self._agents[name] = agent_info
+
+            await self._broadcast_message({
+                "type": "agent_discovered",
+                "agent": agent_info.model_dump(mode="json"),
+            })
+
+            # Fire-and-forget connect: schedules its own work internally,
+            # we don't await it here because the registry reader has to
+            # return quickly so the inotify fd stays drained. Supervised
+            # so any crash in ``connect_to_agent`` lands in the
+            # ``app.utils.supervisor`` log instead of vanishing as a
+            # GC-time "Task exception was never retrieved" asyncio
+            # warning with no traceback.
+            supervise(
+                self.connect_to_agent(name),
+                name=f"connect_to_agent:{name}",
+            )
+
+        # Terminated agents
+        for name in known_names - current_names:
+            logger.info(f"Agent terminated: {name}")
+            if await self.is_connected(name):
+                await self.disconnect_from_agent(name)
+            self._agents.pop(name, None)
+            await self._broadcast_message({
+                "type": "agent_terminated",
+                "agent_name": name,
+            })
+
+        # Already-known agents: reconnect only when we've lost the
+        # connection. NO periodic get_status poll — status updates flow
+        # through the subscribe channel.
+        for name in known_names & current_names:
+            if not await self.is_connected(name):
+                logger.debug(f"Attempting to reconnect to {name}")
+                supervise(
+                    self.connect_to_agent(name),
+                    name=f"reconnect_to_agent:{name}",
                 )
-                
-                current_names = {agent.name for agent in current_agents}
-                known_names = set(self._agents.keys())
-                
-                # Find new agents
-                new_agents = current_names - known_names
-                for name in new_agents:
-                    logger.info(f"Discovered new agent: {name}")
-                    # Add to tracking
-                    proc_info = next(a for a in current_agents if a.name == name)
-                    agent_info = AgentInfo(
-                        name=proc_info.name,
-                        pid=proc_info.pid,
-                        status=AgentStatus.IDLE,
-                        provider="unknown",
-                        model="unknown",
-                        rpyc_port=proc_info.rpyc_port,
-                        working_dir=proc_info.working_dir,
-                        started_at=proc_info.started_at,
+
+    async def monitor_agents(self) -> None:
+        """Event-driven agent-registry monitor.
+
+        Watches ``/tmp`` (the directory containing
+        ``deep_worker_registry.json``) via ``inotify`` + ``loop.add_reader``.
+        The registry file is rewritten atomically with ``write + rename``,
+        which we observe as ``IN_MOVED_TO`` / ``IN_CREATE`` on the parent
+        dir. On every such event we re-read the file and reconcile in
+        ``_reconcile_from_registry``.
+
+        No ``asyncio.sleep``-polling, no periodic status RPC.
+
+        If inotify is unavailable (non-Linux), we fall back to a single
+        long-period safety tick (``loop.call_later(60s)``) that just
+        triggers a reconcile — still not a tight poll.
+
+        Runs until ``self._shutdown_event`` is set.
+        """
+        logger.info("Starting agent monitoring task (inotify-driven)")
+
+        # Initial reconcile so agents discovered before the watcher was
+        # armed show up immediately.
+        try:
+            await self._reconcile_from_registry()
+        except Exception as e:
+            logger.error(f"Initial registry reconcile failed: {e}", exc_info=True)
+
+        loop = asyncio.get_running_loop()
+        inotify_fd: int | None = None
+        watch_dir: Path | None = None
+        next_safety_handle: asyncio.TimerHandle | None = None
+
+        try:
+            try:
+                import ctypes
+                import ctypes.util
+
+                libc_name = ctypes.util.find_library("c")
+                libc = ctypes.CDLL(libc_name or "libc.so.6", use_errno=True)
+                IN_MOVED_TO = 0x00000080
+                IN_CREATE = 0x00000100
+                IN_CLOSE_WRITE = 0x00000008
+                IN_MODIFY = 0x00000002
+                IN_DELETE = 0x00000200
+                O_NONBLOCK = os.O_NONBLOCK
+
+                inotify_init1 = libc.inotify_init1
+                inotify_init1.argtypes = [ctypes.c_int]
+                inotify_init1.restype = ctypes.c_int
+                inotify_add_watch = libc.inotify_add_watch
+                inotify_add_watch.argtypes = [
+                    ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32
+                ]
+                inotify_add_watch.restype = ctypes.c_int
+
+                registry_file = getattr(
+                    self._registry, "registry_file", Path("/tmp/deep_worker_registry.json")
+                )
+                watch_dir = Path(registry_file).parent
+                watch_dir.mkdir(parents=True, exist_ok=True)
+                registry_basename = Path(registry_file).name.encode()
+
+                fd = inotify_init1(O_NONBLOCK)
+                if fd < 0:
+                    raise OSError(ctypes.get_errno(), "inotify_init1 failed")
+                mask = (
+                    IN_MOVED_TO | IN_CREATE | IN_CLOSE_WRITE | IN_MODIFY | IN_DELETE
+                )
+                wd = inotify_add_watch(fd, str(watch_dir).encode(), mask)
+                if wd < 0:
+                    os.close(fd)
+                    raise OSError(ctypes.get_errno(), "inotify_add_watch failed")
+                inotify_fd = fd
+
+                # Debounced reconcile: one pending reconcile at a time.
+                # Multiple inotify events (IN_CREATE + IN_MODIFY +
+                # IN_CLOSE_WRITE + IN_MOVED_TO arriving for the same
+                # ``write+rename`` atomic update) collapse into exactly
+                # one ``_reconcile_from_registry`` run.
+                reconcile_pending = False
+                reconcile_task: asyncio.Task[None] | None = None
+
+                # inotify_event: struct { int wd; uint32 mask; uint32 cookie;
+                #                         uint32 len; char name[]; }
+                import struct
+                _header = struct.Struct("iIII")  # 16 bytes
+
+                async def _debounced_reconcile() -> None:
+                    nonlocal reconcile_pending, reconcile_task
+                    # Coalesce bursts: yield once so any further events
+                    # within the same tick set reconcile_pending=False
+                    # without scheduling a duplicate task.
+                    await asyncio.sleep(0)
+                    reconcile_pending = False
+                    reconcile_task = None
+                    try:
+                        await self._reconcile_from_registry()
+                    except Exception as exc:
+                        logger.error(
+                            "Registry reconcile failed: %s", exc, exc_info=True
+                        )
+
+                def _on_inotify_event() -> None:
+                    """Kernel says *something* changed in watch_dir. Filter
+                    events to only those on the registry file (+ its
+                    ``.tmp`` sibling used by atomic rename), then schedule
+                    a single debounced reconcile.
+
+                    CRITICAL: this is a ``loop.add_reader`` callback — if
+                    it raises, asyncio removes the reader and the whole
+                    monitoring pipeline silently dies. We wrap EVERY
+                    failure mode in a catch-all so a short read, a
+                    ``struct.error`` on a truncated event, or any other
+                    unexpected exception logs-and-survives instead of
+                    killing agent discovery."""
+                    nonlocal reconcile_pending, reconcile_task
+                    try:
+                        matched = False
+                        try:
+                            while True:
+                                try:
+                                    buf = os.read(inotify_fd, 4096)  # type: ignore[arg-type]
+                                except BlockingIOError:
+                                    break
+                                # Parse every event in the buffer.
+                                offset = 0
+                                while offset + _header.size <= len(buf):
+                                    _wd, _mask, _cookie, name_len = _header.unpack_from(
+                                        buf, offset
+                                    )
+                                    name = buf[
+                                        offset + _header.size : offset + _header.size + name_len
+                                    ].rstrip(b"\x00")
+                                    offset += _header.size + name_len
+                                    # We care about the registry file and the
+                                    # temp used by atomic write-rename.
+                                    if name == registry_basename or name == registry_basename + b".tmp":
+                                        matched = True
+                        except OSError:
+                            # Expected on a torn-down fd; skip this tick.
+                            return
+                        if not matched:
+                            return
+                        # Debounce — one task per burst.
+                        if reconcile_pending:
+                            return
+                        reconcile_pending = True
+                        reconcile_task = supervise(
+                            _debounced_reconcile(),
+                            name="debounced_reconcile",
+                        )
+                    except Exception:  # noqa: BLE001
+                        # Never let a reader callback propagate — that
+                        # unregisters the fd and freezes monitoring.
+                        logger.exception(
+                            "inotify reader callback crashed — the "
+                            "reader survives, but the triggering event "
+                            "(if any) was dropped"
+                        )
+
+                # fd is guaranteed non-negative here (we raised on < 0 above).
+                assert inotify_fd is not None
+                loop.add_reader(inotify_fd, _on_inotify_event)
+                logger.info(
+                    f"Inotify watcher installed on {watch_dir} "
+                    f"(fd={inotify_fd}, watching {registry_basename.decode()})"
+                )
+            except (OSError, AttributeError) as exc:
+                logger.warning(
+                    f"Inotify unavailable ({exc}); falling back to a slow 60s safety tick"
+                )
+
+                def _safety_tick() -> None:
+                    nonlocal next_safety_handle
+                    if self._shutdown_event.is_set():
+                        return
+                    supervise(
+                        self._reconcile_from_registry(),
+                        name="safety_tick_reconcile",
                     )
-                    self._agents[name] = agent_info
-                    
-                    # Broadcast agent discovered event
-                    await self._broadcast_message({
-                        "type": "agent_discovered",
-                        "agent": agent_info.model_dump(mode="json"),
-                    })
-                    
-                    # Try to connect
-                    await self.connect_to_agent(name)
-                
-                # Find terminated agents
-                terminated_agents = known_names - current_names
-                for name in terminated_agents:
-                    logger.info(f"Agent terminated: {name}")
-                    
-                    # Disconnect if connected
-                    if await self.is_connected(name):
-                        await self.disconnect_from_agent(name)
-                    
-                    # Remove from tracking
-                    if name in self._agents:
-                        del self._agents[name]
-                    
-                    # Broadcast agent terminated event
-                    await self._broadcast_message({
-                        "type": "agent_terminated",
-                        "agent_name": name,
-                    })
-                
-                # Check existing agents: reconnect or poll status
-                for name in known_names & current_names:
-                    if not await self.is_connected(name):
-                        logger.debug(f"Attempting to reconnect to {name}")
-                        await self.connect_to_agent(name)
-                    else:
-                        # Poll status of connected agents
-                        root = self._roots.get(name)
-                        if root:
-                            await self._update_agent_status(name, root)
-                
-            except asyncio.CancelledError:
-                logger.info("Agent monitoring task cancelled")
-                break
-            except Exception as e:
-                logger.error(f"Error in agent monitoring: {e}", exc_info=True)
-                # Continue monitoring despite errors
-                continue
-        
-        logger.info("Agent monitoring task stopped")
+                    next_safety_handle = loop.call_later(60.0, _safety_tick)
+
+                next_safety_handle = loop.call_later(60.0, _safety_tick)
+
+            # Park the task until shutdown is requested. No polling, no work.
+            await self._shutdown_event.wait()
+        except asyncio.CancelledError:
+            logger.info("Agent monitoring task cancelled")
+        finally:
+            if next_safety_handle is not None:
+                next_safety_handle.cancel()
+            if inotify_fd is not None:
+                try:
+                    loop.remove_reader(inotify_fd)
+                except Exception:
+                    pass
+                try:
+                    os.close(inotify_fd)
+                except OSError:
+                    pass
+            logger.info("Agent monitoring task stopped")
 
     async def shutdown(self) -> None:
         """Shutdown the service and cleanup resources.

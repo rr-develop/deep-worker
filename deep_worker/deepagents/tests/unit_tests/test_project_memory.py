@@ -73,20 +73,23 @@ def test_project_memory_tool_success() -> None:
     """Test project_memory tool with successful search results."""
     # Mock runtime with state containing working_dir
     runtime = SimpleNamespace(
-        state={"working_dir": "/tmp/test_project"},
+        state={"working_dir": "/path/to/project"},
         tool_call_id="test_call_1",
     )
 
     # Mock SearchResult
     mock_result = SimpleNamespace(
-        file_path="/tmp/test_project/src/auth.py",
+        file_path="/path/to/project/src/auth.py",
         score=0.892,
         language="python",
         node_type="parent",
         content="def authenticate(user, password):\n    # Auth implementation\n    ...",
     )
 
-    with patch("deepagents.tools.project_memory.search") as mock_search:
+    with patch(
+        "deepagents.tools.project_memory._ensure_semantic_search",
+        return_value=(mock_search := MagicMock(), type("_", (Exception,), {})),
+    ):
         mock_search.return_value = [mock_result]
 
         # Call the tool
@@ -95,14 +98,14 @@ def test_project_memory_tool_success() -> None:
         # Verify search was called correctly
         mock_search.assert_called_once_with(
             "authentication implementation",
-            repo_path=Path("/tmp/test_project"),
+            repo_path=Path("/path/to/project"),
             top_k=5,
         )
 
         # Verify output format
         assert "Project Memory: 'authentication implementation'" in result
         assert "Result 1 (score=0.892) [python]" in result
-        assert "File: /tmp/test_project/src/auth.py" in result
+        assert "File: /path/to/project/src/auth.py" in result
         assert "Type: parent" in result
         assert "def authenticate(user, password):" in result
 
@@ -112,29 +115,35 @@ def test_project_memory_tool_index_not_found() -> None:
     from semantic_search.exceptions import IndexNotFoundError
 
     runtime = SimpleNamespace(
-        state={"working_dir": "/tmp/no_index"},
+        state={"working_dir": "/path/to/no-index-project"},
         tool_call_id="test_call_2",
     )
 
-    with patch("deepagents.tools.project_memory.search") as mock_search:
+    with patch(
+        "deepagents.tools.project_memory._ensure_semantic_search",
+        return_value=(mock_search := MagicMock(), IndexNotFoundError),
+    ):
         mock_search.side_effect = IndexNotFoundError("Index not found")
 
         result = project_memory.func("some query", runtime=runtime, top_k=5)
 
         # Should return error message with "Error:" prefix
         assert "Error: Project memory not available." in result
-        assert "/tmp/no_index" in result
+        assert "/path/to/no-index-project" in result
         assert "does not have a semantic search index" in result
 
 
 def test_project_memory_tool_no_results() -> None:
     """Test project_memory tool when search returns no results."""
     runtime = SimpleNamespace(
-        state={"working_dir": "/tmp/test_project"},
+        state={"working_dir": "/path/to/project"},
         tool_call_id="test_call_3",
     )
 
-    with patch("deepagents.tools.project_memory.search") as mock_search:
+    with patch(
+        "deepagents.tools.project_memory._ensure_semantic_search",
+        return_value=(mock_search := MagicMock(), type("_", (Exception,), {})),
+    ):
         mock_search.return_value = []  # No results
 
         result = project_memory.func("nonexistent feature", runtime=runtime, top_k=5)
@@ -148,7 +157,7 @@ def test_project_memory_tool_no_results() -> None:
 def test_project_memory_tool_invalid_top_k() -> None:
     """Test project_memory tool with invalid top_k parameter."""
     runtime = SimpleNamespace(
-        state={"working_dir": "/tmp/test_project"},
+        state={"working_dir": "/path/to/project"},
         tool_call_id="test_call_4",
     )
 
@@ -177,7 +186,10 @@ def test_project_memory_tool_runtime_fallback() -> None:
         content="code here",
     )
 
-    with patch("deepagents.tools.project_memory.search") as mock_search:
+    with patch(
+        "deepagents.tools.project_memory._ensure_semantic_search",
+        return_value=(mock_search := MagicMock(), type("_", (Exception,), {})),
+    ):
         mock_search.return_value = [mock_result]
 
         with patch("deepagents.tools.project_memory.Path.cwd") as mock_cwd:

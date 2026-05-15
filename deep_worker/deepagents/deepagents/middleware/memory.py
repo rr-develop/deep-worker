@@ -55,8 +55,10 @@ from typing import TYPE_CHECKING, Annotated, Any, NotRequired, TypedDict, cast
 
 from langchain_core.runnables import RunnableConfig
 
+from deepagents.backends.protocol import BackendProtocol
+
 if TYPE_CHECKING:
-    from deepagents.backends.protocol import BACKEND_TYPES, BackendProtocol
+    from deepagents.backends.protocol import BACKEND_TYPES
 
 from langchain.agents.middleware.types import (
     AgentMiddleware,
@@ -152,7 +154,7 @@ MEMORY_SYSTEM_PROMPT = """<agent_memory>
 """
 
 
-class MemoryMiddleware(AgentMiddleware):
+class MemoryMiddleware(AgentMiddleware[MemoryState, Any, Any]):
     """Middleware for loading agent memory from `AGENTS.md` files.
 
     Loads memory content from configured sources and injects into the system prompt.
@@ -197,20 +199,23 @@ class MemoryMiddleware(AgentMiddleware):
         Returns:
             Resolved backend instance.
         """
-        if callable(self._backend):
-            # Construct an artificial tool runtime to resolve backend factory
-            # Use runtime.config if available, otherwise create empty config
-            config = getattr(runtime, "config", RunnableConfig())
-            tool_runtime: Any = ToolRuntime(
-                state=state,
-                context=runtime.context,
-                stream_writer=runtime.stream_writer,
-                store=runtime.store,
-                config=config,
-                tool_call_id=None,
-            )
-            return self._backend(cast(Any, tool_runtime))
-        return self._backend
+        # `self._backend` is BackendProtocol | BackendFactory. ty can't
+        # narrow `callable(...)`, so use isinstance — factories are plain
+        # Callables, not BackendProtocol instances.
+        if isinstance(self._backend, BackendProtocol):
+            return self._backend
+        # Construct an artificial tool runtime to resolve backend factory.
+        # Use runtime.config if available, otherwise create empty config.
+        config = getattr(runtime, "config", RunnableConfig())
+        tool_runtime: Any = ToolRuntime(
+            state=state,
+            context=runtime.context,
+            stream_writer=runtime.stream_writer,
+            store=runtime.store,
+            config=config,
+            tool_call_id=None,
+        )
+        return self._backend(cast(Any, tool_runtime))
 
     def _format_agent_memory(self, contents: dict[str, str]) -> str:
         """Format memory with locations and contents paired together.
@@ -301,7 +306,7 @@ class MemoryMiddleware(AgentMiddleware):
 
         return None
 
-    def before_agent(self, state: MemoryState, runtime: Any) -> MemoryStateUpdate | None:  # type: ignore[override]
+    def before_agent(self, state: MemoryState, runtime: Any) -> dict[str, Any] | None:
         """Load memory content before agent execution (synchronous).
 
         Loads memory from all configured sources and stores in state.
@@ -327,9 +332,9 @@ class MemoryMiddleware(AgentMiddleware):
                 contents[path] = content
                 logger.debug(f"Loaded memory from: {path}")
 
-        return MemoryStateUpdate(memory_contents=contents)
+        return {"memory_contents": contents}
 
-    async def abefore_agent(self, state: MemoryState, runtime: Any) -> MemoryStateUpdate | None:  # type: ignore[override]
+    async def abefore_agent(self, state: MemoryState, runtime: Any) -> dict[str, Any] | None:
         """Load memory content before agent execution.
 
         Loads memory from all configured sources and stores in state.
@@ -355,7 +360,7 @@ class MemoryMiddleware(AgentMiddleware):
                 contents[path] = content
                 logger.debug(f"Loaded memory from: {path}")
 
-        return MemoryStateUpdate(memory_contents=contents)
+        return {"memory_contents": contents}
 
     def modify_request(self, request: ModelRequest) -> ModelRequest:
         """Inject memory content into the system message.

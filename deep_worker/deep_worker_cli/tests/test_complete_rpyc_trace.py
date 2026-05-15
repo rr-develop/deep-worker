@@ -129,6 +129,18 @@ class CompleteRPyCTracer:
         }
 
 
+@pytest.mark.skip(
+    reason=(
+        "Integration trace — requires a live deep-worker agent named "
+        "'test_dw' already running and registered at the moment the "
+        "test executes. This is a diagnostic/perf harness, not a unit "
+        "test. Run manually against a real agent when you need the "
+        "RPyC message trace. The message-count optimization it was "
+        "originally written to verify is captured by the automated "
+        "unit tests in `tests/test_obtain_netref_fix.py` (which mock "
+        "the RPyC connection)."
+    )
+)
 @pytest.mark.asyncio
 async def test_complete_rpyc_trace_single_get_status():
     """Capture COMPLETE RPyC trace (SEND + RECV) for ONE get_status() call."""

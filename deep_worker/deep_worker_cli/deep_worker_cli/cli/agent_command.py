@@ -28,6 +28,7 @@ _PARSER_DEFAULTS = {
     "memory_only": False,
     "use_sqlite": False,
     "auto_approve_send_message": False,
+    "dev_tree": False,
 }
 
 
@@ -86,6 +87,7 @@ def merge_restart_config(
     effective.auto_approve_send_message = saved.get(
         "auto_approve_send_message", False
     )
+    effective.dev_tree = saved.get("dev_tree", False)
     effective.clean = False  # NEVER inherit --clean
 
     # Override with explicitly provided CLI args
@@ -111,6 +113,11 @@ def merge_restart_config(
         != _PARSER_DEFAULTS["auto_approve_send_message"]
     ):
         effective.auto_approve_send_message = args.auto_approve_send_message
+    if (
+        getattr(args, "dev_tree", _PARSER_DEFAULTS["dev_tree"])
+        != _PARSER_DEFAULTS["dev_tree"]
+    ):
+        effective.dev_tree = args.dev_tree
 
     return effective
 
@@ -135,6 +142,14 @@ def build_launch_config(args: argparse.Namespace) -> dict:
         original_cwd = os.environ.get("DEEP_WORKER_ORIGINAL_CWD")
         working_dir = Path(original_cwd) if original_cwd else Path.cwd()
 
+    # dev_tree may come from either the parsed flag or, after the bash
+    # launcher's re-exec (which strips --dev from argv), from the
+    # DEEP_WORKER_DEV_TREE=1 env var. Honor either source. Only the
+    # exact string "1" counts as truthy — '0', 'false', '' do not.
+    dev_tree = getattr(args, "dev_tree", False) or (
+        os.environ.get("DEEP_WORKER_DEV_TREE") == "1"
+    )
+
     return {
         "provider": args.provider,
         "model": model,
@@ -147,6 +162,7 @@ def build_launch_config(args: argparse.Namespace) -> dict:
         "auto_approve_send_message": getattr(
             args, "auto_approve_send_message", False
         ),
+        "dev_tree": dev_tree,
         "started_at": datetime.now().isoformat(),
         "pid": os.getpid(),
         "cli_args": " ".join(sys.argv[1:]),
@@ -257,7 +273,7 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--provider",
         default="deepseek",
-        choices=["deepseek", "gemini", "openai", "claude-code"],
+        choices=["deepseek", "gemini", "openai", "claude-code", "codex"],
         help="AI provider to use (default: deepseek)",
     )
 
@@ -302,6 +318,21 @@ def create_parser() -> argparse.ArgumentParser:
         "--clean",
         action="store_true",
         help="Clean all history and state before starting (agent must not be running)",
+    )
+
+    parser.add_argument(
+        "--dev",
+        action="store_true",
+        dest="dev_tree",
+        help=(
+            "Run the agent using the development checkout instead of the "
+            "production checkout. The flag is normally consumed by the "
+            "bash launcher (deep-worker) BEFORE Python starts; it is also "
+            "declared here so argparse does not reject it inside the dev "
+            "tree after the re-exec, and so it can be persisted to "
+            "launch_config for --restart auto-detection. See the internal "
+            "design notes for the --dev flag (not included here)."
+        ),
     )
 
     parser.add_argument(
@@ -371,7 +402,27 @@ def create_parser() -> argparse.ArgumentParser:
         "--remove-before",
         metavar="DATE",
         dest="remove_before",
-        help="Remove all threads older than DATE (ISO 8601 or relative like 30d, 1y)",
+        help=(
+            "Remove conversation data older than DATE (ISO 8601 or relative "
+            "like 30d, 1y). Prunes checkpoint threads AND offloaded summary "
+            "sections in the per-agent summaries directory across ALL "
+            "agents in the current $HOME (destructive and global — NEVER "
+            "run in ad-hoc integration tests without an isolated HOME). "
+            "If DATE resolves to a future timestamp, the command refuses "
+            "by default and requires --force (a future cutoff means "
+            "\"delete everything\"). Always pair with --dry-run first."
+        ),
+    )
+
+    parser.add_argument(
+        "--list-summaries",
+        action="store_true",
+        dest="list_summaries",
+        help=(
+            "List offloaded conversation-history files from the per-agent "
+            "summaries directory. Use --agent NAME to filter, "
+            "--format json for machine-readable output."
+        ),
     )
 
     parser.add_argument(
@@ -379,6 +430,17 @@ def create_parser() -> argparse.ArgumentParser:
         action="store_true",
         dest="dry_run",
         help="Show what would be deleted without actually deleting (for -rm and --remove-before)",
+    )
+
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        dest="force",
+        help=(
+            "Required to confirm --remove-before when the cutoff is in "
+            "the future (which would delete ALL data). Harmless for past "
+            "cutoffs. See DESIGN_REMOVE_BEFORE_FUTURE_CUTOFF_GUARD.md."
+        ),
     )
 
     # Mutually exclusive group for storage mode
@@ -433,8 +495,9 @@ async def run_agent(args: argparse.Namespace) -> int:
             )
 
         # Build launch_config for persistent storage
-        # This dict is saved to ~/.deep_worker/{name}/session_metadata.json
-        # so that launch parameters survive process termination.
+        # This dict is saved to session_metadata.json in the agent's
+        # per-agent data directory so that launch parameters survive
+        # process termination.
         launch_config = {
             "provider": config.provider,
             "model": config.resolved_model,
@@ -469,10 +532,10 @@ async def run_agent(args: argparse.Namespace) -> int:
         try:
             await agent.start()
 
-            # Keep running until shutdown signal
-            while agent.running:
-                await asyncio.sleep(1)
-
+            # Keep running until shutdown signal - EVENT DRIVEN, NO POLLING
+            # Wait for shutdown event instead of polling agent.running
+            await agent.shutdown_event.wait()
+            
             return 0
 
         finally:
@@ -487,12 +550,131 @@ async def run_agent(args: argparse.Namespace) -> int:
         return 1
 
 
+def _detach_from_session_scope(agent_name: str | None = None) -> None:
+    """Move the calling process out of any ``session-*.scope`` /
+    ``tmux-spawn-*.scope`` / ``app-*.scope`` it currently lives in,
+    into a freshly-created leaf cgroup under ``user@UID.service``.
+
+    Why this is needed in addition to ``setsid()`` + double-fork:
+    the classic Unix daemonization recipe gives the daemon ``PPid=1``
+    and a fresh session/process-group, but it does NOT change the
+    process's cgroup membership. On systemd hosts the launching
+    shell lives in a session-scope (or tmux-/app-scope), and that
+    scope is what gets torn down on SSH logout / tmux pane close /
+    terminal exit. When the kernel tears down the scope it kills
+    every process inside it — including a fully-daemonised one,
+    because cgroup membership was inherited across ``fork`` and
+    ``setsid`` does not touch it.
+
+    Production incident this guards against: 2026-05-08, agent
+    ``notify_agent`` died at the moment systemd deactivated the SSH
+    session-scope of the bash that originally launched it, even
+    though ``loginctl enable-linger`` was set on the user. ``linger``
+    keeps ``user@UID.service`` running after SSH logout, but it
+    does not make session-scopes immortal — and the daemon was in
+    a session-scope, not in a delegated user-manager subgroup. See
+    a related internal incident analysis (not included here).
+
+    Mechanism (cgroup v2, the unified hierarchy used by every
+    systemd v240+ default):
+
+    1. ``user@UID.service`` itself has ``cgroup.subtree_control``
+       enabled (typically ``cpu memory pids``). cgroup v2's
+       "no internal processes" rule then forbids writing PIDs
+       directly into ``user@UID.service/cgroup.procs`` — that
+       returns ``EBUSY``. So we MUST create a leaf cgroup first.
+    2. ``mkdir`` a fresh ``user@UID.service/dwagent-<name>-<pid>``
+       directory. The user owns ``user@UID.service`` (systemd
+       grants ``Delegate=yes`` by default) so this needs no root.
+    3. Write our PID into ``<that>/cgroup.procs`` to migrate.
+
+    The leaf cgroup is intentionally per-process (PID in the name)
+    so that two agents launched concurrently never collide on the
+    cgroup directory. systemd's user-manager will reap the empty
+    cgroup automatically when the daemon exits and the directory
+    becomes empty — no explicit cleanup is needed in the happy
+    path.
+
+    Failure handling: if any step fails (no cgroup v2, no
+    delegation, sysfs read-only, container without a user manager,
+    EPERM on mkdir, …) the function returns silently. The daemon
+    keeps running in its current cgroup; the parent-shell-death
+    risk remains on those platforms but we don't have a better
+    primitive without taking on a hard dbus / systemd-run runtime
+    dependency.
+
+    Idempotent: if the process is already outside the unsafe scope
+    set, it is a no-op.
+
+    Args:
+        agent_name: optional name to embed in the new cgroup
+            directory name, for ``systemd-cgls`` readability. The
+            PID is always appended, so collisions are impossible.
+    """
+    try:
+        with open("/proc/self/cgroup") as f:
+            line = f.read().strip()
+    except OSError:
+        return  # /proc not available — nothing we can do
+    # cgroup v2 single-line entry: ``0::/path``. cgroup v1 has
+    # multiple lines with ``N:controller:/path``; we don't support
+    # migration there.
+    if not line.startswith("0::"):
+        return
+    cur = line.split("::", 1)[1]
+    user_service = (
+        f"/sys/fs/cgroup/user.slice/user-{os.getuid()}.slice/"
+        f"user@{os.getuid()}.service"
+    )
+    safe_name = "".join(
+        c if (c.isalnum() or c in "-_") else "_"
+        for c in (agent_name or "agent")
+    )[:64]
+    leaf_basename = f"dwagent-{safe_name}-{os.getpid()}"
+    leaf_dir = f"{user_service}/{leaf_basename}"
+    # Skip migration in two cases:
+    # 1. We are already in our OWN leaf cgroup (re-entry, e.g. a
+    #    daemonize() called twice somehow). Idempotency.
+    # 2. We are in a cgroup that is genuinely safe AND owned by us
+    #    (i.e. another daemon's leaf is NOT considered safe — if
+    #    that daemon dies and its leaf is reaped, our process will
+    #    be migrated up by the kernel, but more importantly the
+    #    parent daemon's lifetime should not own ours).
+    # The cgroups that DO get killed when the parent shell dies:
+    #   /user.slice/user-UID.slice/session-N.scope    SSH/login
+    #   /user.slice/user-UID.slice/user@UID.service/tmux-spawn-X.scope
+    #   /user.slice/user-UID.slice/user@UID.service/app-foo.scope
+    # AND: any /dwagent-OTHER-PID leaf belonging to a DIFFERENT
+    # process. If we inherited some other daemon's leaf via fork,
+    # we should still split off into our own.
+    if cur.endswith(f"/{leaf_basename}"):
+        return  # already in our own leaf
+    # If cur is some non-shell, non-dwagent cgroup (e.g. bare
+    # user@UID.service path on a host without subgroups) we still
+    # try to migrate — the cost of an unnecessary migration is one
+    # mkdir, the cost of NOT migrating when we should is the bug.
+    try:
+        # exist_ok=True: in the extremely unlikely case the dir is
+        # already there (re-execed daemon, debugger restart, …) we
+        # just reuse it.
+        os.makedirs(leaf_dir, exist_ok=True)
+        with open(f"{leaf_dir}/cgroup.procs", "w") as f:
+            f.write(f"{os.getpid()}\n")
+    except (OSError, PermissionError):
+        # Delegation not available, sysfs read-only, container, or
+        # cgroup v1. Daemonization continues; the caller is on a
+        # platform where the parent-shell-death-kills-daemon problem
+        # may still apply, but we have no other primitive to use
+        # without taking on a hard dbus / systemd-run dependency.
+        pass
+
+
 def daemonize(name: str, log_dir: Path | None = None) -> None:
-    """Daemonize the current process (Unix double-fork).
+    """Daemonize the current process (Unix double-fork + cgroup detach).
 
     Args:
         name: Agent name for log files
-        log_dir: Directory for log files (default: ~/.deep_worker/logs)
+        log_dir: Directory for log files (default: the per-user log directory)
     """
     # Set up log directory
     if log_dir is None:
@@ -527,6 +709,14 @@ def daemonize(name: str, log_dir: Path | None = None) -> None:
     os.chdir("/")
     os.setsid()
     os.umask(0)
+
+    # Detach from the launching shell's systemd cgroup (session-scope,
+    # tmux-spawn-scope, app-scope, …) so that scope teardown does not
+    # take the daemon down with it. See _detach_from_session_scope's
+    # docstring for the why and the failure-mode rationale. Done after
+    # setsid() but before the second fork, so the migrated cgroup is
+    # what the final daemon process inherits.
+    _detach_from_session_scope(agent_name=name)
 
     # Second fork
     try:
@@ -693,47 +883,199 @@ async def show_history_command(thread_id: str, format: str) -> int:
         return 1
 
 
-async def remove_before_command(date_str: str, dry_run: bool) -> int:
+async def remove_before_command(
+    date_str: str, dry_run: bool, force: bool = False
+) -> int:
     """Handle --remove-before command.
 
+    Prunes BOTH checkpoint threads in per-agent SQLite DBs AND offloaded
+    summary sections in the per-agent summaries directory across
+    ALL agents in the current ``$HOME``.
+
+    Safety guard (DESIGN_REMOVE_BEFORE_FUTURE_CUTOFF_GUARD.md): when the
+    parsed cutoff is in the future — semantically "delete everything" —
+    the command refuses with exit code ``2`` unless ``force=True``. Even
+    ``dry_run=True`` does NOT bypass the guard, because a future dry-run
+    is still a strong signal of an operator bug.
+
     Args:
-        date_str: Date string (ISO 8601 or relative)
-        dry_run: If True, show what would be deleted without deleting
+        date_str: Date string (ISO 8601 or relative).
+        dry_run: If True, show what would be deleted without deleting.
+        force: Bypass the future-cutoff guard. Required when ``cutoff > now``.
 
     Returns:
-        Exit code (0 for success, 1 for error)
+        Exit code:
+
+        - ``0`` success (or nothing to do).
+        - ``1`` real error (invalid date, I/O failure).
+        - ``2`` future-cutoff guard fired; no data touched.
     """
-    from deep_worker_cli.sessions import remove_threads_before
+    from datetime import datetime, timezone
+
+    from deep_worker_cli.sessions import remove_threads_before, parse_date
+    from deep_worker_cli.summaries import prune_summaries_before
     from deep_worker_cli.config import console
 
+    # Parse the cutoff date ONCE here so the summaries side uses the same
+    # timestamp as the DB side (and so we fail fast on malformed input).
     try:
-        result = await remove_threads_before(date_str, dry_run=dry_run)
+        cutoff_dt = parse_date(date_str)
+    except ValueError as e:
+        console.print(f"[red]Error:[/red] Invalid date format: {e}")
+        return 1
 
+    # ----- Future-cutoff safety guard -----
+    # A future cutoff matches every existing thread's updated_at (all of
+    # which are by definition <= now), which is equivalent to "nuke
+    # everything." This is almost always an operator mistake. Block
+    # unless --force was passed explicitly. Fires even in dry-run, since
+    # a dry-run of "would delete everything" is itself the smoking-gun
+    # evidence of the bug we are trying to catch.
+    now = datetime.now(timezone.utc)
+    if cutoff_dt > now and not force:
+        console.print(
+            "[red]Refusing --remove-before: parsed cutoff is in the future.[/red]"
+        )
+        console.print(
+            f"  parsed cutoff: [bold]{cutoff_dt.isoformat()}[/bold]"
+        )
+        console.print(
+            f"  current time:  {now.isoformat()}"
+        )
+        console.print(
+            "  A future cutoff matches every existing thread and would "
+            "delete ALL agent data and ALL offloaded summary files."
+        )
+        console.print(
+            "  If you truly intend this, re-run with [bold]--force[/bold]."
+        )
+        console.print(
+            "  (Even --dry-run requires --force for future cutoffs; "
+            "the dry-run of \"delete everything\" is itself likely a bug.)"
+        )
+        return 2
+
+    try:
+        # --- 1) DB threads ---
+        result = await remove_threads_before(date_str, dry_run=dry_run)
         if not result["success"]:
             console.print(f"[red]Error:[/red] {result['error']}")
             return 1
 
         cutoff_date = result["cutoff_date"]
 
+        # --- 2) Summaries ---
+        # Pure-sync pathlib I/O; no new threads, no async needed, no polling.
+        summary_counts = prune_summaries_before(cutoff_dt, dry_run=dry_run)
+
         if dry_run:
-            console.print(f"[yellow]Dry run - would delete threads before {cutoff_date}:[/yellow]")
+            console.print(f"[yellow]Dry run - would delete data before {cutoff_date}:[/yellow]")
             console.print(f"  - Threads: {result['threads_found']}")
             console.print(f"  - Checkpoints: {result['checkpoints_found']}")
             if result.get("writes_found", 0) > 0:
                 console.print(f"  - Writes: {result['writes_found']}")
+            console.print(
+                f"  - Summary sections: {summary_counts['sections_to_drop']} "
+                f"across {summary_counts['files_scanned']} file(s)"
+            )
             console.print("\n[dim]Run without --dry-run to actually delete[/dim]")
         else:
-            console.print(f"[green]✓ Removed threads before {cutoff_date}:[/green]")
+            console.print(f"[green]✓ Removed data before {cutoff_date}:[/green]")
             console.print(f"  - Threads deleted: {result['threads_deleted']}")
             console.print(f"  - Checkpoints deleted: {result['checkpoints_deleted']}")
             if result.get("writes_deleted", 0) > 0:
                 console.print(f"  - Writes deleted: {result['writes_deleted']}")
+            console.print(
+                f"  - Summary files deleted: {summary_counts['files_deleted']}; "
+                f"rewritten: {summary_counts['files_rewritten']} "
+                f"({summary_counts['sections_deleted']} sections dropped)"
+            )
 
         return 0
 
     except Exception as e:
         console.print(f"[red]Error:[/red] {e}")
         return 1
+
+
+
+async def list_summaries_command(agent_name: str | None, fmt: str) -> int:
+    """Handle --list-summaries command.
+
+    Walks the per-agent summaries directory and prints one row per
+    offloaded thread. Offline, read-only, no RPyC, no running-agent
+    dependency.
+
+    Args:
+        agent_name: Filter to a single agent, or ``None`` for all agents.
+        fmt: ``"text"`` (default human table) or ``"json"``.
+
+    Returns:
+        Exit code (always 0 unless something truly exceptional happens).
+    """
+    import json as _json
+    from deep_worker_cli.summaries import iter_summary_files
+    from deep_worker_cli.config import console
+
+    rows = list(iter_summary_files(agent_name=agent_name))
+
+    if fmt == "json":
+        payload = [
+            {
+                "agent": r.agent,
+                "thread": r.thread,
+                "path": str(r.path),
+                "events": r.events,
+                "latest_ts": r.latest_ts,
+                "size": r.size,
+            }
+            for r in rows
+        ]
+        print(_json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+
+    # Text format
+    if not rows:
+        scope = f" for agent '{agent_name}'" if agent_name else ""
+        console.print(f"[yellow]No summaries found{scope}.[/yellow]")
+        return 0
+
+    title = (
+        f"Offloaded summaries for '{agent_name}' ({len(rows)} file(s))"
+        if agent_name
+        else f"Offloaded summaries ({len(rows)} file(s))"
+    )
+    console.print(f"\n{title}")
+    console.print("=" * 78)
+    # Header
+    console.print(
+        f"{'Agent':<18} {'Thread':<28} {'Events':>6}  "
+        f"{'Latest':<26} {'Size':>8}"
+    )
+    console.print("-" * 78)
+    for r in rows:
+        latest = r.latest_ts or "(no headers)"
+        if len(latest) > 26:
+            latest = latest[:25] + "…"
+        size_h = _human_size(r.size)
+        console.print(
+            f"{r.agent:<18.18} {r.thread:<28.28} {r.events:>6}  "
+            f"{latest:<26.26} {size_h:>8}"
+        )
+    console.print("=" * 78)
+    console.print("[dim]Files live in the per-agent summaries directory.[/dim]")
+    return 0
+
+
+def _human_size(n: int) -> str:
+    """Format a byte count as a short human-readable string."""
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            if unit == "B":
+                return f"{n}{unit}"
+            return f"{n:.1f}{unit}"
+        n //= 1024
+    return f"{n}GB"
 
 
 def main() -> int:
@@ -762,7 +1104,22 @@ def main() -> int:
 
     # Handle --remove-before option
     if args.remove_before:
-        return asyncio.run(remove_before_command(args.remove_before, args.dry_run))
+        return asyncio.run(
+            remove_before_command(
+                args.remove_before,
+                args.dry_run,
+                force=getattr(args, "force", False),
+            )
+        )
+
+    # Handle --list-summaries option (mutually exclusive with running agent)
+    if getattr(args, "list_summaries", False):
+        if args.name:
+            print("Error: Cannot specify agent name with --list-summaries (use --agent NAME instead)", file=sys.stderr)
+            return 2
+        return asyncio.run(
+            list_summaries_command(agent_name=args.agent, fmt=args.format)
+        )
 
     # Require agent name for all other operations
     if not args.name:
@@ -915,7 +1272,7 @@ def main() -> int:
     daemonize(args.name)
 
     # --- Post-daemonize (grandchild only) -------------------------------
-    # Output goes to ~/.deep_worker/logs/<name>.{out,err}.log from here on.
+    # Output goes to the agent's log files (<name>.{out,err}.log) from here on.
 
     if args.clean:
         # Database cleanup is the slow part (can wait up to 30s on SQLite

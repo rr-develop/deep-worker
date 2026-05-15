@@ -34,27 +34,35 @@ class TestStreamEndToEnd:
         async def notify_callback(msg: dict[str, Any]) -> None:
             notifications.append(msg)
 
-        # Simulate streaming messages
+        # Simulate streaming messages. NOTE: text blocks are BATCHED
+        # into a single buffer per-callback and flushed either when
+        # the buffer fills or when a non-text block (tool_call, tool
+        # result, etc.) arrives — see `_add_text_to_buffer` +
+        # `_flush_text_buffer` in stream_processor.py. So two
+        # consecutive text chunks followed by a tool_call produce
+        # ONE concatenated assistant_chunk, not two.
 
         # 1. Text chunk
         ai_msg_1 = Mock(spec=AIMessage)
         ai_msg_1.content_blocks = [{"type": "text", "text": "Let me read "}]
+        ai_msg_1.usage_metadata = None
         await process_message_chunk(
             message=ai_msg_1,
             metadata={},
             notify_callback=notify_callback,
         )
 
-        # 2. Another text chunk
+        # 2. Another text chunk (buffered with #1)
         ai_msg_2 = Mock(spec=AIMessage)
         ai_msg_2.content_blocks = [{"type": "text", "text": "the file."}]
+        ai_msg_2.usage_metadata = None
         await process_message_chunk(
             message=ai_msg_2,
             metadata={},
             notify_callback=notify_callback,
         )
 
-        # 3. Tool call
+        # 3. Tool call — triggers buffer flush.
         ai_msg_3 = Mock(spec=AIMessage)
         ai_msg_3.content_blocks = [
             {
@@ -64,6 +72,7 @@ class TestStreamEndToEnd:
                 "id": "call_abc",
             }
         ]
+        ai_msg_3.usage_metadata = None
         await process_message_chunk(
             message=ai_msg_3,
             metadata={},
@@ -83,31 +92,22 @@ class TestStreamEndToEnd:
             notify_callback=notify_callback,
         )
 
-        # Verify notifications
-        assert len(notifications) == 4
+        # Exactly 3 notifications: concatenated assistant text, tool
+        # call, tool result.
+        assert len(notifications) == 3, notifications
 
-        # Verify text chunks
         assert notifications[0] == {
             "type": "assistant_chunk",
             "role": "assistant",
-            "content": "Let me read ",
+            "content": "Let me read the file.",
         }
         assert notifications[1] == {
-            "type": "assistant_chunk",
-            "role": "assistant",
-            "content": "the file.",
-        }
-
-        # Verify tool call
-        assert notifications[2] == {
             "type": "tool_call",
             "name": "read_file",
             "args": {"path": "test.txt"},
             "id": "call_abc",
         }
-
-        # Verify tool result
-        assert notifications[3] == {
+        assert notifications[2] == {
             "type": "tool_result",
             "tool_call_id": "call_abc",
             "content": "File content here",
@@ -218,6 +218,7 @@ class TestStreamEndToEnd:
 
         # Simulate streaming tool call in 3 chunks
         chunk1 = Mock()
+        chunk1.usage_metadata = None
         chunk1.content_blocks = [
             {
                 "type": "tool_call_chunk",
@@ -229,6 +230,7 @@ class TestStreamEndToEnd:
         ]
 
         chunk2 = Mock()
+        chunk2.usage_metadata = None
         chunk2.content_blocks = [
             {
                 "type": "tool_call_chunk",
@@ -240,6 +242,7 @@ class TestStreamEndToEnd:
         ]
 
         chunk3 = Mock()
+        chunk3.usage_metadata = None
         chunk3.content_blocks = [
             {
                 "type": "tool_call_chunk",

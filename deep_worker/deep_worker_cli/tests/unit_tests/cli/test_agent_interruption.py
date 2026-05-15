@@ -19,30 +19,31 @@ class TestAgentInterruption:
 
     @pytest.mark.asyncio
     async def test_escape_key_interrupts_agent(self):
-        """Test Escape key sends interrupt to agent."""
+        """Test Escape key sends interrupt to agent.
+
+        Interactive now uses `await self._rpyc_root.interrupt_agent()`
+        which returns a JSON-encoded string (see interactive.py ~line
+        1588). We mock the `interrupt_agent` netref method directly.
+        """
+        import json as _json
+
         app = InteractiveApp(agent_name="test-agent")
 
         async with app.run_test() as pilot:
-            # Mock RPyC session
-            mock_session = MagicMock()
-            mock_session.async_call = AsyncMock(return_value={
-                "success": True,
-                "message": "Agent interrupted"
-            })
-
-            app.rpyc_session = mock_session
-            app._connected = True
+            # Mock the RPyC root object used by _interrupt_agent.
+            mock_root = MagicMock()
+            mock_root.interrupt_agent = AsyncMock(
+                return_value=_json.dumps(
+                    {"success": True, "message": "Agent interrupted"}
+                )
+            )
+            app._rpyc_root = mock_root
 
             # Trigger escape action
             app.action_interrupt()
-
-            # Wait for async interrupt call
             await pilot.pause()
 
-            # Should call interrupt_agent via RPyC
-            mock_session.async_call.assert_called()
-            call_args = str(mock_session.async_call.call_args)
-            assert "interrupt_agent" in call_args
+            mock_root.interrupt_agent.assert_called()
 
     @pytest.mark.asyncio
     async def test_interrupt_updates_status(self):
@@ -114,25 +115,25 @@ class TestAgentInterruption:
     @pytest.mark.asyncio
     async def test_ctrl_c_interrupts_agent(self):
         """Test Ctrl+C interrupts agent when running."""
+        import json as _json
+
         app = InteractiveApp(agent_name="test-agent")
 
         async with app.run_test() as pilot:
-            # Mock RPyC session
-            mock_session = MagicMock()
-            mock_session.async_call = AsyncMock(return_value={
-                "success": True,
-                "message": "Agent interrupted"
-            })
-
-            app.rpyc_session = mock_session
-            app._connected = True
+            mock_root = MagicMock()
+            mock_root.interrupt_agent = AsyncMock(
+                return_value=_json.dumps(
+                    {"success": True, "message": "Agent interrupted"}
+                )
+            )
+            app._rpyc_root = mock_root
 
             # Trigger Ctrl+C action
             app.action_quit_or_interrupt()
             await pilot.pause()
 
             # Should call interrupt (not quit)
-            mock_session.async_call.assert_called()
+            mock_root.interrupt_agent.assert_called()
 
     @pytest.mark.asyncio
     async def test_interrupt_hides_spinner(self):
@@ -203,7 +204,12 @@ class TestInterruptRPyCService:
 
     @pytest.mark.asyncio
     async def test_exposed_interrupt_agent_method(self):
-        """Test that RPyC service has exposed_interrupt_agent method."""
+        """Test that RPyC service has exposed_interrupt_agent method.
+
+        The method is `async def` and returns a JSON-encoded string —
+        the client must `await` and then `json.loads` the reply.
+        """
+        import json
         from deep_worker_cli.rpyc_service.agent_service import AgentService
 
         service = AgentService()
@@ -216,8 +222,8 @@ class TestInterruptRPyCService:
         mock_agent.is_running = False
         service._agent_process = mock_agent
 
-        # Call when not running
-        response = service.exposed_interrupt_agent()
+        # Call when not running — async def returning JSON string
+        response = json.loads(await service.exposed_interrupt_agent())
 
         assert response["success"] is False
         assert "No agent execution" in response["message"]
@@ -258,8 +264,9 @@ class TestInterruptRPyCService:
 
         service._notify_subscribers = mock_notify
 
-        # Call interrupt
-        response = service.exposed_interrupt_agent()
+        # Call interrupt — async def returning JSON string
+        import json
+        response = json.loads(await service.exposed_interrupt_agent())
 
         # Should return success
         assert response["success"] is True

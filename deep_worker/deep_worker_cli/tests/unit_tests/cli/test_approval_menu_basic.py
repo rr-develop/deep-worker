@@ -102,20 +102,24 @@ class TestAutoApproveBasic:
 
     @pytest.mark.asyncio
     async def test_auto_approve_skips_menu(self):
-        """Test auto-approve mode skips showing menu."""
+        """Test auto-approve mode skips showing menu.
+
+        The current code path uses `await self._rpyc_root.respond_to_approval(
+        approval_id, decision)` which returns a JSON string (see
+        interactive.py ~line 1502). We mock that netref method directly.
+        """
+        import json as _json
+
         app = InteractiveApp(agent_name="test-agent")
 
         async with app.run_test() as pilot:
-            # Enable auto-approve
             app._auto_approve = True
 
-            # Mock RPyC session
-            mock_session = MagicMock()
-            mock_session.async_call = AsyncMock(return_value={
-                "success": True
-            })
-            app.rpyc_session = mock_session
-            app._connected = True
+            mock_root = MagicMock()
+            mock_root.respond_to_approval = AsyncMock(
+                return_value=_json.dumps({"success": True})
+            )
+            app._rpyc_root = mock_root
 
             # Simulate approval request
             await app._handle_realtime_message({
@@ -127,7 +131,7 @@ class TestAutoApproveBasic:
             # Should NOT show menu (auto-approved)
             assert app._pending_approval_widget is None
 
-            # Should have sent approval via RPyC
-            mock_session.async_call.assert_called()
-            call_args = str(mock_session.async_call.call_args)
-            assert "respond_to_approval" in call_args or "test_auto" in call_args
+            # Should have sent approval via RPyC — with the approval_id.
+            mock_root.respond_to_approval.assert_awaited()
+            call_args = mock_root.respond_to_approval.await_args
+            assert call_args.args[0] == "test_auto"

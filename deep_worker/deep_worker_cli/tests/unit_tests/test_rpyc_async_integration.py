@@ -1,25 +1,31 @@
-"""Test rpyc_async integration.
+"""Test rpyc_async source integration.
 
-This module verifies that the installed rpyc distribution is the rpyc_async
-fork (published on PyPI as ``rpyc-async``), which provides AsyncioServer,
-enable_asyncio_serving and the async callbacks used throughout deep_worker.
+This module verifies that rpyc is correctly imported from the local
+rpyc_async source tree and has all required AsyncioServer features.
 """
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
 import pytest
 
-def test_rpyc_distribution_is_rpyc_async():
-    """The installed rpyc must come from the rpyc-async distribution."""
-    from importlib.metadata import PackageNotFoundError, distribution
+def test_rpyc_imports_from_correct_location():
+    """Test that rpyc is imported from the local rpyc_async source tree."""
+    import rpyc
 
+    rpyc_path = Path(rpyc.__file__).resolve()
+    expected_base = Path("rpyc_async")
+
+    # Check if rpyc is from expected location
     try:
-        distribution("rpyc-async")
-    except PackageNotFoundError:
+        rpyc_path.relative_to(expected_base)
+    except ValueError:
         pytest.fail(
-            "rpyc-async distribution not installed. deep_worker requires the "
-            "AsyncioServer-capable rpyc fork; add rpyc-async>=1.0.0 to your "
-            "environment."
+            f"rpyc imported from wrong location!\n"
+            f"Expected base: {expected_base}\n"
+            f"Actual: {rpyc_path}"
         )
 
 def test_asyncio_server_available():
@@ -75,6 +81,7 @@ def test_asyncresult_awaitable():
 async def test_basic_asyncio_server_can_start():
     """Test that AsyncioServer can be instantiated and started."""
     import rpyc
+    from rpyc.core.async_connect import async_connect
     from rpyc.utils.async_server import AsyncioServer
 
     class TestService(rpyc.Service):
@@ -94,87 +101,153 @@ async def test_basic_asyncio_server_can_start():
     # Close server
     await server.close()
 
-@pytest.mark.asyncio
-async def test_native_rpyc_connection_with_asyncio():
-    """Test native rpyc connection with enable_asyncio_serving."""
-    import asyncio
+import asyncio as _asyncio_top  # noqa: E402
+import contextlib  # noqa: E402
+import multiprocessing  # noqa: E402
+import socket as _socket_top  # noqa: E402
+from collections.abc import Iterator  # noqa: E402
+from typing import Any, Callable  # noqa: E402
 
-    import rpyc
-    from rpyc.utils.async_server import AsyncioServer
+import rpyc  # noqa: E402
 
-    class TestService(rpyc.Service):
-        async def exposed_test_method(self):
-            await asyncio.sleep(0.01)
-            return "test_response"
+def _get_free_port() -> int:
+    s = _socket_top.socket(_socket_top.AF_INET, _socket_top.SOCK_STREAM)
+    s.bind(("127.0.0.1", 0))
+    p = s.getsockname()[1]
+    s.close()
+    return p
 
-    # Start server
-    server = AsyncioServer(TestService, port=0)
-    await server.start()
-    port = server.listener.getsockname()[1]
+def _mp_server_entrypoint(
+    service_factory: Callable[[], Any],
+    port: int,
+    ready_queue: Any,
+) -> None:
+    """Entry point for a child-process AsyncioServer."""
+    import sys as _sys
+    _rpyc_async = "rpyc_async"
+    if _rpyc_async not in _sys.path:
+        _sys.path.insert(0, _rpyc_async)
+
+    import rpyc as _rpyc_child  # noqa: F401
+    from rpyc.utils.async_server import AsyncioServer as _AsyncioServer
+
+    async def _main() -> None:
+        server = _AsyncioServer(
+            service_factory(), hostname="127.0.0.1", port=port
+        )
+        await server.start()
+        ready_queue.put("ready")
+        try:
+            await _asyncio_top.Event().wait()
+        except _asyncio_top.CancelledError:
+            pass
+        finally:
+            await server.close()
 
     try:
-        # Connect client
-        conn = rpyc.connect("localhost", port, config={"allow_all_attrs": True})
+        _asyncio_top.run(_main())
+    except KeyboardInterrupt:
+        pass
 
+@contextlib.contextmanager
+def _mp_asyncio_server(
+    service_factory: Callable[[], Any],
+    *,
+    ready_timeout: float = 5.0,
+) -> Iterator[int]:
+    """Start `AsyncioServer(service_factory())` in a child process.
+
+    Local copy of `tests/support.py::mp_asyncio_server` from
+    the rpyc_async source tree. The same-process server+client topology is
+    forbidden (`docs/DESIGN_NO_SAME_PROCESS_TESTS.md`).
+    """
+    port = _get_free_port()
+    ready_queue: Any = multiprocessing.Queue()
+    proc = multiprocessing.Process(
+        target=_mp_server_entrypoint,
+        args=(service_factory, port, ready_queue),
+        daemon=True,
+    )
+    proc.start()
+    try:
         try:
-            # Get root BEFORE enabling asyncio serving (sync call)
-            root = conn.root
+            signal = ready_queue.get(timeout=ready_timeout)
+        except Exception as exc:
+            raise RuntimeError(
+                f"AsyncioServer child failed to report ready within "
+                f"{ready_timeout}s: {exc!r}"
+            ) from exc
+        if signal != "ready":
+            raise RuntimeError(f"unexpected signal: {signal!r}")
+        yield port
+    finally:
+        if proc.is_alive():
+            proc.terminate()
+            proc.join(timeout=2.0)
+            if proc.is_alive():
+                proc.kill()
+                proc.join(timeout=1.0)
 
-            # Now enable asyncio serving (CRITICAL!)
-            loop = asyncio.get_running_loop()
-            conn.enable_asyncio_serving(loop=loop)
+class _AsyncEchoService(rpyc.Service):
+    """Tiny async service for the round-trip test. Must live at module
+    scope so `multiprocessing` can pickle it."""
 
-            # Make async call
-            result = await root.test_method()
+    async def exposed_test_method(self):
+        import asyncio as _asyncio
+        await _asyncio.sleep(0.01)
+        return "test_response"
+
+class _CallbackService(rpyc.Service):
+    """Service that invokes a client-provided async callback. Must live
+    at module scope for pickling by `multiprocessing`."""
+
+    async def exposed_call_with_callback(self, callback, value):
+        # Server calls client async callback
+        result = await callback(value * 2)
+        return result + 100
+
+@pytest.mark.asyncio
+async def test_native_rpyc_connection_with_asyncio():
+    """Test native rpyc connection round-trips an `async def exposed_*`.
+
+    Runs the server in a child process per
+    `docs/DESIGN_NO_SAME_PROCESS_TESTS.md` — AsyncioServer + client in
+    one process is forbidden (would deadlock on the shared event
+    loop).
+    """
+    from rpyc.core.async_connect import async_connect
+    with _mp_asyncio_server(_AsyncEchoService) as port:
+        conn = await async_connect(
+            "127.0.0.1", port, config={"allow_all_attrs": True}
+        )
+        try:
+            result = await conn.root.test_method()
             assert result == "test_response"
         finally:
-            conn.disable_asyncio_serving()
-            conn.close()
-    finally:
-        await server.close()
+            await conn.aclose()
 
 @pytest.mark.asyncio
 async def test_bidirectional_async_callbacks():
-    """Test that bidirectional async callbacks work (no deadlock)."""
+    """Server calls a client-provided async callback — must not deadlock.
+
+    Runs the server in a child process; the bidirectional-recursion
+    fix (commit fe14779 in rpyc_async) guarantees no self-deadlock
+    under this pattern.
+    """
     import asyncio
+    from rpyc.core.async_connect import async_connect
 
-    import rpyc
-    from rpyc.utils.async_server import AsyncioServer
-
-    class ServerService(rpyc.Service):
-        async def exposed_call_with_callback(self, callback, value):
-            # Server calls client async callback
-            result = await callback(value * 2)
-            return result + 100
-
-    # Start server
-    server = AsyncioServer(ServerService, port=0)
-    await server.start()
-    port = server.listener.getsockname()[1]
-
-    try:
-        # Connect client
-        conn = rpyc.connect("localhost", port, config={"allow_all_attrs": True})
-
+    with _mp_asyncio_server(_CallbackService) as port:
+        conn = await async_connect(
+            "127.0.0.1", port, config={"allow_all_attrs": True}
+        )
         try:
-            # Get root BEFORE enabling asyncio serving
-            root = conn.root
-
-            # Enable asyncio serving
-            loop = asyncio.get_running_loop()
-            conn.enable_asyncio_serving(loop=loop)
-
-            # Define client async callback
             async def client_callback(value):
                 await asyncio.sleep(0.01)
                 return value + 10
 
-            # Server calls client callback - should NOT deadlock!
-            result = await root.call_with_callback(client_callback, 5)
             # 5 * 2 = 10, 10 + 10 = 20, 20 + 100 = 120
+            result = await conn.root.call_with_callback(client_callback, 5)
             assert result == 120
         finally:
-            conn.disable_asyncio_serving()
-            conn.close()
-    finally:
-        await server.close()
+            await conn.aclose()

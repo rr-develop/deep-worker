@@ -18,10 +18,22 @@ class TestSettingsDefaults:
         settings = Settings()
         assert settings.port == 7887
 
-    def test_default_debug_is_true(self) -> None:
-        """Test that debug mode is enabled by default."""
+    def test_default_debug_is_false(self) -> None:
+        """Default ``debug`` must be False.
+
+        Rationale: ``debug=True`` flips uvicorn to DEBUG log level,
+        and uvicorn at DEBUG emits a record per ASGI / WS keepalive
+        event. On a long-lived process with stuck CLOSE-WAIT sockets
+        that translates to ~2700 ``logger.formatTime`` calls/sec, which
+        fragments the glibc heap until RSS is in the multi-GB range
+        even though no Python objects are leaking. See the analysis of the
+        earlier debug-log-storm incident.
+        """
         settings = Settings()
-        assert settings.debug is True
+        assert settings.debug is False, (
+            "debug must default to False — DEBUG logging causes the log-storm "
+            "described in the earlier debug-log-storm incident analysis"
+        )
 
 
 class TestSecurityValidation:
@@ -50,14 +62,19 @@ class TestSecurityValidation:
         with pytest.raises(ValueError, match="SECURITY ERROR: Host must be 127.0.0.1 only"):
             settings.validate_security()
 
-    def test_validate_security_fails_with_wrong_port(self) -> None:
-        """Test that security validation fails with non-7887 port."""
-        settings = Settings(host="127.0.0.1", port=8000)
-        with pytest.raises(ValueError, match="SECURITY ERROR: Port must be 7887 only"):
-            settings.validate_security()
+    def test_validate_security_accepts_a_configured_port(self) -> None:
+        """A port set via DEEP_WORKER_WEB_PORT is accepted.
 
+        Each checkout binds to one port so several checkouts can run side
+        by side; which port that is, is configuration, not a constant.
+        """
+        settings = Settings(host="127.0.0.1", port=8000)
+        assert settings.validate_security() is True
+
+    def test_validate_security_fails_with_privileged_port(self) -> None:
+        """Ports below 1024 need root to bind and are refused."""
         settings = Settings(host="127.0.0.1", port=80)
-        with pytest.raises(ValueError, match="SECURITY ERROR: Port must be 7887 only"):
+        with pytest.raises(ValueError, match="outside the unprivileged range"):
             settings.validate_security()
 
     def test_validate_security_error_messages_are_informative(self) -> None:

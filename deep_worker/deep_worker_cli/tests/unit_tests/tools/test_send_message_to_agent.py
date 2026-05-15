@@ -10,8 +10,9 @@ Architectural invariants verified here:
    forge it.
 
 2. The delivered message has the exact shape:
-       agent:<sender>:> <message>
-   Example for sender="test_1", message="2+2":  "agent:test_1:> 2+2"
+       <sender> -> <receiver> :> <message>
+   Example for sender="test_1", receiver="test_2", message="2+2":
+       "test_1 -> test_2 :> 2+2"
 
 3. Failures (agent not found, connection errors, validation errors) are
    returned as structured dicts with a non-raising contract — the LLM can
@@ -106,12 +107,13 @@ class TestFactory:
 
 
 class TestMessagePrefixing:
-    """Verify agent:<sender>:> <message> is constructed correctly."""
+    """Verify "<sender> -> <receiver> :> <message>" is constructed correctly."""
 
-    async def test_message_prefixed_with_sender_name(
+    async def test_message_prefixed_with_sender_and_receiver(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Sender='test_1', message='2+2' -> delivered='agent:test_1:> 2+2'."""
+        """Sender='test_1', receiver='test_2', message='2+2'
+        -> delivered='test_1 -> test_2 :> 2+2'."""
         tool = make_send_message_to_agent_tool("test_1")
 
         delivered: dict[str, Any] = {}
@@ -123,12 +125,12 @@ class TestMessagePrefixing:
             async def connect(self) -> None:
                 return None
 
-            async def invoke_agent(
-                self, message: str, stream: bool = False
+            async def _send_command(
+                self, command: dict[str, Any]
             ) -> dict[str, Any]:
-                delivered["message"] = message
-                delivered["stream"] = stream
-                return {"success": True}
+                delivered["command"] = command.get("command")
+                delivered["message"] = command.get("message")
+                return {"success": True, "delivered_content": command.get("message")}
 
             async def disconnect(self) -> None:
                 return None
@@ -141,9 +143,10 @@ class TestMessagePrefixing:
 
         assert result["success"] is True
         assert result["target_agent"] == "test_2"
-        assert result["delivered_content"] == "agent:test_1:> 2+2"
+        assert result["delivered_content"] == "test_1 -> test_2 :> 2+2"
         assert delivered["target"] == "test_2"
-        assert delivered["message"] == "agent:test_1:> 2+2"
+        assert delivered["command"] == "enqueue_message"
+        assert delivered["message"] == "test_1 -> test_2 :> 2+2"
 
     async def test_message_fidelity_preserved(
         self, monkeypatch: pytest.MonkeyPatch
@@ -162,11 +165,11 @@ class TestMessagePrefixing:
             async def connect(self) -> None:
                 return None
 
-            async def invoke_agent(
-                self, message: str, stream: bool = False  # noqa: ARG002
+            async def _send_command(
+                self, command: dict[str, Any]
             ) -> dict[str, Any]:
-                captured["message"] = message
-                return {"success": True}
+                captured["message"] = command.get("message")
+                return {"success": True, "delivered_content": command.get("message")}
 
             async def disconnect(self) -> None:
                 return None
@@ -177,7 +180,7 @@ class TestMessagePrefixing:
 
         raw = "  line1\n\nline2 with spaces  "
         await _ainvoke(tool, agent_name="beta", message=raw)
-        assert captured["message"] == f"agent:alpha:> {raw}"
+        assert captured["message"] == f"alpha -> beta :> {raw}"
 
     async def test_factory_bakes_sender_closure(
         self, monkeypatch: pytest.MonkeyPatch
@@ -196,11 +199,11 @@ class TestMessagePrefixing:
             async def connect(self) -> None:
                 return None
 
-            async def invoke_agent(
-                self, message: str, stream: bool = False  # noqa: ARG002
+            async def _send_command(
+                self, command: dict[str, Any]
             ) -> dict[str, Any]:
-                captured_msgs.append(message)
-                return {"success": True}
+                captured_msgs.append(command.get("message", ""))
+                return {"success": True, "delivered_content": command.get("message")}
 
             async def disconnect(self) -> None:
                 return None
@@ -212,8 +215,8 @@ class TestMessagePrefixing:
         await _ainvoke(tool_a, agent_name="gamma", message="hi")
         await _ainvoke(tool_b, agent_name="gamma", message="hi")
 
-        assert captured_msgs[0] == "agent:alpha:> hi"
-        assert captured_msgs[1] == "agent:beta:> hi"
+        assert captured_msgs[0] == "alpha -> gamma :> hi"
+        assert captured_msgs[1] == "beta -> gamma :> hi"
 
 
 # ===========================================================================
@@ -273,10 +276,10 @@ class TestConnectivityErrors:
             async def connect(self) -> None:
                 raise AgentNotFoundError("Agent 'ghost' not found")
 
-            async def invoke_agent(
-                self, message: str, stream: bool = False
+            async def _send_command(
+                self, command: dict[str, Any]
             ) -> dict[str, Any]:  # pragma: no cover - never reached
-                return {"success": True}
+                return {"success": True, "delivered_content": command.get("message")}
 
             async def disconnect(self) -> None:
                 return None
@@ -306,10 +309,10 @@ class TestConnectivityErrors:
             async def connect(self) -> None:
                 raise IPCConnectionError("connection refused")
 
-            async def invoke_agent(
-                self, message: str, stream: bool = False
+            async def _send_command(
+                self, command: dict[str, Any]
             ) -> dict[str, Any]:  # pragma: no cover - never reached
-                return {"success": True}
+                return {"success": True, "delivered_content": command.get("message")}
 
             async def disconnect(self) -> None:
                 return None
@@ -336,8 +339,8 @@ class TestConnectivityErrors:
             async def connect(self) -> None:
                 return None
 
-            async def invoke_agent(
-                self, message: str, stream: bool = False  # noqa: ARG002
+            async def _send_command(
+                self, command: dict[str, Any]  # noqa: ARG002
             ) -> dict[str, Any]:
                 raise RuntimeError("boom")
 
@@ -381,18 +384,15 @@ class TestFireAndForget:
             async def connect(self) -> None:
                 call_order.append("connect")
 
-            async def invoke_agent(
-                self, message: str, stream: bool = False  # noqa: ARG002
+            async def _send_command(
+                self, command: dict[str, Any]  # noqa: ARG002
             ) -> dict[str, Any]:
-                call_order.append("invoke")
-                # Simulate agent accepting the message but producing a
-                # long reply that we must NOT wait for in this test.
+                call_order.append("enqueue")
+                # Simulate server immediately acknowledging the enqueue,
+                # WITHOUT waiting for the recipient's LLM turn.
                 return {
                     "success": True,
-                    "response": {
-                        "role": "assistant",
-                        "content": "(streaming...)",
-                    },
+                    "delivered_content": command.get("message"),
                 }
 
             async def disconnect(self) -> None:
@@ -405,7 +405,7 @@ class TestFireAndForget:
         result = await _ainvoke(tool, agent_name="beta", message="ping")
         assert result["success"] is True
         # Disconnect MUST still be called so we don't leak connections.
-        assert call_order == ["connect", "invoke", "disconnect"]
+        assert call_order == ["connect", "enqueue", "disconnect"]
         # The tool does NOT expose the target's reply content to the LLM.
         # (A separate future ask_agent tool would do that.)
         assert "response" not in result

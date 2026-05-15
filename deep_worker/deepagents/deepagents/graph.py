@@ -65,6 +65,7 @@ def create_deep_agent(
     debug: bool = False,
     name: str | None = None,
     cache: BaseCache | None = None,
+    summarization_history_prefix: str | None = None,
 ) -> CompiledStateGraph:
     """Create a deep agent.
 
@@ -149,10 +150,29 @@ def create_deep_agent(
     # Compute summarization defaults based on model profile
     summarization_defaults = _compute_summarization_defaults(model)
 
+    # Per-caller override for where SummarizationMiddleware offloads
+    # evicted conversation history. When None, the middleware's own
+    # default (`/conversation_history`) is used; callers that wire up
+    # a real on-disk directory (e.g. deep_worker_cli) pass an absolute
+    # path here so the path quoted in the synthetic summary message
+    # corresponds to an actual, human-inspectable file.
+    def _summarization_extra_kwargs() -> dict[str, Any]:
+        if summarization_history_prefix is None:
+            return {}
+        return {"history_path_prefix": summarization_history_prefix}
+
+
     backend = backend if backend is not None else (lambda rt: StateBackend(rt))
 
     # Build general-purpose subagent with default middleware stack
-    gp_middleware: list[AgentMiddleware] = [
+    # Heterogeneous middleware stack — entries specialize StateT differently
+    # (TodoListMiddleware → PlanningState, others → AgentState). Python
+    # generics are invariant, so `list[AgentMiddleware]` (which ty resolves
+    # to `list[AgentMiddleware[AgentState[Any], ...]]`) rejects the
+    # PlanningState variant. Use `list[AgentMiddleware[Any, Any, Any]]` —
+    # the element contract is still AgentMiddleware, only the state/context
+    # binding is erased at the container level.
+    gp_middleware: list[AgentMiddleware[Any, Any, Any]] = [
         TodoListMiddleware(),
         FilesystemMiddleware(backend=backend),
         SummarizationMiddleware(
@@ -162,6 +182,7 @@ def create_deep_agent(
             keep=summarization_defaults["keep"],
             trim_tokens_to_summarize=None,
             truncate_args_settings=summarization_defaults["truncate_args_settings"],
+            **_summarization_extra_kwargs(),
         ),
         AnthropicPromptCachingMiddleware(unsupported_model_behavior="ignore"),
         PatchToolCallsMiddleware(),
@@ -192,7 +213,8 @@ def create_deep_agent(
 
             # Build middleware: base stack + skills (if specified) + user's middleware
             subagent_summarization_defaults = _compute_summarization_defaults(subagent_model)
-            subagent_middleware: list[AgentMiddleware] = [
+            # See explanation above the gp_middleware declaration.
+            subagent_middleware: list[AgentMiddleware[Any, Any, Any]] = [
                 TodoListMiddleware(),
                 FilesystemMiddleware(backend=backend),
                 SummarizationMiddleware(
@@ -202,6 +224,7 @@ def create_deep_agent(
                     keep=subagent_summarization_defaults["keep"],
                     trim_tokens_to_summarize=None,
                     truncate_args_settings=subagent_summarization_defaults["truncate_args_settings"],
+                    **_summarization_extra_kwargs(),
                 ),
                 AnthropicPromptCachingMiddleware(unsupported_model_behavior="ignore"),
                 PatchToolCallsMiddleware(),
@@ -223,7 +246,8 @@ def create_deep_agent(
     all_subagents: list[SubAgent | CompiledSubAgent] = [general_purpose_spec, *processed_subagents]
 
     # Build main agent middleware stack
-    deepagent_middleware: list[AgentMiddleware] = [
+    # See explanation above the gp_middleware declaration.
+    deepagent_middleware: list[AgentMiddleware[Any, Any, Any]] = [
         TodoListMiddleware(),
     ]
     if memory is not None:
@@ -244,6 +268,7 @@ def create_deep_agent(
                 keep=summarization_defaults["keep"],
                 trim_tokens_to_summarize=None,
                 truncate_args_settings=summarization_defaults["truncate_args_settings"],
+                **_summarization_extra_kwargs(),
             ),
             AnthropicPromptCachingMiddleware(unsupported_model_behavior="ignore"),
             PatchToolCallsMiddleware(),

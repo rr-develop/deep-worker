@@ -4,7 +4,7 @@ CRITICAL REQUIREMENT: ALWAYS TEST LOCAL REPOSITORY CODE
 ========================================================
 
 This conftest.py ensures that tests ALWAYS use the local repository code
-from the deepagents directory in this repository, NOT installed packages
+from deep_worker/deepagents, NOT installed packages
 from site-packages.
 
 WHY THIS IS CRITICAL:
@@ -88,3 +88,34 @@ except ImportError:
 
 print(f"✓ Tests will use LOCAL deepagents from: {LOCAL_DEEPAGENTS}")
 print(f"✓ ProjectMemoryMiddleware available from local code")
+
+
+def pytest_collection_modifyitems(config, items):
+    """Auto-mark everything under `tests/integration/` and
+    `tests/integration_ai/` as `@pytest.mark.integration`.
+
+    The default `-m 'not integration'` filter in pyproject.toml
+    deselects those suites because they either spin up a real
+    deep-worker agent or run `AsyncioServer + rpyc client` in the
+    same process (forbidden by the rpyc-async project's own policy on
+    same-process server/client tests).
+    Running them deliberately with `pytest -m integration` or
+    pointing at the directory still works.
+    """
+    import pytest as _pytest
+    tests_dir = Path(__file__).parent.resolve()
+    integration_dirs = {
+        tests_dir / "integration",
+        tests_dir / "integration_ai",
+    }
+    marker = _pytest.mark.integration
+    for item in items:
+        item_path = Path(str(item.fspath)).resolve()
+        for d in integration_dirs:
+            try:
+                item_path.relative_to(d)
+            except ValueError:
+                continue
+            else:
+                item.add_marker(marker)
+                break

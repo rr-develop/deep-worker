@@ -11,10 +11,14 @@ Three verbosity levels are supported:
 - ``text``: every text-bearing AIMessage in the turn, in order.
 - ``full``: same as ``text`` plus interleaved compact tool-call summaries.
 
-Three sources of user-side messages — direct user input, ``TaskManager:>``
-prompts, and ``agent:<name>:>`` inter-agent messages — all produce
-first-class turns at every verbosity. Only ``summarization`` injections
-are filtered out.
+Four sources of user-side messages — direct user input, ``TaskManager:>``
+prompts, ``agent:<name>:>`` inter-agent messages, and context-compaction
+summarization injections — all produce first-class turns at every
+verbosity. Summarization turns are labelled with a dedicated
+``--- Summarization ---`` header so the reader can distinguish synthetic
+context-management events from real user input; they are NEVER dropped,
+because hiding them makes post-compaction agent behaviour unreadable
+(see ``docs/DESIGN_SUMMARIZATION_VISIBLE.md``).
 
 This module is intentionally framework-agnostic — it works on plain dicts
 and is fully synchronous, so the test suite never needs RPyC or asyncio.
@@ -36,7 +40,9 @@ _TOOL_CALL_ARGS_MAX = 200
 _AGENT_PREFIX_SCAN_WINDOW = 64
 
 # Marker substrings that identify summarization-time synthetic
-# HumanMessages (the ONLY filtered case).
+# HumanMessages (context compaction). Detection is unchanged; these
+# turns are now labelled with "--- Summarization ---" instead of being
+# filtered (see DESIGN_SUMMARIZATION_VISIBLE.md).
 _SUMMARIZATION_PREFIX = (
     "You are in the middle of a conversation that has been summarized"
 )
@@ -51,9 +57,10 @@ _SUMMARIZATION_INLINE_MARKER = "Context Extraction Assistant"
 def classify_human(content: str) -> HumanKind:
     """Classify a HumanMessage by its leading marker.
 
-    Order of checks matters; first match wins. The ``summarization`` branch
-    is the only one that triggers filtering — every other classification
-    produces a visible turn.
+    Order of checks matters; first match wins. All four kinds produce a
+    visible rendered turn — ``summarization`` is additionally labelled
+    with its own header so the reader can distinguish synthetic
+    context-compaction events from real user input.
     """
     if content.startswith("TaskManager:>"):
         return "taskmanager"
@@ -130,8 +137,10 @@ def _user_header(kind: HumanKind, content: str) -> str:
         return "--- TaskManager ---"
     if kind == "agent_echo":
         return f"--- From agent:{_agent_echo_sender(content)} ---"
-    # summarization is never rendered, but be defensive
-    return "--- (filtered) ---"
+    if kind == "summarization":
+        return "--- Summarization ---"
+    # defensive; classify_human exhaustively covers HumanKind
+    return "--- (unknown) ---"
 
 
 # ---------------------------------------------------------------------------
@@ -247,9 +256,9 @@ def render_dialog(turns: list[Turn], verbosity: str = "final") -> str:
         if not isinstance(raw, str):
             raw = str(raw)
         kind = classify_human(raw)
-        if kind == "summarization":
-            continue
-        blocks.append(_render_turn(turn, kind, verbosity))  # type: ignore[arg-type]
+        # Summarization turns are labelled, not filtered (see
+        # DESIGN_SUMMARIZATION_VISIBLE.md).
+        blocks.append(_render_turn(turn, kind, verbosity))
 
     if not blocks:
         return NO_HISTORY_TEXT

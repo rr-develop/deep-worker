@@ -75,12 +75,20 @@ class CLIShellBackend(LocalShellBackend):
     each `execute()` call.
     """
 
-    async def execute(  # type: ignore[override]
+    async def execute(  # ty: ignore[invalid-method-override]
         self,
         command: str,
         *,
         timeout: int | None = None,
     ) -> ExecuteResponse:
+        # LSP-breaking override: base `LocalShellBackend.execute` is a
+        # synchronous method without a `timeout` kwarg. This class
+        # intentionally replaces it with an async version so that shell
+        # commands don't block the rpyc event loop while the agent is
+        # serving RPC calls like `get_status`. Callers must always await
+        # this method (see middleware/shell_tool). See
+        # docs/DESIGN_ASYNC_NOTIFICATIONS.md for the refactor rationale.
+
         r"""Execute a shell command asynchronously with optional per-command timeout.
 
         CRITICAL: This method is async to prevent blocking the event loop during
@@ -397,5 +405,12 @@ def patch_filesystem_middleware() -> None:
     import deepagents.graph as graph_module
     import deepagents.middleware.filesystem as fs_module
 
-    fs_module.FilesystemMiddleware = CLIFilesystemMiddleware  # type: ignore[misc]
-    graph_module.FilesystemMiddleware = CLIFilesystemMiddleware  # type: ignore[misc]
+    # Monkey-patch: ty sees this as narrowing the module-level class
+    # reference from `FilesystemMiddleware` to `CLIFilesystemMiddleware`
+    # (a subclass). That's exactly the intent — every call to
+    # `FilesystemMiddleware(...)` in the SDK will now construct our
+    # subclass. ty flags the assignment because class slots are invariant;
+    # we suppress only this one (the whole function is documented as an
+    # intentional runtime-patch).
+    fs_module.FilesystemMiddleware = CLIFilesystemMiddleware  # ty: ignore[invalid-assignment]
+    graph_module.FilesystemMiddleware = CLIFilesystemMiddleware  # ty: ignore[invalid-assignment]

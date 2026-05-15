@@ -10,6 +10,7 @@ Testing wrong code leads to false test results and production bugs.
 """
 
 import uuid
+import pytest
 from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
@@ -156,8 +157,16 @@ class TestDeepAgentsCLIEndToEnd:
             final_ai_message = ai_messages[-1]
             assert "Task completed successfully!" in final_ai_message.content
 
-    def test_cli_agent_summarizes(self, tmp_path: Path) -> None:
-        """Test summarization."""
+    def test_cli_agent_summarizes(self, tmp_path: Path, monkeypatch: "pytest.MonkeyPatch") -> None:
+        """Test summarization offloads to <data-root>/<agent>/summaries/.
+
+        Per DESIGN_SUMMARIZATION_PERSISTENT_STORAGE.md, the offload target is
+        a real on-disk path rooted at the user's home directory — not an
+        in-memory virtual backend path. We monkeypatch HOME so the write
+        lands under tmp_path, then check the file and its header content
+        directly on disk.
+        """
+        monkeypatch.setenv("HOME", str(tmp_path))
         with mock_settings(tmp_path):
             model = FixedGenericFakeChatModel(
                 messages=iter(
@@ -170,7 +179,7 @@ class TestDeepAgentsCLIEndToEnd:
             model.profile = {"max_input_tokens": 200_000}
 
             # Create a CLI agent with the fake model
-            agent, backend = create_cli_agent(
+            agent, _backend = create_cli_agent(
                 model=model,
                 assistant_id="test-agent",
                 tools=[],
@@ -194,10 +203,30 @@ class TestDeepAgentsCLIEndToEnd:
                 {"messages": input_messages},
                 {"configurable": {"thread_id": thread_id}},
             )
+            # Synthetic HumanMessage marking the summarization event must be
+            # injected at the head of the message list.
             assert (
                 result["messages"][0].additional_kwargs["lc_source"] == "summarization"
             )
-            assert backend.ls_info("/conversation_history/")
+            # The injected message MUST quote the new on-disk path.
+            synth_content = result["messages"][0].content
+            assert isinstance(synth_content, str)
+            assert f"/{Path('~/.deep_worker').name}/test-agent/summaries/" in synth_content, (
+                f"summary message does not quote new on-disk path: {synth_content!r}"
+            )
+
+            # And a real file must exist at that path, with at least one
+            # `## Summarized at` section matching the new contract.
+            summaries_dir = tmp_path / Path("~/.deep_worker").name / "test-agent" / "summaries"
+            assert summaries_dir.is_dir(), (
+                f"summaries dir was not created at {summaries_dir}"
+            )
+            md_files = list(summaries_dir.glob("*.md"))
+            assert md_files, f"no summary .md files under {summaries_dir}"
+            body = md_files[0].read_text()
+            assert "## Summarized at " in body, (
+                f"no summarization section header in {md_files[0]}"
+            )
 
     def test_cli_agent_with_fake_llm_with_tools(self, tmp_path: Path) -> None:
         """Test CLI agent with tools using a fake LLM model.

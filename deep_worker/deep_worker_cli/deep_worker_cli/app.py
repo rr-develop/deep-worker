@@ -384,6 +384,7 @@ class DeepAgentsApp(App):
         self._session_state: TextualSessionState | None = None
         self._ui_adapter: TextualUIAdapter | None = None
         self._pending_approval_widget: Any = None
+        self._approval_complete_event: asyncio.Event | None = None
         # Agent task tracking for interruption
         self._agent_worker: Worker[None] | None = None
         self._agent_running = False
@@ -729,9 +730,12 @@ class DeepAgentsApp(App):
                 return result_future
 
         # If there's already a pending approval, wait for it to complete first
+        # EVENT DRIVEN, NO POLLING
         if self._pending_approval_widget is not None:
-            while self._pending_approval_widget is not None:
-                await asyncio.sleep(0.1)
+            if self._approval_complete_event is None:
+                self._approval_complete_event = asyncio.Event()
+            await self._approval_complete_event.wait()
+            self._approval_complete_event = None
 
         # Create menu with unique ID to avoid conflicts
         unique_id = f"approval-menu-{uuid.uuid4().hex[:8]}"
@@ -755,6 +759,10 @@ class DeepAgentsApp(App):
                 unique_id,
             )
             self._pending_approval_widget = None
+            # Signal that approval is complete (EVENT DRIVEN, NO POLLING)
+            if self._approval_complete_event is not None:
+                self._approval_complete_event.set()
+                self._approval_complete_event = None
             if not result_future.done():
                 result_future.set_exception(e)
 
@@ -807,6 +815,10 @@ class DeepAgentsApp(App):
         if self._pending_approval_widget:
             await self._pending_approval_widget.remove()
             self._pending_approval_widget = None
+            # Signal that approval is complete (EVENT DRIVEN, NO POLLING)
+            if self._approval_complete_event is not None:
+                self._approval_complete_event.set()
+                self._approval_complete_event = None
 
         # Refocus the chat input
         if self._chat_input:

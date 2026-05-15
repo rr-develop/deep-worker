@@ -21,8 +21,21 @@ _pkg_path = Path(__file__).parent.parent.parent.parent.parent / "semantic_search
 if _pkg_path.exists() and str(_pkg_path) not in sys.path:
     sys.path.insert(0, str(_pkg_path))
 
-from semantic_search.exceptions import IndexNotFoundError  # noqa: E402
-from semantic_search.retriever import search  # noqa: E402
+# Lazy import — heavy dependencies (llama_index, torch, lancedb)
+# are loaded only on the FIRST real call to project_memory.
+_semantic_search = None  # (search_func, IndexNotFoundError)
+
+
+def _ensure_semantic_search() -> tuple[Any, type[Exception]]:
+    """One-time lazy import of semantic_search."""
+    global _semantic_search
+    if _semantic_search is None:
+        # noqa — function-level import, ordering is safe
+        from semantic_search.exceptions import IndexNotFoundError  # noqa: E402
+        from semantic_search.retriever import search  # noqa: E402
+
+        _semantic_search = (search, IndexNotFoundError)
+    return _semantic_search
 
 
 @tool
@@ -86,10 +99,14 @@ def project_memory(
     if not 1 <= top_k <= 20:
         return "Error: top_k must be between 1 and 20"
 
-    # Execute search
+    # Execute search (lazy import — dependencies loaded only on first call)
     try:
-        results = search(query, repo_path=resolved_dir, top_k=top_k)
-    except IndexNotFoundError:
+        _search, _IndexNotFoundError = _ensure_semantic_search()
+    except Exception as exc:  # noqa: BLE001
+        return f"Error: Failed to load semantic search: {exc}"
+    try:
+        results = _search(query, repo_path=resolved_dir, top_k=top_k)
+    except _IndexNotFoundError:
         return (
             f"Error: Project memory not available.\n"
             f"The directory '{resolved_dir}' does not have a semantic search index.\n"

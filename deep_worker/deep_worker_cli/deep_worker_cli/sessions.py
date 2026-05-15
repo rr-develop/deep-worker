@@ -6,6 +6,9 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 
+#: Relative name of the per-agent data directory inside the home dir.
+_AGENT_DATA_DIR = Path("~/.deep_worker").name  # hidden per-agent data dir
+
 import aiosqlite
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
@@ -28,8 +31,8 @@ if not hasattr(aiosqlite.Connection, "is_alive"):
 
     # Dynamically adding a method to aiosqlite.Connection at runtime.
     # Type checkers can't understand this monkey-patch, so we suppress the
-    # "attr-defined" error that would otherwise be raised.
-    aiosqlite.Connection.is_alive = _is_alive  # type: ignore[attr-defined]
+    # unresolved-attribute error that would otherwise be raised.
+    aiosqlite.Connection.is_alive = _is_alive  # ty: ignore[unresolved-attribute]
 
 
 def _format_timestamp(iso_timestamp: str | None) -> str:
@@ -156,8 +159,8 @@ async def list_threads(
 ) -> list[dict]:
     """List threads from checkpoints table.
 
-    Iterates across every ``sessions_*.db`` file in ``~/.deepagents``
-    plus the legacy global ``sessions.db`` and merges results, so offline
+    Iterates across every per-agent ``sessions_*.db`` file plus the
+    legacy global ``sessions.db`` and merges results, so offline
     threads of all agents are visible (not only those in the legacy
     global DB).
 
@@ -370,9 +373,8 @@ async def _count_messages_from_checkpoint(
 ) -> int:
     """Count messages from the most recent checkpoint blob.
 
-    With durability="exit", messages are stored in the checkpoint blob,
-    not in the writes table. This function deserializes the checkpoint
-    and counts the messages in channel_values.
+    Messages are stored in the checkpoint blob (channel_values).
+    This function deserializes the checkpoint and counts them.
 
     Args:
         conn: Database connection.
@@ -788,13 +790,13 @@ async def clean_agent_history(
     This removes:
     - All checkpoints/threads from sessions.db for this agent
     - All writes from sessions.db for this agent's threads
-    - Agent data directory (~/.deep_worker/{agent_name}/)
-    - Agent log files (~/.deep_worker/logs/{agent_name}.*)
+    - The agent's data directory
+    - The agent's log files
 
     This does NOT remove:
-    - User configuration (~/.deepagents/{agent_name}/AGENTS.md)
-    - User skills (~/.deepagents/{agent_name}/skills/)
-    - User subagents (~/.deepagents/{agent_name}/agents/)
+    - User configuration (the agent's AGENTS.md)
+    - User skills (the agent's skills directory)
+    - User subagents (the agent's subagents directory)
 
     Args:
         agent_name: Name of the agent to clean
@@ -806,14 +808,7 @@ async def clean_agent_history(
     import os
     import shutil
 
-    # Root the runtime paths under ~/.deep_worker/ (project convention);
-    # `_home_dir` is a test hook that redirects that root inside a tmpdir.
-    _RUNTIME_SUBDIR = Path("~/.deep_worker").expanduser().name
     home_dir = _home_dir if _home_dir is not None else Path.home()
-    if _home_dir is None:
-        runtime_root = Path("~/.deep_worker").expanduser()
-    else:
-        runtime_root = _home_dir / _RUNTIME_SUBDIR
 
     checkpoints_deleted = 0
     writes_deleted = 0
@@ -909,14 +904,14 @@ async def clean_agent_history(
             pass
 
     # 3. Remove agent data directory
-    data_dir = runtime_root / agent_name
+    data_dir = home_dir / _AGENT_DATA_DIR / agent_name
     data_dir_removed = False
     if data_dir.exists():
         shutil.rmtree(data_dir)
         data_dir_removed = True
 
     # 4. Remove log files
-    log_dir = runtime_root / "logs"
+    log_dir = home_dir / _AGENT_DATA_DIR / "logs"
     log_files_removed = 0
     if log_dir.exists():
         for log_file in log_dir.glob(f"{agent_name}.*"):
@@ -935,7 +930,7 @@ async def clean_agent_history(
             f"  [dim]- Removed {log_files_removed} log file(s)[/dim]"
         )
     console.print(
-        f"  [dim]- Preserved user config: ~/.deepagents/{agent_name}/[/dim]"
+        f"  [dim]- Preserved user config for agent '{agent_name}'[/dim]"
     )
 
 
@@ -1176,7 +1171,7 @@ async def get_thread_history(
                 "error": (
                     f"Thread '{thread_id}' not found: no session database "
                     f"exists (looked for sessions_<agent>.db and "
-                    f"legacy sessions.db under ~/.deepagents)."
+                    f"the legacy global sessions.db)."
                 ),
             }
         db_path = str(resolved)
@@ -1208,7 +1203,7 @@ async def get_thread_history(
                 if isinstance(msg, dict):
                     msg["timestamp"] = checkpoint_ts
                 elif hasattr(msg, "__dict__"):
-                    msg.timestamp = checkpoint_ts  # type: ignore[attr-defined]
+                    msg.timestamp = checkpoint_ts
 
             # Get checkpoint count
             async with checkpointer.conn.execute(
@@ -1246,7 +1241,7 @@ async def remove_threads_before(
     """Remove all threads older than the specified date.
 
     When ``db_path`` is not provided, the operation is applied to every
-    per-agent ``sessions_<name>.db`` file in ``~/.deepagents`` **and** the
+    per-agent ``sessions_<name>.db`` file **and** the
     legacy global ``sessions.db``.  Counts are summed across all files.
 
     Args:

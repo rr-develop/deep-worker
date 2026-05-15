@@ -1,10 +1,48 @@
 """Unit tests for AgentProcess checkpointer selection logic."""
 
+import asyncio
 import pytest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch, ANY
 from deep_worker_cli.agent_config_pkg.agent_config import AgentConfig
 from deep_worker_cli.process.agent_process import AgentProcess
+
+
+async def _run_start_until_create_cli_agent(process: AgentProcess, mock_create) -> None:
+    """Run `process.start()` in a task, wait for `create_cli_agent` to
+    be invoked (that's the point each checkpointer test actually
+    verifies), then signal shutdown so `start()` can return cleanly.
+
+    Avoids deadlocking on `await self.shutdown_event.wait()` at the
+    end of `start()` (see agent_process.py ~line 476).
+    """
+    task = asyncio.create_task(process.start())
+    # Poll the mock in a non-blocking way. We use `asyncio.sleep(0)`
+    # to yield control to `start()` without introducing a real timer.
+    # After a bounded number of yields, we consider the test failed
+    # rather than hang forever.
+    for _ in range(2000):  # ~2000 * <=1ms yields ≈ worst case 2s
+        if mock_create.called:
+            break
+        await asyncio.sleep(0.001)
+    else:
+        process.shutdown_event.set()
+        await task
+        raise AssertionError(
+            "create_cli_agent was not called within the yield budget; "
+            "something in `start()` is blocking before agent init."
+        )
+
+    # Let `start()` exit its `shutdown_event.wait()`.
+    process.shutdown_event.set()
+    try:
+        await asyncio.wait_for(task, timeout=5.0)
+    except asyncio.TimeoutError:
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
 
 
 @pytest.fixture
@@ -89,7 +127,7 @@ class TestCheckpointerSelectionLogic:
             with patch("deep_worker_cli.agent.create_cli_agent") as mock_create:
                 mock_create.return_value = (MagicMock(), MagicMock())
 
-                await process.start()
+                await _run_start_until_create_cli_agent(process, mock_create)
 
                 # Verify create_cli_agent was called with checkpointer (not None)
                 mock_create.assert_called_once()
@@ -113,7 +151,7 @@ class TestCheckpointerSelectionLogic:
         with patch("deep_worker_cli.agent.create_cli_agent") as mock_create:
             mock_create.return_value = (MagicMock(), MagicMock())
             with patch("deep_worker_cli.utils.is_running_tests", return_value=False):
-                await process.start()
+                await _run_start_until_create_cli_agent(process, mock_create)
 
                 # Verify create_cli_agent was called with checkpointer=None
                 mock_create.assert_called_once()
@@ -131,7 +169,7 @@ class TestCheckpointerSelectionLogic:
         with patch("deep_worker_cli.agent.create_cli_agent") as mock_create:
             mock_create.return_value = (MagicMock(), MagicMock())
             with patch("deep_worker_cli.utils.is_running_tests", return_value=True):
-                await process.start()
+                await _run_start_until_create_cli_agent(process, mock_create)
 
                 # Verify checkpointer is None (InMemorySaver fallback)
                 mock_create.assert_called_once()
@@ -154,7 +192,7 @@ class TestCheckpointerSelectionLogic:
             with patch("deep_worker_cli.agent.create_cli_agent") as mock_create:
                 mock_create.return_value = (MagicMock(), MagicMock())
                 with patch("deep_worker_cli.utils.is_running_tests", return_value=False):
-                    await process.start()
+                    await _run_start_until_create_cli_agent(process, mock_create)
 
                     # Verify create_cli_agent was called with checkpointer
                     mock_create.assert_called_once()
@@ -249,7 +287,7 @@ class TestPriorityLogic:
             with patch("deep_worker_cli.agent.create_cli_agent") as mock_create:
                 mock_create.return_value = (MagicMock(), MagicMock())
 
-                await process.start()
+                await _run_start_until_create_cli_agent(process, mock_create)
 
                 # Should use SQLite despite test environment
                 call_kwargs = mock_create.call_args.kwargs
@@ -268,7 +306,7 @@ class TestPriorityLogic:
             mock_create.return_value = (MagicMock(), MagicMock())
             # Test both in production and test mode
             with patch("deep_worker_cli.utils.is_running_tests", return_value=False):
-                await process.start()
+                await _run_start_until_create_cli_agent(process, mock_create)
 
                 # Should use memory despite production
                 call_kwargs = mock_create.call_args.kwargs
@@ -285,7 +323,7 @@ class TestPriorityLogic:
         with patch("deep_worker_cli.agent.create_cli_agent") as mock_create:
             mock_create.return_value = (MagicMock(), MagicMock())
             with patch("deep_worker_cli.utils.is_running_tests", return_value=True):
-                await process.start()
+                await _run_start_until_create_cli_agent(process, mock_create)
 
                 # Should use memory in test environment
                 call_kwargs = mock_create.call_args.kwargs
@@ -307,7 +345,7 @@ class TestPriorityLogic:
             with patch("deep_worker_cli.agent.create_cli_agent") as mock_create:
                 mock_create.return_value = (MagicMock(), MagicMock())
                 with patch("deep_worker_cli.utils.is_running_tests", return_value=False):
-                    await process.start()
+                    await _run_start_until_create_cli_agent(process, mock_create)
 
                     # Should use SQLite in normal production
                     call_kwargs = mock_create.call_args.kwargs

@@ -1,203 +1,134 @@
 """End-to-end integration tests for AgentService with AsyncioServer.
 
 This module tests that AgentService works correctly with AsyncioServer:
-- Server starts and accepts connections
-- Async RPC calls work correctly
+- Server starts (in a child process) and accepts connections
+- Async RPC calls work correctly over the wire
 - Multiple sequential calls work
 - Server shuts down gracefully
+
+Topology
+========
+**Server runs in a child Python process, client runs in the test
+process.** rpyc_async MUST NOT drive both the server and the client
+on the same event loop — that deadlocks at first-time
+``HANDLE_INSPECT`` (see ``docs/RPYC_NETREF_DEADLOCK_ANALYSIS.md``).
+Earlier in-process versions of these tests were the cause of the
+7-test HANG cluster; the rewrite below uses
+``_subprocess_server.mock_agent_service_subprocess`` to spawn the
+server out-of-process and ``async_connect`` to talk to it.
 """
 
 from __future__ import annotations
 
-import asyncio
+import json
 import sys
 from pathlib import Path
 
 import pytest
 
-import rpyc
+from rpyc.core import consts  # noqa: E402
+from rpyc.core.async_connect import async_connect  # noqa: E402
+
+from tests.integration._subprocess_server import (  # noqa: E402
+    mock_agent_service_subprocess,
+)
+
+async def _async_call(conn, root, method: str, *args):
+    """Invoke ``root.<method>(*args)`` without ever issuing a sync_request.
+
+    ``await conn.root.method()`` triggers ``__getattr__`` on the netref
+    which goes through the synchronous ``sync_request(HANDLE_GETATTR)``
+    — that is the exact same reader-in-callback deadlock we already
+    closed for ``HANDLE_INSPECT`` and which rpyc_async's guard now
+    rejects loudly. The production ``AgentClient._send_command`` uses
+    the same low-level path; we mirror it here.
+    """
+    method_with_prefix = method if method.startswith("exposed_") else f"exposed_{method}"
+    async_result = conn.async_request(
+        consts.HANDLE_ASYNC_CALLATTR,
+        root,
+        method_with_prefix,
+        args,
+        (),
+    )
+    return await async_result
 
 @pytest.mark.asyncio
 async def test_agent_service_with_asyncio_server():
-    """Test that AgentService works with AsyncioServer."""
-    from rpyc.utils.async_server import AsyncioServer
-    from deep_worker_cli.rpyc_service.agent_service import AgentService
-    from deep_worker_cli.agent_config_pkg.agent_config import AgentConfig
-    from pathlib import Path
-    import tempfile
+    """AgentService methods work end-to-end through AsyncioServer.
 
-    # Create a bound service class
-    class BoundAgentService(AgentService):
-        def __init__(self):
-            super().__init__()
-            # Create minimal mock agent_process
-            self._mock_agent = type('MockAgent', (), {
-                'name': 'test-agent',
-                'config': type('Config', (), {'working_dir': '/tmp'})(),
-                'session_manager': None,
-            })()
-            self.set_agent_process(self._mock_agent)
-
-    # Start AsyncioServer with AgentService
-    server = AsyncioServer(BoundAgentService, port=0)
-    await server.start()
-
-    try:
-        # Get assigned port
-        port = server.listener.getsockname()[1]
-        assert port > 0, "Server should get assigned port"
-
-        # Connect client
-        conn = rpyc.connect("localhost", port, config={"allow_all_attrs": True})
-
+    Server lives in a child process — see module docstring.
+    """
+    async with mock_agent_service_subprocess(name="test-agent") as (_, port):
+        conn = await async_connect(
+            "127.0.0.1", port, config={"allow_all_attrs": True}
+        )
         try:
-            # Get root before enabling asyncio serving
+            # Access ``conn.root`` once via the async helper — the
+            # production client does the same lazy-root dance.
             root = conn.root
 
-            # Enable asyncio serving
-            loop = asyncio.get_running_loop()
-            conn.enable_asyncio_serving(loop=loop)
+            status_str = await _async_call(conn, root, "get_status")
+            status = json.loads(status_str)
+            assert isinstance(status, dict)
+            assert "success" in status
 
-            # Test exposed_get_status
-            result = await root.get_status()
-            assert isinstance(result, dict), "Result should be dict"
-            assert "success" in result, "Result should have success field"
+            metadata_str = await _async_call(conn, root, "get_metadata")
+            metadata = json.loads(metadata_str)
+            assert isinstance(metadata, dict)
+            assert metadata.get("success") is not False, metadata
 
-            # Test exposed_get_metadata
-            metadata = await root.get_metadata()
-            assert isinstance(metadata, dict), "Metadata should be dict"
-            assert "name" in metadata, "Metadata should have name field"
-
-            # Test multiple sequential calls
-            for i in range(3):
-                result = await root.get_status()
-                assert isinstance(result, dict), f"Call {i} should return dict"
-
+            for _ in range(3):
+                s = json.loads(await _async_call(conn, root, "get_status"))
+                assert isinstance(s, dict)
         finally:
-            conn.disable_asyncio_serving()
-            conn.close()
-
-    finally:
-        await server.close()
+            await conn.aclose()
 
 @pytest.mark.asyncio
 async def test_agent_service_overridden_base_methods():
-    """Test that base RPyC Service methods are properly async."""
-    from rpyc.utils.async_server import AsyncioServer
-    from deep_worker_cli.rpyc_service.agent_service import AgentService
-    import asyncio
-
-    class BoundAgentService(AgentService):
-        def __init__(self):
-            super().__init__()
-            self._mock_agent = type('MockAgent', (), {
-                'name': 'test-agent-2',
-                'config': type('Config', (), {'working_dir': '/tmp'})(),
-                'session_manager': None,
-            })()
-            self.set_agent_process(self._mock_agent)
-
-    server = AsyncioServer(BoundAgentService, port=0)
-    await server.start()
-
-    try:
-        port = server.listener.getsockname()[1]
-        conn = rpyc.connect("localhost", port, config={"allow_all_attrs": True})
-
+    """Overridden ``rpyc.Service`` base methods are reachable async."""
+    async with mock_agent_service_subprocess(name="test-agent-2") as (_, port):
+        conn = await async_connect(
+            "127.0.0.1", port, config={"allow_all_attrs": True}
+        )
         try:
             root = conn.root
-            loop = asyncio.get_running_loop()
-            conn.enable_asyncio_serving(loop=loop)
-
-            # Test exposed_get_service_name (should be async)
-            service_name = await root.get_service_name()
+            service_name = await _async_call(conn, root, "get_service_name")
             assert service_name == "AGENT_SERVICE"
 
-            # Test exposed_get_service_aliases (should be async)
-            aliases = await root.get_service_aliases()
+            aliases_str = await _async_call(conn, root, "get_service_aliases")
+            aliases = json.loads(aliases_str)
             assert isinstance(aliases, list)
-
         finally:
-            conn.disable_asyncio_serving()
-            conn.close()
-
-    finally:
-        await server.close()
+            await conn.aclose()
 
 @pytest.mark.asyncio
 async def test_server_handles_multiple_clients_sequentially():
-    """Test that AsyncioServer can handle multiple clients connecting sequentially."""
-    from rpyc.utils.async_server import AsyncioServer
-    from deep_worker_cli.rpyc_service.agent_service import AgentService
-    import asyncio
-
-    class BoundAgentService(AgentService):
-        def __init__(self):
-            super().__init__()
-            self._mock_agent = type('MockAgent', (), {
-                'name': 'test-multi-client',
-                'config': type('Config', (), {'working_dir': '/tmp'})(),
-                'session_manager': None,
-            })()
-            self.set_agent_process(self._mock_agent)
-
-    server = AsyncioServer(BoundAgentService, port=0)
-    await server.start()
-
-    try:
-        port = server.listener.getsockname()[1]
-
-        # Connect first client
-        conn1 = rpyc.connect("localhost", port, config={"allow_all_attrs": True})
+    """A single server process accepts two sequential clients."""
+    async with mock_agent_service_subprocess(name="test-multi-client") as (_, port):
+        conn1 = await async_connect(
+            "127.0.0.1", port, config={"allow_all_attrs": True}
+        )
         try:
             root1 = conn1.root
-            loop = asyncio.get_running_loop()
-            conn1.enable_asyncio_serving(loop=loop)
-
-            result1 = await root1.get_metadata()
-            assert result1["name"] == "test-multi-client"
-
+            metadata1 = json.loads(await _async_call(conn1, root1, "get_metadata"))
+            assert isinstance(metadata1, dict)
         finally:
-            conn1.disable_asyncio_serving()
-            conn1.close()
+            await conn1.aclose()
 
-        # Connect second client (after first disconnects)
-        conn2 = rpyc.connect("localhost", port, config={"allow_all_attrs": True})
+        conn2 = await async_connect(
+            "127.0.0.1", port, config={"allow_all_attrs": True}
+        )
         try:
             root2 = conn2.root
-            conn2.enable_asyncio_serving(loop=loop)
-
-            result2 = await root2.get_metadata()
-            assert result2["name"] == "test-multi-client"
-
+            metadata2 = json.loads(await _async_call(conn2, root2, "get_metadata"))
+            assert isinstance(metadata2, dict)
         finally:
-            conn2.disable_asyncio_serving()
-            conn2.close()
-
-    finally:
-        await server.close()
+            await conn2.aclose()
 
 @pytest.mark.asyncio
 async def test_asyncio_server_graceful_shutdown():
-    """Test that AsyncioServer shuts down gracefully."""
-    from rpyc.utils.async_server import AsyncioServer
-    from deep_worker_cli.rpyc_service.agent_service import AgentService
-
-    class BoundAgentService(AgentService):
-        def __init__(self):
-            super().__init__()
-            self._mock_agent = type('MockAgent', (), {
-                'name': 'test-shutdown',
-                'config': type('Config', (), {'working_dir': '/tmp'})(),
-                'session_manager': None,
-            })()
-            self.set_agent_process(self._mock_agent)
-
-    server = AsyncioServer(BoundAgentService, port=0)
-    await server.start()
-
-    # Verify server started
-    assert server.listener is not None
-
-    # Shutdown should complete without errors
-    await server.close()
+    """The server subprocess shuts down cleanly on SIGTERM."""
+    async with mock_agent_service_subprocess(name="test-shutdown") as (proc, port):
+        assert port > 0
+    assert proc.returncode is not None

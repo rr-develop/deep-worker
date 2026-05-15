@@ -27,25 +27,40 @@ class TestCreateModelWithParameters:
         monkeypatch.delenv("GOOGLE_CLOUD_PROJECT", raising=False)
 
     def test_create_model_with_explicit_deepseek(self, monkeypatch):
-        """Should create deepseek model when provider and model_name are explicit."""
-        # Set required API key
-        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-deepseek")
+        """Should create deepseek model when provider and model_name are explicit.
 
+        `create_model` reads the API key from the module-level
+        `settings` singleton (`settings.deepseek_api_key`), which is
+        populated on first import from `~/.deepagents/.env`. A plain
+        `monkeypatch.setenv(...)` does NOT retroactively update a
+        singleton that's already been built, so tests must patch
+        `deep_worker_cli.config.settings` directly.
+        """
         from deep_worker_cli.config import create_model
 
-        with patch("langchain_openai.ChatOpenAI") as mock_openai:
-            mock_model = MagicMock()
-            mock_openai.return_value = mock_model
+        with patch("deep_worker_cli.config.settings") as mock_settings:
+            mock_settings.has_deepseek = True
+            mock_settings.deepseek_api_key = "sk-test-deepseek"
+            mock_settings.openai_api_key = None
+            mock_settings.anthropic_api_key = None
+            mock_settings.google_api_key = None
+            mock_settings.google_cloud_project = None
+            mock_settings.model_name = None
+            mock_settings.model_provider = None
 
-            result = create_model(provider="deepseek", model_name="deepseek-chat")
+            with patch("langchain_openai.ChatOpenAI") as mock_openai:
+                mock_model = MagicMock()
+                mock_openai.return_value = mock_model
 
-            # Should create ChatOpenAI with deepseek config
-            mock_openai.assert_called_once()
-            call_kwargs = mock_openai.call_args[1]
-            assert call_kwargs["model"] == "deepseek-chat"
-            assert call_kwargs["base_url"] == "https://api.deepseek.com"
-            assert call_kwargs["api_key"] == "sk-test-deepseek"
-            assert result == mock_model
+                result = create_model(provider="deepseek", model_name="deepseek-chat")
+
+                # Should create ChatOpenAI with deepseek config
+                mock_openai.assert_called_once()
+                call_kwargs = mock_openai.call_args[1]
+                assert call_kwargs["model"] == "deepseek-chat"
+                assert call_kwargs["base_url"] == "https://api.deepseek.com"
+                assert call_kwargs["api_key"] == "sk-test-deepseek"
+                assert result == mock_model
 
     def test_create_model_with_explicit_openai(self, monkeypatch):
         """Should create openai model when provider and model_name are explicit."""

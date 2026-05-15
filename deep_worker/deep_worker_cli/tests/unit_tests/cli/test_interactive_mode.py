@@ -64,13 +64,18 @@ class TestInteractiveMode:
 
     @pytest.mark.asyncio
     async def test_interactive_app_disconnects_gracefully(self):
-        """Test graceful disconnect from agent via RPyC."""
+        """Test graceful disconnect from agent via RPyC.
+
+        `disconnect_from_agent` now awaits `self._rpyc_conn.aclose()`
+        (the async-native close path from rpyc_async); the legacy
+        sync `.close()` / `disable_asyncio_serving()` pair is no
+        longer called directly — aclose handles both internally.
+        """
         agent_name = "test-agent"
 
-        # Create mock connection
+        # Create mock connection with async aclose.
         mock_conn = MagicMock()
-        mock_conn.disable_asyncio_serving = MagicMock()
-        mock_conn.close = MagicMock()
+        mock_conn.aclose = AsyncMock()
 
         app = InteractiveApp(agent_name=agent_name)
         app._rpyc_conn = mock_conn
@@ -78,9 +83,10 @@ class TestInteractiveMode:
         # Disconnect
         await app.disconnect_from_agent()
 
-        # RPyC connection should be closed
-        mock_conn.disable_asyncio_serving.assert_called_once()
-        mock_conn.close.assert_called_once()
+        # aclose must be awaited exactly once and the conn reference
+        # must be cleared.
+        mock_conn.aclose.assert_awaited_once()
+        assert app._rpyc_conn is None
 
     def test_interactive_app_requires_agent_name(self):
         """Test that agent name is required."""
@@ -103,34 +109,36 @@ class TestInteractiveMode:
         # Create mock root object with get_history method
         mock_root = AsyncMock()
 
+        # _load_more_history does `json.loads(response_json_str)` on
+        # the reply, so the mock must return a JSON STRING — see
+        # interactive.py ~line 1094 and RPYC_SERIALIZATION_DESIGN.md.
         async def mock_get_history(limit, offset):
-            """Mock paginated history responses via RPyC."""
-            # First call (offset=20): return next 20 messages
+            """Mock paginated history responses via RPyC (JSON-encoded)."""
+            import json as _json
             if offset == 20:
                 with open(pagination_log, "a") as f:
                     f.write(f"PAGINATION: offset={offset}, total=100\n")
-                return {
+                return _json.dumps({
                     "success": True,
                     "total": 100,
                     "history": [
                         {"type": "HumanMessage", "content": f"Query {i}"}
                         for i in range(20, 40)
                     ]
-                }
-            # Second call (offset=40): return next 20 messages
+                })
             elif offset == 40:
                 with open(pagination_log, "a") as f:
                     f.write(f"PAGINATION: offset={offset}, total=100\n")
-                return {
+                return _json.dumps({
                     "success": True,
                     "total": 100,
                     "history": [
                         {"type": "HumanMessage", "content": f"Query {i}"}
                         for i in range(40, 60)
                     ]
-                }
+                })
             else:
-                return {"success": True, "total": 100, "history": []}
+                return _json.dumps({"success": True, "total": 100, "history": []})
 
         mock_root.get_history = AsyncMock(side_effect=mock_get_history)
 

@@ -26,7 +26,7 @@ class TestAgentCommandWorkingDirectory:
         with tempfile.TemporaryDirectory() as tmpdir:
             original_cwd = os.getcwd()
             # Save and remove DEEP_WORKER_ORIGINAL_CWD if it exists
-            saved_cwd_env = os.environ.pop("DEEP_WORKER_ORIGINAL_CWD", None)
+            original_deep_worker_cwd = os.environ.pop("DEEP_WORKER_ORIGINAL_CWD", None)
             try:
                 # Change to temp directory (simulating user running command from there)
                 os.chdir(tmpdir)
@@ -40,12 +40,21 @@ class TestAgentCommandWorkingDirectory:
                     skip_permissions=True,
                     task_manager=False,
                     config=None,
+                    memory_only=False,
+                    use_sqlite=False,
+                    clean=False,
+                    auto_approve_send_message=False,
+                    restart=False,
                 )
 
                 # Mock AgentProcess to capture the config
                 captured_config = None
 
-                def mock_agent_init(self, name, config, skip_permissions, enable_task_manager):
+                def mock_agent_init(self, name, config, *args, **kwargs):
+                    # AgentProcess.__init__ has grown several keyword
+                    # parameters (memory_only, use_sqlite, rpyc_port,
+                    # auto_approve_send_message, …) — accept them all
+                    # via **kwargs so this mock keeps up with code drift.
                     nonlocal captured_config
                     captured_config = config
                     self.name = name
@@ -67,8 +76,8 @@ class TestAgentCommandWorkingDirectory:
             finally:
                 os.chdir(original_cwd)
                 # Restore DEEP_WORKER_ORIGINAL_CWD if it was originally set
-                if saved_cwd_env is not None:
-                    os.environ["DEEP_WORKER_ORIGINAL_CWD"] = saved_cwd_env
+                if original_deep_worker_cwd is not None:
+                    os.environ["DEEP_WORKER_ORIGINAL_CWD"] = original_deep_worker_cwd
 
     @pytest.mark.asyncio
     async def test_uses_env_var_when_cwd_is_root(self):
@@ -92,12 +101,21 @@ class TestAgentCommandWorkingDirectory:
                     skip_permissions=True,
                     task_manager=False,
                     config=None,
+                    memory_only=False,
+                    use_sqlite=False,
+                    clean=False,
+                    auto_approve_send_message=False,
+                    restart=False,
                 )
 
                 # Mock AgentProcess to capture the config
                 captured_config = None
 
-                def mock_agent_init(self, name, config, skip_permissions, enable_task_manager):
+                def mock_agent_init(self, name, config, *args, **kwargs):
+                    # AgentProcess.__init__ has grown several keyword
+                    # parameters (memory_only, use_sqlite, rpyc_port,
+                    # auto_approve_send_message, …) — accept them all
+                    # via **kwargs so this mock keeps up with code drift.
                     nonlocal captured_config
                     captured_config = config
                     self.name = name
@@ -139,12 +157,17 @@ class TestAgentCommandWorkingDirectory:
                         skip_permissions=True,
                         task_manager=False,
                         config=None,
+                        memory_only=False,
+                        use_sqlite=False,
+                        clean=False,
+                        auto_approve_send_message=False,
+                        restart=False,
                     )
 
                     # Mock AgentProcess
                     captured_config = None
 
-                    def mock_agent_init(self, name, config, skip_permissions, enable_task_manager):
+                    def mock_agent_init(self, name, config, *args, **kwargs):
                         nonlocal captured_config
                         captured_config = config
                         self.name = name
@@ -243,10 +266,10 @@ class TestMainSetsEnvironmentVariable:
         overwrites DEEP_WORKER_ORIGINAL_CWD set by the bash wrapper.
 
         Real-world scenario:
-        1. User runs: cd /path/to/your/project && deep-worker vc_dw
-        2. Bash wrapper saves: ORIGINAL_CWD=/path/to/your/project
+        1. User runs: cd <user-project> && deep-worker my-agent
+        2. Bash wrapper saves: ORIGINAL_CWD=<user-project>
         3. Bash wrapper does: cd $SCRIPT_DIR (to deep_worker_cli/)
-        4. Bash wrapper sets: DEEP_WORKER_ORIGINAL_CWD=/path/to/your/project
+        4. Bash wrapper sets: DEEP_WORKER_ORIGINAL_CWD=<user-project>
         5. Bash wrapper runs: python3 -m deep_worker_cli.cli.agent_command
         6. Python main() should NOT overwrite with os.getcwd() (which is deep_worker_cli/)
         """

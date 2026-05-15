@@ -60,7 +60,7 @@ After selecting an agent, you can:
    history in a new tab.
 
    The dialog shows pairs of *user-side message → assistant final answer*
-   in chronological order. **Three sources** of user-side messages all
+   in chronological order. **Four sources** of user-side messages all
    appear as first-class turns and are never filtered out:
 
    - **`--- User ---`** — what you typed in dwcli or the web UI.
@@ -70,15 +70,23 @@ After selecting an agent, you can:
    - **`--- From agent:<name> ---`** — messages received from another
      agent via `send_message_to_agent()`. The `agent:<name>:> ` prefix
      is stripped from the body.
+   - **`--- Summarization ---`** — synthetic injections created when
+     the model compacts its own context (body starts with
+     `Context Extraction Assistant…` or `You are in the middle of a
+     conversation that has been summarized…`). These are NOT real user
+     messages, but they are genuine drivers of the agent's next steps
+     (they carry the distilled state the agent works from after the
+     compaction). Showing them with a distinct header lets you see
+     *why* the agent's behaviour pivots after a context compaction
+     without confusing them with real user input. Design:
+     `docs/DESIGN_SUMMARIZATION_VISIBLE.md`.
 
    If the agent has not yet produced a text reply for the most recent
    user-side message, that turn renders with `(no response yet)` so you
    can see what the agent was asked even before it answers.
 
-   The only thing filtered is the model's own context-summarization
-   injection (`Context Extraction Assistant…` / `You are in the middle
-   of a conversation that has been summarized…`) — that is internal
-   bookkeeping, not a real user turn.
+   No message is dropped — Full Dialog is a faithful, post-mortem-grade
+   record of everything the agent saw and said.
 
    ### Verbosity levels
 
@@ -102,6 +110,21 @@ After selecting an agent, you can:
    only ceiling is the agent's own context window.
 
 5. **Stop TaskManager**: Click "⏹️ Stop TaskManager" to stop the agent's TaskManager.
+
+6. **Stop Agent** / **Restart Agent**: Click "⏹ Stop" or "🔄 Restart" in
+   the agent header. Both return instantly; the actual work happens in
+   the background and you'll see toast notifications as it progresses
+   (`Stop requested → Escalated to SIGKILL → Stop ok`). If the agent
+   refuses to die gracefully within the grace window (default 5 s), the
+   web server automatically escalates to SIGKILL — no manual
+   intervention needed. You can also tick agents in the left-hand
+   checkbox list and use the batch toolbar to stop / restart many at
+   once; they run in parallel, not sequentially, and each gets its own
+   notification plus an aggregate "Batch stop: 3/3".
+
+   In the rare case where even SIGKILL can't kill a process (kernel
+   state `D` / `T`), you'll get an error toast with the exact `kill -9 <pid>`
+   command to run manually — the system never fails silently.
 
 ### Real-Time Updates
 
@@ -194,11 +217,15 @@ For development and testing:
 # Run tests
 python3 -m pytest tests/
 
-# Run with auto-reload
-python3 -m app.main
+# Run with auto-reload (uvicorn WatchFiles). Opt-in only — the default
+# is no-reload because WatchFiles runs the app inside a
+# multiprocessing.spawn subprocess whose long-term memory profile is
+# harder to reason about. See docs/DESIGN_AGENT_SERVICE_MEMORY_FIX.md.
+export DEEP_WORKER_WEB_RELOAD=1
+python3 run.py
 
-# Run with debug logging
-export DEBUG=true
+# Run with debug logging (does NOT imply reload):
+export DEEP_WORKER_WEB_DEBUG=true
 python3 run.py
 ```
 

@@ -1,181 +1,128 @@
-"""Test that RPyC responses are converted to local objects using obtain().
+"""Test that AgentClient receives proper local objects over RPyC, not netrefs.
 
-This test verifies Fix #3 for high CPU usage caused by netref object accumulation.
+This is a regression test for Fix #3 (high CPU caused by netref accumulation).
 
-Root cause:
-- RPyC returns netref dict proxies, not local dicts
-- Each .get() call on netref creates intermediate netrefs
-- These objects fail to delete → memory leak
-- cleanup_loop wastes CPU trying to delete them
+In the current implementation (client/agent_client.py ~line 151 onward),
+`_send_command` calls
+`self._conn.async_request(HANDLE_ASYNC_CALLATTR, self._root, "exposed_<name>",
+(...), ())` and `await`s the AsyncResult. The server returns a JSON STRING
+(see RPYC_SERIALIZATION_DESIGN.md), so the client does `json.loads(...)`
+to get a LOCAL dict — no netref dereferencing happens at all during
+field access.
 
-Fix:
-- Use rpyc.utils.classic.obtain() to convert netref to local dict
-- All .get() calls work on local dict → no leaks
+These tests verify the happy-path contract against a mocked connection.
 """
 
-import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
+from __future__ import annotations
+
+import json
+from unittest.mock import MagicMock
 
 import pytest
 
 
+def _make_mock_conn(server_reply: dict) -> MagicMock:
+    """Build a mock rpyc.Connection that replies to any async_request
+    call with ``server_reply`` (JSON-encoded)."""
+
+    async def fake_async_request(*args, **kwargs):
+        return json.dumps(server_reply)
+
+    conn = MagicMock()
+    conn.async_request = MagicMock(side_effect=fake_async_request)
+    conn.root = MagicMock()
+    return conn
+
+
 @pytest.mark.asyncio
 async def test_get_status_returns_local_dict_not_netref():
-    """Test that get_status() converts netref to local dict using obtain().
-
-    CRITICAL: Without obtain(), response is a netref proxy.
-    Each .get() call creates netref objects that leak memory.
-
-    This test verifies that response is a REAL dict, not netref.
-    """
+    """get_status() returns a proper LOCAL Python object after JSON decode."""
     from deep_worker_cli.client.agent_client import AgentClient
 
-    # Create client
     client = AgentClient("test_agent")
-
-    # Mock connection
-    mock_conn = MagicMock()
-    mock_root = MagicMock()
-
-    # Mock get_status to return a dict (simulating RPyC netref)
-    async def mock_get_status():
-        # In real RPyC, this would be a netref
-        # We simulate by returning a regular dict with special marker
-        result = {
-            "success": True,
-            "status": "ready",
-            "error": None,
-            "_is_netref": True  # Marker to detect if obtain() was called
-        }
-        return result
-
-    mock_root.get_status = mock_get_status
-
-    # Set up client with mock connection
-    client._conn = mock_conn
-    client._root = mock_root
+    client._conn = _make_mock_conn({
+        "success": True,
+        "status": "ready",
+        "error": None,
+    })
+    client._root = client._conn.root
     client.connected = True
 
-    # Call get_status
     session_info = await client.get_status()
 
-    # Verify response was processed
+    # Returned structure is built locally from a plain dict — no
+    # further RPCs are needed. If it were a netref, constructing a
+    # SessionInfo would require extra sync_request calls (blocked
+    # by the guard).
     assert session_info.name == "test_agent"
-    assert session_info.status in ["ready", "error", "working"]
-
-    # CRITICAL CHECK: In real scenario with obtain(), the response dict
-    # would be a LOCAL dict, not netref. We can't easily test netref detection
-    # without actual RPyC connection, but we verify the code path works.
-    print("✅ Test passed: get_status() returns SessionInfo from response")
+    assert session_info.status in {"ready", "error", "working"}
 
 
 @pytest.mark.asyncio
 async def test_invoke_agent_returns_local_dict_not_netref():
-    """Test that invoke_agent() converts netref to local dict using obtain().
-
-    Without obtain(), each access to response dict creates netref leaks.
-    """
+    """invoke_agent() returns a plain dict — no netref overhead on fields."""
     from deep_worker_cli.client.agent_client import AgentClient
 
     client = AgentClient("test_agent")
-
-    # Mock connection
-    mock_conn = MagicMock()
-    mock_root = MagicMock()
-
-    async def mock_invoke_agent(message, stream):
-        return {
-            "success": True,
-            "response": {
-                "role": "assistant",
-                "content": "Hello"
-            }
-        }
-
-    mock_root.invoke_agent = mock_invoke_agent
-
-    client._conn = mock_conn
-    client._root = mock_root
+    client._conn = _make_mock_conn({
+        "success": True,
+        "response": {"role": "assistant", "content": "Hello"},
+    })
+    client._root = client._conn.root
     client.connected = True
 
-    # Call invoke_agent
     response = await client.invoke_agent("test message")
 
-    # Verify response
+    assert isinstance(response, dict)
     assert response["success"] is True
-    assert "response" in response
-
-    # The fact that we can access these keys without errors
-    # indicates the response is a proper dict
-    print("✅ Test passed: invoke_agent() returns proper dict response")
+    # Nested dict — exercising `response["response"]["content"]` must
+    # stay local (no netref).
+    assert response["response"]["content"] == "Hello"
+    assert isinstance(response["response"], dict)
 
 
 @pytest.mark.asyncio
 async def test_get_history_returns_local_dict_not_netref():
-    """Test that get_history() converts netref to local dict using obtain()."""
+    """get_history() returns a plain dict with a plain list of messages."""
     from deep_worker_cli.client.agent_client import AgentClient
 
     client = AgentClient("test_agent")
-
-    # Mock connection
-    mock_conn = MagicMock()
-    mock_root = MagicMock()
-
-    async def mock_get_history(limit, offset):
-        return {
-            "success": True,
-            "history": [
-                {"role": "user", "content": "test"}
-            ],
-            "total": 1,
-            "has_more": False
-        }
-
-    mock_root.get_history = mock_get_history
-
-    client._conn = mock_conn
-    client._root = mock_root
+    client._conn = _make_mock_conn({
+        "success": True,
+        "history": [{"role": "user", "content": "test"}],
+        "total": 1,
+        "has_more": False,
+    })
+    client._root = client._conn.root
     client.connected = True
 
-    # Call get_history
     response = await client.get_history(limit=50, offset=0)
 
-    # Verify response
+    assert isinstance(response, dict)
     assert response["success"] is True
-    assert "history" in response
-    assert len(response["history"]) == 1
-
-    print("✅ Test passed: get_history() returns proper dict response")
+    assert isinstance(response["history"], list)
+    assert response["history"][0]["content"] == "test"
 
 
 @pytest.mark.asyncio
-async def test_obtain_integration_with_real_rpyc():
-    """Integration test: verify obtain() works with actual RPyC netrefs.
-
-    This test uses rpyc module to create actual netrefs and verify
-    that obtain() converts them to local objects.
-    """
+async def test_obtain_helper_still_exported():
+    """`rpyc.utils.classic.obtain` remains importable — agent_client
+    used to call it explicitly; the JSON-string return path makes
+    the explicit call unnecessary, but the helper must still be
+    available for any ad-hoc netref-to-local conversion."""
     import sys
     from pathlib import Path
 
-    # Import rpyc from the local rpyc_async source checkout
     _rpyc_async_path = Path("rpyc_async")
     if _rpyc_async_path.exists() and str(_rpyc_async_path) not in sys.path:
         sys.path.insert(0, str(_rpyc_async_path))
 
-    import rpyc
     from rpyc.utils.classic import obtain
 
-    # Test that obtain() is available and works
     test_dict = {"key": "value", "number": 42}
-
-    # obtain() should work on regular dicts too (identity operation)
     result = obtain(test_dict)
-
     assert result == test_dict
     assert isinstance(result, dict)
-
-    print("✅ Test passed: obtain() function works correctly")
 
 
 if __name__ == "__main__":

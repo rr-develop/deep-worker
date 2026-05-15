@@ -1,8 +1,8 @@
 """Unit tests for per-agent DB resolution in offline session helpers.
 
 Covers the bug where `deep-worker --history <agent>` (and friends)
-read the legacy global ~/.deepagents/sessions.db instead of the
-per-agent file ~/.deepagents/sessions_<agent>.db.
+read the legacy global sessions.db instead of the
+per-agent file sessions_<agent>.db.
 
 See: docs/DESIGN_FIX_DW_HISTORY_PER_AGENT_DB.md
 """
@@ -48,46 +48,57 @@ async def _seed_agent_db(
     metadata_updated_at: str | None = None,
     agent_name_meta: str | None = None,
 ) -> None:
-    """Create a minimal per-agent DB with a single checkpoint for thread_id."""
-    async with aiosqlite.connect(str(db_path)) as conn:
-        await conn.execute(_ensure_checkpoints_schema_sql())
-        await conn.execute(_ensure_writes_schema_sql())
+    """Create a per-agent DB with a single checkpoint for thread_id.
 
-        if ts is None:
-            ts = datetime.now(UTC).isoformat()
+    Uses the real `DeltaSqliteCheckpointer` rather than a hand-rolled
+    `CREATE TABLE checkpoints (...)`. The delta-aware reader
+    (`aget_tuple`) requires schema columns that the hand-rolled
+    variant didn't populate — `checkpoint_ns`, `parent_checkpoint_id`,
+    `metadata_blob`, etc. Using the real checkpointer keeps the
+    schema in sync with production no matter how it evolves.
+    """
+    from deep_worker_cli.delta_checkpointer import DeltaSqliteCheckpointer
+    from langchain_core.messages import HumanMessage
+    from langgraph.checkpoint.base import empty_checkpoint
 
-        checkpoint_data = json.dumps(
-            {
-                "ts": ts,
-                "channel_values": {
-                    "messages": [
-                        {"type": "human", "content": content},
-                    ]
-                },
-            }
-        )
+    db_path.parent.mkdir(parents=True, exist_ok=True)
 
-        meta: dict = {}
-        if metadata_updated_at is not None:
-            meta["updated_at"] = metadata_updated_at
-        if agent_name_meta is not None:
-            meta["agent_name"] = agent_name_meta
-        metadata_str = json.dumps(meta)
+    if ts is None:
+        ts = datetime.now(UTC).isoformat()
 
-        await conn.execute(
-            """
-            INSERT INTO checkpoints
-            (thread_id, checkpoint_id, type, checkpoint, metadata)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (thread_id, f"cp-{thread_id}", "json", checkpoint_data, metadata_str),
-        )
-        await conn.commit()
+    meta: dict = {}
+    if metadata_updated_at is not None:
+        meta["updated_at"] = metadata_updated_at
+    if agent_name_meta is not None:
+        meta["agent_name"] = agent_name_meta
+
+    # NB: use UUID7 from langgraph rather than `uuid4().hex`. The
+    # delta checkpointer resolves "latest" via
+    # `ORDER BY checkpoint_id DESC` which is lexicographic — UUID4
+    # is not monotonic and makes the result random; UUID7 is
+    # time-prefixed and matches the production id allocator.
+    checkpoint = {
+        "v": 1,
+        "id": empty_checkpoint()["id"],
+        "ts": ts,
+        "channel_values": {
+            "messages": [HumanMessage(content=content)],
+            "working_dir": "/tmp",
+        },
+        "channel_versions": {"messages": "00000000000000000000000000000001.0"},
+        "versions_seen": {},
+        "pending_sends": [],
+        "updated_channels": ["messages"],
+    }
+    config = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
+
+    async with DeltaSqliteCheckpointer.from_conn_string(str(db_path)) as cp:
+        await cp.aput(config, checkpoint, meta, {})
 
 
 @pytest.fixture
 def fake_home(tmp_path, monkeypatch):
-    """Point ~/.deepagents at tmp_path/.deepagents for the test."""
+    """Point the agents data directory at tmp_path/.deepagents for the test."""
     home = tmp_path / "home"
     (home / ".deepagents").mkdir(parents=True)
     monkeypatch.setenv("HOME", str(home))

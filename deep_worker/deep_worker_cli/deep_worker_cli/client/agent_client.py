@@ -15,7 +15,7 @@ from deep_worker_cli.exceptions import AgentNotFoundError, IPCConnectionError
 from deep_worker_cli.process.registry import ProcessRegistry
 
 import rpyc
-from rpyc.core.async_connect import async_connect  # type: ignore[import-untyped]
+from rpyc.core.async_connect import async_connect
 from rpyc.utils.classic import obtain
 
 if TYPE_CHECKING:
@@ -206,6 +206,22 @@ class AgentClient:
                 response = json.loads(response_json_str)
                 return response
 
+            elif command_type == "enqueue_message":
+                # Fire-and-forget delivery: server enqueues the message and
+                # returns immediately without waiting for the agent's LLM
+                # turn to complete. Used by send_message_to_agent.
+                message = command.get("message", "")
+                async_result = self._conn.async_request(
+                    consts.HANDLE_ASYNC_CALLATTR,
+                    self._root,
+                    "exposed_enqueue_message",
+                    (message,),
+                    ()
+                )
+                response_json_str = await async_result
+                response = json.loads(response_json_str)
+                return response
+
             elif command_type == "get_history":
                 limit = command.get("limit", 50)
                 offset = command.get("offset", 0)
@@ -219,6 +235,44 @@ class AgentClient:
                 )
                 response_json_str = await async_result
                 # Deserialize JSON string to local dict
+                response = json.loads(response_json_str)
+                return response
+
+            elif command_type == "metadata":
+                # Exposes agent-side ``exposed_get_metadata``. Unlike
+                # ``status`` this call returns ONLY what the agent knows
+                # for a fact — ``directory``, ``started``, ``pid``,
+                # ``rpyc_port``, ``model``, ``provider``. The caller must
+                # not invent any field that is missing; if the RPC fails
+                # the helper returns ``{"success": False, ...}`` and the
+                # UI is responsible for printing "N/A" rather than
+                # fabricating a value.
+                async_result = self._conn.async_request(
+                    consts.HANDLE_ASYNC_CALLATTR,
+                    self._root,
+                    "exposed_get_metadata",
+                    (),
+                    (),
+                )
+                response_json_str = await async_result
+                response = json.loads(response_json_str)
+                return response
+
+            elif command_type == "status_raw":
+                # Same as ``status`` but returns the raw dict from
+                # ``exposed_get_status`` (with ``task_manager_active`` /
+                # ``task_manager_disabled`` keys present when the agent
+                # configured a TaskManager). Used by ``--status`` to
+                # display honest TM state without reshaping it through
+                # ``SessionInfo`` (which has no TM fields).
+                async_result = self._conn.async_request(
+                    consts.HANDLE_ASYNC_CALLATTR,
+                    self._root,
+                    "exposed_get_status",
+                    (),
+                    (),
+                )
+                response_json_str = await async_result
                 response = json.loads(response_json_str)
                 return response
 
@@ -287,6 +341,64 @@ class AgentClient:
                 data=None,
                 metadata=None,
             )
+
+    async def get_agent_metadata(self) -> dict[str, Any] | None:
+        """Return raw agent metadata (directory, started, model, …) or None.
+
+        This is a read-only query of ``exposed_get_metadata``. Unlike
+        :meth:`get_status`, this method does NOT invent placeholder
+        values: if the RPC failed or the agent doesn't expose the
+        method, we return ``None`` and let the caller (e.g.
+        ``deep-worker-cli --status``) print "N/A" explicitly.
+
+        Returns:
+            The ``metadata`` dict from the agent (keys: ``directory``,
+            ``pid``, ``started``, ``rpyc_port``, ``agent_type``,
+            ``model``, ``provider``), or ``None`` on error.
+        """
+        try:
+            response = await self._send_command({"command": "metadata"})
+        except IPCConnectionError:
+            return None
+        if not response.get("success"):
+            return None
+        meta = response.get("metadata")
+        return meta if isinstance(meta, dict) else None
+
+    async def get_task_manager_info(self) -> dict[str, Any] | None:
+        """Return TaskManager state from the agent, or ``None`` on error.
+
+        Agent's ``exposed_get_status`` includes
+        ``task_manager_active`` / ``task_manager_disabled`` ONLY when
+        the agent was launched with ``--task-manager`` (see
+        ``rpyc_service/agent_service.py``). We surface three distinct
+        states to the caller:
+
+        * ``{"configured": True, "active": bool, "disabled": bool}``
+          — agent has a TaskManager and told us its state;
+        * ``{"configured": False, "active": None, "disabled": None}``
+          — agent has no TaskManager (fields absent in the response);
+        * ``None`` — we could not reach the agent / RPC error.
+
+        No guessing, no defaults: the UI decides what to display.
+        """
+        try:
+            response = await self._send_command({"command": "status_raw"})
+        except IPCConnectionError:
+            return None
+        if not response.get("success"):
+            return None
+        has_tm_fields = (
+            "task_manager_active" in response
+            or "task_manager_disabled" in response
+        )
+        if not has_tm_fields:
+            return {"configured": False, "active": None, "disabled": None}
+        return {
+            "configured": True,
+            "active": bool(response.get("task_manager_active")),
+            "disabled": bool(response.get("task_manager_disabled")),
+        }
 
     async def invoke_agent(
         self, message: str, stream: bool = False

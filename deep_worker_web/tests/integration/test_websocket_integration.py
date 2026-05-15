@@ -31,29 +31,25 @@ class TestWebSocketWithRealAgent:
 
             # Connect to WebSocket (correct path is /ws/agents)
             with client.websocket_connect("/ws/agents") as websocket:
-                # Should connect successfully
-                # May receive agent_discovered messages first
-                # Read until we get all initial messages
-                received_messages = []
-                try:
-                    # Receive initial agent list (may be multiple messages)
-                    for _ in range(10):  # Max 10 messages
-                        data = websocket.receive_json()
-                        received_messages.append(data)
-                        if data.get("type") == "agent_discovered":
-                            # Got at least one agent discovered message
-                            break
-                except Exception:
-                    # No more messages
-                    pass
-
-                # Send ping
+                # Send ping and wait for the pong specifically. The server
+                # continuously broadcasts agent_discovered / agent_status
+                # events as the monitor loop polls registered agents; those
+                # messages may land on the same channel between our send
+                # and the pong reply. Drain until we see the pong.
                 websocket.send_json({"type": "ping"})
-
-                # Should receive pong
-                data = websocket.receive_json()
-                assert data is not None
-                assert data.get("type") == "pong"
+                pong_received = False
+                seen_types: list[str] = []
+                for _ in range(50):
+                    data = websocket.receive_json()
+                    assert data is not None
+                    msg_type = data.get("type")
+                    seen_types.append(msg_type)
+                    if msg_type == "pong":
+                        pong_received = True
+                        break
+                assert pong_received, (
+                    f"expected 'pong' among ws messages, got types={seen_types}"
+                )
 
             asyncio.run(service.shutdown())
 
@@ -103,8 +99,14 @@ class TestWebSocketWithRealAgent:
         pass
 
     def test_websocket_connection_cleanup(self) -> None:
-        """Test that WebSocket connections are properly cleaned up."""
-        with agent_fixture() as agent_info:
+        """Test that WebSocket connections are properly cleaned up.
+
+        The test uses the same ping/pong probe as
+        ``test_websocket_connection_basic`` but focuses on teardown: the
+        context-manager exit must disconnect cleanly regardless of how
+        many background broadcasts arrived in between.
+        """
+        with agent_fixture() as agent_info:  # noqa: F841 — agent must exist
             registry = ProcessRegistry()
             service = AgentService(registry=registry)
             asyncio.run(service.initialize())
@@ -114,19 +116,19 @@ class TestWebSocketWithRealAgent:
 
             # Connect and disconnect
             with client.websocket_connect("/ws/agents") as websocket:
-                # Read initial messages
-                try:
-                    for _ in range(10):
-                        websocket.receive_json()
-                except Exception:
-                    pass
-
+                # Probe liveness via ping/pong. The monitor loop concurrently
+                # broadcasts agent_discovered / agent_status events so we
+                # drain until we see pong rather than relying on a fixed
+                # receive order.
                 websocket.send_json({"type": "ping"})
-                # Read pong
-                try:
-                    websocket.receive_json()
-                except Exception:
-                    pass
+                for _ in range(50):
+                    data = websocket.receive_json()
+                    if data is not None and data.get("type") == "pong":
+                        break
+                else:
+                    raise AssertionError(
+                        "did not receive pong on websocket ping/pong probe"
+                    )
 
             # Connection should be cleaned up after context exit
             # ConnectionManager should have removed it
@@ -152,14 +154,19 @@ class TestWebSocketWithRealAgent:
 
                 asyncio.run(service._broadcast_message(status_message))
 
-                # Try to receive status update
-                try:
+                # Drain up to N messages looking for the synthetic
+                # ``agent_status_change`` broadcast we just fired. The
+                # monitor loop may push ``agent_discovered`` / ``agent_status``
+                # first. A blocking ``receive_json()`` without a bound
+                # would wedge the test if the event never arrives.
+                found = False
+                for _ in range(50):
                     data = websocket.receive_json()
                     if data and data.get("type") == "agent_status_change":
                         assert data["agent_name"] == agent_info.name
-                except Exception:
-                    # Expected - TestClient limitations with async WebSocket
-                    pass
+                        found = True
+                        break
+                assert found, "did not observe the broadcast agent_status_change"
 
             asyncio.run(service.shutdown())
 

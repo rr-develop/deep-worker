@@ -15,12 +15,12 @@ What this test does
    ``send_message_to_agent("test_smc_dst", "<text>")`` exactly once
    and then stop.
 3. Verifies the source agent's history ends with an ``AIMessage``
-   whose content is exactly ``"agent:test_smc_src:> <text>"``. That
+   whose content is exactly ``"test_smc_src -> test_smc_dst :> <text>"``. That
    is the echo injected by ``SendMessageCompletionMiddleware``.
 4. Verifies the destination agent's history received the prefixed
    message as a ``HumanMessage``.
-5. Replays the exact pair-parser logic from the web UI's
-   ``get_agent_dialog_formatted``
+5. Replays the exact pair-parser logic from
+   ``deep_worker_web/app/services/agent_service.py::get_agent_dialog_formatted``
    and asserts the outgoing message appears as an assistant response
    in the parsed dialog pairs. This is the end state the user cares
    about.
@@ -47,15 +47,15 @@ from . import agent_fixture
 
 
 # ---------------------------------------------------------------------------
-# Helpers copied verbatim from the web UI for fidelity
+# Helpers copied verbatim from deep_worker_web for fidelity
 # ---------------------------------------------------------------------------
 
 
 def _dialog_pairs_from_history(history: list[dict[str, Any]]) -> list[tuple[str, str]]:
-    """Re-implement the web UI's pair parser exactly.
+    """Re-implement deep_worker_web's pair parser exactly.
 
-    Keep this logic identical to the web UI's
-    ``get_agent_dialog_formatted``
+    Keep this logic identical to
+    ``deep_worker_web/app/services/agent_service.py::get_agent_dialog_formatted``
     — the whole point of the middleware is to produce messages the
     same parser renders correctly.
     """
@@ -132,21 +132,55 @@ async def test_send_message_to_agent_echoes_and_ends_turn(two_agents):
         f"Use the send_message_to_agent() tool exactly once "
         f"to send the agent '{_DST_NAME}' exactly this text (without "
         f"quotes): {_MESSAGE_TEXT}\n\n"
-        f"Do not comment or write anything else. Just call the tool."
+        f"Do not comment on or write anything else. Just call the tool."
     )
+
+    import asyncio as _asyncio
+    import time as _time
 
     src_client = AgentClient(src_info.agent_name)
     await src_client.connect()
     try:
+        t0 = _time.monotonic()
         response = await src_client.invoke_agent(prompt, stream=False)
+        src_turn_elapsed = _time.monotonic() - t0
     finally:
         await src_client.disconnect()
 
     assert response.get("success"), f"invoke_agent failed: {response}"
     final_content = response.get("response", {}).get("content", "")
 
+    # --- Step 1b: source agent must return to IDLE quickly (fire-and-forget) ---
+    # With the exposed_enqueue_message transport, source's turn should finish
+    # within ~15s regardless of how long the destination's LLM will take.
+    assert src_turn_elapsed <= 30.0, (
+        f"Source agent turn took {src_turn_elapsed:.1f}s — expected ≤30s "
+        f"(fire-and-forget transport should not wait for destination's LLM)."
+    )
+
+    # Poll status until IDLE (ready). Must be quick now.
+    src_client2 = AgentClient(src_info.agent_name)
+    await src_client2.connect()
+    try:
+        deadline = _time.monotonic() + 15.0
+        last_status = None
+        while _time.monotonic() < deadline:
+            status_resp = await src_client2._send_command({"command": "status"})
+            last_status = (status_resp.get("status") or "").lower()
+            if last_status in ("idle", "ready"):
+                break
+            await _asyncio.sleep(0.2)
+        assert last_status in ("idle", "ready"), (
+            f"Source agent must return to IDLE/ready within 15s after "
+            f"send_message_to_agent; last status: {last_status!r}"
+        )
+    finally:
+        await src_client2.disconnect()
+
     # --- Step 2: final response should be exactly the echo ---
-    expected_echo = f"agent:{src_info.agent_name}:> {_MESSAGE_TEXT}"
+    expected_echo = (
+        f"{src_info.agent_name} -> {dst_info.agent_name} :> {_MESSAGE_TEXT}"
+    )
     assert final_content == expected_echo, (
         f"Final response from source agent must be the echo produced by "
         f"SendMessageCompletionMiddleware.\n"
@@ -204,7 +238,7 @@ async def test_send_message_to_agent_echoes_and_ends_turn(two_agents):
         f"{latest_tool_content[:300]!r}"
     )
 
-    # --- Step 4: dialog pair parser (web UI) renders it ---
+    # --- Step 4: dialog pair parser (deep_worker_web) renders it ---
     pairs = _dialog_pairs_from_history(history)
     assert pairs, (
         "pair-parser must find at least one (user, assistant) pair; "
@@ -213,26 +247,38 @@ async def test_send_message_to_agent_echoes_and_ends_turn(two_agents):
     # The last pair's assistant side must be our echo.
     last_user, last_assistant = pairs[-1]
     assert last_assistant == expected_echo, (
-        f"the web UI's pair parser must render the outgoing message "
+        f"deep_worker_web's pair parser must render the outgoing message "
         f"as the assistant reply.\n"
         f"  expected assistant: {expected_echo!r}\n"
         f"  got assistant:      {last_assistant!r}\n"
         f"  (user side:         {last_user!r})"
     )
 
-    # --- Step 5: destination agent received the message ---
-    dst_client = AgentClient(dst_info.agent_name)
-    await dst_client.connect()
-    try:
-        dst_hist = await dst_client._send_command(
-            {"command": "get_history", "limit": 100, "offset": 0}
-        )
-    finally:
-        await dst_client.disconnect()
+    # --- Step 5: destination agent received the message (eventual) ---
+    # Delivery is fire-and-forget: the destination's background turn may
+    # still be running, but the HumanMessage should appear in its state
+    # quickly after the enqueue RPC completed. Poll up to 30s.
+    dst_history: list = []
+    deadline = _time.monotonic() + 30.0
+    while _time.monotonic() < deadline:
+        dst_client = AgentClient(dst_info.agent_name)
+        await dst_client.connect()
+        try:
+            dst_hist = await dst_client._send_command(
+                {"command": "get_history", "limit": 100, "offset": 0}
+            )
+        finally:
+            await dst_client.disconnect()
+        if dst_hist.get("success"):
+            dst_history = dst_hist.get("history", [])
+            if any(
+                m.get("type") == "HumanMessage"
+                and m.get("content", "") == expected_echo
+                for m in dst_history
+            ):
+                break
+        await _asyncio.sleep(0.5)
 
-    assert dst_hist.get("success"), f"dst get_history failed: {dst_hist}"
-    dst_history = dst_hist.get("history", [])
-    # Look for a HumanMessage with the prefixed text.
     incoming = [
         m for m in dst_history
         if m.get("type") == "HumanMessage"
@@ -240,6 +286,6 @@ async def test_send_message_to_agent_echoes_and_ends_turn(two_agents):
     ]
     assert incoming, (
         f"destination agent must have received the prefixed HumanMessage "
-        f"{expected_echo!r}; "
+        f"{expected_echo!r} within 30s; "
         f"got history: {[(m.get('type'), (m.get('content') or '')[:60]) for m in dst_history]}"
     )

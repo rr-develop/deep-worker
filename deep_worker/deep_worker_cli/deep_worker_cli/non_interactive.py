@@ -389,12 +389,13 @@ async def _stream_agent(
         console: Rich console for formatted output.
         file_op_tracker: Tracker for file-operation diffs.
     """
+    # ⚠️ DO NOT add durability="exit" — it defers checkpoint writes to stream
+    # end, causing data loss if agent is killed mid-stream. See agent_process.py.
     async for chunk in agent.astream(
         stream_input,
         stream_mode=["messages", "updates"],
         subgraphs=True,
         config=config,
-        durability="exit",
     ):
         _process_stream_chunk(chunk, state, console, file_op_tracker)
 

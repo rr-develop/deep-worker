@@ -290,8 +290,12 @@ def test_format_execute_description():
         tool_call, cast("AgentState[Any]", None), cast("Runtime[Any]", None)
     )
 
+    # The description intentionally does NOT include the working
+    # directory anymore — Path.cwd() returns "/" after daemonization,
+    # so showing it was misleading. The backend knows the correct
+    # project_memory_dir and runs the command there. See the inline
+    # comment in `_format_execute_description` (agent.py ~line 404).
     assert "Execute Command: python script.py" in description
-    assert "Working Directory:" in description
 
 
 class TestGetSystemPromptModelIdentity:
@@ -377,7 +381,7 @@ class TestDefaultAgentName:
         """Guard against accidental renames of the default agent identifier.
 
         Other modules (main.py, commands.py) rely on this value matching
-        the directory name under `~/.deepagents/`.
+        the directory name under the agents data directory.
         """
         assert DEFAULT_AGENT_NAME == "agent"
 
@@ -466,10 +470,10 @@ class TestCreateCliAgentBackendWorkingDirectory:
         the backend still operates in the correct working directory.
 
         Failure scenario:
-        - Agent started with: deep-worker dw_lc --dir /path/to/your/project
+        - Agent started with: deep-worker my-agent --dir /path/to/project
         - After daemonize: process cwd = /
         - If backend uses Path.cwd(): backend.cwd = / (WRONG!)
-        - If backend uses project_memory_dir: backend.cwd = /path/to/your/project (CORRECT!)
+        - If backend uses project_memory_dir: backend.cwd = /path/to/project (CORRECT!)
         """
         working_dir = tmp_path / "project"
         working_dir.mkdir()

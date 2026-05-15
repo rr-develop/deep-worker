@@ -96,15 +96,65 @@ deep-worker --history thread_id
 # View history as JSON
 deep-worker --history thread_id --format json
 
-# Remove old threads (before specific date)
+# ⚠️ DANGER: --remove-before is GLOBAL and DESTRUCTIVE.
+# It sweeps every sessions_*.db under ~/.deepagents/ AND every
+# ~/.deep_worker/<agent>/summaries/<thread>.md across ALL agents for the
+# current $HOME. NEVER run this command from an ad-hoc shell / integration
+# test without first isolating $HOME to a temp directory (see the
+# isolated_home / fake_home fixtures under tests/).
+#
+# Safety guard: if DATE resolves to a future timestamp, the command
+# refuses by default (exit code 2) and requires --force to proceed.
+# Future cutoffs match every row and are almost always bugs.
+#
+# Always start with --dry-run.
+
+# Remove old conversation data (threads AND offloaded summary sections)
+# before a specific date. See the Summarization storage section below
+# for what "summary sections" means.
 deep-worker --remove-before 2026-01-01
 
-# Remove threads older than 30 days
+# Remove data older than 30 days
 deep-worker --remove-before 30d
 
 # Other relative formats: 7d, 2w, 3m, 1y
 deep-worker --remove-before 1y --dry-run
 ```
+
+**Summarization storage — find and manage offloaded conversation history:**
+
+When the model's context fills up, `SummarizationMiddleware` evicts older
+messages and writes them to an on-disk file so the agent can later refer
+back to them. Files live at:
+
+```
+~/.deep_worker/<agent_name>/summaries/<thread_id>.md
+```
+
+Each file is an append-only log with one `## Summarized at <ISO-timestamp>`
+section per summarization event. The path quoted in the synthetic summary
+message injected into the agent's history is exactly this absolute path —
+you can `cat`/`grep`/`less` it directly. See
+`deep_worker/docs/DESIGN_SUMMARIZATION_PERSISTENT_STORAGE.md`.
+
+```bash
+# List all offloaded summaries (text table)
+deep-worker --list-summaries
+
+# Filter by agent
+deep-worker --list-summaries --agent my_agent
+
+# Machine-readable JSON output
+deep-worker --list-summaries --format json
+```
+
+The `--remove-before DATE` command also prunes summary files:
+- If **every** section in a summary file is older than DATE → the file is
+  deleted.
+- If **some** are older and **some** are newer → the file is atomically
+  rewritten (via `<file>.tmp` + `os.replace`) keeping only the newer
+  sections.
+- If **all** are newer → the file is untouched.
 
 **Note:** Tests automatically use in-memory storage by default for faster execution and test isolation.
 

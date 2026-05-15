@@ -8,7 +8,7 @@ enable composition without fragile string parsing.
 import re
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, overload
 
 import wcmatch.glob as wcglob
 
@@ -206,6 +206,10 @@ def perform_string_replacement(
     return new_content, occurrences
 
 
+@overload
+def truncate_if_too_long(result: list[str]) -> list[str]: ...
+@overload
+def truncate_if_too_long(result: str) -> str: ...
 def truncate_if_too_long(result: list[str] | str) -> list[str] | str:
     """Truncate list or string result if it exceeds token limit (rough estimate: 4 chars/token)."""
     if isinstance(result, list):

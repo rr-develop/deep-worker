@@ -49,7 +49,7 @@ class AgentConfig:
             raise ValueError("model must be a non-empty string or None")
 
         # Validate provider
-        valid_providers = ["deepseek", "gemini", "openai", "claude-code"]
+        valid_providers = ["deepseek", "gemini", "openai", "claude-code", "codex"]
         if self.provider not in valid_providers:
             raise ValueError(
                 f"provider must be one of {valid_providers}, got '{self.provider}'"
@@ -59,6 +59,9 @@ class AgentConfig:
         if self.api_key is None:
             if self.provider == "claude-code":
                 # Claude Code doesn't require API key (uses local installation)
+                self.api_key = None
+            elif self.provider == "codex":
+                # Codex CLI uses cached login at ~/.codex/auth.json — no key needed.
                 self.api_key = None
             elif self.provider == "deepseek":
                 self.api_key = os.getenv("DEEPSEEK_API_KEY")

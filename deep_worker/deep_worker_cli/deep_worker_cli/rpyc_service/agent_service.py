@@ -381,6 +381,54 @@ class AgentService(rpyc.Service):
             result = {"success": False, "error": str(e)}
             return json.dumps(result)
 
+    async def exposed_enqueue_message(self, message: str) -> str:
+        """Fire-and-forget delivery: enqueue ``message`` as an incoming
+        user-role message and return immediately, without waiting for the
+        agent's LLM turn to complete.
+
+        Used by the inter-agent ``send_message_to_agent`` tool so that the
+        sending agent's turn can end promptly (its SendMessageCompletionMiddleware
+        injects the echo AIMessage and jumps to the graph end) instead of
+        blocking until the recipient finishes processing.
+
+        Returns a JSON string ``{"success": true, "delivered_content": "<message>"}``
+        on successful enqueue, or ``{"success": false, "error": "..."}`` on
+        failure. The background turn's result is NOT awaited here.
+        """
+        if not self._agent_process:
+            return json.dumps({"success": False, "error": "Agent not initialized"})
+
+        # Pin the non-None reference locally. Narrowing of `self._agent_process`
+        # does NOT survive into the nested async function below — ty re-reads
+        # the attribute and sees `AgentProcess | None`.
+        agent_process = self._agent_process
+
+        try:
+            # Fire off the agent turn in the background. Exceptions inside
+            # the task are logged but don't affect the enqueue response.
+            async def _bg_turn() -> None:
+                try:
+                    await agent_process._handle_invoke(
+                        {"command": "invoke", "message": message, "stream": True},
+                        connection=None,
+                        notify_callback=self._notify_subscribers,
+                        approval_callback=None,
+                    )
+                except Exception:  # pragma: no cover - defensive
+                    logger.exception(
+                        "Background turn failed for enqueued message"
+                    )
+
+            asyncio.create_task(_bg_turn())
+
+            return json.dumps({
+                "success": True,
+                "delivered_content": message,
+            })
+        except Exception as e:
+            logger.exception("Error enqueueing message: %s", e)
+            return json.dumps({"success": False, "error": str(e)})
+
     async def exposed_get_history(
         self, limit: int = 50, offset: int = 0
     ) -> str:
@@ -465,21 +513,67 @@ class AgentService(rpyc.Service):
         """
         Subscribe to real-time messages.
 
+        Immediately after registration we push a one-shot
+        ``status_change`` snapshot of the agent's current state to
+        this subscriber. That is what turns the event stream into a
+        self-contained feed: a UI client that reconnects mid-session
+        does NOT have to poll to learn the current status / TM flags
+        — it receives them as the first message.
+
         Args:
-            callback: Callback object with on_message(msg: dict) method
+            callback: Callback object with on_message(msg: str) method
 
         Returns:
             True if subscription successful
         """
         try:
-            # Add to SHARED subscribers set in AgentProcess
-            # This ensures ALL connections see messages from ANY connection
-            if self._agent_process:
-                self._agent_process._message_subscribers.add(callback)
-                logger.info(f"Client subscribed to messages: {callback} (total subscribers: {len(self._agent_process._message_subscribers)})")
-            else:
+            if not self._agent_process:
                 logger.error("Cannot subscribe: agent_process not set")
                 return False
+
+            # Add to SHARED subscribers set in AgentProcess
+            # This ensures ALL connections see messages from ANY connection
+            self._agent_process._message_subscribers.add(callback)
+            logger.info(
+                "Client subscribed to messages (total subscribers: %d)",
+                len(self._agent_process._message_subscribers),
+            )
+
+            # Push the current-state snapshot, BUT from OUTSIDE the
+            # current RPC dispatch. We are still inside the
+            # ``subscribe_messages`` RPC handler — the client has not
+            # yet received our ``True`` reply. ``loop.call_later(0,
+            # ...)`` schedules delivery on the next loop tick so this
+            # handler returns first; by then the subscribe RPC has
+            # flushed its reply and ``await on_message(...)`` is not a
+            # re-entrant sync_request from inside the same dispatch.
+            #
+            # A plain ``await on_message(snapshot_str)`` on an
+            # async-flagged rpyc_async netref routes through
+            # ``HANDLE_ASYNC_CALL`` on its own, so the peer's
+            # ``_dispatch_request_async`` awaits ``exposed_on_message``
+            # correctly. Do NOT wrap with ``rpyc.async_`` — that forces
+            # ``HANDLE_CALL`` (sync) and the peer's async handler is
+            # left as an un-awaited coroutine ("Boxing coroutine object
+            # ... Did you forget to await?"), silently dropping every
+            # status_change on the floor.
+            snapshot = self._agent_process._current_status_snapshot()
+            snapshot_str = json.dumps(snapshot, default=str)
+
+            async def _deliver_snapshot() -> None:
+                try:
+                    await callback.on_message(snapshot_str)
+                except Exception as snap_exc:  # noqa: BLE001
+                    logger.warning(
+                        "initial status snapshot push failed: %s", snap_exc
+                    )
+
+            loop = asyncio.get_running_loop()
+            loop.call_later(
+                0,
+                lambda: asyncio.ensure_future(_deliver_snapshot()),
+            )
+
             return True
         except Exception as e:
             logger.exception("Error subscribing: %s", e)
@@ -499,7 +593,11 @@ class AgentService(rpyc.Service):
             # Remove from SHARED subscribers set in AgentProcess
             if self._agent_process:
                 self._agent_process._message_subscribers.discard(callback)
-                logger.info(f"Client unsubscribed from messages: {callback} (remaining: {len(self._agent_process._message_subscribers)})")
+                # Same reasoning as in exposed_subscribe_messages above.
+                logger.info(
+                    "Client unsubscribed from messages (remaining: %d)",
+                    len(self._agent_process._message_subscribers),
+                )
             else:
                 logger.error("Cannot unsubscribe: agent_process not set")
                 return False
@@ -818,43 +916,81 @@ class AgentService(rpyc.Service):
             }
             return json.dumps(result)
 
-    async def exposed_shutdown(self) -> str:
-        """
-        Request graceful shutdown of agent process.
+    async def exposed_shutdown(
+        self,
+        grace_seconds: float = 5.0,
+        force: bool = False,
+    ) -> str:
+        """Request shutdown. Returns immediately; real shutdown runs async.
 
-        Returns immediately with success status. Actual shutdown happens asynchronously.
-        The RPyC server will be closed after a short delay to allow the response to be sent.
+        The actual exit pipeline is event-driven:
 
-        IMPORTANT: Returns JSON-serialized string to eliminate RPyC netref overhead.
-        Client must json.loads() the response.
+        * ``force=True`` — immediately schedule ``os._exit(0)`` via
+          ``loop.call_later(0.1, ...)``. The 100 ms delay lets the RPyC
+          response flush before the process vanishes.
+        * otherwise — flip ``agent_process.running = False`` (cooperative
+          stop), try to close the RPyC server, and arm a SIGKILL fallback
+          at ``grace_seconds``. The fallback uses ``os._exit(0)`` so we
+          stay inside this process's event loop — no external signals,
+          no new threads.
 
-        Returns:
-            JSON string with success status
+        No ``time.sleep``, no ``asyncio.sleep`` loop. Returns JSON string.
         """
         if not self._agent_process:
             result = {"success": False, "error": "Agent not initialized"}
             return json.dumps(result)
 
         try:
-            # Signal agent to shutdown gracefully
+            import os as _os
+
+            loop = asyncio.get_running_loop()
+            grace = max(0.0, float(grace_seconds))
+
+            if force:
+                # Panic exit — 0.1 s is just enough for the RPyC frame to
+                # flush to the wire before we vanish.
+                loop.call_later(0.1, lambda: _os._exit(0))
+                logger.warning(
+                    "exposed_shutdown(force=True): process will exit in 100ms"
+                )
+                result = {
+                    "success": True,
+                    "message": "Shutdown initiated (forced, immediate)",
+                    "grace_seconds": 0.0,
+                    "force": True,
+                }
+                return json.dumps(result)
+
+            # Graceful: flip the cooperative flag, close RPyC, arm SIGKILL.
             self._agent_process.running = False
 
-            # Close RPyC server after response is sent
-            async def delayed_close_async() -> None:
-                """Async wrapper for closing RPyC server."""
-                import time
-
-                time.sleep(0.5)  # Give time for response to be sent
-                if self._agent_process and self._agent_process.rpyc_server:
+            async def graceful_close() -> None:
+                """Close the RPyC server after a short flush window."""
+                # 50 ms is enough for the JSON response to leave our socket.
+                await asyncio.sleep(0.05)
+                srv = getattr(self._agent_process, "rpyc_server", None)
+                if srv is not None:
                     try:
-                        await self._agent_process.rpyc_server.close()
+                        await srv.close()
                     except Exception:
-                        pass
+                        logger.debug(
+                            "exposed_shutdown: rpyc_server.close() raised",
+                            exc_info=True,
+                        )
 
-            # Schedule the async close in the event loop
-            asyncio.create_task(delayed_close_async())
+            asyncio.create_task(graceful_close())
 
-            result = {"success": True, "message": "Shutdown initiated"}
+            # Hard-kill fallback. If cooperative shutdown worked the
+            # process is already gone; otherwise this guarantees exit
+            # after grace_seconds without external signals.
+            loop.call_later(grace, lambda: _os._exit(0))
+
+            result = {
+                "success": True,
+                "message": "Shutdown initiated",
+                "grace_seconds": grace,
+                "force": False,
+            }
             return json.dumps(result)
 
         except Exception as e:
@@ -1055,6 +1191,23 @@ class AgentService(rpyc.Service):
         # Reference: RPyC docs on async_() and AsyncResult
         # ========================================================================
 
+        # ================================================================
+        # Serialise the message ONCE, on the agent side, and ship it as a
+        # plain ``str`` across RPyC. Subscribers then do ``json.loads`` on
+        # their side — no netref traversal, no ``sync_request()`` from
+        # the subscriber's async loop, no remote-object leaks. See
+        # docs/DESIGN_AGENT_SERVICE_MEMORY_FIX.md (F2).
+        # ================================================================
+        try:
+            payload_str = json.dumps(message, default=str)
+        except (TypeError, ValueError) as exc:
+            # Defensive: never drop a broadcast silently.
+            logger.warning(
+                "Could not JSON-serialise broadcast message (%s); falling back to str()",
+                exc,
+            )
+            payload_str = json.dumps({"type": "raw", "content": str(message)})
+
         for subscriber in subscribers:
             try:
                 rpyc_start = time_mod.time()
@@ -1063,7 +1216,7 @@ class AgentService(rpyc.Service):
                 # In deepagents, all callbacks (mount_message, etc.) are called with await.
                 # We preserve this async pattern across the RPyC boundary.
                 # With AsyncioServer, await works correctly on proxy objects!
-                await subscriber.on_message(message)
+                await subscriber.on_message(payload_str)
 
                 rpyc_end = time_mod.time()
                 rpyc_duration_ms = (rpyc_end - rpyc_start) * 1000

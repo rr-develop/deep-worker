@@ -1370,13 +1370,18 @@ def _detect_provider(model_name: str) -> str | None:
 
 # Provider → (env_var, hardcoded_default) mapping.
 # Single source of truth for default model names.
-_PROVIDER_DEFAULT_MODELS: dict[str, tuple[str | None, str]] = {
+_PROVIDER_DEFAULT_MODELS: dict[str, tuple[str | None, str | None]] = {
     "deepseek": ("DEEPSEEK_MODEL", "deepseek-chat"),
     "openai": ("OPENAI_MODEL", "gpt-5.2"),
     "anthropic": ("ANTHROPIC_MODEL", "claude-sonnet-4-5-20250929"),
     "google": ("GOOGLE_MODEL", "gemini-3-pro-preview"),
     "vertexai": ("VERTEX_AI_MODEL", "gemini-3-pro-preview"),
     "claude-code": (None, "sonnet"),
+    # Codex: do NOT pin a model version. Let Codex CLI pick its own
+    # default (which evolves with the CLI). If the user sets
+    # CODEX_MODEL, we honour it; otherwise we pass nothing and the
+    # CLI chooses. See DESIGN_CODEX_PROVIDER.md §15 Q2.
+    "codex": ("CODEX_MODEL", None),
 }
 
 
@@ -1450,7 +1455,8 @@ def create_model(
                 f"[bold red]Error:[/bold red] Provider '{provider}' requires GOOGLE_CLOUD_PROJECT"
             )
             sys.exit(1)
-        # claude-code doesn't need API key validation
+        # claude-code and codex don't need API key validation
+        # (they use cached local CLI login)
 
         # Provider is valid and has credentials (or doesn't need them)
         # If model_name is None, get from environment or use provider default
@@ -1522,18 +1528,19 @@ def create_model(
     # DO NOT CHANGE THE PROVIDER PRIORITY ORDER!
     # DO NOT REMOVE THE has_deepseek CHECK!
     #
-    # This code is used by the OLD entry point main.py (python3 -m deep_worker_cli.main)
+    # This code is used by the OLD entry point main.py (python3 -m deep_worker_cli.main),
     # which must NOT be used for testing or production!
     #
-    # The ONLY CORRECT way to run it:
-    # ✅ deep-worker [agent-name]  - the command is installed on the user's PATH
+    # The ONLY CORRECT way to launch:
+    # ✅ deep-worker [agent-name]  - the command installed by the package entry point
     #
     # INCORRECT (DO NOT USE):
     # ❌ python3 -m deep_worker_cli.main
     # ❌ python3 -m deep_worker_cli.cli.main
     #
-    # The deep-worker command uses agent_command.py, which explicitly sets provider="deepseek"
-    # by default, so it now PASSES the provider explicitly to create_model().
+    # The deep-worker command uses agent_command.py, which explicitly sets
+    # provider="deepseek" by default, so it now PASSES the provider explicitly
+    # to create_model().
     #
     # See: DEEPSEEK_PROVIDER.md for details
     # ============================================================================
@@ -1610,7 +1617,10 @@ def create_model(
 
         if "claude" in model_lower:
             try:
-                from langchain_google_vertexai.model_garden import (  # type: ignore[unresolved-import]
+                # Optional dependency; install `langchain-google-vertexai`
+                # to enable Vertex AI's Anthropic proxy. The import is
+                # guarded by the enclosing try/except ImportError.
+                from langchain_google_vertexai.model_garden import (  # ty: ignore[unresolved-import]
                     ChatAnthropicVertex,
                 )
             except ImportError:
@@ -1645,7 +1655,7 @@ def create_model(
         # ============================================================================
         # CRITICAL: CLAUDE_CODE_PROVIDER MUST BE IMPORTED FROM SOURCE CODE!
         # ============================================================================
-        # Import claude_code_provider from the repository root
+        # Import claude_code_provider from the local source tree.
         # This is a local package that provides LangChain wrapper for Claude Code SDK
         # ============================================================================
         _repo_root = Path(__file__).parent.parent.parent.parent
@@ -1660,6 +1670,26 @@ def create_model(
         model = ClaudeCodeChatModel(
             model=model_name,
             max_tokens=20_000,
+        )
+    elif provider == "codex":
+        # ============================================================================
+        # CODEX provider — sibling of claude-code (see DESIGN_CODEX_PROVIDER.md).
+        # ============================================================================
+        # Local source import, no API key (cached login via ~/.codex/auth.json).
+        # ``model_name`` may be None — in that case the provider does NOT
+        # pass ``--model`` to ``codex exec`` and the CLI picks its own
+        # current default (Q2: do not pin model version).
+        # ============================================================================
+        _repo_root = Path(__file__).parent.parent.parent.parent
+        if str(_repo_root) not in sys.path:
+            sys.path.insert(0, str(_repo_root))
+
+        from codex_provider import CodexChatModel
+
+        model = CodexChatModel(
+            model=model_name,            # may be None — Codex picks default
+            max_tokens=20_000,
+            # sandbox_mode/approval_policy defaults match Q3 (always-skip-prompts)
         )
     else:
         # Should not reach here due to earlier validation

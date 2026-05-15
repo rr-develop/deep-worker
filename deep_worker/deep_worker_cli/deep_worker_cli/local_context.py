@@ -67,7 +67,7 @@ class LocalContextStateUpdate(TypedDict):
     """Formatted local context: git, cwd, files, tree."""
 
 
-class LocalContextMiddleware(AgentMiddleware):
+class LocalContextMiddleware(AgentMiddleware[LocalContextState, Any, Any]):
     """Middleware for injecting local context into system prompt.
 
     This middleware:
@@ -477,11 +477,11 @@ class LocalContextMiddleware(AgentMiddleware):
 
         return None
 
-    # override - state parameter is intentionally narrowed from
-    # AgentState to LocalContextState for type safety within this middleware.
-    # This violates strict Liskov substitution but is safe since the middleware
-    # only processes its own state schema.
-    def before_agent(  # type: ignore[override]
+    # `state: LocalContextState` is a covariant refinement of the base
+    # `AgentState[Any]`. The `AgentMiddleware[LocalContextState, ...]`
+    # class-level parameterization above makes this override legal under
+    # ty. No suppression comments are needed here.
+    def before_agent(
         self,
         state: LocalContextState,
         runtime: Runtime,

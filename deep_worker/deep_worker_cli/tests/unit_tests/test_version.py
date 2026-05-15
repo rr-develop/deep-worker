@@ -1,11 +1,31 @@
 """Tests for version-related functionality."""
 
+import os
 import subprocess
 import sys
 import tomllib
 from pathlib import Path
 
 from deep_worker_cli._version import __version__
+
+
+def _subprocess_env() -> dict[str, str]:
+    """Return an env for subprocess that keeps local `deepagents`
+    importable — mirrors conftest.py's sys.path injection.
+    Without this, `python -m deep_worker_cli.main` in a
+    child process fails with `ModuleNotFoundError: No module named
+    'deepagents'` because no site-package install exists (policy:
+    tests always run against source, see conftest.py header).
+    """
+    env = dict(os.environ)
+    existing = env.get("PYTHONPATH", "")
+    prefix = os.pathsep.join([
+        str(Path(__file__).parent.parent.parent.parent / "deepagents"),
+        # deep_worker_cli source dir — so `deep_worker_cli.main` resolves:
+        str(Path(__file__).parent.parent.parent),
+    ])
+    env["PYTHONPATH"] = prefix + (os.pathsep + existing if existing else "")
+    return env
 
 
 def test_version_matches_pyproject() -> None:
@@ -31,6 +51,7 @@ def test_cli_version_flag() -> None:
     result = subprocess.run(
         [sys.executable, "-m", "deep_worker_cli.main", "--version"],
         capture_output=True,
+        env=_subprocess_env(),
         text=True,
         check=False,
     )
@@ -52,6 +73,7 @@ def test_help_mentions_version_flag() -> None:
     result = subprocess.run(
         [sys.executable, "-m", "deep_worker_cli.main", "help"],
         capture_output=True,
+        env=_subprocess_env(),
         text=True,
         check=False,
     )
@@ -66,6 +88,7 @@ def test_cli_help_flag() -> None:
     result = subprocess.run(
         [sys.executable, "-m", "deep_worker_cli.main", "--help"],
         capture_output=True,
+        env=_subprocess_env(),
         text=True,
         check=False,
     )
@@ -81,6 +104,7 @@ def test_cli_help_flag_short() -> None:
     result = subprocess.run(
         [sys.executable, "-m", "deep_worker_cli.main", "-h"],
         capture_output=True,
+        env=_subprocess_env(),
         text=True,
         check=False,
     )
@@ -96,6 +120,7 @@ def test_help_excludes_interactive_features() -> None:
     result = subprocess.run(
         [sys.executable, "-m", "deep_worker_cli.main", "--help"],
         capture_output=True,
+        env=_subprocess_env(),
         text=True,
         check=False,
     )

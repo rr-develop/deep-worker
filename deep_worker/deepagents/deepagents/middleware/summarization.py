@@ -54,13 +54,15 @@ from langgraph.config import get_config
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from typing_extensions import TypedDict, override
 
+from deepagents.backends.protocol import BackendProtocol
+
 if TYPE_CHECKING:
     from langchain.agents.middleware.types import AgentState
     from langchain.chat_models import BaseChatModel
     from langchain_core.runnables.config import RunnableConfig
     from langgraph.runtime import Runtime
 
-    from deepagents.backends.protocol import BACKEND_TYPES, BackendProtocol
+    from deepagents.backends.protocol import BACKEND_TYPES
 
 logger = logging.getLogger(__name__)
 
@@ -212,6 +214,42 @@ class SummarizationMiddleware(BaseSummarizationMiddleware):
             self._max_arg_length = truncate_args_settings.get("max_length", 2000)
             self._truncation_text = truncate_args_settings.get("truncation_text", "...(argument truncated)")
 
+        # ═══════════════════════════════════════════════════════════════
+        # Token-count cache (DESIGN_CONTEXT_DELTA_CACHE.md §4.6).
+        #
+        # before_model() runs on every agent turn and needs the total
+        # token count to decide whether to summarize. ``token_counter``
+        # over all messages is O(messages × tokens) — that's the bulk
+        # of the per-turn overhead on a long conversation.
+        #
+        # Invariant used: if the messages-list is the SAME list (by
+        # identity of message ids, in the same order, with the same
+        # length), the token count cannot have changed. The cache
+        # remembers the id-sequence signature of the last list it
+        # counted and returns the cached total on an exact match.
+        #
+        # We intentionally do NOT try to add tokens of appended
+        # messages incrementally: user-supplied token_counter callables
+        # may not be strictly additive (they may account for
+        # separators, prefixes, role tokens), so only exact-list
+        # equality is safe to memoize.
+        # ═══════════════════════════════════════════════════════════════
+        self._cached_token_signature: tuple[Any, ...] | None = None
+        self._cached_token_total: int = 0
+
+    def _cached_total_tokens(self, messages: list[Any]) -> int:
+        """Return total tokens for ``messages``, caching the last result.
+
+        See the comment above ``_cached_token_signature``.
+        """
+        signature = tuple(getattr(m, "id", id(m)) for m in messages)
+        if signature == self._cached_token_signature:
+            return self._cached_token_total
+        total = int(self.token_counter(messages))
+        self._cached_token_signature = signature
+        self._cached_token_total = total
+        return total
+
     @override
     def _trim_messages_for_summary(self, messages: list[AnyMessage]) -> list[AnyMessage]:
         """Trim messages to fit within summary generation limits, accounting for prompt size.
@@ -277,23 +315,27 @@ class SummarizationMiddleware(BaseSummarizationMiddleware):
         Returns:
             Resolved backend instance.
         """
-        if callable(self._backend):
-            # Because we're using `before_model`, which doesn't receive `config` as a
-            # parameter, we access it via `runtime.config` instead.
-            # Cast is safe: empty dict `{}` is a valid `RunnableConfig` (all fields are
-            # optional in TypedDict).
-            config = cast("RunnableConfig", getattr(runtime, "config", {}))
+        # `self._backend` is BackendProtocol | BackendFactory. ty can't
+        # narrow `callable(...)`, so use isinstance — factories are plain
+        # Callables, not BackendProtocol instances.
+        if isinstance(self._backend, BackendProtocol):
+            return self._backend
 
-            tool_runtime = ToolRuntime(
-                state=state,
-                context=runtime.context,
-                stream_writer=runtime.stream_writer,
-                store=runtime.store,
-                config=config,
-                tool_call_id=None,
-            )
-            return self._backend(cast(Any, tool_runtime))
-        return self._backend
+        # Because we're using `before_model`, which doesn't receive `config` as a
+        # parameter, we access it via `runtime.config` instead.
+        # Cast is safe: empty dict `{}` is a valid `RunnableConfig` (all fields are
+        # optional in TypedDict).
+        config = cast("RunnableConfig", getattr(runtime, "config", {}))
+
+        tool_runtime = ToolRuntime(
+            state=state,
+            context=runtime.context,
+            stream_writer=runtime.stream_writer,
+            store=runtime.store,
+            config=config,
+            tool_call_id=None,
+        )
+        return self._backend(cast(Any, tool_runtime))
 
     def _get_thread_id(self) -> str:
         """Extract `thread_id` from langgraph config.
@@ -512,7 +554,7 @@ A condensed summary follows:
             Tuple of (truncated_messages, modified). If modified is False,
             truncated_messages is the same as input messages.
         """
-        total_tokens = self.token_counter(messages)
+        total_tokens = self._cached_total_tokens(messages)
         if not self._should_truncate_args(messages, total_tokens):
             return messages, False
 
@@ -722,8 +764,11 @@ A condensed summary follows:
         # Step 1: Truncate args if configured
         truncated_messages, args_were_truncated = self._truncate_args(messages)
 
-        # Step 2: Check if summarization should happen
-        total_tokens = self.token_counter(truncated_messages)
+        # Step 2: Check if summarization should happen.
+        # ``_cached_total_tokens`` memoizes the last-counted list by
+        # message-id signature so a repeat before_model call on the
+        # same history skips the O(messages × tokens) pass.
+        total_tokens = self._cached_total_tokens(truncated_messages)
         should_summarize = self._should_summarize(truncated_messages, total_tokens)
 
         # If only truncation happened (no summarization)
@@ -806,8 +851,11 @@ A condensed summary follows:
         # Step 1: Truncate args if configured
         truncated_messages, args_were_truncated = self._truncate_args(messages)
 
-        # Step 2: Check if summarization should happen
-        total_tokens = self.token_counter(truncated_messages)
+        # Step 2: Check if summarization should happen.
+        # ``_cached_total_tokens`` memoizes the last-counted list by
+        # message-id signature so a repeat before_model call on the
+        # same history skips the O(messages × tokens) pass.
+        total_tokens = self._cached_total_tokens(truncated_messages)
         should_summarize = self._should_summarize(truncated_messages, total_tokens)
 
         # If only truncation happened (no summarization)

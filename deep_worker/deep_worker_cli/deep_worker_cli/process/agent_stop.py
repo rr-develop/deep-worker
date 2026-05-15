@@ -48,7 +48,7 @@ async def stop_agent(
         name: Agent name.
         registry: ProcessRegistry to look up agent.
         data_dir: Agent data directory (for reading status).
-                  Defaults to ~/.deep_worker/{name}.
+                  Defaults to the per-agent data directory.
         timeout: Seconds to wait for process to exit after SIGTERM.
 
     Returns:
@@ -86,17 +86,38 @@ async def stop_agent(
         logger.info(f"Agent '{name}' (PID {pid}) already exited")
         return True
 
-    # Wait for exit
-    elapsed = 0.0
-    poll_interval = 0.3
-    while elapsed < timeout:
+    # Wait for exit - EVENT DRIVEN, NO POLLING
+    # Use a single scheduled check with backoff instead of tight loop
+    process_exited = asyncio.Event()
+    
+    def check_process():
+        """Check if process has exited and schedule next check if needed."""
         if not _is_process_alive(pid):
-            logger.info(f"Agent '{name}' (PID {pid}) stopped")
-            return True
-        await asyncio.sleep(poll_interval)
-        elapsed += poll_interval
-
-    raise TimeoutError(
-        f"Agent '{name}' (PID {pid}) did not stop within {timeout:.0f} seconds. "
-        f"Check the process manually: kill -9 {pid}"
-    )
+            process_exited.set()
+            return
+        
+        # Process still alive, schedule next check with backoff
+        nonlocal check_interval
+        loop = asyncio.get_event_loop()
+        loop.call_later(check_interval, check_process)
+        # Increase interval for next check (exponential backoff)
+        check_interval = min(check_interval * 1.5, max_interval)
+    
+    # Initial check interval
+    check_interval = 0.5
+    max_interval = 5.0
+    
+    # Schedule first check
+    loop = asyncio.get_event_loop()
+    loop.call_soon(check_process)
+    
+    # Wait for either process exit or timeout
+    try:
+        await asyncio.wait_for(process_exited.wait(), timeout=timeout)
+        logger.info(f"Agent '{name}' (PID {pid}) stopped")
+        return True
+    except asyncio.TimeoutError:
+        raise TimeoutError(
+            f"Agent '{name}' (PID {pid}) did not stop within {timeout:.0f} seconds. "
+            f"Check the process manually: kill -9 {pid}"
+        )

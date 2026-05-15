@@ -204,14 +204,20 @@ class TestThreadFunctions:
 class TestGetCheckpointer:
     """Tests for get_checkpointer async context manager."""
 
-    def test_returns_async_sqlite_saver(self, tmp_path):
-        """Get checkpointer returns AsyncSqliteSaver."""
+    def test_returns_delta_sqlite_checkpointer(self, tmp_path):
+        """get_checkpointer() yields the project's DeltaSqliteCheckpointer.
+
+        The older AsyncSqliteSaver has been replaced by the
+        delta-based `DeltaSqliteCheckpointer` (see
+        `deep_worker_cli.delta_checkpointer`) so that each checkpoint
+        is stored as a small delta instead of a full state snapshot.
+        """
 
         async def _test() -> None:
             db_path = tmp_path / "test.db"
             with patch.object(sessions, "get_db_path", return_value=db_path):
                 async with sessions.get_checkpointer() as cp:
-                    assert "AsyncSqliteSaver" in type(cp).__name__
+                    assert "DeltaSqliteCheckpointer" in type(cp).__name__
 
         asyncio.run(_test())
 
@@ -566,7 +572,7 @@ class TestCleanAgentHistory:
         conn.close()
 
         # Create agent data directory
-        data_dir = tmp_path / Path("~/.deep_worker").expanduser().name / "test_agent1"
+        data_dir = tmp_path / Path("~/.deep_worker").name / "test_agent1"
         data_dir.mkdir(parents=True)
         metadata_file = data_dir / "session_metadata.json"
         metadata_file.write_text(json.dumps({
@@ -578,7 +584,7 @@ class TestCleanAgentHistory:
         }))
 
         # Create log files
-        log_dir = tmp_path / Path("~/.deep_worker").expanduser().name / "logs"
+        log_dir = tmp_path / Path("~/.deep_worker").name / "logs"
         log_dir.mkdir(parents=True)
         (log_dir / "test_agent1.out.log").write_text("stdout log content")
         (log_dir / "test_agent1.err.log").write_text("stderr log content")

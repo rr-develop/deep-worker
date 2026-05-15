@@ -120,41 +120,115 @@ async def list_agents() -> int:
 async def show_status(agent_name: str) -> int:
     """Show detailed status of an agent.
 
-    Args:
-        agent_name: Name of the agent
+    Prints ONLY data the agent actually reported. Anything the agent
+    did not return is surfaced as "N/A" — we never substitute a
+    placeholder (no fake ``/tmp`` working dir, no
+    ``datetime.now()`` stand-in for ``created_at``, no guessed
+    TaskManager state). Every field here has exactly one honest
+    source:
 
-    Returns:
-        Exit code
+    * ``Working Dir``, ``Started``, ``Model``, ``Provider``,
+      ``PID``, ``RPyC Port`` — from ``get_agent_metadata()``
+      (agent's ``exposed_get_metadata``).
+    * ``Status`` — from ``get_status()``.
+    * ``TaskManager`` — from ``get_task_manager_info()`` (keys
+      ``task_manager_active`` / ``task_manager_disabled`` on the
+      same status response; absent when the agent has no TM).
+    * ``Last Activity``, ``Tasks Completed``, ``Message Count`` —
+      from ``SessionInfo.data`` when present; printed as "N/A"
+      otherwise.
     """
+
+    def _fmt(value: object) -> str:
+        """Format a value for display. ``None``/empty → "N/A"."""
+        if value is None:
+            return "N/A"
+        s = str(value)
+        return s if s else "N/A"
+
+    def _fmt_iso(iso_ts: object) -> str:
+        """ISO timestamp → 'YYYY-MM-DD HH:MM:SS', else "N/A"."""
+        if not iso_ts:
+            return "N/A"
+        from datetime import datetime as _dt
+        try:
+            return _dt.fromisoformat(str(iso_ts)).strftime("%Y-%m-%d %H:%M:%S")
+        except (ValueError, TypeError):
+            return _fmt(iso_ts)
+
     try:
         client = AgentClient(agent_name)
         await client.connect()
 
-        # Get full SessionInfo via new API
-        session_info = await client.get_status()
+        # Pull each piece of honest data separately. If any RPC fails
+        # we still print what we have and mark the rest N/A.
+        session_info = None
+        try:
+            session_info = await client.get_status()
+        except Exception as e:
+            print(f"  ⚠ get_status failed: {e}", file=sys.stderr)
+
+        metadata = await client.get_agent_metadata()  # None on error
+        tm_info = await client.get_task_manager_info()  # None on error
 
         print(f"\nAgent Status: {agent_name}")
         print("=" * 60)
-        print(f"  Status:          {session_info.status.value}")
-        print(f"  Session Type:    {session_info.session_type}")
-        print(f"  Working Dir:     {session_info.working_dir}")
-        print(f"  Created:         {session_info.created_at.strftime('%Y-%m-%d %H:%M:%S')}")
 
-        if session_info.last_activity:
-            print(f"  Last Activity:   {session_info.last_activity.strftime('%Y-%m-%d %H:%M:%S')}")
+        if session_info is not None:
+            print(f"  Status:          {session_info.status.value}")
+            print(f"  Session Type:    {session_info.session_type}")
+        else:
+            print(f"  Status:          N/A")
+            print(f"  Session Type:    N/A")
 
-        print(f"  Tasks Completed: {session_info.tasks_completed}")
+        # Working dir, start time, model, provider, pid, rpyc port —
+        # ONLY from live metadata. NO fallbacks to SessionInfo
+        # placeholders.
+        print(f"  Working Dir:     {_fmt(metadata.get('directory') if metadata else None)}")
+        print(f"  Started:         {_fmt_iso(metadata.get('started') if metadata else None)}")
+        print(f"  Model:           {_fmt(metadata.get('model') if metadata else None)}")
+        print(f"  Provider:        {_fmt(metadata.get('provider') if metadata else None)}")
+        print(f"  PID:             {_fmt(metadata.get('pid') if metadata else None)}")
+        print(f"  RPyC Port:       {_fmt(metadata.get('rpyc_port') if metadata else None)}")
 
-        if session_info.data:
-            print(f"  Message Count:   {session_info.data.message_count}")
-            print(f"  Process ID:      {session_info.data.process_id}")
+        # TaskManager — three states, each printed distinctly.
+        if tm_info is None:
+            print(f"  TaskManager:     N/A (unreachable)")
+        elif not tm_info["configured"]:
+            print(f"  TaskManager:     not configured")
+        else:
+            if tm_info["disabled"]:
+                state = "disabled"
+            elif tm_info["active"]:
+                state = "active"
+            else:
+                state = "inactive"
+            print(f"  TaskManager:     {state}")
 
-        if session_info.metadata:
-            print(f"  Model:           {session_info.metadata.properties.get('model', 'N/A')}")
-            print(f"  Clients:         {session_info.metadata.properties.get('clients_count', 0)}")
+        # Remaining SessionInfo-derived fields. Printed only when the
+        # agent returned them; N/A otherwise.
+        if session_info is not None:
+            if session_info.last_activity:
+                print(
+                    f"  Last Activity:   "
+                    f"{session_info.last_activity.strftime('%Y-%m-%d %H:%M:%S')}"
+                )
+            else:
+                print(f"  Last Activity:   N/A")
 
-        if session_info.error_message:
-            print(f"\n  ⚠ Error:         {session_info.error_message}")
+            # tasks_completed can legitimately be 0; only print a number
+            # when SessionInfo.data is present (otherwise we'd be
+            # surfacing the placeholder default).
+            if session_info.data is not None:
+                print(f"  Tasks Completed: {session_info.tasks_completed}")
+                print(f"  Message Count:   {session_info.data.message_count}")
+                print(f"  Process ID:      {session_info.data.process_id}")
+            else:
+                print(f"  Tasks Completed: N/A")
+                print(f"  Message Count:   N/A")
+
+            if session_info.error_message:
+                print(f"\n  ⚠ Error:         {session_info.error_message}")
 
         print("=" * 60)
 
@@ -223,24 +297,36 @@ async def stop_agent(agent_name: str) -> int:
             print(f"Error: Permission denied to stop process {agent_info.pid}", file=sys.stderr)
             return 1
 
-        # Wait up to 5 seconds for graceful shutdown
+        # Wait up to 5 seconds for graceful shutdown - EVENT DRIVEN, NO POLLING
         max_wait = 5.0  # seconds
-        check_interval = 0.1  # seconds
-        waited = 0.0
-
-        while waited < max_wait:
-            await asyncio.sleep(check_interval)
-            waited += check_interval
-
-            # Check if process is dead
+        
+        # Use event-driven approach with scheduled checks
+        process_exited = asyncio.Event()
+        
+        def check_process():
+            """Check if process has exited."""
             try:
                 os.kill(agent_info.pid, 0)  # Check if process exists
-                # Still alive, keep waiting
+                # Still alive, schedule next check
+                loop = asyncio.get_event_loop()
+                loop.call_later(0.1, check_process)  # Check every 100ms
             except ProcessLookupError:
                 # Process died gracefully!
-                print(f"Agent '{agent_name}' stopped gracefully ({waited:.1f}s)")
-                registry.unregister(agent_name)
-                return 0
+                process_exited.set()
+        
+        # Schedule first check
+        loop = asyncio.get_event_loop()
+        loop.call_soon(check_process)
+        
+        # Wait for process exit or timeout
+        try:
+            await asyncio.wait_for(process_exited.wait(), timeout=max_wait)
+            print(f"Agent '{agent_name}' stopped gracefully")
+            registry.unregister(agent_name)
+            return 0
+        except asyncio.TimeoutError:
+            # Process didn't exit within timeout
+            pass
 
         # Phase 2: Process didn't respond to SIGTERM - FORCE KILL!
         print(f"Agent didn't respond to SIGTERM after {max_wait}s - force killing with SIGKILL...")

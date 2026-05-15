@@ -108,7 +108,14 @@ class TestAgentsAPIWithRealAgent:
             asyncio.run(service.shutdown())
 
     def test_get_history_from_real_agent(self, app: FastAPI) -> None:
-        """Test GET /api/agents/{agent_name}/history with real agent."""
+        """Test GET /api/agents/{agent_name}/history with real agent.
+
+        The endpoint follows a fire-and-forget contract: it returns
+        immediately with a ``request_id`` and the actual history is
+        delivered via WebSocket (``history_response`` event). See
+        ``deep_worker_web/app/routers/agents.py:get_history``. The
+        synchronous response only confirms the request was accepted.
+        """
         with agent_fixture() as agent_info:
             registry = ProcessRegistry()
             service = AgentService(registry=registry)
@@ -127,8 +134,11 @@ class TestAgentsAPIWithRealAgent:
                     assert response.status_code == 200
                     data = response.json()
 
-                    # Should return a list of messages (even if empty)
-                    assert isinstance(data, list)
+                    # Fire-and-forget response: {success, request_id, message}
+                    assert isinstance(data, dict)
+                    assert data.get("success") is True
+                    assert isinstance(data.get("request_id"), str)
+                    assert data["request_id"]
 
             asyncio.run(run_test())
             asyncio.run(service.shutdown())
@@ -162,7 +172,13 @@ class TestAgentsAPIWithRealAgent:
             asyncio.run(service.shutdown())
 
     def test_get_agent_status(self, app: FastAPI) -> None:
-        """Test GET /api/agents/{agent_name}/status with real agent."""
+        """Test GET /api/agents/{agent_name}/status with real agent.
+
+        Fire-and-forget endpoint (see
+        ``deep_worker_web/app/routers/agents.py:get_status``) — returns
+        ``{success, request_id, message}`` immediately; detailed status
+        arrives via WebSocket (``detailed_status_response``).
+        """
         with agent_fixture() as agent_info:
             registry = ProcessRegistry()
             service = AgentService(registry=registry)
@@ -181,10 +197,11 @@ class TestAgentsAPIWithRealAgent:
                     assert response.status_code == 200
                     data = response.json()
 
-                    # Should have status information
-                    assert "status" in data
-                    # Valid statuses: idle, running, waiting, error
-                    assert data["status"] in ["idle", "running", "waiting", "error"]
+                    # Fire-and-forget acknowledgement.
+                    assert isinstance(data, dict)
+                    assert data.get("success") is True
+                    assert isinstance(data.get("request_id"), str)
+                    assert data["request_id"]
 
             asyncio.run(run_test())
             asyncio.run(service.shutdown())

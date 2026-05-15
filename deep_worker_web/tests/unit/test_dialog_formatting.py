@@ -3,11 +3,12 @@
 Covers all 50 cases from
 DESIGN_FULL_DIALOG_FINAL_RESPONSE_PAIRS.md sections 4.1-4.6 and 4.8.
 
-(The 5 no-limit RPyC-server tests live in the CLI package's
-``process/test_get_history_no_limit.py`` because they target the
-agent-side ``_handle_get_history`` and need the CLI import path.)
+(The 5 no-limit RPyC-server tests live in
+deep_worker_cli/tests/unit_tests/process/test_get_history_no_limit.py
+because they target the agent-side ``_handle_get_history`` and need the
+``deep_worker_cli`` import path.)
 
-(The real-agent regression test is not part of the public tree.)
+(The demo-agent regression test lives in test_dialog_regression_demo_site.py.)
 """
 
 from __future__ import annotations
@@ -270,50 +271,101 @@ class TestNonDirectUserSources:
 
 
 # ============================================================================
-# 4.3  Summarization (the only filtered case)
+# 4.3  Summarization — MUST be visible, labelled with its own header
+#
+# Rationale (DESIGN_SUMMARIZATION_VISIBLE.md): hiding the summarization
+# node breaks post-mortem analysis because the reader cannot tell why the
+# agent's behaviour pivots after a context compaction. The node is the
+# explanation and MUST render — but under an unambiguous header so it is
+# clearly distinct from real user input.
 # ============================================================================
 
 
-class TestSummarizationFiltering:
-    def test_summarization_human_filtered(self) -> None:
+SUMMARIZATION_HEADER = "--- Summarization ---"
+
+
+class TestSummarizationVisibility:
+    def test_summarization_human_is_rendered_with_summarization_header(self) -> None:
         out = fmt([
             human("Context Extraction Assistant\nblah blah"),
             ai("synthetic-summary"),
             human("real query"),
             ai("real-A"),
         ])
-        assert "synthetic-summary" not in out
-        assert "Context Extraction Assistant" not in out
+        # summarization turn is visible and labelled
+        assert SUMMARIZATION_HEADER in out
+        # its synthetic AI body (the distilled recap) is visible
+        assert "synthetic-summary" in out
+        # the marker substring appears only under --- Summarization ---,
+        # NOT under a --- User --- block preceding it
+        pre_sum = out.split(SUMMARIZATION_HEADER, 1)[0]
+        assert "Context Extraction Assistant" not in pre_sum
+        # the following real turn is intact
         assert "real query" in out
         assert "real-A" in out
 
-    def test_summarization_legacy_marker_filtered(self) -> None:
+    def test_summarization_legacy_marker_is_rendered(self) -> None:
         out = fmt([
             human("You are in the middle of a conversation that has been summarized\n\nblah"),
-            ai("ignored"),
+            ai("recap-of-prior-context"),
             human("real"),
             ai("real-A"),
         ])
-        assert "ignored" not in out
+        assert SUMMARIZATION_HEADER in out
+        assert "recap-of-prior-context" in out
         assert "real-A" in out
 
-    def test_summarization_only_history_returns_no_history(self) -> None:
+    def test_summarization_only_history_still_renders(self) -> None:
+        # Prior contract returned NO_HISTORY; new contract: summarization
+        # alone IS content and MUST render.
         out = fmt([
             human("You are in the middle of a conversation that has been summarized: foo"),
         ])
-        assert out == NO_HISTORY
+        assert out != NO_HISTORY
+        assert SUMMARIZATION_HEADER in out
 
-    def test_summarization_does_not_swallow_following_turn(self) -> None:
+    def test_summarization_and_following_turn_both_render(self) -> None:
         out = fmt([
-            human("You are in the middle of a conversation that has been summarized: skip"),
+            human("You are in the middle of a conversation that has been summarized: ctx"),
             human("real"),
             ai("real-A"),
         ])
+        assert out.count(SUMMARIZATION_HEADER) == 1
+        assert out.count("--- User ---") == 1
         assert "real" in out
         assert "real-A" in out
-        assert "skip" not in out
-        # only ONE rendered turn
-        assert out.count("--- User ---") == 1
+
+    def test_summarization_body_preserved_verbatim(self) -> None:
+        """Body is NOT silently truncated — post-mortem readers need the
+        full distilled summary."""
+        out = fmt([
+            human("Context Extraction Assistant\n---\nDistilled: agent did X, found Y."),
+            ai("continuation"),
+        ])
+        assert out.count(SUMMARIZATION_HEADER) == 1
+        assert "Distilled: agent did X, found Y." in out
+        assert "continuation" in out
+
+    def test_summarization_visible_in_text_mode(self) -> None:
+        out = fmt([
+            human("Context Extraction Assistant\nsummary-body"),
+            ai("synthetic-1"),
+            ai("synthetic-2"),
+        ], verbosity="text")
+        assert SUMMARIZATION_HEADER in out
+        # text mode renders all text-bearing AIMessages in the turn
+        assert "synthetic-1" in out
+        assert "synthetic-2" in out
+
+    def test_summarization_visible_in_full_mode_with_tool_calls(self) -> None:
+        out = fmt([
+            human("Context Extraction Assistant\nsummary-body"),
+            ai("synthetic", tool_calls=[tc("execute", {"command": "ls"})]),
+        ], verbosity="full")
+        assert SUMMARIZATION_HEADER in out
+        assert "synthetic" in out
+        # full mode surfaces tool-calls attached to the synthetic AI
+        assert "execute" in out
 
 
 # ============================================================================
@@ -408,9 +460,9 @@ class TestFullMode:
     def test_full_mode_handles_unicode_args(self) -> None:
         out = fmt([
             human("q"),
-            ai("", tool_calls=[tc("execute", {"command": "recherché"})]),
+            ai("", tool_calls=[tc("execute", {"command": "café"})]),
         ], verbosity="full")
-        assert "recherché" in out  # not escaped to \u…
+        assert "café" in out  # not escaped to \u…
 
     def test_full_mode_no_response_still_renders_placeholder(self) -> None:
         out = fmt([human("q")], verbosity="full")

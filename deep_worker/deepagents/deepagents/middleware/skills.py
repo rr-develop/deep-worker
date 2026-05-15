@@ -98,8 +98,10 @@ from typing import TYPE_CHECKING, Annotated, Any, cast
 import yaml
 from langchain.agents.middleware.types import PrivateStateAttr
 
+from deepagents.backends.protocol import BackendProtocol
+
 if TYPE_CHECKING:
-    from deepagents.backends.protocol import BACKEND_TYPES, BackendProtocol
+    from deepagents.backends.protocol import BACKEND_TYPES
 
 from collections.abc import Awaitable, Callable
 from typing import NotRequired, TypedDict
@@ -590,7 +592,7 @@ Remember: Skills make you more capable and consistent. When in doubt, check if a
 """
 
 
-class SkillsMiddleware(AgentMiddleware):
+class SkillsMiddleware(AgentMiddleware[SkillsState, Any, Any]):
     """Middleware for loading and exposing agent skills to the system prompt.
 
     Loads skills from backend sources and injects them into the system prompt
@@ -647,24 +649,26 @@ class SkillsMiddleware(AgentMiddleware):
         Returns:
             Resolved backend instance
         """
-        if callable(self._backend):
-            # Construct an artificial tool runtime to resolve backend factory
-            # Use runtime.config if available, otherwise create empty config
-            config = getattr(runtime, "config", RunnableConfig())
-            tool_runtime: Any = ToolRuntime(
-                state=state,
-                context=runtime.context,
-                stream_writer=runtime.stream_writer,
-                store=runtime.store,
-                config=config,
-                tool_call_id=None,
-            )
-            backend = self._backend(cast(Any, tool_runtime))
-            if backend is None:
-                raise AssertionError("SkillsMiddleware requires a valid backend instance")
-            return backend
+        # `self._backend` is BackendProtocol | BackendFactory. ty can't
+        # narrow `callable(...)`, so use isinstance — factories are plain
+        # Callables, not BackendProtocol instances.
+        if isinstance(self._backend, BackendProtocol):
+            return self._backend
 
-        return self._backend
+        # Construct an artificial tool runtime to resolve backend factory.
+        config = getattr(runtime, "config", RunnableConfig())
+        tool_runtime: Any = ToolRuntime(
+            state=state,
+            context=runtime.context,
+            stream_writer=runtime.stream_writer,
+            store=runtime.store,
+            config=config,
+            tool_call_id=None,
+        )
+        backend = self._backend(cast(Any, tool_runtime))
+        if backend is None:
+            raise AssertionError("SkillsMiddleware requires a valid backend instance")
+        return backend
 
     def _format_skills_locations(self) -> str:
         """Format skills locations for display in system prompt."""
@@ -718,7 +722,7 @@ class SkillsMiddleware(AgentMiddleware):
 
         return request.override(system_message=new_system_message)
 
-    def before_agent(self, state: SkillsState, runtime: Any) -> SkillsStateUpdate | None:  # type: ignore[override]
+    def before_agent(self, state: SkillsState, runtime: Any) -> dict[str, Any] | None:
         """Load skills metadata before agent execution (synchronous).
 
         Runs before each agent interaction to discover available skills from all
@@ -750,9 +754,9 @@ class SkillsMiddleware(AgentMiddleware):
                 all_skills[skill["name"]] = skill
 
         skills = list(all_skills.values())
-        return SkillsStateUpdate(skills_metadata=skills)
+        return {"skills_metadata": skills}
 
-    async def abefore_agent(self, state: SkillsState, runtime: Any) -> SkillsStateUpdate | None:  # type: ignore[override]
+    async def abefore_agent(self, state: SkillsState, runtime: Any) -> dict[str, Any] | None:
         """Load skills metadata before agent execution (async).
 
         Runs before each agent interaction to discover available skills from all
@@ -785,7 +789,7 @@ class SkillsMiddleware(AgentMiddleware):
                 all_skills[skill["name"]] = skill
 
         skills = list(all_skills.values())
-        return SkillsStateUpdate(skills_metadata=skills)
+        return {"skills_metadata": skills}
 
     def wrap_model_call(
         self,

@@ -5,7 +5,21 @@ let ws = null;
 let selectedAgent = null;
 let agents = {};
 let selectedAgents = new Set(); // Multi-select for batch operations
-let pendingRequests = new Map(); // Request correlation for fire-and-forget
+// request_id → pending entry. Two coexisting shapes discriminated by
+// ``type``:
+//   * { type: 'last_response' | 'status' | 'history' | …,
+//       agentName, resolve, reject, timeout }
+//       Used by request/response promise correlation (``loadLastResponse``
+//       etc.) — a WS event with the matching request_id resolves the
+//       promise.
+//   * { type: 'button', btn, originalText, op, agentName, startedAt }
+//       Used by the lifecycle button tracker (``trackButton`` /
+//       ``finalizeRequest``) so stop/restart/batch buttons can be
+//       re-enabled on the terminal WS event with the matching request_id.
+// Request IDs are UUIDs (client-side) or server-issued uuid4 hex —
+// both are globally unique, so the two use-cases coexist safely in one
+// Map.
+let pendingRequests = new Map();
 let currentApprovalId = null;
 let autoApproveEnabled = false;
 
@@ -88,7 +102,7 @@ function renderAgentList() {
     updateBatchToolbar();
 }
 
-// Get CSS class for status indicator dot
+// Get CSS class for status indicator dot (matches the web UI)
 function getStatusDotClass(status) {
     if (status === 'ready' || status === 'idle') return 'status-ready';
     if (status === 'working' || status === 'running') return 'status-working';
@@ -97,7 +111,7 @@ function getStatusDotClass(status) {
     return '';
 }
 
-// Get CSS class for status text
+// Get CSS class for status text (matches the web UI)
 function getStatusTextClass(status) {
     if (status === 'ready' || status === 'idle') return 'status-text-ready';
     if (status === 'working' || status === 'running') return 'status-text-working';
@@ -126,8 +140,13 @@ function selectAgent(name) {
     document.getElementById('agent-provider').textContent = agent.provider;
     document.getElementById('agent-model').textContent = agent.model;
 
-    // Update Stop TaskManager button state
+    // Update Stop TaskManager button state AND TM control row
+    // visibility so the row appears immediately based on the info
+    // we already have in ``agents[name]`` (updated by
+    // handleAgentStatus / initial snapshot), without waiting for
+    // the next status event.
     updateStopTaskManagerButton(agent);
+    updateTmControls(agent);
 
     // Load last assistant response
     loadLastResponse(name);
@@ -236,7 +255,7 @@ async function sendMessage() {
     }
 }
 
-// Copy last response to clipboard
+// Copy last response to clipboard (matches the web UI's copyLastResponse)
 async function copyLastResponse(event) {
     const content = document.getElementById('last-response-content');
     const text = content.textContent;
@@ -415,7 +434,7 @@ function handleLastResponseResult(data) {
     console.log(`Last response result for ${agent_name}, request_id: ${request_id}`);
 
     const pending = pendingRequests.get(request_id);
-    if (pending) {
+    if (pending && pending.type !== 'button') {
         clearTimeout(pending.timeout);
         pending.resolve(last_response);
         pendingRequests.delete(request_id);
@@ -434,7 +453,7 @@ function handleLastResponseError(data) {
     console.error(`Last response error for ${agent_name}:`, error);
 
     const pending = pendingRequests.get(request_id);
-    if (pending) {
+    if (pending && pending.type !== 'button') {
         clearTimeout(pending.timeout);
         pending.reject(new Error(error));
         pendingRequests.delete(request_id);
@@ -545,28 +564,29 @@ function updateStopTaskManagerButton(agent) {
     }
 }
 
-// Stop TaskManager
+// Stop TaskManager (fire-and-forget, result arrives via WebSocket).
 async function stopTaskManager() {
     if (!selectedAgent) return;
 
     if (!confirm('Stop TaskManager for this agent?')) return;
 
+    const btn = document.getElementById('stop-taskmanager-btn');
     try {
         const response = await fetch(`/api/agents/${selectedAgent}/stop_task_manager`, {
             method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-            },
+            headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ force: false }),
         });
 
-        if (!response.ok) throw new Error('Failed to stop TaskManager');
-
-        console.log('TaskManager stop requested');
-        alert('TaskManager stop requested');
+        if (!response.ok) {
+            showNotification(`Failed to stop TaskManager (HTTP ${response.status})`, 'error');
+            return;
+        }
+        const data = await response.json();
+        trackButton(data.request_id, btn, 'task_manager_stop', selectedAgent, '⏳ Stopping TM…');
+        showNotification('TaskManager stop requested', 'info');
     } catch (error) {
-        console.error('Error stopping TaskManager:', error);
-        alert('Failed to stop TaskManager');
+        showNotification('Error stopping TaskManager: ' + error.message, 'error');
     }
 }
 
@@ -638,6 +658,51 @@ function connectWebSocket() {
     };
 }
 
+// -------- Fire-and-forget lifecycle: per-request UI tracker --------------
+//
+// Every button click against a fire-and-forget endpoint gets a request_id
+// back. We register it in the shared ``pendingRequests`` Map (declared at
+// the top of this file) so the matching WS terminal event
+// (_completed/_failed) can re-enable the button. Entries here use
+// ``type: 'button'`` to distinguish them from promise-correlation entries
+// produced by ``loadLastResponse`` / history / status flows.
+
+function trackButton(requestId, btn, op, agentName, pendingText) {
+    if (!requestId || !btn) return;
+    const originalText = btn.textContent;
+    pendingRequests.set(requestId, {
+        type: 'button',
+        btn,
+        originalText,
+        op,
+        agentName,
+        startedAt: Date.now(),
+    });
+    btn.disabled = true;
+    if (pendingText) btn.textContent = pendingText;
+}
+
+function finalizeRequest(requestId) {
+    const entry = pendingRequests.get(requestId);
+    if (!entry || entry.type !== 'button') return;
+    pendingRequests.delete(requestId);
+    try {
+        entry.btn.disabled = false;
+        if (entry.originalText) entry.btn.textContent = entry.originalText;
+    } catch (_) { /* button gone from DOM — fine */ }
+}
+
+function labelForOp(op) {
+    const m = {
+        agent_stop: 'Stop',
+        agent_restart: 'Restart',
+        agent_spawn: 'Start',
+        batch: 'Batch',
+        task_manager_stop: 'Stop TaskManager',
+    };
+    return m[op] || op;
+}
+
 // Handle WebSocket messages
 function handleWebSocketMessage(data) {
     console.log('WebSocket message:', data);
@@ -699,6 +764,72 @@ function handleWebSocketMessage(data) {
         case 'agent_interrupt_result':
             handleAgentInterruptResult(data);
             break;
+
+        // ---- Fire-and-forget lifecycle events ----
+        case 'agent_stop_started':
+        case 'agent_restart_started':
+        case 'agent_spawn_started':
+        case 'batch_started':
+        case 'agent_shutdown_requested':
+            // Informational — UI already knows (we just clicked). Log only.
+            console.log(`lifecycle ${data.type}: ${data.agent_name || ''} (${data.request_id || ''})`);
+            break;
+        case 'agent_stop_escalated':
+            showNotification(
+                `Escalated to SIGKILL: ${data.agent_name} (grace expired)`,
+                'info',
+            );
+            break;
+        case 'batch_progress':
+            // Throttled progress; log only — summary shows final state.
+            if (data.payload) {
+                console.log(
+                    `batch ${data.payload.action}: ${data.payload.completed}/${data.payload.total}`,
+                );
+            }
+            break;
+        case 'agent_stop_completed':
+        case 'agent_restart_completed':
+        case 'agent_spawn_completed':
+            finalizeRequest(data.request_id);
+            showNotification(
+                `${labelForOp(data.type.replace(/_completed$/, ''))} ok: ${data.agent_name || ''}`,
+                'success',
+            );
+            break;
+        case 'batch_completed':
+            finalizeRequest(data.request_id);
+            {
+                const p = data.payload || {};
+                showNotification(
+                    `Batch ${p.action || ''}: ${p.completed || 0}/${p.total || 0}` +
+                    (p.failed ? `, ${p.failed} failed` : ''),
+                    p.failed ? 'error' : 'success',
+                );
+            }
+            break;
+        case 'agent_stop_failed':
+        case 'agent_restart_failed':
+        case 'agent_spawn_failed':
+        case 'batch_failed':
+            finalizeRequest(data.request_id);
+            showNotification(
+                `${labelForOp(data.type.replace(/_failed$/, ''))} failed: ${data.agent_name || ''} — ${data.error || 'unknown error'} (${data.error_type || ''})`,
+                'error',
+            );
+            break;
+
+        // ---- TaskManager stop (previously silent) ----
+        case 'task_manager_stopped':
+            showNotification(`TaskManager stopped: ${data.agent_name || ''}`, 'success');
+            break;
+        case 'task_manager_stop_error':
+            showNotification(
+                `TaskManager stop failed: ${data.agent_name || ''} — ${data.error || 'unknown'}`,
+                'error',
+            );
+            break;
+
         case 'pong':
             // Ping response, ignore
             break;
@@ -816,7 +947,7 @@ function handleHistoryResponse(data) {
 
     // Find pending request
     const pending = pendingRequests.get(request_id);
-    if (pending) {
+    if (pending && pending.type !== 'button') {
         clearTimeout(pending.timeout);
         pending.resolve(history);
         pendingRequests.delete(request_id);
@@ -835,7 +966,7 @@ function handleHistoryError(data) {
 
     // Find pending request
     const pending = pendingRequests.get(request_id);
-    if (pending) {
+    if (pending && pending.type !== 'button') {
         clearTimeout(pending.timeout);
         pending.reject(new Error(error));
         pendingRequests.delete(request_id);
@@ -851,7 +982,7 @@ function handleDetailedStatusResponse(data) {
 
     // Find pending request
     const pending = pendingRequests.get(request_id);
-    if (pending) {
+    if (pending && pending.type !== 'button') {
         clearTimeout(pending.timeout);
         pending.resolve(status);
         pendingRequests.delete(request_id);
@@ -878,7 +1009,7 @@ function handleDetailedStatusError(data) {
 
     // Find pending request
     const pending = pendingRequests.get(request_id);
-    if (pending) {
+    if (pending && pending.type !== 'button') {
         clearTimeout(pending.timeout);
         pending.reject(new Error(error));
         pendingRequests.delete(request_id);
@@ -960,16 +1091,25 @@ function handleAgentDiscovered(data) {
 function handleAgentTerminated(data) {
     const { agent_name } = data;
     console.log('Agent terminated:', agent_name);
-    
+
     delete agents[agent_name];
-    
+
+    // Drop from batch multi-select too — otherwise the checkbox
+    // for a dead agent stays ticked in memory, and the batch
+    // toolbar keeps counting it as "selected" even though the
+    // row is gone from the list. Re-render reads ``selectedAgents``
+    // via ``has(name)``; cleaning it keeps the Set honest.
+    if (selectedAgents && selectedAgents.has(agent_name)) {
+        selectedAgents.delete(agent_name);
+    }
+
     // Deselect if it was the selected agent
     if (selectedAgent === agent_name) {
         selectedAgent = null;
         document.getElementById('no-agent-selected').style.display = 'flex';
         document.getElementById('agent-selected').style.display = 'none';
     }
-    
+
     renderAgentList();
 }
 
@@ -1163,8 +1303,6 @@ async function batchStop() {
     if (selectedAgents.size === 0) return;
     const names = Array.from(selectedAgents);
     const btn = document.getElementById('batch-stop-btn');
-    btn.disabled = true;
-    btn.textContent = '⏳ Stopping...';
 
     try {
         const response = await fetch('/api/agents/batch', {
@@ -1172,19 +1310,19 @@ async function batchStop() {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ action: 'stop', agent_names: names }),
         });
-        const data = await response.json();
-        let ok = 0, fail = 0;
-        for (const [name, result] of Object.entries(data.results || {})) {
-            if (result.success) { ok++; } else { fail++; }
+        if (!response.ok) {
+            const err = await response.json().catch(() => ({}));
+            showNotification(`Batch stop rejected: ${err.detail || response.status}`, 'error');
+            return;
         }
-        showNotification(`Stopped ${ok} agent(s)${fail ? `, ${fail} failed` : ''}`, fail ? 'error' : 'success');
+        const data = await response.json();
+        // Track the aggregate batch id — batch_completed will release us.
+        trackButton(data.request_id, btn, 'batch', names.join(','), '⏳ Stopping…');
+        showNotification(`Stop requested for ${names.length} agent(s)`, 'info');
         selectedAgents.clear();
         renderAgentList();
     } catch (error) {
         showNotification('Error stopping agents: ' + error.message, 'error');
-    } finally {
-        btn.disabled = false;
-        btn.textContent = '⏹ Stop';
     }
 }
 
@@ -1192,8 +1330,6 @@ async function batchRestart() {
     if (selectedAgents.size === 0) return;
     const names = Array.from(selectedAgents);
     const btn = document.getElementById('batch-restart-btn');
-    btn.disabled = true;
-    btn.textContent = '⏳ Restarting...';
 
     try {
         const response = await fetch('/api/agents/batch', {
@@ -1201,32 +1337,38 @@ async function batchRestart() {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ action: 'restart', agent_names: names }),
         });
-        const data = await response.json();
-        let ok = 0, fail = 0;
-        for (const [name, result] of Object.entries(data.results || {})) {
-            if (result.success) { ok++; } else { fail++; }
+        if (!response.ok) {
+            const err = await response.json().catch(() => ({}));
+            showNotification(`Batch restart rejected: ${err.detail || response.status}`, 'error');
+            return;
         }
-        showNotification(`Restarted ${ok} agent(s)${fail ? `, ${fail} failed` : ''}`, fail ? 'error' : 'success');
+        const data = await response.json();
+        trackButton(data.request_id, btn, 'batch', names.join(','), '⏳ Restarting…');
+        showNotification(`Restart requested for ${names.length} agent(s)`, 'info');
         selectedAgents.clear();
         renderAgentList();
     } catch (error) {
         showNotification('Error restarting agents: ' + error.message, 'error');
-    } finally {
-        btn.disabled = false;
-        btn.textContent = '🔄 Restart';
     }
 }
 
 async function stopCurrentAgent() {
     if (!selectedAgent) return;
+    const btn = document.getElementById('stop-agent-btn');
     try {
-        const response = await fetch(`/api/agents/${selectedAgent}/stop`, { method: 'POST' });
-        const data = await response.json();
-        if (response.ok) {
-            showNotification(data.message || `Agent '${selectedAgent}' stopped`, 'success');
-        } else {
-            showNotification(data.detail || 'Failed to stop agent', 'error');
+        const response = await fetch(`/api/agents/${selectedAgent}/stop`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({}),
+        });
+        if (!response.ok) {
+            const err = await response.json().catch(() => ({}));
+            showNotification(`Stop rejected: ${err.detail || response.status}`, 'error');
+            return;
         }
+        const data = await response.json();
+        trackButton(data.request_id, btn, 'agent_stop', selectedAgent, '⏳ Stopping…');
+        showNotification(`Stop requested for '${selectedAgent}'`, 'info');
     } catch (error) {
         showNotification('Error stopping agent: ' + error.message, 'error');
     }
@@ -1234,18 +1376,21 @@ async function stopCurrentAgent() {
 
 async function restartCurrentAgent() {
     if (!selectedAgent) return;
+    const btn = document.getElementById('restart-agent-btn');
     try {
         const response = await fetch(`/api/agents/${selectedAgent}/restart`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({}),
         });
-        const data = await response.json();
-        if (response.ok) {
-            showNotification(data.message || `Agent '${selectedAgent}' restarted`, 'success');
-        } else {
-            showNotification(data.detail || 'Failed to restart agent', 'error');
+        if (!response.ok) {
+            const err = await response.json().catch(() => ({}));
+            showNotification(`Restart rejected: ${err.detail || response.status}`, 'error');
+            return;
         }
+        const data = await response.json();
+        trackButton(data.request_id, btn, 'agent_restart', selectedAgent, '⏳ Restarting…');
+        showNotification(`Restart requested for '${selectedAgent}'`, 'info');
     } catch (error) {
         showNotification('Error restarting agent: ' + error.message, 'error');
     }

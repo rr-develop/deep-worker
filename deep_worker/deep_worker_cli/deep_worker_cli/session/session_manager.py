@@ -2,10 +2,17 @@
 
 import asyncio
 import json
+import logging
+from collections.abc import Awaitable, Callable
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from deep_worker_cli.types import AgentStatus
+
+logger = logging.getLogger(__name__)
+
+StatusNotifier = Callable[[dict[str, Any]], Awaitable[None]]
 
 
 class SessionManager:
@@ -24,6 +31,8 @@ class SessionManager:
         self,
         data_dir: Path,
         launch_config: dict | None = None,
+        *,
+        notifier: StatusNotifier | None = None,
     ):
         """Initialize the session manager.
 
@@ -33,7 +42,16 @@ class SessionManager:
                 working_dir, skip_permissions, task_manager, etc.). When provided,
                 it is persisted to session_metadata.json so that launch parameters
                 survive process termination and can be inspected later.
+            notifier: Optional async callable that receives a dict
+                describing every state transition (``set_status``,
+                ``set_error``, ``clear_error``). The envelope is
+                ``{"type": "status_change", "status": <enum_value>,
+                "error_message": <str|None>}``. ``AgentProcess`` wires
+                this so subscribers learn about state changes event-
+                driven, with no polling. If None, SessionManager
+                persists as before — no push.
         """
+        self._notifier = notifier
         self.data_dir = data_dir
         self.metadata_file = data_dir / "session_metadata.json"
 
@@ -65,6 +83,25 @@ class SessionManager:
         if not self.metadata_file.exists() or launch_config is not None:
             self._persist_sync()
 
+    async def _notify_status(self) -> None:
+        """Push a ``status_change`` event to the subscriber channel.
+
+        Defensive: a broken / slow subscriber MUST NOT corrupt the
+        persisted state. We log and swallow any exception so the
+        caller can continue.
+        """
+        if self._notifier is None:
+            return
+        payload = {
+            "type": "status_change",
+            "status": self.status.value,
+            "error_message": self.error_message,
+        }
+        try:
+            await self._notifier(payload)
+        except Exception as exc:  # noqa: BLE001 — defensive
+            logger.warning("status notifier raised: %s", exc)
+
     async def set_status(self, status: AgentStatus) -> None:
         """Set the agent status.
 
@@ -74,6 +111,7 @@ class SessionManager:
         self.status = status
         self.last_activity = datetime.now()
         await self._persist()
+        await self._notify_status()
 
     async def set_error(self, error_message: str) -> None:
         """Set error status with message.
@@ -85,11 +123,13 @@ class SessionManager:
         self.error_message = error_message
         self.last_activity = datetime.now()
         await self._persist()
+        await self._notify_status()
 
     async def clear_error(self) -> None:
         """Clear error message."""
         self.error_message = None
         await self._persist()
+        await self._notify_status()
 
     async def increment_tasks_completed(self) -> None:
         """Increment the tasks completed counter."""

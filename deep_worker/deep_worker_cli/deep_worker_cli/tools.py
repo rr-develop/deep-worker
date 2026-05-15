@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 # CRITICAL: CLAUDE_CODE_PROVIDER MUST BE IMPORTED FROM SOURCE CODE, NOT FROM PIP/VENV!
 # ============================================================================
 # Path calculation: __file__ is at deep_worker/deep_worker_cli/deep_worker_cli/tools.py
-# .parent x4 = the repository root
+# .parent x4 =  (repository root)
 _repo_root = Path(__file__).parent.parent.parent.parent
 _claude_code_provider_path = _repo_root / "claude_code_provider"
 if not _claude_code_provider_path.exists():
@@ -324,9 +324,12 @@ def read_image(file_path: str) -> list[dict[str, Any]] | str:
 # LLM cannot forge it.
 #
 # The delivered message always has the shape:
-#     agent:<sender>:> <original text>
-# mirroring the existing TaskManager:> convention used for corrective
-# prompts (task_manager.py:345).
+#     <sender> -> <receiver> :> <original text>
+# Both the sending agent's name and the receiving agent's name are
+# embedded so the message is self-describing in every history view
+# (sender's Full Dialog, receiver's Full Dialog, dwcli --history, etc.).
+# The sender name is bound by the factory from AgentProcess.name and
+# cannot be forged by the LLM.
 #
 # Full design: docs/DESIGN_SEND_MESSAGE_TO_AGENT_TOOL.md
 # ===========================================================================
@@ -344,7 +347,11 @@ try:  # pragma: no cover - import fallback exercised only in test setups
 except Exception:  # pragma: no cover
     # Keep the attribute available for monkeypatch even if the eager
     # import fails (e.g. during unrelated unit tests that don't need it).
-    AgentClient = None  # type: ignore[assignment,misc]
+    # Intentionally rebind the imported name to None so tests / callers
+    # can monkeypatch `deep_worker_cli.tools.AgentClient` without worrying
+    # about import failures during collection. The shape violation is
+    # deliberate — callers check for None before use.
+    AgentClient = None  # ty: ignore[invalid-assignment]
 
 
 class _SendMessageToAgentArgs(BaseModel):
@@ -368,7 +375,9 @@ class _SendMessageToAgentArgs(BaseModel):
         description=(
             "The message text to deliver. It will be delivered to the "
             "target agent as a user-role message whose content is "
-            "automatically prefixed with 'agent:<your-name>:> '."
+            "automatically prefixed with '<your-name> -> <target-name> :> ' "
+            "(both sender and receiver names are included so every "
+            "reader of the conversation can see who said what to whom)."
         ),
     )
 
@@ -400,10 +409,10 @@ def make_send_message_to_agent_tool(sender_name: str) -> BaseTool:
     ) -> dict[str, Any]:
         """Send a message to another running deep-worker agent.
 
-        The name of the CURRENT (sending) agent is automatically prepended to
-        the message in the form:
+        Both the sending agent's name and the target agent's name are
+        automatically embedded in the delivered content in the form:
 
-            agent:<sender_name>:> <message>
+            <sender_name> -> <target_name> :> <message>
 
         The target agent will see this as an incoming user-role message.
         It is delivered fire-and-forget: this call returns once the target
@@ -431,7 +440,7 @@ def make_send_message_to_agent_tool(sender_name: str) -> BaseTool:
 
                 {"success": True,
                  "target_agent": "<agent_name>",
-                 "delivered_content": "agent:<sender>:> <message>"}
+                 "delivered_content": "<sender> -> <agent_name> :> <message>"}
 
             On failure (NEVER raises — always returns a dict):
 
@@ -471,9 +480,13 @@ def make_send_message_to_agent_tool(sender_name: str) -> BaseTool:
             }
 
         # --- prefixing ------------------------------------------------
-        # Exact shape: "agent:<sender>:> <message>"
-        # Mirrors the existing TaskManager:> convention.
-        prefixed = f"agent:{sender_name}:> {message}"
+        # Exact shape: "<sender> -> <receiver> :> <message>"
+        # Both sender and receiver are included so every reader of the
+        # history (sender side, receiver side, Full Dialog, dwcli
+        # --history) can see at a glance who sent what to whom. The
+        # sender name is bound by the factory and cannot be forged by
+        # the LLM; the receiver is the "agent_name" argument.
+        prefixed = f"{sender_name} -> {target} :> {message}"
 
         # --- delivery -------------------------------------------------
         # Resolve AgentClient at call time so tests can monkeypatch the
@@ -517,12 +530,25 @@ def make_send_message_to_agent_tool(sender_name: str) -> BaseTool:
 
         try:
             try:
-                # stream=True matches how dwcli and TaskManager feed
-                # messages so the target broadcasts per-chunk to its
-                # subscribers normally. We do NOT interpret the return
-                # value as "the reply" — see fire-and-forget note in the
-                # design doc.
-                await client.invoke_agent(prefixed, stream=True)
+                # TRUE fire-and-forget: enqueue the prefixed message on the
+                # target agent and return immediately. The server schedules
+                # the LLM turn in the background via asyncio.create_task so
+                # our own turn (which produced this tool call) can end
+                # promptly — SendMessageCompletionMiddleware will inject
+                # the echo AIMessage and jump to END on the sender side.
+                resp = await client._send_command({
+                    "command": "enqueue_message",
+                    "message": prefixed,
+                })
+                if not resp.get("success"):
+                    return {
+                        "success": False,
+                        "error": "connection_failed",
+                        "message": (
+                            f"Delivery to '{target}' rejected: "
+                            f"{resp.get('error', 'unknown error')}"
+                        ),
+                    }
             except AgentNotFoundError as e:
                 return {
                     "success": False,

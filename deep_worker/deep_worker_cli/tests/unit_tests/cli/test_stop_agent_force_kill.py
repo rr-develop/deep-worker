@@ -36,9 +36,14 @@ class TestStopAgentForceKill:
         registry_file = tmp_path / "test_graceful_registry.json"
         registry = ProcessRegistry(registry_file=registry_file)
 
-        # Start a simple sleep process that will respond to SIGTERM
+        # Start a simple python process that will respond to SIGTERM.
+        # NOTE: `ProcessRegistry._is_process_alive()` greps /proc/<pid>/cmdline
+        # for 'deep-worker', 'deep_worker', 'pytest' or 'python'. A raw
+        # `sleep 300` fails that check and `lookup()` reports the entry
+        # as stale — so we spawn python instead.
         import subprocess
-        proc = subprocess.Popen(["sleep", "300"])
+        import sys
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"])
         pid = proc.pid
 
         # Register in registry
@@ -190,9 +195,11 @@ while True:
         """Test that stop_agent() reports what it's doing."""
         registry = ProcessRegistry()
 
-        # Start a simple process
+        # Spawn a python subprocess — see the note on
+        # `_is_process_alive` in test_stop_graceful_shutdown above.
         import subprocess
-        proc = subprocess.Popen(["sleep", "300"])
+        import sys
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"])
         pid = proc.pid
 
         # Register

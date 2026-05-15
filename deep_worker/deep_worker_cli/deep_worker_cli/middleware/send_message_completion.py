@@ -120,7 +120,7 @@ class SendMessageCompletionMiddleware(AgentMiddleware):
     # Explicit empty list — this middleware registers no tools of its own.
     # Declared at class level so ``middleware.tools`` is always iterable
     # even before ``__init__`` runs (some langgraph code introspects this).
-    tools: list = []  # type: ignore[assignment]
+    tools: list = []
 
     @hook_config(can_jump_to=["end"])
     def before_model(

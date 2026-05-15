@@ -1422,21 +1422,18 @@ class TestFilesystemMiddleware:
 
 class TestPatchToolCallsMiddleware:
     def test_first_message(self) -> None:
+        """With no AIMessages yet, there are no dangling tool calls to
+        patch — the middleware MUST return None so delta-checkpointing
+        can append the upcoming AI response as a single delta. Returning
+        Overwrite here rewrites the whole channel on every turn. See
+        deep_worker/docs/DESIGN_CONTEXT_DELTA_CACHE.md §4.6."""
         input_messages = [
             SystemMessage(content="You are a helpful assistant.", id="1"),
             HumanMessage(content="Hello, how are you?", id="2"),
         ]
         middleware = PatchToolCallsMiddleware()
         state_update = middleware.before_agent({"messages": input_messages}, None)
-        assert state_update is not None
-        assert isinstance(state_update["messages"], Overwrite)
-        patched_messages = state_update["messages"].value
-        assert len(patched_messages) == 2
-        assert patched_messages[0].type == "system"
-        assert patched_messages[0].content == "You are a helpful assistant."
-        assert patched_messages[1].type == "human"
-        assert patched_messages[1].content == "Hello, how are you?"
-        assert patched_messages[1].id == "2"
+        assert state_update is None
 
     def test_missing_tool_call(self) -> None:
         input_messages = [
@@ -1471,6 +1468,10 @@ class TestPatchToolCallsMiddleware:
         assert patched_messages[4].content == "What is the weather in Tokyo?"
 
     def test_no_missing_tool_calls(self) -> None:
+        """All tool calls have matching ToolMessages → no patching
+        required → middleware returns None so delta-checkpointing
+        can append cleanly on the next turn. See
+        deep_worker/docs/DESIGN_CONTEXT_DELTA_CACHE.md §4.6."""
         input_messages = [
             SystemMessage(content="You are a helpful assistant.", id="1"),
             HumanMessage(content="Hello, how are you?", id="2"),
@@ -1484,23 +1485,7 @@ class TestPatchToolCallsMiddleware:
         ]
         middleware = PatchToolCallsMiddleware()
         state_update = middleware.before_agent({"messages": input_messages}, None)
-        assert state_update is not None
-        assert isinstance(state_update["messages"], Overwrite)
-        patched_messages = state_update["messages"].value
-        assert len(patched_messages) == 5
-        assert patched_messages[0].type == "system"
-        assert patched_messages[0].content == "You are a helpful assistant."
-        assert patched_messages[1].type == "human"
-        assert patched_messages[1].content == "Hello, how are you?"
-        assert patched_messages[2].type == "ai"
-        assert len(patched_messages[2].tool_calls) == 1
-        assert patched_messages[2].tool_calls[0]["id"] == "123"
-        assert patched_messages[2].tool_calls[0]["name"] == "get_events_for_days"
-        assert patched_messages[2].tool_calls[0]["args"] == {"date_str": "2025-01-01"}
-        assert patched_messages[3].type == "tool"
-        assert patched_messages[3].tool_call_id == "123"
-        assert patched_messages[4].type == "human"
-        assert patched_messages[4].content == "What is the weather in Tokyo?"
+        assert state_update is None
 
     def test_two_missing_tool_calls(self) -> None:
         input_messages = [

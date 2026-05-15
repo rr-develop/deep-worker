@@ -1,20 +1,138 @@
 #!/usr/bin/env bash
+# deep-worker launcher — minimal wrapper that
+#   1. dispatches between the production tree (this tree, default) and a
+#      separate developer checkout (when --dev is given or auto-detected
+#      from a previous launch's session_metadata.json), and
+#   2. sets PYTHONPATH so the agent process imports deep_worker_cli /
+#      deepagents / claude_code_provider from THIS tree.
+#
+# See the internal design notes for the --dev flag (not included here) for
+# the full design.
+#
+# Testing hook:
+#   DEEP_WORKER_DEV_TREE_ROOT_OVERRIDE — when set, replaces the default
+#   dev-tree location as the target of --dev dispatch. Used ONLY by
+#   the integration test suite (tests/integration_tests/test_dev_launcher.py)
+#   to point the dispatcher at a tmpdir without touching real checkouts.
 
-# deep-worker launcher - a minimal wrapper around the Python module
-# Runs the agent process directly, without installation via pip
+set -u
 
-# Get the script directory
+# ---------------------------------------------------------------------------
+# Resolve "this tree's" location from the script path. readlink -f follows
+# the deep-worker symlink (typically placed in a user bin directory and
+# user bin directory), so SCRIPT_DIR is always the directory of the
+# *physical* file, regardless of how the user invoked the command.
+# ---------------------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
-
-# Parent directory containing deepagents
 PARENT_DIR="$(dirname "$SCRIPT_DIR")"
-
-# Save the user's current working directory
+THIS_TREE_ROOT="$(dirname "$PARENT_DIR")"
 ORIGINAL_CWD="$(pwd)"
 
-# Add the module paths to PYTHONPATH
-export PYTHONPATH="$SCRIPT_DIR:$PARENT_DIR/deepagents:${PYTHONPATH:-}"
+# ---------------------------------------------------------------------------
+# Dev-tree dispatch.
+#
+# We accept --dev anywhere in the args. We also auto-detect "this is a
+# restart of an agent that originally ran with --dev" by peeking at the
+# agent's session_metadata.json in its per-agent data directory — same
+# auto-inheritance rule that --restart already applies to provider / model
+# / etc.
+# ---------------------------------------------------------------------------
 
-# Change to the script directory so Python modules import correctly,
-# and pass the user's original directory through the environment
-cd "$SCRIPT_DIR" && DEEP_WORKER_ORIGINAL_CWD="$ORIGINAL_CWD" exec python3 -m deep_worker_cli.cli.agent_command "$@"
+# Default dev checkout: a sibling directory of this tree named
+# "<this-tree>_dev". Override with DEEP_WORKER_DEV_TREE_ROOT_OVERRIDE.
+DEV_TREE_DEFAULT="${THIS_TREE_ROOT}_dev"
+DEV_TREE="${DEEP_WORKER_DEV_TREE_ROOT_OVERRIDE:-$DEV_TREE_DEFAULT}"
+DEV_LAUNCHER="$DEV_TREE/deep_worker/deep_worker_cli/deep-worker"
+
+dev_requested=0
+filtered_args=()
+positional_first=""
+saw_restart=0
+
+# 1. Filter --dev out (only the first occurrence — defensive against
+#    accidental duplication). Remember whether --restart and the first
+#    positional argument (the agent name) appeared.
+for arg in "$@"; do
+  case "$arg" in
+    --dev)
+      if [[ $dev_requested -eq 0 ]]; then
+        dev_requested=1
+        continue  # drop this token from the forwarded args
+      fi
+      filtered_args+=("$arg")
+      ;;
+    --restart)
+      saw_restart=1
+      filtered_args+=("$arg")
+      ;;
+    -*|--*)
+      filtered_args+=("$arg")
+      ;;
+    *)
+      if [[ -z "$positional_first" ]]; then
+        positional_first="$arg"
+      fi
+      filtered_args+=("$arg")
+      ;;
+  esac
+done
+
+# 2. Auto-detect on --restart: if user said --restart but NOT --dev, peek
+#    session_metadata.json for the agent's previous dev_tree setting.
+if [[ $dev_requested -eq 0 && $saw_restart -eq 1 && -n "$positional_first" ]]; then
+  meta_file="${HOME}/.deep_worker/${positional_first}/session_metadata.json"
+  if [[ -f "$meta_file" ]]; then
+    # python3 is always available — it's our interpreter — so no need for jq.
+    # Failing to parse → leave dev_requested=0 (safe default: prod tree).
+    inherited=$(python3 -c "
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        cfg = json.load(f).get('launch_config') or {}
+    print('1' if cfg.get('dev_tree') else '0')
+except Exception:
+    print('0')
+" "$meta_file" 2>/dev/null || echo 0)
+    if [[ "$inherited" == "1" ]]; then
+      dev_requested=1
+    fi
+  fi
+fi
+
+# 3. If we are not already inside the dev tree and a dispatch is requested,
+#    re-exec into the dev tree's launcher. We compare resolved paths so a
+#    weird invocation (symlinks, relative paths) still detects "I am
+#    already the dev launcher".
+if [[ $dev_requested -eq 1 ]]; then
+  if [[ "$THIS_TREE_ROOT" == "$DEV_TREE" ]]; then
+    # Already in dev tree — fall through to the normal PYTHONPATH-setup
+    # below using THIS tree's code. Set the marker env so downstream
+    # Python (build_launch_config) persists dev_tree=true.
+    export DEEP_WORKER_DEV_TREE=1
+  else
+    if [[ ! -d "$DEV_TREE" ]]; then
+      echo "deep-worker: --dev requested but dev tree does not exist: $DEV_TREE" >&2
+      echo "             (override via DEEP_WORKER_DEV_TREE_ROOT_OVERRIDE for testing)" >&2
+      exit 2
+    fi
+    if [[ ! -x "$DEV_LAUNCHER" ]]; then
+      echo "deep-worker: --dev requested but launcher missing or not executable: $DEV_LAUNCHER" >&2
+      exit 2
+    fi
+    export DEEP_WORKER_DEV_TREE=1
+    export DEEP_WORKER_TREE_ROOT="$DEV_TREE"
+    # Preserve DEEP_WORKER_DEV_TREE_ROOT_OVERRIDE so the dev launcher
+    # itself sees the same value (relevant only for tests).
+    exec "$DEV_LAUNCHER" "${filtered_args[@]}"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# Normal launch in THIS tree.
+# ---------------------------------------------------------------------------
+
+export PYTHONPATH="$SCRIPT_DIR:$PARENT_DIR/deepagents:${PYTHONPATH:-}"
+export DEEP_WORKER_TREE_ROOT="${DEEP_WORKER_TREE_ROOT:-$THIS_TREE_ROOT}"
+
+cd "$SCRIPT_DIR" && DEEP_WORKER_ORIGINAL_CWD="$ORIGINAL_CWD" \
+  exec python3 -m deep_worker_cli.cli.agent_command "${filtered_args[@]}"

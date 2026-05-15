@@ -12,12 +12,18 @@ class TestAgentCommand:
     """Tests for deep-worker agent command."""
 
     def test_parse_minimal_args(self):
-        """Test parsing minimal required arguments."""
+        """Test parsing minimal required arguments.
+
+        Model defaults to `None` at parse time; the provider-specific
+        default (e.g. 'deepseek-chat') is resolved later by
+        `AgentConfig.resolved_model`. Tests that care about the
+        resolved value should call `AgentConfig(...)` directly.
+        """
         parser = create_agent_parser()
         args = parser.parse_args(["my-agent"])
 
         assert args.name == "my-agent"
-        assert args.model == "deepseek-chat"
+        assert args.model is None
         assert args.provider == "deepseek"
         assert args.dir is None  # Will be set to DEEP_WORKER_ORIGINAL_CWD at runtime
         assert args.config is None

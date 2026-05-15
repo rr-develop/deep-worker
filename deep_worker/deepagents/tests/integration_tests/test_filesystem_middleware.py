@@ -79,7 +79,11 @@ class TestFilesystem:
         assert "read_file" in tools
         assert tools["read_file"].description == "Bulbasaur"
         assert "write_file" in tools
-        assert tools["write_file"].description == WRITE_FILE_TOOL_DESCRIPTION
+        # langchain's ``BaseTool.description`` strips trailing whitespace from
+        # the source string, so compare against the canonical constant after
+        # the same ``rstrip()``. Constant itself is the LLM prompt source of
+        # truth and must keep its trailing newline.
+        assert tools["write_file"].description == WRITE_FILE_TOOL_DESCRIPTION.rstrip()
         assert "edit_file" in tools
         assert tools["edit_file"].description == "Squirtle"
 
@@ -104,7 +108,8 @@ class TestFilesystem:
         assert "read_file" in tools
         assert tools["read_file"].description == "Bulbasaur"
         assert "write_file" in tools
-        assert tools["write_file"].description == WRITE_FILE_TOOL_DESCRIPTION
+        # See note above on ``BaseTool.description`` rstrip behaviour.
+        assert tools["write_file"].description == WRITE_FILE_TOOL_DESCRIPTION.rstrip()
         assert "edit_file" in tools
         assert tools["edit_file"].description == "Squirtle"
 
@@ -933,7 +938,10 @@ class TestFilesystem:
 
     def test_execute_tool_filtered_for_non_sandbox_backend(self):
         """Verify execute tool is filtered out when backend doesn't support it."""
-        from langchain.agents import AgentMiddleware
+        # langchain >= 1.x moved ``AgentMiddleware`` from ``langchain.agents``
+        # to the ``langchain.agents.middleware`` sub-module. Import from
+        # there to stay forward-compatible.
+        from langchain.agents.middleware import AgentMiddleware
 
         from deepagents.backends.protocol import ExecuteResponse
 
@@ -985,7 +993,9 @@ class TestFilesystem:
 
     def test_system_prompt_includes_execute_instructions_only_when_supported(self):
         """Verify EXECUTION_SYSTEM_PROMPT is only added when backend supports execution."""
-        from langchain.agents import AgentMiddleware
+        # See ``test_execute_tool_filtered_for_non_sandbox_backend`` above
+        # for why the import is from ``langchain.agents.middleware``.
+        from langchain.agents.middleware import AgentMiddleware
 
         from deepagents.backends.protocol import ExecuteResponse
 
@@ -1038,13 +1048,22 @@ class TestFilesystem:
 
     def test_composite_backend_execution_support_detection(self):
         """Verify _supports_execution correctly detects CompositeBackend capabilities."""
-        from deepagents.backends.protocol import ExecuteResponse
+        from deepagents.backends.protocol import ExecuteResponse, SandboxBackendProtocol
         from deepagents.middleware.filesystem import _supports_execution
 
         # Mock sandbox backend
-        class MockSandboxBackend(StateBackend):
+        # ``_supports_execution`` uses ``isinstance(..., SandboxBackendProtocol)``,
+        # so a real mock MUST inherit from ``SandboxBackendProtocol`` — duck-
+        # typing alone is not enough. See ``unit_tests/test_middleware.py``
+        # ``test_supports_execution_helper_with_composite_backend`` for the
+        # same pattern.
+        class MockSandboxBackend(SandboxBackendProtocol, StateBackend):
             def execute(self, command: str) -> ExecuteResponse:
                 return ExecuteResponse(output="test", exit_code=0, truncated=False)
+
+            @property
+            def id(self) -> str:
+                return "mock-sandbox-backend"
 
         # Create runtimes
         state = {"messages": [], "files": {}}

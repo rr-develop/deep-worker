@@ -21,6 +21,9 @@ http://127.0.0.1:7887
 - `GET /api/agents/{agent_name}/last-response` - Returns immediately, last response via WebSocket
 - `GET /api/agents/{agent_name}/status` - Returns immediately, status via WebSocket
 - `POST /api/agents/{agent_name}/stop_task_manager` - Returns immediately, result via WebSocket
+- `POST /api/agents/{agent_name}/stop` - **202 Accepted**, progress via WebSocket (see Lifecycle)
+- `POST /api/agents/{agent_name}/restart` - **202 Accepted**, progress via WebSocket (see Lifecycle)
+- `POST /api/agents/batch` - **202 Accepted**, per-agent progress via WebSocket (see Lifecycle)
 
 **Timeouts:**
 - Send message: 60 seconds
@@ -28,6 +31,41 @@ http://127.0.0.1:7887
 - Get last response: 5 seconds
 - Get status: 10 seconds
 - Stop TaskManager: 5 seconds
+
+### Lifecycle operations — fire-and-forget contract
+
+Every lifecycle button in the UI (Stop / Restart / batch variants) is a
+fire-and-forget call: the HTTP handler returns **`202 Accepted`** with a
+`request_id` in **<100 ms**, and all progress flows through WebSocket
+events correlated by that `request_id`.
+
+Internals (event-driven, no polling, no threads):
+
+- Process death is detected via `os.pidfd_open` + `loop.add_reader`
+- SIGTERM → grace → SIGKILL escalation via one `loop.call_later`
+- Registry appearance (spawn) is detected via inotify + `loop.add_reader`
+- Batch is a parallel fan-out (`asyncio.create_task` per agent), not a
+  serial `for await`
+
+On-agent `exposed_shutdown(grace_seconds, force)` is tried first; if the
+RPC succeeds, the agent self-exits after a 50 ms flush window. If it
+isn't available (older agent) or the RPC fails, the web server falls
+back to SIGTERM + pidfd watcher.
+
+Event sequence (happy path):
+
+```
+HTTP  /api/agents/X/stop   → 202 {"request_id": "abc..."}
+WS    agent_stop_started       {request_id, agent_name, payload.pid}
+WS    agent_shutdown_requested (if RPyC path available)
+WS    agent_stop_escalated     (if grace expired; payload.signal=SIGKILL)
+WS    agent_terminated         {agent_name}
+WS    agent_stop_completed     {request_id, payload.phase}
+```
+
+If stop fails (e.g. SIGKILL didn't actually kill), `agent_stop_failed`
+is broadcast with `error`, `error_type`, and enough payload to debug
+manually (`kill -9 <pid>`).
 
 See **WebSocket API** section below for response message formats.
 
@@ -196,6 +234,127 @@ Stop the TaskManager running inside an agent.
 }
 ```
 
+### Stop Agent (fire-and-forget)
+
+Stop the agent process. Returns **202 Accepted** immediately. Real
+work runs in a background task; watch WebSocket events correlated
+by `request_id` for progress.
+
+**Endpoint:** `POST /api/agents/{agent_name}/stop`
+
+**Request Body (all optional):**
+```json
+{
+  "grace_seconds": 5.0,
+  "force": false
+}
+```
+
+- `grace_seconds` — wait this long after SIGTERM before escalating to
+  SIGKILL. Default `5.0`.
+- `force` — skip SIGTERM entirely, send SIGKILL immediately. Default
+  `false`. Use when the agent is genuinely stuck.
+
+**Response (202):**
+```json
+{
+  "success": true,
+  "request_id": "6f2c8b...",
+  "message": "agent_stop scheduled; watch WebSocket for progress",
+  "agent_name": "project-a"
+}
+```
+
+Unknown agents do NOT return 404 — they return 202 and surface the
+failure via an `agent_stop_failed` WS event with `error_type="LookupError"`.
+This keeps the HTTP contract uniform so every UI button click gets
+a trackable `request_id`.
+
+### Restart Agent (fire-and-forget)
+
+Restart the agent: stop then spawn using the saved launch_config
+in `~/.deep_worker/{name}/session_metadata.json`. Returns **202**
+instantly; watch WS events.
+
+**Endpoint:** `POST /api/agents/{agent_name}/restart`
+
+**Request Body (all optional):**
+```json
+{
+  "model": null,
+  "provider": null,
+  "clean": false,
+  "grace_seconds": 5.0,
+  "force": false
+}
+```
+
+- `model`, `provider`, `clean` — override saved launch config.
+- `grace_seconds`, `force` — passed to the stop phase.
+
+**Response (202):**
+```json
+{
+  "success": true,
+  "request_id": "6f2c8b...",
+  "message": "agent_restart scheduled; watch WebSocket for progress",
+  "agent_name": "project-a"
+}
+```
+
+WS events flow: `agent_restart_started` → `agent_stop_*` sequence →
+`agent_spawn_started` → `agent_spawn_completed` (or `agent_spawn_failed`
+with a tail of `~/.deep_worker/logs/{name}.spawn.log` as payload).
+
+### Batch Operations (fire-and-forget)
+
+Fan out `stop` or `restart` across multiple agents in parallel.
+Returns **202** with per-agent `request_id`s plus a batch-level
+`request_id` for aggregate tracking.
+
+**Endpoint:** `POST /api/agents/batch`
+
+**Request Body:**
+```json
+{
+  "action": "stop",
+  "agent_names": ["project-a", "project-b", "project-c"],
+  "grace_seconds": 5.0,
+  "force": false,
+  "model": null,
+  "provider": null,
+  "clean": false
+}
+```
+
+- `action` — `"stop"` or `"restart"`.
+- `agent_names` — non-empty list.
+- `grace_seconds`, `force` — applied to every agent.
+- `model`, `provider`, `clean` — only used when `action="restart"`.
+
+**Response (202):**
+```json
+{
+  "success": true,
+  "request_id": "batch-abc...",
+  "action": "stop",
+  "jobs": [
+    {
+      "success": true,
+      "request_id": "job-1...",
+      "message": "stop scheduled",
+      "agent_name": "project-a"
+    },
+    {"success": true, "request_id": "job-2...", "message": "stop scheduled", "agent_name": "project-b"}
+  ]
+}
+```
+
+Each per-agent job emits its own full `agent_stop_*` / `agent_restart_*`
+event sequence. A `batch_progress` event is broadcast periodically with
+`{completed, pending, total}`, and `batch_completed` fires once all
+child jobs reach a terminal state.
+
 ### Get Detailed Status
 
 Get detailed status information for an agent.
@@ -308,8 +467,46 @@ Real-time stream of agent events.
 ```json
 {
   "type": "agent_terminated",
-  "agent_name": "project-a"
+  "request_id": "6f2c8b...",
+  "agent_name": "project-a",
+  "timestamp": "2026-04-23T18:40:03.456Z",
+  "payload": {"pid": 12345, "phase": "pidfd"}
 }
+```
+
+**Lifecycle — Agent Stop:**
+```json
+{"type": "agent_stop_started",   "request_id": "...", "agent_name": "project-a", "timestamp": "...", "payload": {"pid": 12345, "grace_seconds": 5.0, "force": false}}
+{"type": "agent_shutdown_requested","agent_name": "project-a", "timestamp": "...", "payload": {"grace_seconds": 5.0, "force": false}}
+{"type": "agent_stop_escalated", "request_id": "...", "agent_name": "project-a", "timestamp": "...", "payload": {"pid": 12345, "signal": "SIGKILL"}}
+{"type": "agent_stop_completed", "request_id": "...", "agent_name": "project-a", "timestamp": "...", "payload": {"pid": 12345, "phase": "escalated_sigkill"}}
+{"type": "agent_stop_failed",    "request_id": "...", "agent_name": "project-a", "timestamp": "...", "error": "Process 12345 still alive (state='D') after escalated_sigkill", "error_type": "RuntimeError", "payload": {"pid": 12345, "phase": "escalated_sigkill", "proc_state": "D"}}
+```
+
+`phase` values: `pidfd` (happy path — kernel event), `forced_sigkill`
+(force=True), `escalated_sigkill` (grace expired), `already_dead`,
+`no_pidfd` (fallback if pidfd_open unavailable).
+
+**Lifecycle — Agent Restart / Spawn:**
+```json
+{"type": "agent_restart_started",  "request_id": "...", "agent_name": "project-a"}
+{"type": "agent_spawn_started",    "request_id": "...", "agent_name": "project-a"}
+{"type": "agent_spawn_completed",  "request_id": "...", "agent_name": "project-a", "payload": {"pid": 67890}}
+{"type": "agent_spawn_failed",     "request_id": "...", "agent_name": "project-a", "error": "...", "payload": {"spawn_log_tail": "..."}}
+{"type": "agent_restart_completed","request_id": "...", "agent_name": "project-a", "payload": {"spawn_request_id": "..."}}
+```
+
+**Lifecycle — Batch:**
+```json
+{"type": "batch_started",   "request_id": "batch-...", "payload": {"action": "stop", "agent_names": ["a","b","c"]}}
+{"type": "batch_progress",  "request_id": "batch-...", "payload": {"action": "stop", "total": 3, "completed": 2, "pending": 1}}
+{"type": "batch_completed", "request_id": "batch-...", "payload": {"action": "stop", "total": 3, "completed": 3, "failed": 0}}
+```
+
+**TaskManager Stop (fire-and-forget):**
+```json
+{"type": "task_manager_stopped", "agent_name": "project-a", "success": true, "force": false}
+{"type": "task_manager_stop_error", "agent_name": "project-a", "success": false, "error": "..."}
 ```
 
 **Agent Response (Fire-and-Forget Success):**

@@ -5,7 +5,7 @@ These tests verify that:
 1. ``create_cli_agent`` registers the middleware unconditionally.
 2. The TaskManager evaluation is skipped in ``AgentProcess._handle_invoke``
    when the ``full_response`` is an outgoing inter-agent echo
-   (starts with ``agent:<self.name>:> ``).
+   (starts with ``<self.name> -> <receiver> :> ``).
 
 We avoid spinning up a real LangGraph — we monkeypatch ``create_deep_agent``
 to capture kwargs, and for the TaskManager case we build a minimally-mocked
@@ -91,7 +91,7 @@ class TestCreateCliAgentWiring:
 
 class TestTaskManagerSkipForOutgoingEcho:
     """When the agent's final response for a turn is an outgoing
-    inter-agent message (``agent:<self.name>:> ...``), TaskManager's
+    inter-agent message (``<self.name> -> <receiver> :> ...``), TaskManager's
     ``on_subordinate_response`` must NOT be called — this turn is not
     a reply to the user's task, it's a message addressed to a peer
     agent. The TaskManager loop should exit cleanly.
@@ -116,7 +116,7 @@ class TestTaskManagerSkipForOutgoingEcho:
 
         assert AgentProcess._is_outgoing_inter_agent_echo(
             agent_name="alpha",
-            response="agent:alpha:> hello",
+            response="alpha -> beta :> hello",
         )
 
     def test_detects_own_outgoing_multiline_echo(self) -> None:
@@ -124,19 +124,20 @@ class TestTaskManagerSkipForOutgoingEcho:
 
         assert AgentProcess._is_outgoing_inter_agent_echo(
             agent_name="alpha",
-            response="agent:alpha:> line1\nline2",
+            response="alpha -> beta :> line1\nline2",
         )
 
     def test_rejects_incoming_from_other_agent(self) -> None:
         """An agent 'alpha' that sees its own history will also see
-        incoming messages like 'agent:beta:> ...' but those are
+        incoming messages like 'beta -> alpha :> ...' but those are
         HumanMessages, not AIMessages / full_response. Even so, we
-        strictly tie the predicate to the agent's OWN name to be safe."""
+        strictly tie the predicate to the agent's OWN name (as sender)
+        to be safe."""
         from deep_worker_cli.process.agent_process import AgentProcess
 
         assert not AgentProcess._is_outgoing_inter_agent_echo(
             agent_name="alpha",
-            response="agent:beta:> hi alpha",
+            response="beta -> alpha :> hi alpha",
         )
 
     def test_rejects_normal_response(self) -> None:
@@ -153,7 +154,7 @@ class TestTaskManagerSkipForOutgoingEcho:
         # Must be a PREFIX, not anywhere-substring.
         assert not AgentProcess._is_outgoing_inter_agent_echo(
             agent_name="alpha",
-            response="I wrote: agent:alpha:> something",
+            response="I wrote: alpha -> beta :> something",
         )
 
     def test_rejects_empty_response(self) -> None:
@@ -190,7 +191,7 @@ class TestTaskManagerSkipForOutgoingEcho:
         tm.on_subordinate_response = AsyncMock(return_value=None)
 
         # Simulate what _handle_invoke's guard would do.
-        full_response = "agent:alpha:> hello beta"
+        full_response = "alpha -> beta :> hello beta"
         should_skip = AgentProcess._is_outgoing_inter_agent_echo(
             agent_name="alpha",
             response=full_response,

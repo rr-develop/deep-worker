@@ -12,11 +12,9 @@ This module provides REST API endpoints for:
 All endpoints follow REST conventions and return JSON responses.
 """
 
-import asyncio
 import logging
 import os
 import subprocess
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
 
@@ -25,11 +23,12 @@ from fastapi.responses import PlainTextResponse
 
 from app.schemas.agent_schemas import (
     AgentInfo,
-    AgentStatusInfo,
+    BatchAcceptedResponse,
     BatchRequest,
-    MessageInfo,
+    JobAcceptedResponse,
     MessageRequest,
     RestartRequest,
+    StopRequest,
     StopTaskManagerRequest,
 )
 from app.services.agent_service import AgentService
@@ -136,13 +135,27 @@ async def send_message(
     
     # Send message via RPyC
     response = await service.send_message(agent_name, request.message)
-    
+
     if not response.get("success"):
+        error = response.get("error", "Unknown error")
+        # "Failed to connect" is the canonical marker the service
+        # uses when the RPyC connection is unavailable. Translate
+        # that into 503 Service Unavailable so the client can
+        # distinguish "agent down, retry later" from a real 500.
+        if "Failed to connect" in str(error) or "agent_disconnected" in str(error).lower():
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": "agent_disconnected",
+                    "agent_name": agent_name,
+                    "message": str(error),
+                },
+            )
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to send message: {response.get('error', 'Unknown error')}",
+            detail=f"Failed to send message: {error}",
         )
-    
+
     return {
         "success": True,
         "message": "Message sent successfully",
@@ -355,51 +368,87 @@ async def stop_task_manager(
     # Try to stop TaskManager via fire-and-forget
     from rpyc.utils.helpers import fire_and_forget_async
 
-    if await service.is_connected(agent_name):
-        root = service.get_root(agent_name)
-        if root and hasattr(root, 'stop_task_manager'):
+    # Distinguish two failure modes that used to look identical:
+    #
+    # * **Disconnected**: ``is_connected`` is False AND we cannot
+    #   re-establish — this is a transient agent-unreachable state.
+    #   Respond 503 so the UI shows a retry banner.
+    # * **No TaskManager feature**: we ARE connected, but the agent
+    #   was started without ``--task-manager``, so ``root`` has no
+    #   ``stop_task_manager`` method. This is a normal "nothing to
+    #   do" state — respond 200 (pre-existing contract).
+    is_connected = await service.is_connected(agent_name)
+    if not is_connected:
+        # One attempt to reconnect, honouring fire-and-forget patterns.
+        is_connected = await service.connect_to_agent(agent_name)
 
-            async def on_success(response: dict[str, Any]) -> None:
-                """Handle successful TaskManager stop."""
-                logger.info(f"TaskManager stopped for {agent_name}")
-                # Broadcast to WebSocket
-                await service._broadcast_message({
-                    "type": "task_manager_stopped",
-                    "agent_name": agent_name,
-                    "success": True,
-                    "force": request.force,
-                })
+    root = service.get_root(agent_name) if is_connected else None
 
-            async def on_error(exc: BaseException) -> None:
-                """Handle TaskManager stop errors."""
-                logger.error(f"Failed to stop TaskManager for {agent_name}: {exc}")
-                await service._broadcast_message({
-                    "type": "task_manager_stop_error",
-                    "agent_name": agent_name,
-                    "success": False,
-                    "error": str(exc),
-                })
-
-            # Fire and forget with 5s timeout
-            fire_and_forget_async(
-                root.stop_task_manager(force=request.force),
-                timeout=5.0,
-                success_callback=on_success,
-                error_callback=on_error,
-                name=f"stop_task_manager_{agent_name}",
-            )
-
-            return {
-                "success": True,
-                "message": "TaskManager stop requested (result will arrive via WebSocket)",
+    if root is None:
+        # Connection genuinely unavailable — this is the disconnect
+        # case.
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "agent_disconnected",
                 "agent_name": agent_name,
-                "force": request.force,
-            }
+                "message": (
+                    "TaskManager stop cannot be delivered: agent is "
+                    "not connected (no live RPyC session)"
+                ),
+            },
+        )
 
-    # Fallback if method not available
+    if not hasattr(root, "stop_task_manager"):
+        # Connected, but the feature isn't installed on this agent.
+        # Keep the pre-existing 200 contract — clients (and the
+        # integration test at
+        # tests/integration/test_api_agents_integration.py::
+        # test_stop_task_manager) expect a success-shaped "nothing
+        # to do" response here, not a 503.
+        return {
+            "success": True,
+            "message": (
+                "TaskManager stop requested (feature may not be "
+                "available on this agent build)"
+            ),
+            "agent_name": agent_name,
+            "force": request.force,
+        }
+
+    async def on_success(response: dict[str, Any]) -> None:
+        """Handle successful TaskManager stop."""
+        logger.info(f"TaskManager stopped for {agent_name}")
+        # Broadcast to WebSocket
+        await service._broadcast_message({
+            "type": "task_manager_stopped",
+            "agent_name": agent_name,
+            "success": True,
+            "force": request.force,
+        })
+
+    async def on_error(exc: BaseException) -> None:
+        """Handle TaskManager stop errors."""
+        logger.error(f"Failed to stop TaskManager for {agent_name}: {exc}")
+        await service._broadcast_message({
+            "type": "task_manager_stop_error",
+            "agent_name": agent_name,
+            "success": False,
+            "error": str(exc),
+        })
+
+    # Fire and forget with 5s timeout
+    fire_and_forget_async(
+        root.stop_task_manager(force=request.force),
+        timeout=5.0,
+        success_callback=on_success,
+        error_callback=on_error,
+        name=f"stop_task_manager_{agent_name}",
+    )
+
     return {
         "success": True,
-        "message": "TaskManager stop requested (feature may not be available)",
+        "message": "TaskManager stop requested (result will arrive via WebSocket)",
         "agent_name": agent_name,
         "force": request.force,
     }
@@ -507,14 +556,19 @@ async def get_dialog_text(
     - ``text``: every text-bearing AIMessage of the turn.
     - ``full``: like ``text`` plus compact tool-call summaries.
 
-    Three sources of user-side messages are all rendered as first-class turns
+    Four sources of user-side messages are all rendered as first-class turns
     at every verbosity:
 
     - Direct user input → ``--- User ---``
     - TaskManager prompts → ``--- TaskManager ---``
     - Inter-agent messages → ``--- From agent:<name> ---``
+    - Context-compaction summarization injections → ``--- Summarization ---``
 
-    Only summarization-time synthetic injections are filtered.
+    No message is filtered out — the summarization node renders with its
+    own explicit header so readers can tell synthetic context-management
+    events apart from real user input without losing the "why did the
+    agent pivot?" signal after a compaction. See
+    ``docs/DESIGN_SUMMARIZATION_VISIBLE.md``.
 
     Args:
         agent_name: Name of the agent.
@@ -558,72 +612,34 @@ async def get_dialog_text(
 
 
 # ===========================================================================
-# Agent Stop / Restart / Batch
+# Agent Stop / Restart / Batch (fire-and-forget)
 # ===========================================================================
-
-
-async def stop_agent_process(agent_name: str, service: AgentService) -> dict[str, Any]:
-    """Stop an agent process gracefully.
-
-    Uses deep_worker_cli.process.agent_stop.stop_agent under the hood.
-
-    Returns:
-        Dict with success/message or raises RuntimeError/TimeoutError.
-    """
-    import asyncio
-    import json
-    import os
-    import signal
-    from pathlib import Path
-
-    from deep_worker_cli.process.registry import ProcessRegistry
-
-    registry = ProcessRegistry()
-    agent_info = registry.lookup(agent_name)
-    if agent_info is None:
-        return {"success": True, "message": f"Agent '{agent_name}' is not running"}
-
-    # Check status
-    data_dir = Path("~/.deep_worker").expanduser() / agent_name
-    metadata_file = data_dir / "session_metadata.json"
-    status = "idle"
-    if metadata_file.exists():
-        try:
-            data = json.loads(metadata_file.read_text())
-            status = data.get("status", "idle")
-        except (json.JSONDecodeError, OSError):
-            pass
-
-    if status == "running":
-        raise RuntimeError(
-            f"Agent '{agent_name}' is actively running (status: running). "
-            f"Wait for it to finish or interrupt it first."
-        )
-
-    pid = agent_info.pid
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return {"success": True, "message": f"Agent '{agent_name}' already stopped"}
-
-    # Wait for exit
-    for _ in range(20):  # 10 seconds with 0.5s intervals
-        if not Path(f"/proc/{pid}").exists():
-            # Broadcast termination
-            await service._broadcast_message({
-                "type": "agent_terminated",
-                "agent_name": agent_name,
-            })
-            return {"success": True, "message": f"Agent '{agent_name}' stopped"}
-        await asyncio.sleep(0.5)
-
-    raise TimeoutError(f"Agent '{agent_name}' (PID {pid}) did not stop within 10 seconds")
+#
+# These endpoints are the fire-and-forget rewrite described in
+# ``docs/DESIGN_FIRE_AND_FORGET_LIFECYCLE.md``.  The HTTP handler does only:
+#
+#   1. validate input
+#   2. ask AgentLifecycleService to schedule the op (returns a request_id)
+#   3. return 202 Accepted with {"request_id"} — immediately
+#
+# All progress (started / escalated / terminated / completed / failed) is
+# broadcast via WebSocket with that request_id as the correlation key.
+#
+# Event-driven internals live in ``app/services/lifecycle.py``:
+#   * ``os.pidfd_open`` + ``loop.add_reader`` for process exit (no polling)
+#   * ``inotify`` + ``loop.add_reader`` for spawn registry wait (no polling)
+#   * one ``loop.call_later`` per grace / hard-timeout
+#
+# NOTE: the old helpers ``stop_agent_process`` and ``_wait_for_agent_in_registry``
+# have been removed — they violated the no-polling / no-blocking contract and
+# had no other callers.  ``load_launch_config`` and ``_spawn_subprocess`` are
+# kept here as pure-function helpers because ``lifecycle.py`` depends on them
+# (see ``AgentLifecycleService._drive_spawn``).
 
 
 def load_launch_config(agent_name: str) -> dict[str, Any] | None:
     """Load launch_config from session_metadata.json."""
     import json
-    from pathlib import Path
 
     data_dir = Path("~/.deep_worker").expanduser() / agent_name
     metadata_file = data_dir / "session_metadata.json"
@@ -632,44 +648,25 @@ def load_launch_config(agent_name: str) -> dict[str, Any] | None:
         return None
     try:
         data = json.loads(metadata_file.read_text())
-        return data.get("launch_config")
+        cfg = data.get("launch_config")
+        return cfg if isinstance(cfg, dict) else None
     except (json.JSONDecodeError, OSError):
         return None
 
 
-async def _wait_for_agent_in_registry(agent_name: str, timeout: float = 15.0) -> bool:
-    """Wait for agent to appear in ProcessRegistry.
-
-    Returns True if agent appeared, False if timeout.
-    """
-    from deep_worker_cli.process.registry import ProcessRegistry
-
-    elapsed = 0.0
-    poll = 0.5
-    registry = ProcessRegistry()
-    while elapsed < timeout:
-        info = registry.lookup(agent_name)
-        if info is not None:
-            return True
-        await asyncio.sleep(poll)
-        elapsed += poll
-    return False
-
-
-async def spawn_agent_process(
+def _spawn_subprocess(
     agent_name: str,
     config: dict[str, Any],
     *,
     model: str | None = None,
     provider: str | None = None,
     clean: bool = False,
-) -> dict[str, Any]:
-    """Spawn a new agent process via subprocess.
+) -> subprocess.Popen[bytes]:
+    """Launch the agent daemon via subprocess. Returns immediately.
 
-    Builds the CLI command from config and runs it as a daemon.
-    Sets PYTHONPATH explicitly so the subprocess can find deep_worker_cli
-    and deepagents regardless of the web server's environment.
-    Waits for agent to appear in registry before returning success.
+    This is a pure *fire* helper — it does NOT wait for the registry.
+    ``AgentLifecycleService._drive_spawn`` handles the event-driven wait
+    via inotify.
     """
     cmd = [
         "python3", "-m", "deep_worker_cli.cli.agent_command",
@@ -689,159 +686,164 @@ async def spawn_agent_process(
     if clean:
         cmd.append("--clean")
 
-    # Build environment with correct PYTHONPATH
-    # The web server may not have deep_worker_cli/deepagents on its path,
-    # so we set it explicitly for the subprocess.
+    # Tree-local PYTHONPATH: spawn agents using the SAME codebase the web
+    # server lives in. The production-tree web → prod agents, the dev-tree
+    # web → dev agents.  Hard-coding the prod path
+    # here used to silently spawn prod agents from the dev web server,
+    # defeating operational isolation.  See docs/DESIGN_DEV_FLAG.md.
+    #
+    # __file__ here =
+    #   deep_worker_web/app/routers/agents.py
+    # parent x3 =
+    #   <TREE>
+    _tree_root = Path(__file__).resolve().parent.parent.parent.parent
     env = os.environ.copy()
-    # Locate sibling packages relative to this checkout so the subprocess
-    # can find them without host-specific absolute paths.
-    _repo_root = Path(__file__).resolve().parents[3]
     env["PYTHONPATH"] = ":".join([
-        str(_repo_root / "deep_worker" / "deep_worker_cli"),
-        str(_repo_root / "deep_worker" / "deepagents"),
+        str(_tree_root / "deep_worker" / "deep_worker_cli"),
+        str(_tree_root / "deep_worker" / "deepagents"),
+        "rpyc_async",
     ])
-    # Preserve DEEP_WORKER_ORIGINAL_CWD for the working directory
     env["DEEP_WORKER_ORIGINAL_CWD"] = config.get("working_dir", ".")
+    # Mark the spawned agent as belonging to this tree.  build_launch_config
+    # reads DEEP_WORKER_DEV_TREE=1 to persist dev_tree in session_metadata.
+    if _tree_root == Path("/path/to/dev-tree"):
+        env["DEEP_WORKER_DEV_TREE"] = "1"
+    env["DEEP_WORKER_TREE_ROOT"] = str(_tree_root)
 
     logger.info(f"Spawning agent: {' '.join(cmd)}")
 
-    # Redirect stderr to agent's log file for debugging (not /dev/null)
     log_dir = Path("~/.deep_worker").expanduser() / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     err_log = log_dir / f"{agent_name}.spawn.log"
 
-    with open(err_log, "w") as err_file:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=err_file,
-            env=env,
-            start_new_session=True,  # Detach from parent
-        )
-
-    # The CLI daemonizes itself (double-fork), so proc exits quickly.
-    # Wait for the actual daemon to appear in the registry.
-    appeared = await _wait_for_agent_in_registry(agent_name, timeout=15.0)
-
-    if appeared:
-        return {
-            "success": True,
-            "pid": proc.pid,
-            "message": f"Agent '{agent_name}' restarted successfully",
-        }
-    else:
-        # Read spawn log for error details
-        error_details = ""
-        if err_log.exists():
-            error_details = err_log.read_text()[-500:]  # Last 500 chars
-        return {
-            "success": False,
-            "error": f"Agent '{agent_name}' did not appear in registry within 15s. "
-                     f"Check {err_log} for details. {error_details}",
-        }
+    err_file = open(err_log, "w")  # kept open for subprocess stderr redirection
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=err_file,
+        env=env,
+        start_new_session=True,
+    )
+    return proc
 
 
-@router.post("/{agent_name}/stop")
+@router.post("/{agent_name}/stop", response_model=JobAcceptedResponse, status_code=202)
 async def stop_agent(
     agent_name: str,
+    request: StopRequest | None = None,
     service: AgentService = Depends(get_agent_service),
-) -> dict[str, Any]:
-    """Stop an agent process gracefully.
+) -> JobAcceptedResponse:
+    """Fire-and-forget agent stop.
 
-    Sends SIGTERM and waits for the process to exit.
-    Returns 409 if agent is actively running (status=running).
+    Accepts instantly; the kill pipeline runs as a background task.
+    Watch WS events (``agent_stop_started``, ``agent_stop_escalated``,
+    ``agent_terminated``, ``agent_stop_completed`` / ``agent_stop_failed``)
+    correlated by ``request_id``.
+
+    ``force=True`` — SIGKILL immediately (like ``dwcli --stop`` panic path).
+    Otherwise SIGTERM → wait ``grace_seconds`` → SIGKILL.
+
+    Note: we intentionally do NOT 404 when the agent isn't in the in-memory
+    cache — the lifecycle service does its own lookup against the live
+    registry and broadcasts ``agent_stop_failed`` if the agent is truly
+    unknown. That keeps the contract uniform (every button click gets a
+    request_id it can track).
     """
-    agent = await service.get_agent(agent_name)
-    if agent is None:
-        raise HTTPException(status_code=404, detail=f"Agent '{agent_name}' not found")
+    params = request if request is not None else StopRequest(grace_seconds=5.0, force=False)
+    lifecycle = service.get_lifecycle()
+    request_id = await lifecycle.request_stop(
+        agent_name,
+        grace_seconds=params.grace_seconds,
+        force=params.force,
+    )
+    return JobAcceptedResponse(
+        success=True,
+        request_id=request_id,
+        message="agent_stop scheduled; watch WebSocket for progress",
+        agent_name=agent_name,
+    )
 
-    try:
-        result = await stop_agent_process(agent_name, service)
-        return result
-    except RuntimeError as e:
-        raise HTTPException(status_code=409, detail=str(e))
-    except TimeoutError as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
-
-@router.post("/{agent_name}/restart")
+@router.post("/{agent_name}/restart", response_model=JobAcceptedResponse, status_code=202)
 async def restart_agent(
     agent_name: str,
     request: RestartRequest | None = None,
     service: AgentService = Depends(get_agent_service),
-) -> dict[str, Any]:
-    """Restart an agent using saved launch_config.
+) -> JobAcceptedResponse:
+    """Fire-and-forget restart: stop → spawn.
 
-    Stops the running agent (if idle/waiting), then re-launches with saved
-    parameters. Optional overrides can be passed in the request body.
-    Returns 404 if no launch_config exists, 409 if actively running.
+    Returns immediately with a ``request_id``; WS events per phase
+    (``agent_stop_*``, ``agent_spawn_*``, ``agent_restart_completed`` /
+    ``agent_restart_failed``).
     """
-    # Load saved config
-    config = load_launch_config(agent_name)
-    if config is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No previous launch configuration for '{agent_name}'. Start it normally first.",
-        )
-
-    # Stop if running
-    try:
-        await stop_agent_process(agent_name, service)
-    except RuntimeError as e:
-        raise HTTPException(status_code=409, detail=str(e))
-    except TimeoutError as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-    # Apply overrides
-    model = request.model if request and request.model else None
-    provider = request.provider if request and request.provider else None
-    clean = request.clean if request else False
-
-    # Spawn new process
-    result = await spawn_agent_process(
-        agent_name, config,
-        model=model, provider=provider, clean=clean,
+    params = request if request is not None else RestartRequest(
+        model=None, provider=None, clean=False, grace_seconds=5.0, force=False,
     )
-    if not result.get("success"):
-        raise HTTPException(status_code=500, detail=result.get("error", "Spawn failed"))
-    return result
+    lifecycle = service.get_lifecycle()
+    request_id = await lifecycle.request_restart(
+        agent_name,
+        grace_seconds=params.grace_seconds,
+        force=params.force,
+        model=params.model,
+        provider=params.provider,
+        clean=params.clean,
+    )
+    return JobAcceptedResponse(
+        success=True,
+        request_id=request_id,
+        message="agent_restart scheduled; watch WebSocket for progress",
+        agent_name=agent_name,
+    )
 
 
-@router.post("/batch")
+@router.post("/batch", response_model=BatchAcceptedResponse, status_code=202)
 async def batch_operation(
     request: BatchRequest,
     service: AgentService = Depends(get_agent_service),
-) -> dict[str, Any]:
-    """Execute batch operations on multiple agents.
+) -> BatchAcceptedResponse:
+    """Fire-and-forget batch stop / restart.
 
-    Supported actions: 'stop', 'restart'.
+    Fans out across agents in parallel — HTTP returns once all child
+    jobs are *scheduled*, not completed. Each child has its own
+    ``request_id``; follow them individually via WS, plus aggregate
+    ``batch_started`` / ``batch_progress`` / ``batch_completed``.
     """
     if request.action not in ("stop", "restart"):
-        raise HTTPException(status_code=400, detail=f"Invalid action: '{request.action}'. Use 'stop' or 'restart'.")
-
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid action: '{request.action}'. Use 'stop' or 'restart'.",
+        )
     if not request.agent_names:
-        raise HTTPException(status_code=400, detail="agent_names list cannot be empty")
+        raise HTTPException(
+            status_code=400,
+            detail="agent_names list cannot be empty",
+        )
 
-    results: dict[str, dict[str, Any]] = {}
-
-    for name in request.agent_names:
-        try:
-            if request.action == "stop":
-                result = await stop_agent_process(name, service)
-                results[name] = result
-            elif request.action == "restart":
-                config = load_launch_config(name)
-                if config is None:
-                    results[name] = {"success": False, "error": f"No launch config for '{name}'"}
-                    continue
-                await stop_agent_process(name, service)
-                result = await spawn_agent_process(name, config)
-                results[name] = result
-        except RuntimeError as e:
-            results[name] = {"success": False, "error": str(e)}
-        except TimeoutError as e:
-            results[name] = {"success": False, "error": str(e)}
-        except Exception as e:
-            results[name] = {"success": False, "error": str(e)}
-
-    return {"results": results}
+    params: dict[str, Any] = {
+        "grace_seconds": request.grace_seconds,
+        "force": request.force,
+        "model": request.model,
+        "provider": request.provider,
+        "clean": request.clean,
+    }
+    lifecycle = service.get_lifecycle()
+    handle = await lifecycle.request_batch(
+        action=request.action,
+        agent_names=list(request.agent_names),
+        params=params,
+    )
+    jobs = [
+        JobAcceptedResponse(
+            success=True,
+            request_id=j["request_id"],
+            message=f"{request.action} scheduled",
+            agent_name=j["agent_name"],
+        )
+        for j in handle["jobs"]
+    ]
+    return BatchAcceptedResponse(
+        success=True,
+        request_id=handle["request_id"],
+        action=handle["action"],
+        jobs=jobs,
+    )

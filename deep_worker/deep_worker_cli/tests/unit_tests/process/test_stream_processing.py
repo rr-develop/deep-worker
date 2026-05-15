@@ -41,16 +41,29 @@ class TestStreamProcessing:
 
     @pytest.mark.asyncio
     async def test_extract_text_chunk_from_ai_message(self) -> None:
-        """Test extraction of text chunks from AIMessage content_blocks."""
-        # Arrange
-        from deep_worker_cli.process.stream_processor import process_message_chunk
+        """Test extraction of text chunks from AIMessage content_blocks.
 
-        # Create AIMessage with content_blocks
+        Text blocks are BATCHED into a buffer per-callback (see
+        `_add_text_to_buffer` / `_flush_text_buffer` in
+        `stream_processor.py`) to reduce RPyC overhead. The test
+        therefore asserts the final flushed concatenation, not a
+        chunk-per-block fan-out.
+
+        `usage_metadata` is explicitly set to None — otherwise
+        Mock() makes it a nested MagicMock and `usage.get(...)`
+        returns Mock objects that can't be added together.
+        """
+        from deep_worker_cli.process.stream_processor import (
+            process_message_chunk,
+            flush_all_text_buffers,
+        )
+
         ai_message = Mock()
         ai_message.content_blocks = [
             {"type": "text", "text": "Hello "},
             {"type": "text", "text": "World"},
         ]
+        ai_message.usage_metadata = None
 
         notifications: list[dict[str, Any]] = []
 
@@ -63,19 +76,17 @@ class TestStreamProcessing:
             metadata={},
             notify_callback=mock_notify,
         )
+        # End-of-stream: flush all pending text buffers. In production
+        # this is done by the driver that owns the agent stream; in
+        # tests we do it explicitly.
+        await flush_all_text_buffers()
 
-        # Assert
-        assert len(notifications) == 2
-        assert notifications[0] == {
-            "type": "assistant_chunk",
-            "role": "assistant",
-            "content": "Hello ",
-        }
-        assert notifications[1] == {
-            "type": "assistant_chunk",
-            "role": "assistant",
-            "content": "World",
-        }
+        # After the flush there is exactly one assistant_chunk
+        # carrying the full concatenated text.
+        assistant_chunks = [n for n in notifications if n.get("type") == "assistant_chunk"]
+        assert len(assistant_chunks) == 1, notifications
+        assert assistant_chunks[0]["role"] == "assistant"
+        assert assistant_chunks[0]["content"] == "Hello World"
 
     @pytest.mark.asyncio
     async def test_extract_tool_call_from_content_blocks(self) -> None:
@@ -83,7 +94,9 @@ class TestStreamProcessing:
         # Arrange
         from deep_worker_cli.process.stream_processor import process_message_chunk
 
-        # Create AIMessage with tool_call in content_blocks
+        # Create AIMessage with tool_call in content_blocks.
+        # See note in test_extract_text_chunk_from_ai_message re:
+        # `usage_metadata = None`.
         ai_message = Mock()
         ai_message.content_blocks = [
             {
@@ -93,6 +106,7 @@ class TestStreamProcessing:
                 "id": "call_123",
             }
         ]
+        ai_message.usage_metadata = None
 
         notifications: list[dict[str, Any]] = []
 
@@ -180,7 +194,9 @@ class TestStreamProcessing:
         # Arrange
         from deep_worker_cli.process.stream_processor import process_message_chunk
 
-        # Simulate streaming tool call in chunks
+        # Simulate streaming tool call in chunks.
+        # See note re: `usage_metadata = None` in
+        # test_extract_text_chunk_from_ai_message.
         ai_message1 = Mock()
         ai_message1.content_blocks = [
             {
@@ -191,8 +207,10 @@ class TestStreamProcessing:
                 "index": 0,
             }
         ]
+        ai_message1.usage_metadata = None
 
         ai_message2 = Mock()
+        ai_message2.usage_metadata = None
         ai_message2.content_blocks = [
             {
                 "type": "tool_call_chunk",

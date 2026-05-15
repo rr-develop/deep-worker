@@ -23,9 +23,10 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager
-from typing import Any
+from dataclasses import dataclass, field
+from typing import Any, cast
 
 import aiosqlite
 from langchain_core.runnables import RunnableConfig
@@ -43,6 +44,55 @@ logger = logging.getLogger(__name__)
 
 # Delta format version
 _DELTA_VERSION = 2
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Delta context cache
+# ═══════════════════════════════════════════════════════════════════════════
+# See ``deep_worker/docs/DESIGN_CONTEXT_DELTA_CACHE.md`` (Phase 1).
+#
+# Purpose: eliminate the per-step parent-chain walk that dominated CPU on an
+# idle agent. Every ``aput`` already has the fully materialised
+# ``channel_values`` in hand — we stash it into the per-(thread_id, ns)
+# cache so the very next ``aget_tuple`` is a direct dict lookup.
+#
+# Invariants:
+#   * one entry per (thread_id, checkpoint_ns) per process
+#   * cache is populated by ``aput``; invalidated-and-replaced by the next
+#     ``aput``; never populated speculatively from read paths
+#   * historical reads (explicit non-latest ``checkpoint_id``) do NOT mutate
+#     the cached latest entry
+#   * version is monotonic within a process; it is NOT a SQLite-level
+#     counter and MUST NOT be persisted
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@dataclass
+class ThreadCacheEntry:
+    """Per-(thread_id, checkpoint_ns) materialised checkpoint.
+
+    ``channel_values`` is stored by reference, not deep-copied. LangGraph
+    treats returned checkpoint objects as immutable; callers that mutate
+    them violate the contract and would also corrupt SQLite writes.
+    """
+
+    thread_id: str
+    checkpoint_ns: str
+    checkpoint_id: str
+    parent_checkpoint_id: str | None
+    checkpoint: Checkpoint
+    metadata: dict[str, Any]
+    version: int = 0
+    # Optional: pre-built parent-config dict to avoid re-allocating on every
+    # aget_tuple hit. None means "no parent" (root).
+    parent_config: dict[str, Any] | None = field(default=None)
+
+
+CacheListener = Callable[[str, str, int], None]
+"""Callback fired after every successful aput.
+
+Signature: ``(thread_id, checkpoint_ns, new_version)``.
+"""
 
 # SQL for table creation
 _CREATE_TABLES_SQL = """
@@ -93,21 +143,141 @@ class DeltaSqliteCheckpointer(BaseCheckpointSaver):
         conn: aiosqlite.Connection,
         *,
         snapshot_interval: int = 0,
+        cache_enabled: bool = True,
     ) -> None:
         super().__init__(serde=self.serde)
         self.conn = conn
         self._snapshot_interval = snapshot_interval
         self._is_setup = False
-        # Cache: (thread_id, checkpoint_ns) → reconstructed channel_values
-        self._state_cache: dict[tuple[str, str], dict[str, Any]] = {}
+        # ═══════════════════════════════════════════════════════════════
+        # Delta context cache — see module header and
+        # docs/DESIGN_CONTEXT_DELTA_CACHE.md.
+        # ═══════════════════════════════════════════════════════════════
+        self._cache_enabled = cache_enabled
+        self._cache: dict[tuple[str, str], ThreadCacheEntry] = {}
+        self._listeners: list[CacheListener] = []
+        # Observability — read via get_cache_stats().
+        self._cache_hits_total = 0
+        self._cache_misses_total = 0
+        self._chain_walks_total = 0
 
     @classmethod
     @asynccontextmanager
     async def from_conn_string(
-        cls, conn_string: str, *, snapshot_interval: int = 0
+        cls,
+        conn_string: str,
+        *,
+        snapshot_interval: int = 0,
+        cache_enabled: bool = True,
     ) -> AsyncIterator["DeltaSqliteCheckpointer"]:
         async with aiosqlite.connect(conn_string) as conn:
-            yield cls(conn, snapshot_interval=snapshot_interval)
+            yield cls(
+                conn,
+                snapshot_interval=snapshot_interval,
+                cache_enabled=cache_enabled,
+            )
+
+    # ------------------------------------------------------------------
+    # Cache API — listeners and stats
+    # ------------------------------------------------------------------
+
+    def add_cache_listener(self, listener: CacheListener) -> None:
+        """Register a callback invoked after every successful aput.
+
+        Listeners are intended for derivative caches (middleware, message-
+        dict caches) that need to invalidate when the checkpointer state
+        changes. Callbacks run synchronously in aput's event-loop context
+        — they MUST be cheap and MUST NOT await.
+        """
+        self._listeners.append(listener)
+
+    def remove_cache_listener(self, listener: CacheListener) -> None:
+        """Unregister a previously-added listener. No-op if absent."""
+        try:
+            self._listeners.remove(listener)
+        except ValueError:
+            pass
+
+    def get_cache_stats(self) -> dict[str, int]:
+        """Return current cache counters for debugging / benchmarking."""
+        return {
+            "cache_enabled": int(self._cache_enabled),
+            "cache_size_entries": len(self._cache),
+            "cache_hits_total": self._cache_hits_total,
+            "cache_misses_total": self._cache_misses_total,
+            "chain_walks_total": self._chain_walks_total,
+        }
+
+    def _fire_listeners(self, thread_id: str, ns: str, version: int) -> None:
+        for listener in self._listeners:
+            try:
+                listener(thread_id, ns, version)
+            except Exception:  # noqa: BLE001 — listener bugs must not crash aput
+                logger.exception(
+                    "cache listener failed (thread_id=%s ns=%s version=%d)",
+                    thread_id, ns, version,
+                )
+
+    def _cache_put(
+        self,
+        thread_id: str,
+        ns: str,
+        checkpoint: Checkpoint,
+        parent_checkpoint_id: str | None,
+        metadata: dict[str, Any],
+    ) -> int:
+        """Write an entry into the cache and return its new version.
+
+        No-op (returns 0) when caching is disabled. Listeners are NOT
+        fired here — callers fire them after commit so derivative caches
+        see a durable state.
+        """
+        if not self._cache_enabled:
+            return 0
+        key = (thread_id, ns)
+        existing = self._cache.get(key)
+        next_version = (existing.version + 1) if existing is not None else 1
+        cp_id = checkpoint["id"]
+        parent_config: dict[str, Any] | None = None
+        if parent_checkpoint_id is not None:
+            parent_config = {
+                "configurable": {
+                    "thread_id": thread_id,
+                    "checkpoint_ns": ns,
+                    "checkpoint_id": parent_checkpoint_id,
+                }
+            }
+        self._cache[key] = ThreadCacheEntry(
+            thread_id=thread_id,
+            checkpoint_ns=ns,
+            checkpoint_id=cp_id,
+            parent_checkpoint_id=parent_checkpoint_id,
+            checkpoint=checkpoint,
+            metadata=metadata,
+            version=next_version,
+            parent_config=parent_config,
+        )
+        return next_version
+
+    def _cache_lookup(
+        self, thread_id: str, ns: str, checkpoint_id: str | None
+    ) -> ThreadCacheEntry | None:
+        """Return a cache entry iff it matches the requested checkpoint.
+
+        Requesting the latest (``checkpoint_id is None``) always matches
+        any cached entry for the same (thread_id, ns). Requesting a
+        specific id only matches when the cached entry was built from
+        that id; historical browse misses on purpose (see
+        DESIGN_CONTEXT_DELTA_CACHE.md §5.1).
+        """
+        if not self._cache_enabled:
+            return None
+        entry = self._cache.get((thread_id, ns))
+        if entry is None:
+            return None
+        if checkpoint_id is not None and entry.checkpoint_id != checkpoint_id:
+            return None
+        return entry
 
     async def setup(self) -> None:
         if self._is_setup:
@@ -126,6 +296,47 @@ class DeltaSqliteCheckpointer(BaseCheckpointSaver):
         thread_id = config["configurable"]["thread_id"]
         checkpoint_ns = config["configurable"].get("checkpoint_ns", "")
         checkpoint_id = get_checkpoint_id(config)
+
+        # ═══════════════════════════════════════════════════════════════
+        # Cache fast path. See DESIGN_CONTEXT_DELTA_CACHE.md §4.3.
+        #
+        # If caller asked for the latest (checkpoint_id is None) OR the
+        # specific id they asked for matches the cached one, serve from
+        # RAM — zero SQLite queries, no blob deserialization, no chain
+        # walk. Pending writes are NOT cached (they are per-checkpoint
+        # side-data fetched below via a narrow single SELECT only when
+        # the caller might need them — i.e. on a cache miss OR whenever
+        # we re-enter this function for a confirmed match).
+        #
+        # Pending-writes policy on cache hit: we skip the fetch entirely.
+        # aput_writes writes them to SQLite but does NOT propagate into
+        # the cached entry; the legitimate consumer of pending_writes is
+        # LangGraph's own recovery path, which does a cold aget_tuple on
+        # a fresh process where the cache is empty anyway.
+        # ═══════════════════════════════════════════════════════════════
+        cached = self._cache_lookup(thread_id, checkpoint_ns, checkpoint_id)
+        if cached is not None:
+            self._cache_hits_total += 1
+            cp_config: dict[str, Any] = {
+                "configurable": {
+                    "thread_id": cached.thread_id,
+                    "checkpoint_ns": cached.checkpoint_ns,
+                    "checkpoint_id": cached.checkpoint_id,
+                }
+            }
+            return CheckpointTuple(
+                config=cast("RunnableConfig", cp_config),
+                checkpoint=cached.checkpoint,
+                metadata=cast("CheckpointMetadata", cached.metadata),
+                parent_config=cast(
+                    "RunnableConfig | None", cached.parent_config
+                ),
+                pending_writes=None,
+            )
+
+        # Cache miss: cold start OR historical browse. Fall through to the
+        # original chain-walking path.
+        self._cache_misses_total += 1
 
         if checkpoint_id:
             query = (
@@ -194,6 +405,38 @@ class DeltaSqliteCheckpointer(BaseCheckpointSaver):
                 }
             }
 
+        # ═══════════════════════════════════════════════════════════════
+        # Populate cache after a cold-start reconstruction. Two cases:
+        #
+        #   (a) caller did not specify a checkpoint_id → the fetched row
+        #       is the LATEST by SQL definition (ORDER BY checkpoint_id
+        #       DESC LIMIT 1) — safe to cache.
+        #   (b) caller specified a checkpoint_id but the cache is empty
+        #       → this is a cold start after agent restart; the id they
+        #       handed us typically came from their own prior aput, so
+        #       it is effectively "the latest they know about". Cache
+        #       it; subsequent historical browses will NOT evict it (see
+        #       _cache_lookup + the early-return on a cache HIT for
+        #       matching id).
+        #
+        # Historical browse proper (cache already populated with a
+        # different id) does NOT reach this branch because the guard
+        # below skips population when an entry already exists.
+        # See DESIGN_CONTEXT_DELTA_CACHE.md §5.1.
+        # ═══════════════════════════════════════════════════════════════
+        should_populate = (
+            self._cache_enabled
+            and (thread_id, checkpoint_ns) not in self._cache
+        )
+        if should_populate:
+            self._cache_put(
+                thread_id,
+                checkpoint_ns,
+                checkpoint,
+                parent_id,
+                metadata,
+            )
+
         return CheckpointTuple(
             config=cp_config,
             checkpoint=checkpoint,
@@ -217,7 +460,11 @@ class DeltaSqliteCheckpointer(BaseCheckpointSaver):
         if data.get("v", 1) != _DELTA_VERSION or data.get("is_full_snapshot", False):
             return data
 
-        # v2 delta — walk parent chain to reconstruct
+        # v2 delta — walk parent chain to reconstruct. This is the
+        # expensive path that the cache exists to avoid; bump the
+        # observability counter so benchmarks can verify walks drop to
+        # zero in steady state.
+        self._chain_walks_total += 1
         chain: list[dict[str, Any]] = [data]
         current_parent = None
 
@@ -283,7 +530,10 @@ class DeltaSqliteCheckpointer(BaseCheckpointSaver):
             "versions_seen": newest.get("versions_seen", {}),
             "pending_sends": newest.get("pending_sends", []),
         }
-        return result  # type: ignore[return-value]
+        # Checkpoint is a TypedDict; the dict we built above matches its
+        # shape but ty cannot verify that from an untyped literal. The
+        # cast re-states the known contract without changing runtime.
+        return cast("Checkpoint", result)
 
     # ------------------------------------------------------------------
     # Core: aput — compute and store delta
@@ -375,9 +625,24 @@ class DeltaSqliteCheckpointer(BaseCheckpointSaver):
 
         await self.conn.commit()
 
-        # Update cache
-        cache_key = (thread_id, checkpoint_ns)
-        self._state_cache[cache_key] = dict(checkpoint.get("channel_values", {}))
+        # ═══════════════════════════════════════════════════════════════
+        # Update the delta context cache from the checkpoint we have in
+        # hand — we just serialised its channel_values, so storing the
+        # same object is free. The next aget_tuple for (thread_id, ns)
+        # is now a pure dict lookup. Listeners fire AFTER commit so
+        # derivative caches observe a durable state.
+        # ═══════════════════════════════════════════════════════════════
+        # CheckpointMetadata is a TypedDict (i.e. at runtime a dict); the
+        # cast re-states that without an actual copy.
+        new_version = self._cache_put(
+            thread_id,
+            checkpoint_ns,
+            checkpoint,
+            parent_checkpoint_id,
+            cast("dict[str, Any]", metadata),
+        )
+        if new_version:
+            self._fire_listeners(thread_id, checkpoint_ns, new_version)
 
         return {
             "configurable": {
@@ -454,12 +719,21 @@ class DeltaSqliteCheckpointer(BaseCheckpointSaver):
     async def _get_prev_channel_values(
         self, thread_id: str, checkpoint_ns: str, checkpoint_id: str
     ) -> dict[str, Any] | None:
-        """Get channel_values from previous checkpoint (cached or reconstructed)."""
-        cache_key = (thread_id, checkpoint_ns)
-        if cache_key in self._state_cache:
-            return self._state_cache[cache_key]
+        """Get channel_values from previous checkpoint for delta computation.
+
+        Consults the unified delta-context cache: if the cached latest
+        entry matches ``checkpoint_id``, return its channel_values
+        directly. Otherwise fall back to a single-row SELECT + chain
+        reconstruction. The cache is NOT populated here — writes own
+        the cache invariant, reads are observational.
+        """
+        cached = self._cache_lookup(thread_id, checkpoint_ns, checkpoint_id)
+        if cached is not None:
+            self._cache_hits_total += 1
+            return dict(cached.checkpoint.get("channel_values", {}))
 
         # Reconstruct from DB
+        self._cache_misses_total += 1
         async with self.conn.execute(
             "SELECT type, checkpoint FROM checkpoints "
             "WHERE thread_id = ? AND checkpoint_ns = ? AND checkpoint_id = ?",
@@ -473,9 +747,7 @@ class DeltaSqliteCheckpointer(BaseCheckpointSaver):
         cp = await self._reconstruct_checkpoint(
             thread_id, checkpoint_ns, checkpoint_id, row[0], row[1]
         )
-        cv = cp.get("channel_values", {})
-        self._state_cache[cache_key] = dict(cv)
-        return cv
+        return cp.get("channel_values", {})
 
     async def _count_deltas_since_full(
         self, thread_id: str, checkpoint_ns: str, from_id: str

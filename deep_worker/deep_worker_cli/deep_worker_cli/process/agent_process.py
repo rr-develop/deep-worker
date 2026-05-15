@@ -8,9 +8,8 @@ import sys
 import traceback
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
-import rpyc
 from rpyc.core.protocol import DEFAULT_CONFIG
 from rpyc.utils.async_server import AsyncioServer  # AsyncioServer from rpyc_async!
 
@@ -91,10 +90,16 @@ class AgentProcess:
         """Return True iff ``response`` is this agent's own outgoing
         inter-agent echo (produced by ``SendMessageCompletionMiddleware``).
 
-        An outgoing echo has the exact shape ``"agent:<self.name>:> ..."``
-        at the very start of the string — it's not a reply to the user
-        but a message addressed to a peer agent. TaskManager must skip
-        evaluation of such turns because they aren't task responses.
+        An outgoing echo has the exact shape
+        ``"<self.name> -> <receiver> :> ..."`` at the very start of the
+        string — it's not a reply to the user but a message addressed
+        to a peer agent. TaskManager must skip evaluation of such turns
+        because they aren't task responses.
+
+        The check only anchors on the sender side (``"<self.name> -> "``)
+        because any receiver name is valid for an outgoing echo — what
+        matters for the TaskManager-skip semantics is that THIS agent
+        was the sender.
 
         Args:
             agent_name: This agent's own name (typically ``self.name``).
@@ -103,12 +108,19 @@ class AgentProcess:
                 tool-block lists, etc.) return False safely.
 
         Returns:
-            True iff the string starts with the exact outgoing marker.
+            True iff the string starts with ``"<agent_name> -> "`` AND
+            contains the ``" :> "`` separator (so we don't accidentally
+            match free-form text that happens to begin with the name).
         """
         if not isinstance(response, str):
             return False
-        marker = f"agent:{agent_name}:> "
-        return response.startswith(marker)
+        sender_prefix = f"{agent_name} -> "
+        if not response.startswith(sender_prefix):
+            return False
+        # After "<sender> -> " there must be a receiver name and the
+        # " :> " separator before the message body.
+        tail = response[len(sender_prefix):]
+        return " :> " in tail
 
     def __init__(
         self,
@@ -195,6 +207,7 @@ class AgentProcess:
 
         # State
         self.running = False
+        self.shutdown_event = asyncio.Event()
         self.started_at: datetime | None = None  # Set when agent starts
 
         # Track how many messages we've broadcasted per thread
@@ -202,6 +215,17 @@ class AgentProcess:
         # Similar to sent_count pattern in ClaudeCodeChatModel
         # Key: thread_id, Value: number of messages already broadcasted
         self._last_broadcasted_count: dict[str, int] = {}
+
+        # ═══════════════════════════════════════════════════════════════
+        # Message-dict cache — see DESIGN_CONTEXT_DELTA_CACHE.md §4.7.
+        # ``_handle_get_history`` serializes each LangChain message into
+        # a JSON-ready dict on every call. Messages are immutable once
+        # their id is assigned, so we memoize by id and only build dicts
+        # for messages we have not seen before. Invalidated by
+        # summarization via ``MessageDictCache.prune_to()``.
+        # ═══════════════════════════════════════════════════════════════
+        from deep_worker_cli.process.message_dict_cache import MessageDictCache
+        self._message_dict_cache = MessageDictCache()
 
         # Agent-side command state
         # These are used by slash commands (/clear, /tokens, etc.)
@@ -225,13 +249,98 @@ class AgentProcess:
         # This upholds the "agent is single source of truth" architecture principle.
         self._message_subscribers: set[Any] = set()
 
+    def _current_status_snapshot(self) -> dict[str, Any]:
+        """Return the ``status_change`` envelope for the agent's current state.
+
+        Subscribers use it:
+
+        * ``session_manager`` calls it (via the notifier wiring below)
+          on every transition, so status changes propagate to UI
+          clients immediately without polling;
+        * ``exposed_subscribe_messages`` delivers it as the first
+          message to every new subscriber, so a UI reloaded at any
+          point gets accurate state without waiting for the next
+          transition.
+
+        TaskManager fields are included ONLY when TaskManager is
+        configured on this process — we never fabricate them.
+        """
+        status_value = (
+            self.session_manager.status.value  # type: ignore[union-attr]
+            if self.session_manager is not None
+            else "idle"
+        )
+        error_message = (
+            self.session_manager.error_message  # type: ignore[union-attr]
+            if self.session_manager is not None
+            else None
+        )
+        payload: dict[str, Any] = {
+            "type": "status_change",
+            "status": status_value,
+            "error_message": error_message,
+        }
+        if self.task_manager is not None:
+            payload["task_manager_active"] = (
+                self.task_manager.state != "inactive"
+            )
+            payload["task_manager_disabled"] = bool(self.task_manager.disabled)
+        return payload
+
+    async def _dispatch_status_event(self, _payload: dict[str, Any]) -> None:
+        """Notifier wired into ``SessionManager``.
+
+        ``session_manager`` hands us its own minimal payload; we
+        ignore it and rebuild the full envelope via
+        ``_current_status_snapshot()`` so TaskManager fields — which
+        live outside SessionManager — are always fresh.
+
+        Each subscriber is pushed to via a fresh ``asyncio.create_task``
+        so the caller (usually ``SessionManager.set_status``) returns
+        immediately and — more importantly — we never make a
+        synchronous re-entrant RPyC call from an asyncio handler that
+        is already processing a message on the same connection. The
+        ``sync_request() from asyncio loop`` guard in rpyc would
+        otherwise trip. The deferred dispatch is still event-driven
+        (no polling, no sleeps), just scheduled on the next loop tick.
+
+        ``await on_message(payload_str)`` on a rpyc_async async-flagged
+        netref routes through ``HANDLE_ASYNC_CALL`` by itself, which
+        the peer's ``_dispatch_request_async`` awaits correctly. Do
+        NOT wrap with ``rpyc.async_`` — that forces ``HANDLE_CALL``
+        (sync) on the peer, which calls ``async def exposed_on_message``
+        without awaiting, leaving a stranded coroutine ("Boxing
+        coroutine object ... Did you forget to await?") and silently
+        dropping every status_change on the way to the UI.
+        """
+        import json as _json
+
+        if not self._message_subscribers:
+            return
+        payload_str = _json.dumps(self._current_status_snapshot(), default=str)
+
+        async def _push(target: Any) -> None:
+            try:
+                await target.on_message(payload_str)
+            except Exception as exc:  # noqa: BLE001
+                # Use id() to avoid netref attribute access that would
+                # round-trip over a possibly dying connection.
+                print(
+                    f"[AGENT] status push to subscriber id={id(target)} failed: {exc}",
+                    file=sys.stderr,
+                )
+
+        for subscriber in list(self._message_subscribers):
+            asyncio.create_task(_push(subscriber))
+
     async def start(self) -> None:
         """Start the agent process.
 
         This is the main entry point for the agent.
         """
         try:
-            # 0. Set started_at timestamp
+            # 0. Reset shutdown event and set started_at timestamp
+            self.shutdown_event.clear()
             self.started_at = datetime.now()
 
             # 1. Create PID file
@@ -241,9 +350,14 @@ class AgentProcess:
             self._setup_signal_handlers()
 
             # 3. Initialize session manager (with launch_config for post-mortem inspection)
+            # ``notifier=self._dispatch_status_event`` wires every
+            # ``set_status`` / ``set_error`` transition into the
+            # subscribe-messages broadcast, so UI clients learn of
+            # state changes without any polling.
             self.session_manager = SessionManager(
                 data_dir=self.data_dir,
                 launch_config=self.launch_config,
+                notifier=self._dispatch_status_event,
             )
 
             # 4. Initialize agent with create_cli_agent
@@ -256,7 +370,7 @@ class AgentProcess:
                 sys.stdout.flush()
                 print(msg, file=sys.stderr)
 
-                # Load environment variables from ~/.deepagents/.env BEFORE importing config
+                # Load environment variables from the .env file in the user's agents directory BEFORE importing config
                 # This is critical because config.py initializes Settings at module level
                 # and needs OPENAI_MODEL, OPENAI_BASE_URL, etc. to be set before import
                 deepagents_env = PathLib.home() / ".deepagents" / ".env"
@@ -267,9 +381,34 @@ class AgentProcess:
                     sys.stdout.flush()
                     print(msg, file=sys.stderr)
 
-                # deepagents is installed as a sibling package (see
-                # pyproject.toml `[tool.uv.sources]` / packaging config).
-                # Now import AFTER environment is loaded
+                # ================================================================
+                # CRITICAL: Add deepagents to sys.path BEFORE imports
+                # ================================================================
+                # deepagents must be imported from source, not from pip/venv —
+                # this ensures correct version and avoids pip-vs-local
+                # divergence.
+                #
+                # The path is derived from __file__ so the SAME line works
+                # for BOTH the production tree and the developer tree.
+                # Hard-coding the prod path here used to defeat the --dev
+                # launcher dispatch: even after the bash launcher correctly
+                # re-execs into the dev tree, this insertion would prepend
+                # the prod ``deepagents`` and shadow the dev one. See
+                # docs/DESIGN_DEV_FLAG.md.
+                #
+                # __file__ here =
+                #   deep_worker/deep_worker_cli/deep_worker_cli/process/agent_process.py
+                # parent x4 =
+                #   deep_worker
+                # ================================================================
+                deepagents_path = (
+                    PathLib(__file__).resolve().parent.parent.parent.parent
+                    / "deepagents"
+                )
+                if deepagents_path.exists() and str(deepagents_path) not in sys.path:
+                    sys.path.insert(0, str(deepagents_path))
+
+                # Now import AFTER environment is loaded and deepagents is in path
                 from deep_worker_cli.agent import create_cli_agent
                 from deep_worker_cli.config import create_model
                 from deep_worker_cli.tools import (
@@ -435,10 +574,10 @@ class AgentProcess:
             print(f"RPyC port: {self.rpyc_port}")
             print(f"Working directory: {self.config.working_dir}")
 
-            # Main event loop: wait for shutdown signal
-            while self.running:
-                await asyncio.sleep(1.0)
-
+            # Main event loop: wait for shutdown signal - EVENT DRIVEN, NO POLLING
+            # Wait for shutdown event instead of polling self.running
+            await self.shutdown_event.wait()
+            
             print(f"Agent '{self.name}' event loop exiting...")
 
             # Graceful shutdown after event loop exits
@@ -470,6 +609,7 @@ class AgentProcess:
 
         print(f"Shutting down agent '{self.name}'...")
         self.running = False
+        self.shutdown_event.set()
 
         # 1. Stop TaskManager if enabled
         if self.task_manager:
@@ -563,7 +703,11 @@ class AgentProcess:
         - The local environment is trusted
         - No malicious processes can connect to localhost
         """
-        if not self.rpyc_port:
+        if self.rpyc_port is None:
+            # ``rpyc_port`` is explicitly opted-out (None). ``0`` is a
+            # valid value meaning "let the OS pick a free port" — do
+            # NOT treat it as falsy here. The actual assigned port is
+            # read back below from ``self.rpyc_server.listener``.
             return
 
         from deep_worker_cli.rpyc_service.agent_service import AgentService
@@ -787,54 +931,24 @@ class AgentProcess:
                 start_idx = max(0, end_idx - limit)
             selected_messages = messages[start_idx:end_idx]
 
-            # Convert LangChain messages to JSON-serializable format
-            history = []
-            for msg in selected_messages:
-                msg_dict: dict[str, Any] = {
-                    "type": msg.__class__.__name__,
-                    "id": getattr(msg, "id", None),
-                }
-
-                if isinstance(msg, HumanMessage):
-                    content = msg.content if isinstance(msg.content, str) else str(msg.content)
-                    msg_dict["content"] = content
-
-                elif isinstance(msg, AIMessage):
-                    content = msg.content
-                    if isinstance(content, str):
-                        msg_dict["content"] = content
-                    elif isinstance(content, list):
-                        # Handle content blocks
-                        text_content = ""
-                        for block in content:
-                            if isinstance(block, dict) and block.get("type") == "text":
-                                text_content += block.get("text", "")
-                            elif isinstance(block, str):
-                                text_content += block
-                        msg_dict["content"] = text_content
-                    else:
-                        msg_dict["content"] = str(content)
-
-                    # Include tool calls if present
-                    tool_calls = getattr(msg, "tool_calls", [])
-                    if tool_calls:
-                        msg_dict["tool_calls"] = [
-                            {
-                                "id": tc.get("id"),
-                                "name": tc.get("name"),
-                                "args": tc.get("args", {}),
-                            }
-                            for tc in tool_calls
-                        ]
-
-                elif isinstance(msg, ToolMessage):
-                    content = msg.content if isinstance(msg.content, str) else str(msg.content)
-                    msg_dict["content"] = content
-                    msg_dict["tool_call_id"] = getattr(msg, "tool_call_id", None)
-                    msg_dict["name"] = getattr(msg, "name", "unknown")
-                    msg_dict["status"] = getattr(msg, "status", "success")
-
-                history.append(msg_dict)
+            # Convert LangChain messages to JSON-serializable format.
+            # Serialization is memoized per-message-id via MessageDictCache —
+            # messages are immutable once their id is assigned, so the same
+            # call on the same history returns the same dicts without
+            # allocation. See DESIGN_CONTEXT_DELTA_CACHE.md §4.7.
+            history = [
+                self._message_dict_cache.serialize(msg)
+                for msg in selected_messages
+            ]
+            # Prune stale entries left over from summarization: keep only
+            # ids that are in the full (not sliced) history. Cheap — just
+            # a set-diff + dict pops.
+            live_ids: set[str] = set()
+            for msg in messages:
+                msg_id = getattr(msg, "id", None)
+                if isinstance(msg_id, str) and msg_id:
+                    live_ids.add(msg_id)
+            self._message_dict_cache.prune_to(live_ids)
 
             has_more = start_idx > 0
 
@@ -1086,17 +1200,24 @@ class AgentProcess:
                                 if self.task_manager:
                                     f.write(f"  TaskManager iteration: {iteration}\n")
                                 f.write(f"  stream_mode=['messages', 'updates']\n")
-                                f.write(f"  durability='exit'\n")
+                                f.write(f"  durability=None (default — checkpoints on every node)\n")
                                 f.write(f"  Env DWCLI_DEBUG_ASTREAM={os.environ.get('DWCLI_DEBUG_ASTREAM')}\n")
                                 f.write(f"{'='*80}\n")
 
                         # Stream with full message visibility
+                        # ⚠️ DO NOT add durability="exit" here!
+                        # With durability="exit", checkpoints are written ONLY when
+                        # astream completes. If agent is killed/restarted mid-stream,
+                        # all data is lost (stuck in writes table, unrecoverable).
+                        # Without it, checkpoints are written after each node —
+                        # streaming still works (chunks appear immediately), and
+                        # data is safely persisted. With DeltaSqliteCheckpointer,
+                        # each checkpoint is a small delta, not a full state copy.
                         async for chunk in self.agent.astream(
                             {"messages": [{"role": "user", "content": current_message}]},
                             stream_mode=["messages", "updates"],
                             subgraphs=True,
                             config=config,
-                            durability="exit",  # Match deepagents - required for immediate streaming
                         ):
                             chunk_count += 1
 
@@ -1144,7 +1265,12 @@ class AgentProcess:
                                                 f.write(f"    Content blocks: {len(content)}\n")
                                                 for i, block in enumerate(content):
                                                     if isinstance(block, dict):
-                                                        block_type = block.get('type', 'unknown')
+                                                        # `content` here is AIMessage.content — LangChain
+                                                        # types it as `list[str | dict[Any, Any]]`. The
+                                                        # unparameterized dict confuses ty's overload
+                                                        # resolution for `.get()`; the cast pins it.
+                                                        block_typed = cast("dict[str, Any]", block)
+                                                        block_type = block_typed.get('type', 'unknown')
                                                         f.write(f"      Block {i}: type={block_type}\n")
                                                         if block_type in {'tool_call_chunk', 'tool_call'}:
                                                             f.write(f"        ✅ TOOL_CALL_CHUNK/CALL DETECTED!\n")

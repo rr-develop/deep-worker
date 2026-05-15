@@ -1,6 +1,7 @@
 # Design: `send_message_to_agent` — Inter-Agent Messaging Tool
 
 **Status:** ✅ Approved — ready for implementation
+**Author:** AI Assistant
 **Date:** 2026-04-18 (approved 2026-04-18)
 **Related:**
 - `deep_worker_cli/ARCHITECTURE.md` (agent as single source of truth)
@@ -620,5 +621,114 @@ All questions below are now resolved and frozen for v1 implementation.
 - Failures are returned as structured tool results (never raised).
 - HITL-gated when `auto_approve=False`.
 
-**Design file path:**
+**Design file full path:**
 `deep_worker/deep_worker_cli/docs/DESIGN_SEND_MESSAGE_TO_AGENT_TOOL.md`
+
+---
+
+## Transport evolution: fire-and-forget via `exposed_enqueue_message`
+
+**Originally** the tool called `AgentClient.invoke_agent(prefixed, stream=True)`
+on the target, which blocked the sender's tool call until the recipient
+finished its own LLM turn. If the recipient happened to reply with another
+`send_message_to_agent(...)` to the original sender, both sides deadlocked —
+neither ever returned to IDLE, and `SendMessageCompletionMiddleware` never
+got to run because the tool itself hadn't returned yet.
+
+**Now** the tool calls a new server method `exposed_enqueue_message(message)`
+which:
+
+1. Schedules the agent's `_handle_invoke(...)` in the background via
+   `asyncio.create_task(...)` — the destination runs its LLM turn
+   asynchronously, broadcasting chunks to its subscribers as usual.
+2. Returns `{"success": true, "delivered_content": "<prefixed>"}` to the
+   caller immediately, without awaiting the background turn.
+
+Effect: the sender's tool returns in milliseconds, `ToolMessage` lands in
+state, `SendMessageCompletionMiddleware.before_model` injects the echo
+`AIMessage(content="agent:<sender>:> <text>")` and `jump_to="end"` — the
+sender's turn terminates cleanly and the agent moves to IDLE within seconds
+regardless of how long the recipient takes.
+
+The client plumbing is a new `"enqueue_message"` command in
+`AgentClient._send_command`, invoking `exposed_enqueue_message` via the
+same low-level `HANDLE_ASYNC_CALLATTR` path used for every other RPC.
+
+### Integration test
+
+`tests/integration_ai/test_send_message_completion_e2e.py` spawns two real
+DeepSeek agents, invokes `send_message_to_agent`, and asserts:
+- source turn completes in ≤30s wall-clock and status polls to `IDLE`
+  within 15s,
+- last source history message is the echo `AIMessage(content=<prefixed>)`
+  with no tool_calls,
+- destination eventually (≤30s) shows a `HumanMessage(content=<prefixed>)`
+  in its history.
+
+Run with `DEEPSEEK_API_KEY` set. Result on 2026-04-19: **1 passed in 39.13s**,
+call phase 3.51s (sender returns to IDLE fast thanks to fire-and-forget).
+
+---
+
+## Prefix format evolution: `<sender> -> <receiver> :> <msg>`
+
+**Originally** the delivered content was `agent:<sender>:> <msg>`. In practice
+this had a usability problem: when the **sender** looked at its own history
+(or Full Dialog), every outgoing line read `agent:adam:> 2+2` which is
+redundant — of course it's adam, adam is me. The piece of information the
+sender actually wanted to see — **who is the recipient** — was missing.
+
+**New format:** `<sender> -> <receiver> :> <msg>`. Example:
+`adam -> eva :> hi there`. Both names are always visible, so every reader
+of the conversation (sender's history, receiver's history, Full Dialog in
+deep_worker_web, `dwcli --history`, the web UI) can see at a glance who
+said what to whom.
+
+The sender part is still bound by the factory (not forgeable by the LLM);
+the receiver part is the `agent_name` argument passed to the tool.
+
+### Agent identity in system prompt
+
+To make the new format unambiguous for the LLM, `get_system_prompt(...)`
+in `deep_worker_cli/agent.py` now emits a `### Your Agent Identity`
+section at the top of the prompt (right after the base instructions):
+
+```
+### Your Agent Identity
+
+Your agent name is `adam`. This is the name by which other agents and
+the process registry refer to you. In inter-agent messages of the form
+`<sender> -> <receiver> :> <text>`:
+
+- When YOU send a message via `send_message_to_agent(<peer>, <text>)`,
+  the delivered content is automatically formatted as
+  `adam -> <peer> :> <text>` — your name appears as the sender, so
+  you do NOT need to write it yourself.
+- When you RECEIVE a user-role message whose content starts with
+  `<someone> -> adam :> <text>`, it was sent to you by another agent
+  named `<someone>`; treat it as a peer request.
+```
+
+This replaces the previous implicit assumption that the LLM would
+figure out its own name from the working-directory path.
+
+### Affected files
+
+| File | Change |
+|---|---|
+| `deep_worker_cli/tools.py` | prefix format + docstring + args_schema description |
+| `deep_worker_cli/agent.py` | new `### Your Agent Identity` section in `get_system_prompt` |
+| `deep_worker_cli/default_agent_prompt.md` | rewrote the `send_message_to_agent` subsection to describe the new marker and reference "Your Agent Identity" |
+| `deep_worker_cli/process/agent_process.py` | `_is_outgoing_inter_agent_echo` now looks for `"<agent_name> -> "` + `" :> "` instead of `"agent:<agent_name>:> "` |
+| `tests/unit_tests/tools/test_send_message_to_agent.py` | all prefix assertions → new format |
+| `tests/unit_tests/middleware/test_send_message_completion.py` | all `delivered` strings → new format |
+| `tests/unit_tests/middleware/test_send_message_completion_integration.py` | predicate tests → new marker |
+| `tests/unit_tests/test_agent_identity_in_prompt.py` (**new**) | asserts prompt contains the identity section, distinct agents get distinct identities, marker format is explained |
+| `tests/integration_ai/test_send_message_completion_e2e.py` | `expected_echo` → new format |
+
+### Test results (2026-04-19)
+
+- 56 unit tests passed in 0.76s (incl. 3 new identity tests)
+- Integration test: **1 passed in 41.44s** (call phase 5.54s — source returns
+  to IDLE quickly thanks to fire-and-forget; prefix format verified
+  end-to-end with 2 real DeepSeek agents)

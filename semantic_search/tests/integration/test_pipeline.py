@@ -7,6 +7,7 @@ Marked with pytest.mark.integration for optional selective running.
 from __future__ import annotations
 
 import pytest
+import subprocess
 from pathlib import Path
 
 from llama_index.core.embeddings.mock_embed_model import MockEmbedding
@@ -19,6 +20,25 @@ from semantic_search.retriever import SearchResult, search
 EMBED_DIM = 32  # small dimension for tests
 
 
+def _init_git_repo(repo_path: Path) -> None:
+    """Initialise *repo_path* as a minimal git repository.
+
+    ``scanner.scan_files`` requires the repository to be a git repo so it
+    can honour ``.gitignore``. Tests build a fake repo on-disk and must
+    therefore run ``git init`` (+ a quick ``git add -A``) before calling
+    the indexer. We deliberately leave the files *unstaged* — the scanner
+    accepts untracked-but-not-ignored files just fine, and avoiding a
+    real ``git commit`` keeps the fixture fast and isolated from
+    ``user.name``/``user.email`` global config.
+    """
+    subprocess.run(
+        ["git", "init", "--quiet", "--initial-branch=main"],
+        cwd=repo_path,
+        check=True,
+        capture_output=True,
+    )
+
+
 @pytest.fixture
 def mock_embed() -> MockEmbedding:
     return MockEmbedding(embed_dim=EMBED_DIM)
@@ -26,7 +46,7 @@ def mock_embed() -> MockEmbedding:
 
 @pytest.fixture
 def python_repo(tmp_path: Path) -> Path:
-    """A small fake Python repository."""
+    """A small fake Python repository (real git repo on disk)."""
     src = tmp_path / "src"
     src.mkdir()
 
@@ -49,18 +69,20 @@ def python_repo(tmp_path: Path) -> Path:
     (tmp_path / "pyproject.toml").write_text(
         "[project]\nname = 'calculator'\nversion = '0.1.0'\n"
     )
+    _init_git_repo(tmp_path)
     return tmp_path
 
 
 @pytest.fixture
 def mixed_repo(tmp_path: Path) -> Path:
-    """A repository with multiple languages."""
+    """A repository with multiple languages (real git repo on disk)."""
     (tmp_path / "app.py").write_text("def main(): pass\n")
     (tmp_path / "index.ts").write_text("export function hello(): string { return 'hi'; }\n")
     (tmp_path / "Main.java").write_text(
         "public class Main {\n    public static void main(String[] args) {}\n}\n"
     )
     (tmp_path / "README.md").write_text("# Mixed repo\n")
+    _init_git_repo(tmp_path)
     return tmp_path
 
 

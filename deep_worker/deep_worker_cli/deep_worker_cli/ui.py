@@ -42,15 +42,18 @@ def build_help_parent(
     return [parent]
 
 
-def _format_timeout(seconds: int) -> str:
+def _format_timeout(seconds: int | float | str) -> str:
     """Format timeout in human-readable units (e.g., 300 -> '5m', 3600 -> '1h').
 
     Args:
         seconds: The timeout value in seconds to format.
+                 Accepts int, float, or string (from JSON tool args).
 
     Returns:
         Human-readable timeout string (e.g., '5m', '1h', '300s').
     """
+    # Tool args from MCP/JSON may arrive as strings
+    seconds = int(seconds)
     if seconds < 60:
         return f"{seconds}s"
     if seconds < 3600 and seconds % 60 == 0:

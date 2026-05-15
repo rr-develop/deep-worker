@@ -4,7 +4,7 @@ This test verifies that the WebSearchDelegationTool is properly integrated
 into the deep_worker CLI agent tools system without requiring a full TUI session.
 
 Run with:
-    python3 -m pytest deep_worker/deep_worker_cli/tests/test_websearch_tool_integration.py -v -s
+    cd <repo-root> && python3 -m pytest deep_worker/deep_worker_cli/tests/test_websearch_tool_integration.py -v -s
 """
 
 import pytest
@@ -12,7 +12,7 @@ import pytest
 
 def test_websearch_tool_import():
     """Test that WebSearchDelegationTool can be imported from tools.py."""
-    from deep_worker.deep_worker_cli.deep_worker_cli.tools import web_search_delegation_tool
+    from deep_worker_cli.tools import web_search_delegation_tool
 
     assert web_search_delegation_tool is not None
     assert web_search_delegation_tool.name == "web_search"
@@ -25,13 +25,17 @@ def test_websearch_tool_import():
 
 def test_websearch_tool_attributes():
     """Test that WebSearchDelegationTool has correct attributes."""
-    from deep_worker.deep_worker_cli.deep_worker_cli.tools import web_search_delegation_tool
+    from deep_worker_cli.tools import web_search_delegation_tool
 
     # Check required attributes
     assert web_search_delegation_tool.name == "web_search"
     assert web_search_delegation_tool.description is not None
     assert len(web_search_delegation_tool.description) > 0
-    assert web_search_delegation_tool.timeout == 30.0
+    # Timeout is now 120s (raised from 30s) to accommodate slower
+    # web-search round-trips via Claude Code SDK. Assert it's a
+    # positive float — the exact default is a tuning knob.
+    assert isinstance(web_search_delegation_tool.timeout, float)
+    assert web_search_delegation_tool.timeout > 0
     assert web_search_delegation_tool.verbose is False
 
     print(f"✓ Tool attributes verified")
@@ -71,7 +75,7 @@ def test_websearch_tool_in_non_interactive():
 @pytest.mark.asyncio
 async def test_websearch_tool_callable():
     """Test that WebSearchDelegationTool can be called (mock test)."""
-    from deep_worker.deep_worker_cli.deep_worker_cli.tools import web_search_delegation_tool
+    from deep_worker_cli.tools import web_search_delegation_tool
     from unittest.mock import AsyncMock, patch
 
     # Mock the ClaudeSDKClient to avoid actual SDK calls

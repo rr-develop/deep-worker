@@ -8,7 +8,7 @@ import subprocess  # S404: subprocess required for user-initiated shell commands
 import sys
 import uuid
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 from textual.app import App
 from textual.binding import Binding, BindingType
@@ -18,6 +18,7 @@ from textual.message import Message
 from textual.widgets import Static
 
 import rpyc
+from rpyc.core.async_connect import async_connect
 from deep_worker_cli.process.registry import ProcessRegistry
 from deep_worker_cli.widgets.chat_input import ChatInput
 from deep_worker_cli.widgets.loading import LoadingWidget
@@ -135,7 +136,7 @@ class InteractiveApp(App):
 
         # RPyC connection for real-time messaging
         self._rpyc_conn: rpyc.Connection | None = None
-        self._rpyc_root: Any = None  # Obtained before enable_asyncio_serving
+        self._rpyc_root: Any = None  # Obtained from async_connect (eager handshake)
         self.rpyc_port: int | None = None
         self.rpyc_callback: Any = None
 
@@ -325,16 +326,23 @@ class InteractiveApp(App):
             "allow_public_attrs": True,
             # NO TIMEOUT - connection can live for days/weeks
         }
-        self._rpyc_conn = rpyc.connect("127.0.0.1", self.rpyc_port, config=config)
-
-        # CRITICAL: Enable asyncio serving BEFORE accessing root!
-        # With AsyncioServer, we must enable asyncio serving first,
-        # otherwise conn.root will hang/timeout when the agent uses AsyncioServer.
-        # This matches the pattern in AgentClient and fixes TUI startup hangs.
-        loop = asyncio.get_running_loop()
-        self._rpyc_conn.enable_asyncio_serving(loop=loop)
-
-        # Now safe to get root (after asyncio serving is enabled)
+        # ============================================================================
+        # Use async_connect, NOT sync rpyc.connect.
+        # ============================================================================
+        # We're inside a Textual asyncio event loop. Synchronous rpyc.connect()
+        # blocks the loop on TCP handshake and on every later sync_request; since
+        # rpyc_async's policy update it also raises RuntimeError when called from
+        # a running loop.
+        #
+        # async_connect() is natively non-blocking, auto-enables asyncio serving
+        # internally, and eager-fetches conn.root — so we don't need a separate
+        # enable_asyncio_serving call afterwards.
+        # ============================================================================
+        self._rpyc_conn = await async_connect(
+            "127.0.0.1",
+            self.rpyc_port,
+            config=config,
+        )
         self._rpyc_root = self._rpyc_conn.root
 
         # Subscribe to real-time messages
@@ -356,7 +364,7 @@ class InteractiveApp(App):
         # where all callbacks are async (await adapter._mount_message, etc.)
         #
         # This ensures deep-worker/dwcli follows the SAME async patterns as
-        # the original upstream deepagents implementation.
+        # the original deepagents implementation.
         #
         # ARCHITECTURE: Single-thread, single event loop
         # ================================================
@@ -372,8 +380,9 @@ class InteractiveApp(App):
                 """Receive message from agent (async exposed for RPyC!).
 
                 CRITICAL: This callback is invoked by RPyC AsyncioServer in the agent's
-                event loop. Since dwcli uses enable_asyncio_serving() with Textual's
-                event loop, this callback runs in dwcli's asyncio loop.
+                event loop. Since dwcli uses async_connect() (which auto-enables
+                asyncio serving) against Textual's event loop, this callback runs in
+                dwcli's asyncio loop.
 
                 We MUST NOT block here! call_from_thread() is a BLOCKING call that waits
                 for Textual to process the callback. Instead, we schedule the handler
@@ -394,7 +403,7 @@ class InteractiveApp(App):
             if not success:
                 raise RuntimeError("Failed to subscribe to messages")
 
-    async def _handle_realtime_message(self, msg: dict[str, Any]) -> None:
+    async def _handle_realtime_message(self, msg: Any) -> None:
         """Handle real-time message received via RPyC callback.
 
         This is the ONLY place where messages are displayed in dwcli!
@@ -423,8 +432,33 @@ class InteractiveApp(App):
         state from agent, maintaining single source of truth.
 
         Args:
-            msg: Message dict with keys: type, role, content (and others depending on type)
+            msg: Either a JSON-string (new agent contract) or a dict (legacy).
+                 The agent-side ``_notify_subscribers`` in the RPyC service now
+                 ``json.dumps`` the payload once and ships a plain ``str`` so
+                 subscribers never touch netrefs. We accept both shapes for
+                 transitional compatibility.
         """
+        import json
+
+        if isinstance(msg, (bytes, bytearray)):
+            try:
+                msg = msg.decode("utf-8")
+            except UnicodeDecodeError:
+                return
+        if isinstance(msg, str):
+            try:
+                msg = json.loads(msg)
+            except (json.JSONDecodeError, ValueError):
+                # Malformed — just surface the raw text as an error line.
+                msg = {"type": "error", "content": msg}
+        if not isinstance(msg, dict):
+            # Unknown shape (netref from an even older agent, or None).
+            return
+
+        # Narrow for the type checker: ``msg`` is now definitely a local
+        # ``dict[str, Any]`` (decoded above from JSON-string/bytes or
+        # received directly from a legacy agent).
+        msg = cast("dict[str, Any]", msg)
         msg_type = msg.get("type")
         role = msg.get("role")
         content = msg.get("content", "")
@@ -706,8 +740,19 @@ class InteractiveApp(App):
 
         if self._rpyc_conn:
             try:
-                self._rpyc_conn.disable_asyncio_serving()
-                self._rpyc_conn.close()
+                # ═══════════════════════════════════════════════════════════════
+                # async close — matches async_connect's non-blocking contract.
+                # sync close() here would hit rpyc_async's sync_request guard
+                # inside the running Textual loop.
+                #
+                # FORBIDDEN: annotating this call with type ignore comments
+                # (type: ignore, ty: ignore[...], pyright: ignore[...], etc.)
+                # Type checks MUST see `rpyc_async` via
+                # `[tool.ty.environment].extra-paths` in pyproject.toml.
+                # If `ty` ever claims `Connection` has no `aclose`, the fix is
+                # to restore that extra-paths entry, NOT to silence the check.
+                # ═══════════════════════════════════════════════════════════════
+                await self._rpyc_conn.aclose()
             except Exception:
                 pass
             self._rpyc_conn = None

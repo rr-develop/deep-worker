@@ -8,7 +8,7 @@ import json
 import uuid
 from contextlib import suppress
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -320,12 +320,14 @@ async def execute_task_textual(
             suppress_resumed_output = False
             pending_interrupts: dict[str, HITLRequest] = {}
 
+            # ⚠️ DO NOT add durability="exit" — it defers checkpoint writes to
+            # stream end, causing data loss if agent is killed mid-stream.
+            # See agent_process.py for detailed explanation.
             async for chunk in agent.astream(
                 stream_input,
                 stream_mode=["messages", "updates"],
                 subgraphs=True,
                 config=config,
-                durability="exit",
             ):
                 if not isinstance(chunk, tuple) or len(chunk) != 3:
                     continue
@@ -667,9 +669,13 @@ async def execute_task_textual(
                                 session_state.auto_approve = True
                                 if adapter._on_auto_approve_enabled:
                                     adapter._on_auto_approve_enabled()
-                                # Approve all
+                                # Approve all. Explicit typed cons avoids
+                                # ty narrowing `decisions` to
+                                # `list[ApproveDecision]` / `list[RejectDecision]`
+                                # across branches, which would then fail the
+                                # HITLResponse assignment (invariant list).
                                 decisions = [
-                                    ApproveDecision(type="approve")
+                                    cast("HITLDecision", ApproveDecision(type="approve"))
                                     for _ in action_requests
                                 ]
                                 for tool_msg in adapter._current_tool_messages.values():
@@ -687,7 +693,7 @@ async def execute_task_textual(
                             elif decision_type == "approve":
                                 # Approve all
                                 decisions = [
-                                    ApproveDecision(type="approve")
+                                    cast("HITLDecision", ApproveDecision(type="approve"))
                                     for _ in action_requests
                                 ]
                                 for tool_msg in adapter._current_tool_messages.values():
@@ -705,7 +711,7 @@ async def execute_task_textual(
                             elif decision_type == "reject":
                                 # Reject all
                                 decisions = [
-                                    RejectDecision(type="reject")
+                                    cast("HITLDecision", RejectDecision(type="reject"))
                                     for _ in action_requests
                                 ]
                                 for tool_msg in adapter._current_tool_messages.values():
@@ -714,13 +720,14 @@ async def execute_task_textual(
                                 any_rejected = True
                             else:
                                 decisions = [
-                                    RejectDecision(type="reject")
+                                    cast("HITLDecision", RejectDecision(type="reject"))
                                     for _ in action_requests
                                 ]
                                 any_rejected = True
                         else:
                             decisions = [
-                                RejectDecision(type="reject") for _ in action_requests
+                                cast("HITLDecision", RejectDecision(type="reject"))
+                                for _ in action_requests
                             ]
                             any_rejected = True
 
