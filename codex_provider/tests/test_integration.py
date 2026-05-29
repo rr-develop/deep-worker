@@ -18,16 +18,34 @@ import os
 import shutil
 import sys
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 import pytest
 from langchain_core.messages import (
     AIMessage,
+    BaseMessage,
     HumanMessage,
     SystemMessage,
     ToolMessage,
 )
+from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
+
+
+def _text(content: Any) -> str:
+    """Coerce an AIMessage.content (which can be ``str`` or
+    ``list[str | dict]``) to a flat string for assertions."""
+    if isinstance(content, str):
+        return content
+    parts: list[str] = []
+    for chunk in content:
+        if isinstance(chunk, str):
+            parts.append(chunk)
+        elif isinstance(chunk, dict):
+            t = chunk.get("text") if isinstance(chunk.get("text"), str) else None
+            if t:
+                parts.append(t)
+    return "\n".join(parts)
 
 _pkg_root = Path(__file__).resolve().parent.parent.parent
 if str(_pkg_root) not in sys.path:
@@ -66,6 +84,28 @@ def _isolate_state() -> None:
     get_global_client_state()._states.clear()  # type: ignore[attr-defined]
 
 
+@pytest.fixture(autouse=True)
+async def _cleanup_codex_globals():  # pyright: ignore[reportUnusedFunction]
+    """Ensure live tests do not leave proxy MCP registrations behind."""
+    yield
+    import codex_provider.proxy_mcp_server as proxy_mod
+
+    proxy = proxy_mod._global_proxy  # type: ignore[attr-defined]
+    if proxy is not None:
+        server_name = proxy.server_name
+        await proxy.stop()
+        proxy_mod._global_proxy = None  # type: ignore[attr-defined]
+        proc = await asyncio.create_subprocess_exec(
+            "codex",
+            "mcp",
+            "remove",
+            server_name,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await proc.wait()
+
+
 @tool
 def get_magic_word(topic: Annotated[str, "topic name"]) -> str:
     """Return a magic word for the given topic. You MUST call this to learn it."""
@@ -81,15 +121,16 @@ async def test_hello_world_no_tools() -> None:
     from codex_provider import CodexChatModel
 
     m = CodexChatModel()
+    cfg: RunnableConfig = {"configurable": {"thread_id": "test_hello"}}
     r = await m.ainvoke(
         [
             SystemMessage(content="You are terse. Reply with one word only."),
             HumanMessage(content="Say HELLO."),
         ],
-        config={"configurable": {"thread_id": "test_hello"}},
+        config=cfg,
     )
     assert isinstance(r, AIMessage)
-    assert "HELLO" in r.content.upper()
+    assert "HELLO" in _text(r.content).upper()
 
 
 async def test_multi_turn_memory() -> None:
@@ -101,9 +142,9 @@ async def test_multi_turn_memory() -> None:
     from codex_provider.client_state import get_global_client_state
 
     m = CodexChatModel()
-    cfg = {"configurable": {"thread_id": "test_memory"}}
+    cfg: RunnableConfig = {"configurable": {"thread_id": "test_memory"}}
 
-    msgs: list = [
+    msgs: list[BaseMessage] = [
         SystemMessage(content="Reply in one short sentence."),
         HumanMessage(content="Please remember: my favourite colour is purple."),
     ]
@@ -117,7 +158,7 @@ async def test_multi_turn_memory() -> None:
 
     msgs.append(HumanMessage(content="What is my favourite colour? One word."))
     r2 = await m.ainvoke(msgs, config=cfg)
-    assert "purple" in r2.content.lower(), (
+    assert "purple" in _text(r2.content).lower(), (
         f"Codex didn't recall purple across turns — content was: {r2.content!r}"
     )
     # Same session continued — UUID unchanged
@@ -138,9 +179,9 @@ async def test_tool_call_round_trip() -> None:
     from codex_provider import CodexChatModel
 
     m = CodexChatModel().bind_tools([get_magic_word])
-    cfg = {"configurable": {"thread_id": "test_tool"}}
+    cfg: RunnableConfig = {"configurable": {"thread_id": "test_tool"}}
 
-    msgs: list = [
+    msgs: list[BaseMessage] = [
         SystemMessage(content=(
             "You have a tool get_magic_word(topic). The user wants the magic "
             "word for a topic; you CANNOT know it on your own and MUST call "
@@ -159,12 +200,12 @@ async def test_tool_call_round_trip() -> None:
     # Execute the tool inline (in production this is LangGraph's ToolNode).
     tool_output = get_magic_word.invoke(tc["args"])
     msgs.append(ToolMessage(
-        content=tool_output, tool_call_id=tc["id"], name=tc["name"],
+        content=str(tool_output), tool_call_id=tc["id"], name=tc["name"],
     ))
 
     r2 = await m.ainvoke(msgs, config=cfg)
     assert isinstance(r2, AIMessage)
-    assert "WAFFLE-EIGHT-FORTY-TWO" in r2.content, (
+    assert "WAFFLE-EIGHT-FORTY-TWO" in _text(r2.content), (
         f"Codex didn't echo back the magic word it just received: {r2.content!r}"
     )
 
@@ -202,7 +243,7 @@ async def test_thread_isolation_main_vs_taskmanager() -> None:
     # The TM thread MUST NOT see the main thread's "otter" — fresh
     # session means Codex doesn't have that fact. (Codex may answer
     # anything, including refuse — but it MUST NOT say "otter".)
-    assert "otter" not in r_tm.content.lower(), (
+    assert "otter" not in _text(r_tm.content).lower(), (
         f"TaskManager thread leaked main agent's state: {r_tm.content!r}"
     )
 

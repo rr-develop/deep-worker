@@ -71,8 +71,24 @@ def test_agent_py_passes_per_agent_summaries_prefix_into_create_deep_agent():
         "agent.py must forward a per-agent summaries prefix to create_deep_agent."
     )
     # The prefix must be derived from the blessed per-agent data layout
-    # (~/.deep_worker/<agent>/summaries).
+    # (<agent-data-dir>/<agent>/summaries).
     assert "summaries" in src
+
+
+def test_ensure_summaries_dir_enforces_private_permissions(tmp_path, monkeypatch):
+    """Summaries directory is per-agent storage and must be owner-only."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    summaries_dir = tmp_path / Path("~/.deep_worker").name / "test_v3" / "summaries"
+    summaries_dir.mkdir(parents=True, mode=0o777)
+    summaries_dir.chmod(0o777)
+
+    from deep_worker_cli.summaries import ensure_summaries_dir
+
+    result = ensure_summaries_dir("test_v3")
+
+    assert result == summaries_dir
+    assert oct((tmp_path / Path("~/.deep_worker").name / "test_v3").stat().st_mode & 0o777) == "0o700"
+    assert oct(summaries_dir.stat().st_mode & 0o777) == "0o700"
 
 
 def test_large_results_route_unchanged():

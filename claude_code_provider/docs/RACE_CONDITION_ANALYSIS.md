@@ -1,7 +1,34 @@
-# Analysis of the Race Condition and Performance Problems in claude_code_provider
+# Race Condition and Performance Analysis of claude_code_provider
 
 **Date:** 2026-04-03
 **Version:** 1.0
+**Author:** Claude Code Analysis
+
+---
+
+## Update 2026-05-16
+
+The old 50 ms polling loop was removed earlier, but the provider still
+contained short sleep-based grace waits around `ToolUseBlock` handling
+(`await asyncio.sleep(0.001)` and `await asyncio.sleep(0)`). Those are
+now removed too.
+
+Current implementation:
+
+- `ProxyMCPServer.wait_for_pending_calls(...)` and
+  `wait_for_matching_pending_calls(...)` park on one-shot
+  `asyncio.Future` waiters.
+- The MCP handler wakes matching waiters immediately after it registers
+  `pending_calls[call_id]`.
+- `ClaudeCodeChatModel.ainvoke()` awaits that Future after seeing proxy
+  `ToolUseBlock` values. If one `AssistantMessage` contains multiple
+  proxy tool uses, it waits for all matching pending calls and returns
+  all `tool_calls`.
+- There is no sleep loop, no repeated `has_pending_calls()` wait, and
+  no polling in the active tool-call path.
+
+The rest of this document is retained as historical context for the
+original race condition and why polling-based detection is forbidden.
 
 ---
 
@@ -11,8 +38,8 @@ After a thorough analysis of the `claude_code_provider` implementation and the C
 
 1. ✅ **Confirmed**: Race condition between polling and event collection (lines 486-501)
 2. ✅ **Confirmed**: Polling every 50ms creates excessive CPU load
-3. ✅ **Solution found**: The Claude SDK DOES have an event-based detection mechanism via the message stream
-4. ⚠️ **Critical**: The current approach may lose the final response text
+3. ✅ **Solution found**: The Claude SDK HAS an event-based detection mechanism via the message stream
+4. ⚠️ **Critical**: The current approach can lose the final response text
 
 ---
 
@@ -51,43 +78,43 @@ for task in pending:
 T+0ms:   collect_task starts reading events from Claude
 T+0ms:   poll_task starts polling pending_calls
 T+50ms:  poll_task checks pending_calls (empty)
-T+80ms:  Claude calls an MCP tool via ProxyMCPServer
-T+80ms:  ProxyMCPServer creates a Future and blocks
+T+80ms:  Claude calls MCP tool through ProxyMCPServer
+T+80ms:  ProxyMCPServer creates Future and blocks
 T+80ms:  pending_calls now contains the tool call
-T+85ms:  collect_task receives a TextBlock with a partial response
+T+85ms:  collect_task receives TextBlock with partial response
 T+100ms: poll_task checks pending_calls (found!)
-T+100ms: poll_task finishes FIRST
-T+101ms: collect_task IS CANCELLED via task.cancel()
-T+120ms: Claude sends the final TextBlock with the complete response
-         ❌ BUT collect_task is already cancelled — the text is lost!
+T+100ms: poll_task completes FIRST
+T+101ms: collect_task is CANCELLED via task.cancel()
+T+120ms: Claude sends the final TextBlock with the full response
+         ❌ BUT collect_task is already cancelled - text is lost!
 ```
 
 **Result:**
 - LangGraph receives `AIMessage(content="", tool_calls=[...])`
-- Claude's final response text is lost
-- The user does not see the explanation or the context
+- The final response text from Claude is lost
+- The user does not see the explanation or context
 
 ### 1.3 Why This Is a Race Condition
 
-**Definition of a race condition:**
-> A situation where the result of an operation depends on the non-deterministic order in which events execute.
+**Definition of a Race Condition:**
+> A situation where the result of an operation depends on the non-deterministic ordering of event execution.
 
 **In our case:**
-- If `poll_task` detects the tool call EARLIER than `collect_task` receives the full response → **the text is lost**
-- If `collect_task` finishes EARLIER → **the text is preserved**
+- If `poll_task` detects the tool call EARLIER than `collect_task` receives the full response → **text is lost**
+- If `collect_task` finishes EARLIER → **text is preserved**
 - The result depends on the timing between:
   - Network speed (latency to the Claude API)
   - Polling frequency (50ms)
-  - The moment the tool is called (when Claude decides to call a tool)
+  - The moment of the tool call (when Claude decides to call a tool)
 
 **Probability of the problem:**
-- **High** for fast tool calls (Claude calls the tool immediately)
+- **High** for fast tool calls (Claude calls a tool immediately)
 - **Medium** for tool calls with reasoning (Claude explains first)
 - **Low** if the tool call happens at the end of a long response
 
 ---
 
-## 2. Analysis of the Polling Mechanism and CPU Usage
+## 2. Polling Mechanism and CPU Usage Analysis
 
 ### 2.1 Current Polling Implementation
 
@@ -112,14 +139,14 @@ Operations per minute: 20 * 60 = 1200 checks
 ```
 
 **What happens on each check:**
-1. `asyncio.sleep(0.05)` - a context switch in the event loop
-2. `proxy_mcp.has_pending_calls()` - access to the `pending_calls` dict
-3. `len(self.pending_calls) > 0` - computing the dict length
+1. `asyncio.sleep(0.05)` - context switch in the event loop
+2. `proxy_mcp.has_pending_calls()` - access to the `pending_calls` dictionary
+3. `len(self.pending_calls) > 0` - computing the dictionary length
 4. Return to the event loop
 
 **Overhead:**
 - ❌ Runs continuously even when there are no tool calls
-- ❌ The event loop wakes up constantly every 50ms
+- ❌ The event loop constantly wakes up every 50ms
 - ❌ Context switches create overhead
 - ❌ Cache misses due to constant memory access
 - ❌ The CPU cannot enter deep sleep (power management)
@@ -137,13 +164,13 @@ Multi-thread:  20-50% CPU for 5-10 concurrent sessions
 **Tool call detection delay:**
 
 ```
-Minimum delay: 0ms (if the check coincided with the call creation)
-Maximum delay: 50ms (if the call was created right after a check)
+Minimum delay: 0ms (if the check coincides with call creation)
+Maximum delay: 50ms (if the call is created right after the check)
 Average delay: 25ms (statistically)
 ```
 
 **Impact on the user:**
-- ⚠️ A 25ms delay is added to every tool call
+- ⚠️ 25ms delay added to every tool call
 - ⚠️ For chains of 10 tool calls: +250ms
 - ⚠️ The user perceives "lag"
 
@@ -181,7 +208,7 @@ Client.receive_messages()
 Client.receive_response()
 ```
 
-**Key files (in the Claude Agent SDK package):**
+**Key files:**
 - `claude_agent_sdk/client.py:160-168` - `receive_messages()`
 - `claude_agent_sdk/_internal/query.py:154-204` - `_read_messages()`
 - `claude_agent_sdk/_internal/query.py:525-534` - `receive_messages()`
@@ -207,7 +234,7 @@ ContentBlock = (
 )
 ```
 
-### 3.3 ToolUseBlock — the Key to the Solution!
+### 3.3 ToolUseBlock - The Key to the Solution!
 
 **Definition (types.py:436-441):**
 
@@ -216,7 +243,7 @@ ContentBlock = (
 class ToolUseBlock:
     """Tool use content block."""
     id: str              # Unique tool call ID
-    name: str            # Tool name (for example "read_file")
+    name: str            # Tool name (e.g. "read_file")
     input: dict[str, Any]  # Tool call arguments
 ```
 
@@ -242,7 +269,7 @@ AssistantMessage(
 **Timeline from the Claude API:**
 
 ```
-1. User query is sent
+1. User query sent
 2. Claude starts generating a response
 3. Stream events:
    ├─ AssistantMessage(content=[TextBlock("I'll help...")])  # Text
@@ -253,7 +280,7 @@ AssistantMessage(
 
 **IMPORTANT:**
 - ✅ ToolUseBlock arrives THROUGH the message stream
-- ✅ ToolUseBlock is PART OF an AssistantMessage
+- ✅ ToolUseBlock is PART of AssistantMessage
 - ✅ ToolUseBlock arrives BEFORE ResultMessage
 - ✅ The SDK already parses ToolUseBlock in message_parser.py:102-107
 
@@ -262,13 +289,13 @@ AssistantMessage(
 **When Claude calls an MCP tool:**
 
 ```
-1. Claude sends a ToolUseBlock into the stream
-2. The SDK receives the ToolUseBlock and parses it
+1. Claude sends ToolUseBlock to the stream
+2. The SDK receives ToolUseBlock and parses it
 3. The SDK sends an MCP request to ProxyMCPServer (control protocol)
    - Request type: "mcp_message"
    - Server name: "deepworker"
    - Method: "tools/call"
-4. The ProxyMCPServer handler is called (proxy_mcp_server.py:112-124)
+4. ProxyMCPServer handler is invoked (proxy_mcp_server.py:112-124)
 5. The handler creates an asyncio.Future and BLOCKS
 6. pending_calls is populated
 ```
@@ -290,27 +317,27 @@ async def _handle_control_request(self, request: SDKControlRequest):
 ```
 
 **Important:**
-- ⚠️ The MCP request is handled IN THE BACKGROUND via `_tg.start_soon()`
+- ⚠️ The MCP request is processed IN THE BACKGROUND via `_tg.start_soon()`
 - ⚠️ `_handle_control_request` DOES NOT BLOCK the message stream
 - ⚠️ The handler in ProxyMCPServer blocks ON THE FUTURE
 
 ---
 
-## 4. Event-Based Detection: the Correct Solution
+## 4. Event-Based Detection: The Right Solution
 
-### 4.1 Why Is Event-Based Better Than Polling?
+### 4.1 Why Event-Based Is Better Than Polling?
 
 | Criterion | Polling (current) | Event-Based |
 |----------|-------------------|-------------|
 | CPU Usage | 5-10% constantly | <0.1% (only on events) |
 | Latency | 0-50ms (avg 25ms) | <1ms (instant) |
 | Scalability | Poor (O(n) sessions) | Excellent (O(1)) |
-| Race Condition | ✅ Present | ❌ None |
+| Race Condition | ✅ Yes | ❌ No |
 | Complexity | Medium | Medium |
 
-### 4.2 How to Detect a Tool Call Through Events
+### 4.2 How to Detect Tool Calls Through Events
 
-**Solution #1: Check for ToolUseBlock in receive_response()**
+**Solution #1: Check ToolUseBlock in receive_response()**
 
 ```python
 async def ainvoke(...):
@@ -345,12 +372,12 @@ async def ainvoke(...):
 
 **Advantages:**
 - ✅ No polling - event-driven
-- ✅ No race condition - all the text is collected BEFORE checking pending_calls
+- ✅ No race condition - the entire text is collected BEFORE checking pending_calls
 - ✅ Latency <1ms - instant detection
 - ✅ Minimal CPU usage
 
 **Potential problem:**
-- ⚠️ The ToolUseBlock may arrive BEFORE the MCP handler manages to create the Future
+- ⚠️ ToolUseBlock may arrive BEFORE the MCP handler has a chance to create the Future
 - ⚠️ Timing between the message stream and the control protocol
 
 ### 4.3 Solution #2: Synchronization Through ToolUseBlock IDs
@@ -396,9 +423,9 @@ async def ainvoke(...):
 ```
 
 **Advantages:**
-- ✅ All the text is guaranteed to be collected
-- ✅ A short wait only when there are tool calls
-- ✅ A fallback if the timing did not line up
+- ✅ The entire text is guaranteed to be collected
+- ✅ Short wait only when there are tool calls
+- ✅ Fallback if the timing does not match
 
 ### 4.4 Solution #3: Use the PreToolUse Hook
 
@@ -436,24 +463,24 @@ options = ClaudeAgentOptions(
 )
 ```
 
-**PreToolUse hook timing:**
+**Timing of the PreToolUse hook:**
 ```
-1. Claude generates a ToolUseBlock
-2. The ToolUseBlock enters the message stream
-3. The SDK parses the ToolUseBlock
-4. ❗ The PreToolUse hook IS CALLED ❗
+1. Claude generates ToolUseBlock
+2. ToolUseBlock enters the message stream
+3. The SDK parses ToolUseBlock
+4. ❗ The PreToolUse hook IS INVOKED ❗
 5. The SDK sends the MCP request
-6. The ProxyMCPServer handler creates a Future
+6. ProxyMCPServer handler creates the Future
 ```
 
 **Problem:**
-- ⚠️ PreToolUse is called SYNCHRONOUSLY in the SDK
-- ⚠️ Blocking in the hook = blocking the message stream
+- ⚠️ PreToolUse is invoked SYNCHRONOUSLY in the SDK
+- ⚠️ Blocking the hook = blocking the message stream
 - ⚠️ A callback mechanism is needed in ClaudeCodeChatModel
 
 ---
 
-## 5. Recommendations for Fixing
+## 5. Recommendations for the Fix
 
 ### 5.1 Recommended Solution: Event-Based Detection
 
@@ -479,14 +506,13 @@ async def ainvoke(...):
             # ✅ Response FULLY collected
             break
 
-    # Now check pending calls (after stream complete)
+    # Now wait for pending calls from the proxy.
     if has_tool_use_blocks:
-        # Small grace period for MCP handler to populate pending_calls
-        await asyncio.sleep(0.01)  # 10ms should be enough
-
-        if proxy_mcp.has_pending_calls():
-            pending = proxy_mcp.get_pending_calls()
-            return AIMessage(content=response_text, tool_calls=pending)
+        pending = await proxy_mcp.wait_for_matching_pending_calls(
+            expected_calls=[(block.name, dict(block.input)) for block in proxy_blocks],
+            timeout=30.0,
+        )
+        return AIMessage(content=response_text, tool_calls=pending)
 
     return AIMessage(content=response_text)
 ```
@@ -495,10 +521,10 @@ async def ainvoke(...):
 - ✅ Eliminates the race condition
 - ✅ Preserves the entire response text
 - ✅ Minimal CPU usage
-- ✅ Latency <10ms
+- ✅ No sleep-based latency
 
 **Disadvantages:**
-- ⚠️ A 10ms grace period (but better than the 25ms average of polling)
+- ⚠️ All proxy `ToolUseBlock` values must be matched precisely to pending calls
 
 ### 5.2 Alternative: Event + Signal
 
@@ -571,7 +597,7 @@ async def ainvoke(...):
 
 ### 6.1 Confirmation of the Problems
 
-1. ✅ **Race Condition EXISTS**: Polling may detect a tool call BEFORE the final text is received
+1. ✅ **Race Condition EXISTS**: Polling can detect the tool call BEFORE the final text is received
 2. ✅ **CPU Usage HIGH**: 20 checks/second * N sessions = excessive load
 3. ✅ **Event Mechanism EXISTS**: The Claude SDK provides ToolUseBlock in the message stream
 4. ✅ **Better Solution EXISTS**: Event-based detection eliminates both problems
@@ -581,11 +607,11 @@ async def ainvoke(...):
 **Phase 1: Quick Fix (1 hour)**
 - Collect ALL events until the end of the stream
 - Check pending_calls AFTER ResultMessage
-- Add a 10ms grace period
+- Do not use a sleep-based grace period; wait for the signal from the proxy
 
 **Phase 2: Event-Based Solution (2-3 hours)**
-- Add `tool_call_event: asyncio.Event` to ProxyMCPServer
-- Change the logic in ainvoke to wait on the event
+- Add a Future waiter API to ProxyMCPServer
+- Change the logic in ainvoke to wait for matching pending calls
 - Remove the polling loop
 
 **Phase 3: Testing (1-2 hours)**
@@ -603,7 +629,7 @@ async def ainvoke(...):
 **After the fix:**
 - CPU Usage: <0.1% per session (98% improvement)
 - Latency: <10ms (60% improvement)
-- Race condition: 0% (completely eliminated)
+- Race condition: 0% (fully eliminated)
 
 **Scalability:**
 - 10 sessions: 50-100% CPU → <1% CPU
@@ -621,9 +647,9 @@ result = await asyncio.wait_for(future, timeout=self.timeout)
 ```
 
 - ⚠️ Default timeout = 60 seconds
-- ⚠️ If the host application does not respond → timeout exception
+- ⚠️ If deep-worker does not respond → timeout exception
 - ⚠️ But pending_calls will no longer be in the list (line 138: finally: pop)
-- ⚠️ This may create an inconsistent state
+- ⚠️ May create an inconsistent state
 
 ### 7.2 Potential Issues in ClientManager
 
@@ -657,7 +683,7 @@ self._client_manager.update_sent_count(thread_id, len(messages))
 
 **Potential issue:**
 - ⚠️ If LangGraph truncates history → sent_count > len(messages)
-- ✅ Handling exists (lines 401-405), but without resetting the Claude session
+- ✅ There is handling (line 401-405), but without resetting the Claude session
 - ⚠️ The Claude session may contain old messages
 
 ---
@@ -851,7 +877,7 @@ Checks per second: 20
 Time per check: ~0.1ms (dict lookup)
 CPU time per second: 20 * 0.1ms = 2ms
 CPU usage: 2ms / 1000ms = 0.2% (pure compute)
-Overhead (context switches): ~5-10x = 1-2% in practice
+Overhead (context switches): ~5-10x = 1-2% actual
 Total CPU: 2-4% per session (idle)
 Peak CPU: 10-20% (with processing)
 
@@ -878,7 +904,7 @@ Peak CPU: 0.1% (event handling)
 |-------|-----|-----|---------|-----|-----|
 | Polling 50ms | 0ms | 50ms | 25ms | 45ms | 50ms |
 | Polling 10ms | 0ms | 10ms | 5ms | 9ms | 10ms |
-| Event-Based + 10ms grace | 10ms | 10ms | 10ms | 10ms | 10ms |
+| Event-Based + Future waiter | <1ms | bounded by handler scheduling | <1ms after handler registration | <1ms after handler registration | <1ms after handler registration |
 | Event + Signal | <1ms | <1ms | <1ms | <1ms | <1ms |
 
 **End-to-End Latency (user query → tool execution):**

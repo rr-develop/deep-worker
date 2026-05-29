@@ -15,11 +15,22 @@ SessionTypeId = Literal["cco", "csdk", "persistent_csdk", "langchain"]
 
 
 class SessionStatus(str, Enum):
-    """Session status enumeration compatible with BaseSession protocol."""
+    """Session status enumeration compatible with BaseSession protocol.
+
+    Mirrors the ``deep_worker_cli.types.AgentStatus`` enum but uses the
+    BaseSession protocol names (``READY``/``WORKING`` vs ``IDLE``/
+    ``RUNNING``). Mapping lives in ``session_adapter.map_agent_status``.
+
+    ``INTERRUPTED`` is a first-class state: agent paused mid-turn by a
+    user interrupt, awaiting the user's next message (typically a
+    correction). Distinct from ``WAITING_INPUT`` which represents the
+    in-turn tool-running state.
+    """
 
     READY = "ready"
     WORKING = "working"
     WAITING_INPUT = "waiting_input"
+    INTERRUPTED = "interrupted"
     ERROR = "error"
     UNKNOWN = "unknown"
 

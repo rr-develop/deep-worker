@@ -248,6 +248,258 @@ class TestClaudeCodeChatModelToolCalls:
         assert result.tool_calls[0]["id"] == "call_1"
 
     @pytest.mark.asyncio
+    async def test_tooluseblock_waits_event_driven_without_sleep(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """ToolUseBlock → pending call bridge must use wait_for_any_pending_call,
+        not asyncio.sleep polling. The visible block is only a signal; the
+        authoritative call is read from get_pending_calls() afterwards."""
+        from claude_agent_sdk import AssistantMessage as ClaudeAssistantMessage
+        from claude_agent_sdk import ToolUseBlock
+
+        model = ClaudeCodeChatModel(base_options=None)
+        model = model.bind_tools([test_calculator])
+
+        mock_client = Mock()
+        mock_client.query = AsyncMock()
+
+        async def mock_receive():
+            yield ClaudeAssistantMessage(
+                content=[
+                    ToolUseBlock(
+                        id="toolu_1",
+                        name="test_calculator",
+                        input={"a": 5, "b": 3},
+                    )
+                ],
+                model="claude-sonnet-4-5-20250929",
+            )
+
+        mock_client.receive_response = mock_receive
+
+        mock_proxy = Mock()
+        # has_pending_calls returns False before the wait, True after it
+        # returns — mimicking the real proxy where the handler task
+        # registers the pending call only after we break out of
+        # receive_response.
+        _state = {"registered": False}
+
+        def _has_pending_calls() -> bool:
+            return _state["registered"]
+
+        def _get_pending_calls() -> list[dict[str, Any]]:
+            return [
+                {"id": "call_1", "name": "test_calculator", "args": {"a": 5, "b": 3}}
+            ] if _state["registered"] else []
+
+        async def _wait_for_any_pending_call(*, timeout: float) -> None:
+            _state["registered"] = True
+
+        mock_proxy.has_pending_calls = Mock(side_effect=_has_pending_calls)
+        mock_proxy.get_pending_calls = Mock(side_effect=_get_pending_calls)
+        mock_proxy.wait_for_any_pending_call = AsyncMock(
+            side_effect=_wait_for_any_pending_call
+        )
+
+        async def _sleep_is_polling(_delay: float) -> None:
+            raise AssertionError("polling sleep is forbidden in ClaudeCodeChatModel")
+
+        monkeypatch.setattr("claude_code_provider.chat_model.asyncio.sleep", _sleep_is_polling)
+
+        with patch.object(
+            model.client_manager, "get_or_create_client", return_value=(mock_client, mock_proxy)
+        ):
+            result = await model.ainvoke(
+                [HumanMessage(content="Calculate 5+3")],
+                config={"configurable": {"thread_id": "test_chat_event_driven"}},
+            )
+
+        assert isinstance(result, AIMessage)
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["name"] == "test_calculator"
+        mock_proxy.wait_for_any_pending_call.assert_awaited_once_with(timeout=30.0)
+
+    @pytest.mark.asyncio
+    async def test_visible_block_args_diverge_from_control_channel_call(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The visible message-stream ToolUseBlock and the actual MCP
+        control-channel call are the SAME logical call, but Claude can stream
+        slightly different (partial/earlier) argument JSON in the assistant
+        message than what is finalized and delivered to the MCP handler.
+
+        Live evidence (2026-05-26):
+          visible  grep(pattern='unsubscribe_messages')
+          pending  grep(pattern='unsubscribe')
+          visible  read_file(..., limit=30)
+          pending  read_file(..., limit=40)
+
+        The control channel is authoritative — its pending call (keyed by the
+        handler's call_id) is what gets executed and later resolve_call'd. The
+        visible block is only a SIGNAL that a tool is coming. ainvoke must wait
+        for a handler to register, then surface the real pending call. It must
+        NOT deadlock waiting for a pending call whose args exactly equal the
+        visible block's args.
+        """
+        from claude_agent_sdk import AssistantMessage as ClaudeAssistantMessage
+        from claude_agent_sdk import ToolUseBlock
+
+        model = ClaudeCodeChatModel(base_options=None)
+        model = model.bind_tools([test_reader])
+
+        mock_client = Mock()
+        mock_client.query = AsyncMock()
+
+        async def mock_receive():
+            # Visible block carries the streamed (earlier) args limit=30.
+            yield ClaudeAssistantMessage(
+                content=[
+                    ToolUseBlock(
+                        id="toolu_read",
+                        name="mcp__deepworker__test_reader",
+                        input={"path": "/tmp/x.py", "limit": 30},
+                    ),
+                ],
+                model="claude-sonnet-4-5-20250929",
+            )
+
+        mock_client.receive_response = mock_receive
+
+        # Control channel delivers the FINAL args limit=40 — same logical call,
+        # different argument value than the visible block.
+        control_channel_pending = [
+            {
+                "id": "test_reader_1_42",
+                "name": "test_reader",
+                "args": {"path": "/tmp/x.py", "limit": 40},
+            },
+        ]
+        _state = {"registered": False}
+        mock_proxy = Mock()
+        mock_proxy.has_pending_calls = Mock(
+            side_effect=lambda: _state["registered"]
+        )
+        mock_proxy.get_pending_calls = Mock(
+            side_effect=lambda: control_channel_pending if _state["registered"] else []
+        )
+
+        async def _wait_for_any_pending_call(*, timeout: float) -> None:
+            _state["registered"] = True
+
+        mock_proxy.wait_for_any_pending_call = AsyncMock(
+            side_effect=_wait_for_any_pending_call
+        )
+
+        async def _sleep_is_polling(_delay: float) -> None:
+            raise AssertionError("polling sleep is forbidden in ClaudeCodeChatModel")
+
+        monkeypatch.setattr("claude_code_provider.chat_model.asyncio.sleep", _sleep_is_polling)
+
+        with patch.object(
+            model.client_manager, "get_or_create_client", return_value=(mock_client, mock_proxy)
+        ):
+            result = await model.ainvoke(
+                [HumanMessage(content="read the file")],
+                config={"configurable": {"thread_id": "test_chat_divergent_args"}},
+            )
+
+        # Must NOT deadlock; must surface the authoritative control-channel call
+        # (limit=40) — NOT the visible block's args (limit=30), and NOT error.
+        assert isinstance(result, AIMessage)
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["name"] == "test_reader"
+        assert result.tool_calls[0]["args"] == {"path": "/tmp/x.py", "limit": 40}
+        assert result.tool_calls[0]["id"] == "test_reader_1_42"
+        mock_proxy.wait_for_any_pending_call.assert_awaited_once_with(timeout=30.0)
+
+    @pytest.mark.asyncio
+    async def test_single_assistant_message_multiple_proxy_tooluseblocks(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Claude CLI dispatches MCP control_requests SEQUENTIALLY: even when
+        an AssistantMessage carries multiple proxy ToolUseBlocks, only the
+        first handler is invoked and only ONE pending call exists. ainvoke
+        must surface that one to LangGraph and exit — the next ainvoke
+        iteration picks up the next pending call after resolve_call.
+
+        Trying to wait for ALL handlers to register would deadlock, because
+        Claude does not send the next control_request until it receives the
+        previous tool_result. This was the freeze observed in live testing.
+        """
+        from claude_agent_sdk import AssistantMessage as ClaudeAssistantMessage
+        from claude_agent_sdk import ToolUseBlock
+
+        model = ClaudeCodeChatModel(base_options=None)
+        model = model.bind_tools([test_calculator, test_reader])
+
+        mock_client = Mock()
+        mock_client.query = AsyncMock()
+
+        async def mock_receive():
+            # Both ToolUseBlocks visible in one AssistantMessage, mirroring
+            # real Claude payload for parallel tool calls.
+            yield ClaudeAssistantMessage(
+                content=[
+                    ToolUseBlock(
+                        id="toolu_calc",
+                        name="test_calculator",
+                        input={"a": 5, "b": 3},
+                    ),
+                    ToolUseBlock(
+                        id="toolu_read",
+                        name="test_reader",
+                        input={"path": "/tmp/file.txt"},
+                    ),
+                ],
+                model="claude-sonnet-4-5-20250929",
+            )
+
+        mock_client.receive_response = mock_receive
+
+        # Only the FIRST handler ever registers (Claude CLI sequential
+        # dispatch). The second one will only register on the NEXT ainvoke
+        # iteration after the first is resolve_call'd — out of scope here.
+        first_pending = [
+            {"id": "call_calc", "name": "test_calculator", "args": {"a": 5, "b": 3}},
+        ]
+        _state = {"registered": False}
+        mock_proxy = Mock()
+        mock_proxy.has_pending_calls = Mock(
+            side_effect=lambda: _state["registered"]
+        )
+        mock_proxy.get_pending_calls = Mock(
+            side_effect=lambda: first_pending if _state["registered"] else []
+        )
+
+        async def _wait_for_any_pending_call(*, timeout: float) -> None:
+            # Only the FIRST handler registers (sequential control dispatch).
+            _state["registered"] = True
+
+        mock_proxy.wait_for_any_pending_call = AsyncMock(
+            side_effect=_wait_for_any_pending_call
+        )
+
+        async def _sleep_is_polling(_delay: float) -> None:
+            raise AssertionError("polling sleep is forbidden in ClaudeCodeChatModel")
+
+        monkeypatch.setattr("claude_code_provider.chat_model.asyncio.sleep", _sleep_is_polling)
+
+        with patch.object(
+            model.client_manager, "get_or_create_client", return_value=(mock_client, mock_proxy)
+        ):
+            result = await model.ainvoke(
+                [HumanMessage(content="Calculate and read")],
+                config={"configurable": {"thread_id": "test_chat_event_batch"}},
+            )
+
+        # Critical: must return ONLY the first registered pending call, NOT
+        # block waiting for both handlers (the second only registers on the
+        # next ainvoke iteration after the first is resolve_call'd).
+        assert isinstance(result, AIMessage)
+        assert [tc["name"] for tc in result.tool_calls] == ["test_calculator"]
+        mock_proxy.wait_for_any_pending_call.assert_awaited_once_with(timeout=30.0)
+
+    @pytest.mark.asyncio
     async def test_ainvoke_multiple_tool_calls(self) -> None:
         """Should handle multiple simultaneous tool calls."""
         model = ClaudeCodeChatModel(base_options=None)
@@ -417,3 +669,155 @@ class TestClaudeCodeChatModelMessageConversion:
         # ⚠️ PROXY: ToolMessage resolved via resolve_call, NOT query
         mock_proxy.resolve_call.assert_called_once()
         # query called only for HumanMessage, NOT for ToolMessage
+
+
+class TestClaudeCodeChatModelControlChannelRecovery:
+    """Recovery behaviour when matching pending-call registration times out.
+
+    Claude CLI's control channel can hang mid-turn: a ``ToolUseBlock``
+    arrives on the message stream, but the matching ``control_request``
+    is never delivered. We observed this on a live agent on
+    2026-05-19: 90 s of nothing, no 429, no rate-limit, no API errors,
+    Python side healthy — the Claude CLI subprocess itself was wedged.
+
+    Retrying in-place against the same wedged subprocess is futile (an
+    earlier 3 × 30 s retry policy reproduced the same hang each time).
+    Contract: a single 30 s wait; on timeout, kill the stuck client via
+    ``ClientManager.cleanup_client`` and raise. The next ``ainvoke``
+    spawns a fresh Claude CLI subprocess and resumes the same session
+    via the rotation tracking in ``ClientManager``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_no_cleanup_when_first_attempt_succeeds(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Happy path: the first ``wait_for_any_pending_call`` succeeds
+        in milliseconds (typical case). ``cleanup_client`` MUST NOT
+        be invoked."""
+        from claude_agent_sdk import AssistantMessage as ClaudeAssistantMessage
+        from claude_agent_sdk import ToolUseBlock
+
+        model = ClaudeCodeChatModel(base_options=None)
+        model = model.bind_tools([test_calculator])
+
+        mock_client = Mock()
+        mock_client.query = AsyncMock()
+
+        async def mock_receive():
+            yield ClaudeAssistantMessage(
+                content=[
+                    ToolUseBlock(
+                        id="toolu_1",
+                        name="test_calculator",
+                        input={"a": 1, "b": 2},
+                    )
+                ],
+                model="claude-sonnet-4-5-20250929",
+            )
+
+        mock_client.receive_response = mock_receive
+
+        mock_proxy = Mock()
+        _state = {"registered": False}
+
+        def _has_pending_calls() -> bool:
+            return _state["registered"]
+
+        def _get_pending_calls() -> list[dict[str, Any]]:
+            return (
+                [{"id": "c1", "name": "test_calculator", "args": {"a": 1, "b": 2}}]
+                if _state["registered"]
+                else []
+            )
+
+        async def _wait(*, timeout: float) -> None:
+            _state["registered"] = True
+
+        mock_proxy.has_pending_calls = Mock(side_effect=_has_pending_calls)
+        mock_proxy.get_pending_calls = Mock(side_effect=_get_pending_calls)
+        mock_proxy.wait_for_any_pending_call = AsyncMock(side_effect=_wait)
+
+        cleanup_mock = AsyncMock()
+
+        with patch.object(
+            model.client_manager,
+            "get_or_create_client",
+            return_value=(mock_client, mock_proxy),
+        ), patch.object(
+            model.client_manager,
+            "cleanup_client",
+            cleanup_mock,
+        ):
+            await model.ainvoke(
+                [HumanMessage(content="test")],
+                config={"configurable": {"thread_id": "test_recover_happy"}},
+            )
+
+        # Exactly one wait, no cleanup.
+        assert mock_proxy.wait_for_any_pending_call.await_count == 1
+        cleanup_mock.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_timeout_returns_visible_tool_call_fallback(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import asyncio as _asyncio
+        from langchain_core.messages import AIMessage
+        from claude_agent_sdk import AssistantMessage as ClaudeAssistantMessage
+        from claude_agent_sdk import ToolUseBlock
+
+        model = ClaudeCodeChatModel(base_options=None)
+        model = model.bind_tools([test_calculator])
+
+        mock_client = Mock()
+        mock_client.query = AsyncMock()
+
+        async def mock_receive():
+            yield ClaudeAssistantMessage(
+                content=[
+                    ToolUseBlock(
+                        id="toolu_1",
+                        name="test_calculator",
+                        input={"a": 1, "b": 2},
+                    )
+                ],
+                model="claude-sonnet-4-5-20250929",
+            )
+
+        mock_client.receive_response = mock_receive
+
+        mock_proxy = Mock()
+        mock_proxy.has_pending_calls = Mock(return_value=False)
+        mock_proxy.get_pending_calls = Mock(return_value=[])
+
+        async def _wait_always_times_out(*, timeout: float) -> None:
+            raise _asyncio.TimeoutError
+
+        mock_proxy.wait_for_any_pending_call = AsyncMock(
+            side_effect=_wait_always_times_out
+        )
+
+        cleanup_mock = AsyncMock()
+        thread_id = "test_recover_fallback"
+
+        with patch.object(
+            model.client_manager,
+            "get_or_create_client",
+            return_value=(mock_client, mock_proxy),
+        ), patch.object(
+            model.client_manager,
+            "cleanup_client",
+            cleanup_mock,
+        ):
+            result = await model.ainvoke(
+                [HumanMessage(content="test")],
+                config={"configurable": {"thread_id": thread_id}},
+            )
+
+        assert isinstance(result, AIMessage)
+        assert result.tool_calls == [
+            {"name": "test_calculator", "args": {"a": 1, "b": 2}, "id": "toolu_1", "type": "tool_call"}
+        ]
+        assert mock_proxy.wait_for_any_pending_call.await_count == 1
+        cleanup_mock.assert_not_awaited()

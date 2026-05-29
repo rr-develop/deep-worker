@@ -180,12 +180,133 @@ class TestMergeRestartConfig:
         assert result.name == "myagent"
 
     def test_provider_default_not_treated_as_override(self, saved_launch_config, default_args):
-        """When provider is parser-default 'deepseek', saved value wins."""
+        """When provider is parser-default 'deepseek' and NOT explicitly passed,
+        the saved value wins (this is the no-override restart case)."""
         from deep_worker_cli.cli.agent_command import merge_restart_config
 
         assert default_args.provider == "deepseek"  # parser default
-        result = merge_restart_config(saved_launch_config, default_args)
+        # No explicit flags passed on the CLI.
+        result = merge_restart_config(saved_launch_config, default_args, explicit=set())
         assert result.provider == "claude-code"  # from saved
+
+
+# ===========================================================================
+# Provider-switch regression tests (incident observed 2026-05-29)
+#
+# `deep-worker --restart <agent> --provider deepseek` was silently restarting
+# with the PREVIOUS provider/model. Two root causes in merge_restart_config:
+#   1. Override detection compared args.provider against _PARSER_DEFAULTS.
+#      Since the parser default IS "deepseek", an explicit `--provider deepseek`
+#      compared equal to the default and was dropped -> saved provider kept.
+#   2. When the provider changed but --model was not given, the saved model of
+#      the OLD provider leaked through, so the new provider booted on a stale,
+#      incompatible model.
+# ===========================================================================
+
+def _parse(argv):
+    """Parse argv with the real CLI parser (mirrors the production path)."""
+    from deep_worker_cli.cli.agent_command import create_parser
+    return create_parser().parse_args(argv)
+
+
+class TestProviderSwitchRegression:
+    """Explicit --provider must win and must not drag the old model along."""
+
+    def test_explicit_provider_equal_to_parser_default_is_honored(self, saved_launch_config):
+        """`--restart a --provider deepseek` over a saved claude-code config.
+
+        The reported bug: deepseek equals the parser default, so it was treated
+        as 'not passed' and the saved claude-code provider was kept.
+        """
+        from deep_worker_cli.cli.agent_command import merge_restart_config
+
+        assert saved_launch_config["provider"] == "claude-code"
+        args = _parse(["myagent", "--restart", "--provider", "deepseek"])
+        explicit = {"provider"}
+
+        result = merge_restart_config(saved_launch_config, args, explicit=explicit)
+
+        assert result.provider == "deepseek"
+
+    def test_provider_switch_drops_stale_saved_model(self, saved_launch_config):
+        """Switching provider without --model must NOT inherit the old model.
+
+        saved = claude-code/opus ; restart with --provider deepseek (no --model).
+        The opus model is a claude model and must not leak onto deepseek.
+        """
+        from deep_worker_cli.cli.agent_command import merge_restart_config
+
+        assert saved_launch_config["model"] == "opus"
+        args = _parse(["myagent", "--restart", "--provider", "deepseek"])
+        explicit = {"provider"}
+
+        result = merge_restart_config(saved_launch_config, args, explicit=explicit)
+
+        assert result.provider == "deepseek"
+        assert result.model != "opus", (
+            "Stale claude-code model 'opus' leaked onto the new deepseek provider"
+        )
+
+    @pytest.mark.parametrize(
+        "argv, exp_provider, exp_model",
+        [
+            # No override at all: saved provider/model both win.
+            (["myagent", "--restart"], "claude-code", "opus"),
+            # provider only (== parser default): new provider, model reset.
+            (["myagent", "--restart", "--provider", "deepseek"], "deepseek", None),
+            # provider only (!= parser default): new provider, model reset.
+            (["myagent", "--restart", "--provider", "gemini"], "gemini", None),
+            # provider + model: both explicit values win.
+            (["myagent", "--restart", "--provider", "deepseek", "--model", "deepseek-chat"],
+             "deepseek", "deepseek-chat"),
+            # model only: saved provider kept, explicit model wins.
+            (["myagent", "--restart", "--model", "sonnet"], "claude-code", "sonnet"),
+            # same provider re-passed explicitly + no model: keep saved model
+            # (provider did NOT actually change, so nothing stale to drop).
+            (["myagent", "--restart", "--provider", "claude-code"], "claude-code", "opus"),
+        ],
+    )
+    def test_override_matrix(self, saved_launch_config, argv, exp_provider, exp_model):
+        """Exhaustive override combinations, derived from the real parser.
+
+        Guards against a future refactor silently swallowing an explicit flag
+        again — especially `--provider <parser-default>`.
+        """
+        from deep_worker_cli.cli.agent_command import (
+            _explicit_cli_flags,
+            merge_restart_config,
+        )
+
+        args = _parse(argv)
+        explicit = _explicit_cli_flags(argv[1:])  # strip leading "myagent"
+        result = merge_restart_config(saved_launch_config, args, explicit=explicit)
+
+        assert result.provider == exp_provider
+        assert result.model == exp_model
+
+
+class TestExplicitCliFlags:
+    """_explicit_cli_flags must report presence, not value."""
+
+    def test_provider_equal_to_default_still_detected(self):
+        from deep_worker_cli.cli.agent_command import _explicit_cli_flags
+
+        # deepseek IS the parser default, yet it was explicitly passed.
+        assert "provider" in _explicit_cli_flags(["--restart", "--provider", "deepseek"])
+
+    def test_absent_flags_not_reported(self):
+        from deep_worker_cli.cli.agent_command import _explicit_cli_flags
+
+        flags = _explicit_cli_flags(["myagent", "--restart"])
+        assert "provider" not in flags
+        assert "model" not in flags
+
+    def test_short_and_long_boolean_flags_detected(self):
+        from deep_worker_cli.cli.agent_command import _explicit_cli_flags
+
+        flags = _explicit_cli_flags(["a", "--restart", "-sp", "--model", "x"])
+        assert "skip_permissions" in flags
+        assert "model" in flags
 
 
 # ===========================================================================
@@ -208,7 +329,7 @@ class TestStopAgent:
             name="myagent",
             pid=99999,
             pid_file=Path("/tmp/deep_worker_myagent.pid"),
-            working_dir="/tmp/test_project",
+            working_dir="/path/to/test",
             started_at=datetime.now(),
             rpyc_port=18861,
         )
@@ -233,7 +354,7 @@ class TestStopAgent:
         registry = MagicMock(spec=ProcessRegistry)
         registry.lookup.return_value = AgentProcessInfo(
             name="myagent", pid=99999, pid_file=Path("/tmp/x.pid"),
-            working_dir="/tmp/test_project", started_at=datetime.now(), rpyc_port=18861,
+            working_dir="/path/to/test", started_at=datetime.now(), rpyc_port=18861,
         )
 
         with patch("deep_worker_cli.process.agent_stop.os.kill"), \
@@ -253,7 +374,7 @@ class TestStopAgent:
         registry = MagicMock(spec=ProcessRegistry)
         registry.lookup.return_value = AgentProcessInfo(
             name="myagent", pid=99999, pid_file=Path("/tmp/x.pid"),
-            working_dir="/tmp/test_project", started_at=datetime.now(), rpyc_port=18861,
+            working_dir="/path/to/test", started_at=datetime.now(), rpyc_port=18861,
         )
 
         with pytest.raises(RuntimeError, match="actively running"):
@@ -284,7 +405,7 @@ class TestStopAgent:
         registry = MagicMock(spec=ProcessRegistry)
         registry.lookup.return_value = AgentProcessInfo(
             name="myagent", pid=99999, pid_file=Path("/tmp/x.pid"),
-            working_dir="/tmp/test_project", started_at=datetime.now(), rpyc_port=18861,
+            working_dir="/path/to/test", started_at=datetime.now(), rpyc_port=18861,
         )
 
         with patch("deep_worker_cli.process.agent_stop.os.kill"), \
@@ -303,7 +424,7 @@ class TestStopAgent:
         registry = MagicMock(spec=ProcessRegistry)
         registry.lookup.return_value = AgentProcessInfo(
             name="myagent", pid=99999, pid_file=Path("/tmp/x.pid"),
-            working_dir="/tmp/test_project", started_at=datetime.now(), rpyc_port=18861,
+            working_dir="/path/to/test", started_at=datetime.now(), rpyc_port=18861,
         )
 
         with patch("deep_worker_cli.process.agent_stop.os.kill"), \

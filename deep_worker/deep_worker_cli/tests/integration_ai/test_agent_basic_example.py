@@ -49,7 +49,6 @@ def test_agent(request):
     with agent_fixture(
         agent_name="test_agent_basic_example",
         working_dir=Path("/tmp"),
-        model="deepseek-chat",
         provider="deepseek",
         skip_permissions=True,
         api_key=api_key,

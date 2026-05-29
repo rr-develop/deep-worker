@@ -14,11 +14,11 @@ session-scope is later deactivated by systemd (logout, ``loginctl
 terminate-session``, sshd restart, etc.), every process inside it is
 SIGKILLed, including the supposedly-daemonised agent.
 
-Production observation (2026-05-08): a long-running agent (13 hours
-uptime) died at the moment systemd deactivated the session-2828
-scope of the SSH login that originally started it, even though the
-SSH user had already logged out hours earlier and ``linger=yes`` was
-set on the user. ``linger`` keeps ``user@UID.service`` alive across
+Production observation (2026-05-08, a web-app agent incident, separate
+report): an agent that had been running 13 hours died at the moment
+systemd deactivated the session-2828 scope of the SSH login that
+originally started it, even though the SSH user had already logged out
+hours earlier and ``linger=yes`` was set on the user. ``linger`` keeps ``user@UID.service`` alive across
 SSH disconnect, but it does **not** make individual session-scopes
 immortal — and the daemon was inside a session-scope, not in
 ``user@UID.service``.
@@ -110,12 +110,54 @@ def _process_cgroup(pid: int) -> str:
     return ""
 
 
+def _can_migrate_into_user_service() -> bool:
+    """True iff this process can ACTUALLY migrate itself into
+    ``user@UID.service`` by writing its PID to that cgroup's
+    ``cgroup.procs``.
+
+    ``os.access(cgroup.procs, os.W_OK)`` is NOT sufficient here: on this
+    kind of host the file's mode bits report writable (W_OK → True) yet
+    the kernel still rejects the write with ``EACCES`` because cgroup
+    process-migration requires ``Delegate=yes`` on ``user@UID.service``
+    (and common ancestry rules), which sandboxes/containers without
+    delegation do not grant. The only reliable probe is to attempt the
+    write. Writing our own PID into ``user@UID.service`` is a safe no-op
+    when it succeeds — we are already a descendant of that cgroup, so the
+    membership does not actually change — and harmlessly fails with
+    PermissionError when delegation is absent.
+    """
+    if not _USER_PROCS.exists():
+        return False
+    try:
+        with open(_USER_PROCS, "a") as f:
+            f.write(f"{os.getpid()}\n")
+    except OSError:
+        return False
+    return True
+
+
 _HAVE_CGROUP_V2 = _is_cgroup_v2()
 _USER_PROCS = _user_service_cgroup_procs()
 _HAVE_USER_SERVICE_CGROUP = _USER_PROCS.exists()
-_CAN_WRITE_USER_SERVICE = (
-    _HAVE_USER_SERVICE_CGROUP and os.access(_USER_PROCS, os.W_OK)
-)
+_CAN_WRITE_USER_SERVICE = _HAVE_CGROUP_V2 and _can_migrate_into_user_service()
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _sweep_stale_dwagent_leaves():
+    """Reap pre-existing empty ``dwagent-*`` leaves once per module run.
+
+    Production agents that have since died leave empty leaf cgroups behind
+    (the leak this suite's fixes address). Hundreds of them accumulating made
+    cgroup operations slower/flakier and were the root of the intermittent
+    end-to-end failures. Sweep them before the tests run so the suite starts
+    from a clean ``user@UID.service`` regardless of host history. Best-effort;
+    only EMPTY leaves are removed.
+    """
+    if _CAN_WRITE_USER_SERVICE:
+        _reap_empty_dwagent_leaves()
+    yield
+    if _CAN_WRITE_USER_SERVICE:
+        _reap_empty_dwagent_leaves()
 
 
 # --------------------------------------------------------------------
@@ -123,8 +165,14 @@ _CAN_WRITE_USER_SERVICE = (
 # --------------------------------------------------------------------
 
 @pytest.mark.skipif(
-    not _HAVE_CGROUP_V2 or not _HAVE_USER_SERVICE_CGROUP,
-    reason="needs cgroup v2 + user@UID.service cgroup",
+    not _HAVE_CGROUP_V2 or not _HAVE_USER_SERVICE_CGROUP or not _CAN_WRITE_USER_SERVICE,
+    reason=(
+        "needs cgroup v2 + WRITABLE user@UID.service cgroup. The actual "
+        "migration writes this process's PID into user@UID.service/"
+        "cgroup.procs; without cgroup.procs write delegation (sandboxes, "
+        "containers, no Delegate=yes) the move is a no-op and the "
+        "out-of-session-scope assertion cannot be demonstrated."
+    ),
 )
 def test_detach_helper_moves_self_out_of_session_scope() -> None:
     """The helper that does the migration MUST exist and MUST move the
@@ -150,7 +198,7 @@ def test_detach_helper_moves_self_out_of_session_scope() -> None:
     assert hasattr(agent_command, "_detach_from_session_scope"), (
         "_detach_from_session_scope helper is missing from "
         "deep_worker_cli.cli.agent_command. The fix for the SSH-scope "
-        "kill bug must add it."
+        "kill bug (the 2026-05-08 incident) must add it."
     )
 
     before = _current_cgroup()
@@ -248,6 +296,23 @@ def _registry_entries() -> dict:
         return {}
 
 
+def _wait_for_registration(name: str, timeout: float = 5.0) -> dict | None:
+    """Poll the registry until the daemonized child registers itself.
+
+    Mirrors the helper in ``test_cli_fast_return.py`` — see that file
+    for the full motivation. Short version: the CLI fast-return path
+    detaches BEFORE writing the registry entry, so an immediate read
+    races and misses the child.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        entry = _registry_entries().get(name)
+        if entry and isinstance(entry.get("pid"), int):
+            return entry
+        time.sleep(0.05)
+    return None
+
+
 def _kill_agent(pid: int) -> None:
     try:
         os.kill(pid, signal.SIGTERM)
@@ -263,6 +328,24 @@ def _kill_agent(pid: int) -> None:
         os.kill(pid, signal.SIGKILL)
     except ProcessLookupError:
         pass
+
+
+def _resolve_agent_pid(name: str) -> int | None:
+    """Best-effort: find the daemonized agent's PID, even if the
+    registry hasn't been written yet (use the pid file as fallback).
+    """
+    entry = _wait_for_registration(name)
+    if entry is not None:
+        cand = entry.get("pid")
+        if isinstance(cand, int):
+            return cand
+    pid_file = Path(f"/tmp/deep_worker_{name}.pid")
+    if pid_file.exists():
+        try:
+            return int(pid_file.read_text().strip())
+        except (OSError, ValueError):
+            return None
+    return None
 
 
 def _remove_agent_data(name: str) -> None:
@@ -284,19 +367,78 @@ def _remove_agent_data(name: str) -> None:
             pass
 
 
+def _unregister_agent(name: str) -> None:
+    """Drop the agent's entry from ``/tmp/deep_worker_registry.json``.
+
+    Without this, the test process is gone but the registry still
+    advertises the stale name. ``dwcli --list`` keeps showing it and
+    repeat test runs accumulate registry junk forever. See
+    2026-05-20 cleanup-leak audit.
+    """
+    try:
+        from deep_worker_cli.process.registry import ProcessRegistry  # noqa: PLC0415
+        ProcessRegistry().unregister(name)
+    except Exception:
+        # Best-effort: never fail a passing test on cleanup.
+        pass
+
+
+def _reap_empty_dwagent_leaves(name_prefix: str | None = None) -> None:
+    """rmdir empty ``dwagent-*`` leaf cgroups under ``user@UID.service``.
+
+    The end-to-end tests spawn real agents that migrate into per-agent
+    ``dwagent-<name>-<pid>`` leaves. The agent's own leaf is NOT removed when
+    the agent dies (the kernel doesn't auto-reap empty cgroup dirs), so each
+    run used to leak leaves and that accumulation is what made these tests
+    flaky. Teardown sweeps them here. When ``name_prefix`` is given we only
+    reap leaves for THIS test's agent; otherwise all empty dwagent leaves.
+    """
+    user_service = Path(
+        f"/sys/fs/cgroup/user.slice/user-{os.getuid()}.slice/"
+        f"user@{os.getuid()}.service"
+    )
+    try:
+        entries = list(user_service.iterdir())
+    except OSError:
+        return
+    for leaf in entries:
+        if not leaf.name.startswith("dwagent-"):
+            continue
+        if name_prefix is not None and not leaf.name.startswith(name_prefix):
+            continue
+        try:
+            procs = (leaf / "cgroup.procs").read_text().strip()
+            if procs:
+                continue  # still has live procs — never touch it
+            leaf.rmdir()
+        except OSError:
+            continue
+
+
 @pytest.fixture
 def agent_name():
     name = f"test_cgroup_detach_{os.getpid()}_{int(time.time() * 1000) % 100000}"
     yield name
-    entry = _registry_entries().get(name)
-    if entry and isinstance(entry.get("pid"), int):
-        _kill_agent(entry["pid"])
+    pid = _resolve_agent_pid(name)
+    if pid is not None:
+        _kill_agent(pid)
     _remove_agent_data(name)
+    _unregister_agent(name)
+    # rmdir the cgroup leaf the spawned agent migrated into. The fixture used
+    # to leave it behind, so every run leaked an empty dwagent-* leaf — the
+    # accumulation that made these tests flaky (2026-05-23). The agent is dead
+    # by now (killed above), so its leaf is empty and reapable.
+    time.sleep(0.2)  # let the kernel finish removing the dead PID from the leaf
+    _reap_empty_dwagent_leaves(name_prefix=f"dwagent-{name}-")
 
 
 @pytest.mark.skipif(
-    not _HAVE_CGROUP_V2 or not _HAVE_USER_SERVICE_CGROUP,
-    reason="needs cgroup v2 + user@UID.service cgroup",
+    not _HAVE_CGROUP_V2 or not _HAVE_USER_SERVICE_CGROUP or not _CAN_WRITE_USER_SERVICE,
+    reason=(
+        "needs cgroup v2 + WRITABLE user@UID.service cgroup (the spawned "
+        "agent migrates itself via cgroup.procs write; without write "
+        "delegation it cannot leave the launching session-scope)."
+    ),
 )
 @pytest.mark.skipif(
     shutil.which("deep-worker") is None,
@@ -377,7 +519,7 @@ def test_spawned_agent_is_not_in_test_runner_session_scope(
             f"agent landed inside a {m}-scope ({agent_cgroup!r}). "
             f"This scope is tied to the launching shell and will "
             f"be torn down by systemd when the shell goes away — "
-            f"the 2026-05-08 notify_agent failure mode."
+            f"the 2026-05-08 observed failure mode."
         )
     # The fix uses ``dwagent-<name>-<pid>`` for the new leaf cgroup
     # name so it is recognisable in ``systemd-cgls`` and in
@@ -398,8 +540,14 @@ def test_spawned_agent_is_not_in_test_runner_session_scope(
 
 
 @pytest.mark.skipif(
-    not _HAVE_CGROUP_V2 or not _HAVE_USER_SERVICE_CGROUP,
-    reason="needs cgroup v2 + user@UID.service cgroup",
+    not _HAVE_CGROUP_V2 or not _HAVE_USER_SERVICE_CGROUP or not _CAN_WRITE_USER_SERVICE,
+    reason=(
+        "needs cgroup v2 + WRITABLE user@UID.service cgroup. The survival "
+        "guarantee relies on the agent migrating out of the launching "
+        "shell's session-scope via a cgroup.procs write; without write "
+        "delegation that migration cannot happen, so the scenario is not "
+        "demonstrable here."
+    ),
 )
 @pytest.mark.skipif(
     shutil.which("deep-worker") is None,

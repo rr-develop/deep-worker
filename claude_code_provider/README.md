@@ -55,7 +55,7 @@ pip install -e /path/to/claude_code_provider
 
 **Dependencies:**
 - `langchain-core>=0.3.0`
-- `claude-agent-sdk` (from a local checkout of the Claude Agent SDK)
+- `claude-agent-sdk` (from a local source checkout)
 - `pydantic>=2.0`
 
 ## Quick Start
@@ -249,6 +249,20 @@ class ProxyMCPServer:
     def get_pending_calls(self) -> list[PendingCall]:
         """Get list of pending tool calls."""
 
+    async def wait_for_pending_calls(
+        self, *, tool_name: str | None = None,
+        arguments: dict[str, Any] | None = None,
+        timeout: float = 30.0,
+    ) -> list[PendingCall]:
+        """Wait for a matching pending call without polling."""
+
+    async def wait_for_matching_pending_calls(
+        self, *,
+        expected_calls: Sequence[tuple[str, dict[str, Any]]],
+        timeout: float = 30.0,
+    ) -> list[PendingCall]:
+        """Wait until all matching pending calls exist without polling."""
+
     def resolve_call(self, call_id: str, result: MCPResult) -> None:
         """Resolve pending tool call with result."""
 ```
@@ -299,8 +313,7 @@ This package uses strict typing with pyright:
 {
   "typeCheckingMode": "strict",
   "extraPaths": [
-    "<path to the Claude Agent SDK checkout>/src",
-    "<repository root>"
+    "/path/to/claude_sdk/src"
   ]
 }
 ```
@@ -322,11 +335,16 @@ This is the key innovation that enables transparent tool delegation:
 
 1. Claude calls tool through MCP
 2. ProxyMCPServer handler creates `asyncio.Future` and **blocks**
-3. `ClaudeCodeChatModel` detects pending call and returns `AIMessage` with `tool_calls`
-4. LangGraph executes tool in deep-worker
-5. `ToolMessage` triggers `resolve_call()` which resolves the Future
-6. ProxyMCPServer unblocks and returns result to Claude
-7. Claude continues with final answer
+3. `ClaudeCodeChatModel` sees proxy `ToolUseBlock` values and awaits
+   `wait_for_matching_pending_calls(...)`; the MCP handlers wake that
+   waiter as each pending call is registered. A single AssistantMessage
+   with multiple proxy tool uses returns all matching `tool_calls`.
+   There is no sleep loop or repeated polling.
+4. `ClaudeCodeChatModel` returns `AIMessage` with `tool_calls`
+5. LangGraph executes tool in deep-worker
+6. `ToolMessage` triggers `resolve_call()` which resolves the Future
+7. ProxyMCPServer unblocks and returns result to Claude
+8. Claude continues with final answer
 
 This design maintains full transparency - LangGraph controls all tool execution while Claude thinks it's calling tools directly through MCP.
 

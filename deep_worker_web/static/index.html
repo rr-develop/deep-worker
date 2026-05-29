@@ -100,6 +100,23 @@
                         </div>
                     </div>
 
+                    <!-- Last Error Panel (separate from Last Response;
+                         persistent, copyable, manually dismissed) -->
+                    <div id="last-error-panel" class="last-error-panel" style="display: none;">
+                        <div class="last-error-header">
+                            <h3>⚠️ Last Error</h3>
+                            <div class="last-error-actions">
+                                <button id="copy-error-btn" onclick="copyLastError(event)" class="btn btn-secondary btn-sm" title="Copy error">
+                                    📋 Copy
+                                </button>
+                                <button id="dismiss-error-btn" onclick="dismissLastError()" class="btn btn-secondary btn-sm" title="Dismiss error">
+                                    ✕ Dismiss
+                                </button>
+                            </div>
+                        </div>
+                        <pre id="last-error-content" class="error-content"></pre>
+                    </div>
+
                     <!-- Message Input -->
                     <div class="message-input-panel">
                         <h3>Send Message</h3>

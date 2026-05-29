@@ -67,7 +67,7 @@ with agent_fixture() as agent_info:
 ### Agent Fixture Configuration
 - **skip_permissions=True**: Required for tests (avoids hanging on approval prompts)
 - **rpyc_port=True**: Auto-assigns ports (prevents port conflicts)
-- **model/provider**: Default is deepseek-chat/deepseek (no API key needed for basic tests)
+- **model/provider**: Default is deepseek-v4-flash/deepseek (no API key needed for basic tests)
 
 ### API Key Requirements
 Most integration tests don't require API keys because they test infrastructure (connections, routing) rather than AI responses. Tests that send actual messages to agents may require API keys configured in `~/.deepagents/.env`.

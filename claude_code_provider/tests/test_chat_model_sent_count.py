@@ -1,4 +1,8 @@
-"""Tests for sent_count tracking in ClaudeCodeChatModel."""
+"""Tests for sent_count tracking in ClaudeCodeChatModel.
+
+Session-state persistence isolation + singleton reset is handled by the
+autouse ``_isolate_claude_session_state`` fixture in conftest.py.
+"""
 
 import pytest
 from unittest.mock import AsyncMock, Mock, patch
@@ -59,7 +63,10 @@ class TestSentCountTracking:
         assert mock_client.query.call_count == 1
         mock_client.query.assert_called_with("2+2", session_id="test")
 
-        # Second call - send only NEW message
+        # Second call - send only NEW message. The real ClientManager caches
+        # the client after the first call; keep the mock environment faithful so
+        # this in-process follow-up is not mistaken for a restart restore.
+        model.client_manager.clients["test"] = (mock_client, mock_proxy)
         mock_client.query.reset_mock()
 
         async def mock_receive_2():

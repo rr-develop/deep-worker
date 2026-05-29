@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
+
+import pytest
 
 from semantic_search.scanner import (
     compute_file_hash,
@@ -10,6 +13,22 @@ from semantic_search.scanner import (
     is_code_file,
     scan_files,
 )
+
+
+def _git_init(path: Path) -> None:
+    """Initialise *path* as a minimal git repo for unit-test mocking.
+
+    Tests that exercise the git-aware branch of ``scan_files`` need a real
+    ``.git/`` directory because the branch shells out to ``git ls-files``.
+    We deliberately ``git init`` only — no commits, no user config — to keep
+    the fixture fast and isolated from the developer's global git config.
+    """
+    subprocess.run(
+        ["git", "init", "--quiet", "--initial-branch=main"],
+        cwd=path,
+        check=True,
+        capture_output=True,
+    )
 
 
 class TestScanFiles:
@@ -34,12 +53,17 @@ class TestScanFiles:
         assert "config.toml" in result
 
     def test_excludes_git_directory(self, tmp_path: Path) -> None:
+        # We're testing the filesystem walker's exclusion list, not the
+        # git-aware branch — the latter is covered by TestScanFilesGitMode.
+        # A bare-bones ``.git/HEAD`` placeholder is enough to make
+        # ``scan_files`` auto-detect git mode and then choke on
+        # ``git ls-files``; force filesystem mode explicitly.
         git_dir = tmp_path / ".git"
         git_dir.mkdir()
         (git_dir / "HEAD").write_text("ref: refs/heads/main")
         (tmp_path / "main.py").write_text("x = 1")
 
-        result = list(scan_files(tmp_path))
+        result = list(scan_files(tmp_path, use_git=False))
 
         assert all(".git" not in str(p) for p in result)
 
@@ -257,3 +281,90 @@ class TestComputeFileHash:
         f.write_text("x = 2")
         hash_after = compute_file_hash(f)
         assert hash_before != hash_after
+
+
+class TestScanFilesGitMode:
+    """Tests for the explicit git/no-git modes of :func:`scan_files`.
+
+    The default behaviour (auto-detect from ``.git/`` presence) is covered
+    by the existing :class:`TestScanFiles` tests under a plain ``tmp_path``
+    (filesystem mode) and by the integration suite (git mode).
+
+    These tests lock in the *opt-in* contract:
+
+      - ``use_git=True``  → must call ``git ls-files`` → honours ``.gitignore``.
+                            Raises ``RuntimeError`` if ``.git/`` is absent.
+      - ``use_git=False`` → must walk the filesystem → ignores ``.gitignore``.
+      - ``use_git=None``  → auto-detect from ``.git/`` presence.
+    """
+
+    def test_use_git_true_raises_on_non_git_dir(self, tmp_path: Path) -> None:
+        """Explicit git mode on a non-git dir must still error out loudly."""
+        (tmp_path / "main.py").write_text("x = 1")
+
+        with pytest.raises(RuntimeError, match="Not a git repository"):
+            list(scan_files(tmp_path, use_git=True))
+
+    def test_use_git_true_respects_gitignore(self, tmp_path: Path) -> None:
+        """Git mode must skip files matched by ``.gitignore`` for free."""
+        _git_init(tmp_path)
+        (tmp_path / ".gitignore").write_text("ignored.py\n")
+        (tmp_path / "included.py").write_text("x = 1")
+        (tmp_path / "ignored.py").write_text("x = 2")
+
+        names = {p.name for p in scan_files(tmp_path, use_git=True)}
+
+        assert "included.py" in names
+        assert "ignored.py" not in names
+
+    def test_use_git_false_ignores_gitignore(self, tmp_path: Path) -> None:
+        """Filesystem mode must NOT consult ``.gitignore`` even if present."""
+        _git_init(tmp_path)
+        (tmp_path / ".gitignore").write_text("ignored.py\n")
+        (tmp_path / "included.py").write_text("x = 1")
+        (tmp_path / "ignored.py").write_text("x = 2")
+
+        names = {p.name for p in scan_files(tmp_path, use_git=False)}
+
+        # Filesystem mode yields BOTH files — it has no concept of gitignore.
+        assert "included.py" in names
+        assert "ignored.py" in names
+
+    def test_use_git_false_works_without_dotgit(self, tmp_path: Path) -> None:
+        """Filesystem mode must work on plain (non-git) directories."""
+        (tmp_path / "main.py").write_text("x = 1")
+
+        result = list(scan_files(tmp_path, use_git=False))
+
+        assert len(result) == 1
+        assert result[0].name == "main.py"
+
+    def test_auto_detect_uses_git_when_dotgit_exists(self, tmp_path: Path) -> None:
+        """Default ``use_git=None`` picks git mode when ``.git/`` is present."""
+        _git_init(tmp_path)
+        (tmp_path / ".gitignore").write_text("ignored.py\n")
+        (tmp_path / "included.py").write_text("x = 1")
+        (tmp_path / "ignored.py").write_text("x = 2")
+
+        # No ``use_git`` arg → must auto-detect → must honour ``.gitignore``.
+        names = {p.name for p in scan_files(tmp_path)}
+
+        assert "included.py" in names
+        assert "ignored.py" not in names
+
+    def test_auto_detect_uses_filesystem_when_no_dotgit(
+        self, tmp_path: Path
+    ) -> None:
+        """Default ``use_git=None`` picks filesystem mode when ``.git/`` absent.
+
+        This is the regression test for the bug that broke the entire unit
+        suite: ``scan_files(tmp_path)`` on a plain tmp dir used to raise
+        ``RuntimeError: Not a git repository``.
+        """
+        (tmp_path / "main.py").write_text("x = 1")
+
+        # MUST NOT raise.
+        result = list(scan_files(tmp_path))
+
+        assert len(result) == 1
+        assert result[0].name == "main.py"

@@ -32,6 +32,7 @@ def map_agent_status(agent_status: AgentStatus) -> SessionStatus:
         AgentStatus.IDLE: SessionStatus.READY,
         AgentStatus.RUNNING: SessionStatus.WORKING,
         AgentStatus.WAITING_INPUT: SessionStatus.WAITING_INPUT,
+        AgentStatus.INTERRUPTED: SessionStatus.INTERRUPTED,
         AgentStatus.ERROR: SessionStatus.ERROR,
         AgentStatus.SHUTDOWN: SessionStatus.UNKNOWN,
     }

@@ -25,7 +25,9 @@ This was the bug in commits a8cbdcd/01872d7 that broke dwcli.
 """
 
 import asyncio
+import contextlib
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -80,8 +82,13 @@ class ProxyMCPServer:
         """
         self.pending_calls: dict[str, PendingCallInternal] = {}
         self.tool_handlers: list[Any] = []
+        self._tool_names = [m["name"] for m in tools_metadata]
         self.timeout = timeout
         self._call_counter = 0
+        self._pending_waiters: list[
+            tuple[asyncio.Future[None], str | None, dict[str, Any] | None]
+        ] = []
+        self._pending_change_waiters: set[asyncio.Future[None]] = set()
         self._working_dir = working_dir
         self._agent_name = agent_name
 
@@ -118,6 +125,7 @@ class ProxyMCPServer:
             self.pending_calls[call_id] = {
                 "future": future, "name": tool_name, "args": args,
             }
+            self._wake_matching_pending_waiters(tool_name, args)
 
             try:
                 result = await asyncio.wait_for(future, timeout=self.timeout)
@@ -137,6 +145,11 @@ class ProxyMCPServer:
 
         return handler
 
+    @property
+    def tool_names(self) -> list[str]:
+        """Tool names exposed through this proxy MCP server."""
+        return list(self._tool_names)
+
     def has_pending_calls(self) -> bool:
         """Check if there are any pending tool calls."""
         return len(self.pending_calls) > 0
@@ -148,6 +161,115 @@ class ProxyMCPServer:
             for call_id, info in self.pending_calls.items()
         ]
 
+    async def wait_for_pending_calls(
+        self,
+        *,
+        tool_name: str | None = None,
+        arguments: dict[str, Any] | None = None,
+        timeout: float = 30.0,
+    ) -> list[PendingCall]:
+        """Wait until a matching pending call exists, without polling.
+
+        The Claude SDK may deliver ``ToolUseBlock`` before the spawned MCP
+        handler task has registered its pending call. This method handles both
+        possible orderings: return an existing match immediately, or park on a
+        one-shot Future that the handler wakes when it creates a matching call.
+        """
+        existing = self._matching_pending_calls(tool_name, arguments)
+        if existing:
+            return existing
+
+        fut = asyncio.get_running_loop().create_future()
+        waiter = (fut, tool_name, arguments)
+        self._pending_waiters.append(waiter)
+        try:
+            await asyncio.wait_for(fut, timeout=timeout)
+            return self._matching_pending_calls(tool_name, arguments)
+        finally:
+            with contextlib.suppress(ValueError):
+                self._pending_waiters.remove(waiter)
+
+    async def wait_for_any_pending_call(
+        self,
+        *,
+        timeout: float = 30.0,
+    ) -> None:
+        """Wait until at least one pending call exists, without polling.
+
+        Returns as soon as any handler registers a pending call (the
+        ``_pending_change_waiters`` Future is woken from
+        :meth:`_wake_matching_pending_waiters`, which is called from inside
+        ``_create_tool_handler`` right after ``self.pending_calls[call_id] =
+        ...``). Returns immediately if a pending call already exists.
+
+        Use this from ``ainvoke`` to know when it is safe to surface the
+        currently-registered pending calls to LangGraph. Note that Claude
+        CLI dispatches MCP control_requests SEQUENTIALLY (the next one is
+        only sent after the previous tool_result), so even when multiple
+        ``ToolUseBlock`` values arrive in one ``AssistantMessage`` only
+        the first handler is actually invoked. ``ainvoke`` must therefore
+        return after the first pending call registers, let LangGraph run
+        that tool, ``resolve_call`` it, and pick up the next handler on
+        the next iteration — NOT try to wait for all of them at once
+        (that would deadlock).
+
+        Raises:
+            asyncio.TimeoutError: if no handler registers within ``timeout``
+                seconds. ``timeout`` only bounds the registration race
+                between the ``ToolUseBlock`` arriving in the message stream
+                and the corresponding ``control_request`` (and handler
+                spawn) being received via the SDK control channel; it does
+                NOT bound the actual tool execution (handlers block on
+                ``self.timeout`` once registered).
+        """
+        if self.pending_calls:
+            return
+
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[None] = loop.create_future()
+        self._pending_change_waiters.add(fut)
+        try:
+            await asyncio.wait_for(fut, timeout=timeout)
+        finally:
+            self._pending_change_waiters.discard(fut)
+
+    async def wait_for_matching_pending_calls(
+        self,
+        *,
+        expected_calls: Sequence[tuple[str, dict[str, Any]]],
+        timeout: float = 30.0,
+    ) -> list[PendingCall]:
+        """Wait until all expected pending calls exist, without polling.
+
+        Multiple ``ToolUseBlock`` values can arrive in one
+        ``AssistantMessage``. The SDK may register the corresponding MCP
+        handler Futures in separate tasks, so ``ainvoke`` must not return
+        after the first one. This method waits on pending-call creation events
+        and returns only when every expected ``(tool_name, args)`` pair has a
+        distinct active pending call.
+        """
+        if not expected_calls:
+            return []
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+
+        while True:
+            existing = self._matching_pending_call_batch(expected_calls)
+            if existing:
+                return existing
+
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise asyncio.TimeoutError
+
+            fut = loop.create_future()
+            self._pending_change_waiters.add(fut)
+            try:
+                await asyncio.wait_for(fut, timeout=remaining)
+            finally:
+                self._pending_change_waiters.discard(fut)
+
     def resolve_call(self, call_id: str, result: MCPResult) -> None:
         """Resolve a pending tool call with result from LangGraph ToolNode.
 
@@ -157,3 +279,61 @@ class ProxyMCPServer:
             future = self.pending_calls[call_id]["future"]
             if not future.done():
                 future.set_result(result)
+
+    def _matching_pending_calls(
+        self,
+        tool_name: str | None,
+        arguments: dict[str, Any] | None,
+    ) -> list[PendingCall]:
+        out: list[PendingCall] = []
+        for call_id, info in self.pending_calls.items():
+            if tool_name is not None and info["name"] != tool_name:
+                continue
+            if arguments is not None and info["args"] != arguments:
+                continue
+            out.append({"id": call_id, "name": info["name"], "args": info["args"]})
+        return out
+
+    def _matching_pending_call_batch(
+        self,
+        expected_calls: Sequence[tuple[str, dict[str, Any]]],
+    ) -> list[PendingCall]:
+        available = list(self.pending_calls.items())
+        used_indexes: set[int] = set()
+        matched: list[PendingCall] = []
+
+        for expected_name, expected_args in expected_calls:
+            found_index: int | None = None
+            for idx, (call_id, info) in enumerate(available):
+                if idx in used_indexes:
+                    continue
+                if info["name"] == expected_name and info["args"] == expected_args:
+                    found_index = idx
+                    matched.append({
+                        "id": call_id,
+                        "name": info["name"],
+                        "args": info["args"],
+                    })
+                    break
+            if found_index is None:
+                return []
+            used_indexes.add(found_index)
+
+        return matched
+
+    def _wake_matching_pending_waiters(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+    ) -> None:
+        for fut, wanted_tool, wanted_args in list(self._pending_waiters):
+            if fut.done():
+                continue
+            if wanted_tool is not None and wanted_tool != tool_name:
+                continue
+            if wanted_args is not None and wanted_args != arguments:
+                continue
+            fut.set_result(None)
+        for fut in list(self._pending_change_waiters):
+            if not fut.done():
+                fut.set_result(None)

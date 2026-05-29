@@ -48,7 +48,7 @@ from langchain_openai import ChatOpenAI
 model = ChatOpenAI(
     api_key=os.getenv("DEEPSEEK_API_KEY"),
     base_url="https://api.deepseek.com/v1",
-    model="deepseek-chat"
+    model="deepseek-v4-flash"
 )
 model_with_search = model.bind_tools([WebSearchDelegationTool()])
 ```

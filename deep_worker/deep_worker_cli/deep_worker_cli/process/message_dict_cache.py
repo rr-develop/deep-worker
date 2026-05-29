@@ -35,6 +35,8 @@ from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
+from deepagents.middleware.message_timestamps import CREATED_AT_KEY, TOOL_CALL_CREATED_AT_KEY
+
 
 def serialize_message(msg: Any) -> dict[str, Any]:
     """Convert a LangChain message into a JSON-ready dict.
@@ -50,6 +52,11 @@ def serialize_message(msg: Any) -> dict[str, Any]:
         "type": msg.__class__.__name__,
         "id": getattr(msg, "id", None),
     }
+    additional_kwargs = getattr(msg, "additional_kwargs", {})
+    if isinstance(additional_kwargs, dict):
+        created_at = additional_kwargs.get(CREATED_AT_KEY)
+        if isinstance(created_at, str):
+            msg_dict[CREATED_AT_KEY] = created_at
 
     if isinstance(msg, HumanMessage):
         content = msg.content if isinstance(msg.content, str) else str(msg.content)
@@ -62,7 +69,7 @@ def serialize_message(msg: Any) -> dict[str, Any]:
         elif isinstance(content, list):
             # Concatenate text blocks (the only shape we currently emit
             # in streaming). Non-text blocks fall through silently — a
-            # plain-text history view is what the web UI needs.
+            # plain-text history view is what the web client needs.
             text_content = ""
             for block in content:
                 if isinstance(block, dict) and block.get("type") == "text":
@@ -75,14 +82,25 @@ def serialize_message(msg: Any) -> dict[str, Any]:
 
         tool_calls = getattr(msg, "tool_calls", [])
         if tool_calls:
-            msg_dict["tool_calls"] = [
-                {
-                    "id": tc.get("id"),
+            tool_call_created_at = {}
+            if isinstance(additional_kwargs, dict):
+                raw_map = additional_kwargs.get(TOOL_CALL_CREATED_AT_KEY)
+                if isinstance(raw_map, dict):
+                    tool_call_created_at = raw_map
+            serialized_tool_calls = []
+            for tc in tool_calls:
+                call_id = tc.get("id")
+                call_dict = {
+                    "id": call_id,
                     "name": tc.get("name"),
                     "args": tc.get("args", {}),
                 }
-                for tc in tool_calls
-            ]
+                if isinstance(call_id, str):
+                    call_created_at = tool_call_created_at.get(call_id)
+                    if isinstance(call_created_at, str):
+                        call_dict[CREATED_AT_KEY] = call_created_at
+                serialized_tool_calls.append(call_dict)
+            msg_dict["tool_calls"] = serialized_tool_calls
 
     elif isinstance(msg, ToolMessage):
         content = msg.content if isinstance(msg.content, str) else str(msg.content)

@@ -1,55 +1,55 @@
-# Proposals for Integrating the Claude Code Provider
+# Proposal for Integrating Claude Code Provider with Deep-Worker
 
-## Analysis of the current architecture
+## Current Architecture Analysis
 
-### Key findings
+### Key Findings
 
-1. **The agent command vs the CLI client**:
-   - `deep-worker [name]` - starts the agent itself (`cli/agent_command.py`)
-   - The CLI client - connects to an already running agent as a client
-   - The source of truth is the AGENT, not the client
+1. **deep-worker vs dwcli**:
+   - `deep-worker [name]` - launches the agent itself (`deep_worker_cli/cli/agent_command.py`)
+   - `dwcli` - connects to an already-running agent as a CLI client
+   - The source of truth is the AGENT, not dwcli
 
 2. **How provider configuration works**:
    ```python
-   # agent_command.py creates the AgentConfig
+   # agent_command.py creates AgentConfig
    config = AgentConfig(
-       model=args.model,        # From the --model flag
-       provider=args.provider,  # From the --provider flag
+       model=args.model,        # From --model flag
+       provider=args.provider,  # From --provider flag
        working_dir=working_dir
    )
 
-   # agent_process.py starts the agent
-   model = create_model()  # ❌ PROBLEM: the config is NOT PASSED!
+   # agent_process.py launches the agent
+   model = create_model()  # ❌ PROBLEM: config is NOT PASSED!
    ```
 
 3. **Critical problem in the current code**:
    - `AgentConfig` stores `provider` and `model`
    - But `create_model()` is called WITHOUT parameters!
-   - `create_model()` determines the provider from the presence of API keys (priority: deepseek → openai → anthropic → google)
-   - This means the `--provider` and `--model` flags are IGNORED!
+   - `create_model()` determines the provider based on the presence of API keys (priority: deepseek → openai → anthropic → google)
+   - This means that the `--provider` and `--model` flags are IGNORED!
 
-4. **The Claude Code SDK supports simple model names**:
+4. **Claude Code SDK supports simple model names**:
    ```python
    # In types.py:
    model: Literal["sonnet", "opus", "haiku", "inherit"] | None = None
 
-   # The Claude CLI resolves automatically:
-   # "sonnet" -> "claude-sonnet-4-5-20250929" (the latest version)
-   # "haiku" -> "claude-3-5-haiku-20241022" (the latest version)
-   # "opus" -> "claude-opus-4-1-20250805" (the latest version)
+   # The Claude CLI automatically resolves:
+   # "sonnet" -> "claude-sonnet-4-5-20250929" (latest version)
+   # "haiku" -> "claude-3-5-haiku-20241022" (latest version)
+   # "opus" -> "claude-opus-4-1-20250805" (latest version)
    ```
 
-## Integration proposals
+## Integration Proposals
 
-### IMPORTANT: Fixes for CRITICAL PROBLEMS
+### IMPORTANT: CRITICAL ISSUE FIXES
 
 Before adding Claude Code, the current code must be fixed:
 
-**File: `process/agent_process.py`**
+**File: `deep_worker/deep_worker_cli/deep_worker_cli/process/agent_process.py`**
 
 Line 173, CHANGE:
 ```python
-# BEFORE (DOES NOT USE config.provider and config.model!):
+# WAS (DOES NOT USE config.provider and config.model!):
 model = create_model()
 
 # SHOULD BE:
@@ -59,11 +59,11 @@ model = create_model(
 )
 ```
 
-**File: `config.py`**
+**File: `deep_worker/deep_worker_cli/deep_worker_cli/config.py`**
 
 Line 1061, CHANGE the function signature:
 ```python
-# BEFORE:
+# WAS:
 def create_model(model_name_override: str | None = None) -> BaseChatModel:
 
 # SHOULD BE:
@@ -102,13 +102,13 @@ def create_model(
         # EXISTING auto-detection logic (lines 1152-1182)
         if settings.has_deepseek:
             provider = "deepseek"
-            model_name = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
+            model_name = os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash")
         # ... etc
 ```
 
 ### CLAUDE CODE INTEGRATION
 
-After fixing the critical problems, add Claude Code:
+After fixing the critical issues, add Claude Code:
 
 #### 1. File: `agent_command.py` (CLI arguments)
 
@@ -116,7 +116,7 @@ Lines 42-47, CHANGE:
 ```python
 parser.add_argument(
     "--provider",
-    default="deepseek",  # We do not change the default!
+    default="deepseek",  # Do not change the default!
     choices=["deepseek", "gemini", "openai", "claude-code"],  # Add claude-code
     help="AI provider to use (default: deepseek)",
 )
@@ -173,7 +173,7 @@ if self.api_key is None:
             )
 ```
 
-Lines 31-39, CHANGE the model default:
+Lines 31-39, CHANGE the default models:
 ```python
 @dataclass
 class AgentConfig:
@@ -216,7 +216,7 @@ After line 1258, ADD a new branch for claude-code:
             "sonnet": "sonnet",      # The Claude SDK automatically resolves
             "haiku": "haiku",        # to the latest version
             "opus": "opus",
-            # We also support full names for compatibility:
+            # Also support full names for compatibility:
             "claude-sonnet-4-5-20250929": "claude-sonnet-4-5-20250929",
             "claude-3-5-haiku-20241022": "claude-3-5-haiku-20241022",
             "claude-opus-4-1-20250805": "claude-opus-4-1-20250805",
@@ -239,7 +239,7 @@ After line 1258, ADD a new branch for claude-code:
         logger.info("  Note: Claude Code uses local installation, no API key required")
 ```
 
-Also at lines 1185-1186, UPDATE:
+Also in lines 1185-1186, UPDATE:
 ```python
 # Store model info in settings for display
 settings.model_name = model_name
@@ -254,30 +254,30 @@ settings.model_provider = provider
 # Default model (sonnet):
 deep-worker myagent --provider claude-code
 
-# A specific model (haiku - fast):
+# Specific model (haiku - fast):
 deep-worker myagent --provider claude-code --model haiku
 
-# A specific model (opus - powerful):
+# Specific model (opus - powerful):
 deep-worker myagent --provider claude-code --model opus
 
-# A full model name (for a specific version):
+# Full model name (for a specific version):
 deep-worker myagent --provider claude-code --model claude-sonnet-4-5-20250929
 ```
 
 #### Verification:
 
 ```bash
-# Connect to the running agent with the CLI client:
+# Connect to the running agent:
 dwcli myagent
 
-# Or via the API:
-from client import DeepWorkerClient  # the CLI client package
+# Or via API:
+from deep_worker_cli.client import DeepWorkerClient
 
 client = DeepWorkerClient(agent_name="myagent")
 response = await client.send_message("Hello!")
 ```
 
-## Claude Code models
+## Claude Code Models
 
 | Simple name | Purpose | Speed | Quality |
 |------------|-----------|----------|----------|
@@ -287,37 +287,37 @@ response = await client.send_message("Hello!")
 
 The Claude SDK automatically resolves simple names to the latest model versions.
 
-## Advantages of this approach
+## Advantages of the Approach
 
-1. **No hardcoded model versions** - the Claude SDK itself resolves "sonnet" → the latest version
-2. **The source of truth is AgentConfig** - provider and model are passed explicitly
+1. **No hardcoded model versions** - the Claude SDK itself resolves "sonnet" → latest version
+2. **AgentConfig as the source of truth** - provider and model are passed explicitly
 3. **No API key required** - Claude Code uses a local installation
 4. **Backward compatibility** - old code continues to work with auto-detection
 5. **Default provider = deepseek** - unchanged
 6. **Simple model names** - "sonnet", "haiku", "opus" instead of long strings
 
-## Files to be changed (Total: 3 files)
+## Files to be Modified (Total: 3 files)
 
-1. `cli/agent_command.py`
+1. `deep_worker/deep_worker_cli/deep_worker_cli/cli/agent_command.py`
    - Add "claude-code" to choices
 
-2. `agent_config_pkg/agent_config.py`
+2. `deep_worker/deep_worker_cli/deep_worker_cli/agent_config_pkg/agent_config.py`
    - Add "claude-code" to valid_providers
    - Do not require an API key for claude-code
    - Allow model=None (the provider's default model is used)
 
-3. `config.py`
-   - Add the `provider` and `model_name` parameters to `create_model()`
+3. `deep_worker/deep_worker_cli/deep_worker_cli/config.py`
+   - Add `provider` and `model_name` parameters to `create_model()`
    - Add a branch for the claude-code provider
    - Use simple model names
 
-4. `process/agent_process.py`
-   - Pass `config.provider` and `config.model` into `create_model()`
+4. `deep_worker/deep_worker_cli/deep_worker_cli/process/agent_process.py`
+   - Pass `config.provider` and `config.model` to `create_model()`
 
-## Critical problems in the current code (require fixing)
+## Critical Problems in the Current Code (require fixing)
 
-1. **agent_process.py line 173**: `create_model()` is called without parameters - the config is ignored!
-2. **The --provider and --model flags do not work**: an AgentConfig is created, but is not used afterwards
-3. **provider/model are not passed into create_model()**: only auto-detection by API keys
+1. **agent_process.py line 173**: `create_model()` is called without parameters - config is ignored!
+2. **The --provider and --model flags do not work**: AgentConfig is created but then not used
+3. **No provider/model passed to create_model()**: only auto-detection based on API keys
 
 These problems MUST be fixed before or together with adding Claude Code.

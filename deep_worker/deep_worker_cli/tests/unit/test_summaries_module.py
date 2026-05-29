@@ -4,7 +4,7 @@ conversation-history inventory & pruning helpers.
 Design: deep_worker/docs/DESIGN_SUMMARIZATION_PERSISTENT_STORAGE.md
 
 Layout under test:
-    <data-root>/<agent_name>/summaries/<thread_id>.md
+    $HOME/.deep_worker/<agent_name>/summaries/<thread_id>.md
     each file contains one or more "## Summarized at <iso-ts>\n\n<body>\n\n"
     sections, appended chronologically.
 """
@@ -52,14 +52,14 @@ class TestIterSummaryFiles:
 
     def test_lists_one_agent_one_thread(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HOME", str(tmp_path))
-        f = tmp_path / Path("~/.deep_worker").name / "demo_site" / "summaries" / "demo_site.md"
+        f = tmp_path / Path("~/.deep_worker").name / "agent_a" / "summaries" / "agent_a.md"
         _write_summary(f, ["2026-04-22T15:40:18.122420+00:00"])
         items = list(iter_summary_files())
         assert len(items) == 1
         info = items[0]
         assert isinstance(info, SummaryFileInfo)
-        assert info.agent == "demo_site"
-        assert info.thread == "demo_site"
+        assert info.agent == "agent_a"
+        assert info.thread == "agent_a"
         assert info.path == f
         assert info.events == 1
         assert info.size > 0
@@ -180,8 +180,10 @@ class TestPruneSummariesBefore:
             body_per_ts="BODY",
         )
         cutoff = datetime(2026, 3, 1, tzinfo=UTC)
+        f.chmod(0o644)
         result = prune_summaries_before(cutoff, dry_run=False)
         assert f.exists(), "file kept because some sections are newer"
+        assert oct(f.stat().st_mode & 0o777) == "0o600"
         remaining = f.read_text()
         assert "2026-01-01T00:00:00+00:00" not in remaining
         assert "2026-02-01T00:00:00+00:00" not in remaining

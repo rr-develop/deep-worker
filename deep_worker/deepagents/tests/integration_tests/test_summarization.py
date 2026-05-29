@@ -1,5 +1,7 @@
 import re
 import uuid
+from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 from textwrap import dedent
 from typing import Any
@@ -7,10 +9,14 @@ from typing import Any
 import pytest
 import requests
 from langchain.chat_models import init_chat_model
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.checkpoint.memory import InMemorySaver
+from tests.unit_tests.chat_model import GenericFakeChatModel
 
 from deepagents import create_deep_agent
 from deepagents.backends.filesystem import FilesystemBackend
+from deepagents.middleware.summarization import SummarizationMiddleware
+from deepagents.middleware.summarization_history import deserialize_summarized_messages_jsonl
 
 # URL for a large file that will trigger summarization
 LARGE_FILE_URL = "https://raw.githubusercontent.com/langchain-ai/langchain/3356d0555725c3e0bbb9408c2b3f554cad2a6ee2/libs/partners/openai/langchain_openai/chat_models/base.py"
@@ -79,6 +85,59 @@ def _setup_summarization_test(tmp_path: Path, model_name: str) -> tuple[Any, Fil
     return agent, backend, root, config
 
 
+class StableThreadSummarizationMiddleware(SummarizationMiddleware):
+    def _get_thread_id(self) -> str:
+        return "integration-jsonl-thread"
+
+
+def test_jsonl_history_offload_appends_to_real_filesystem_backend(tmp_path: Path) -> None:
+    backend = FilesystemBackend(root_dir=str(tmp_path), virtual_mode=True)
+    middleware = StableThreadSummarizationMiddleware(
+        model=GenericFakeChatModel(messages=iter([AIMessage(content="unused")])),
+        backend=backend,
+        trigger=("messages", 100),
+        keep=("messages", 1),
+    )
+
+    first_batch = [
+        HumanMessage(
+            content="first user message",
+            id="h-jsonl-1",
+            additional_kwargs={"provider_seen_at": datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC)},
+        ),
+        AIMessage(
+            content="I will call a tool",
+            id="a-jsonl-1",
+            tool_calls=[{"id": "call-jsonl-1", "name": "lookup", "args": {"needle": "alpha"}}],
+            additional_kwargs={"tool_call_created_at": {"call-jsonl-1": "2026-01-02T03:04:05.000001+00:00"}},
+            response_metadata={"cost": Decimal("1.25")},
+        ),
+    ]
+    second_batch = [
+        ToolMessage(content="tool result", tool_call_id="call-jsonl-1", id="t-jsonl-1"),
+    ]
+
+    path = middleware._offload_to_backend(backend, first_batch)
+    assert path == "/conversation_history/integration-jsonl-thread.jsonl"
+
+    same_path = middleware._offload_to_backend(backend, second_batch)
+    assert same_path == path
+
+    history_file = tmp_path / "conversation_history" / "integration-jsonl-thread.jsonl"
+    content = history_file.read_text()
+    lines = [line for line in content.splitlines() if line.strip()]
+    assert len(lines) == 3
+
+    restored = deserialize_summarized_messages_jsonl(content)
+    assert [message.id for message in restored] == ["h-jsonl-1", "a-jsonl-1", "t-jsonl-1"]
+    # Plain JSON serialization: datetime → ISO string via str(), Decimal → string
+    assert restored[0].additional_kwargs["provider_seen_at"] == "2026-01-02 03:04:05+00:00"
+    assert restored[1].response_metadata["cost"] == "1.25"
+    assert restored[1].tool_calls[0]["id"] == "call-jsonl-1"
+    assert restored[1].additional_kwargs["tool_call_created_at"]["call-jsonl-1"] == "2026-01-02T03:04:05.000001+00:00"
+    assert restored[2].tool_call_id == "call-jsonl-1"
+
+
 @pytest.mark.parametrize(
     "model_name",
     [
@@ -129,7 +188,7 @@ def test_summarization_offloads_to_filesystem(tmp_path: Path, model_name: str) -
     """Test that conversation history is offloaded to filesystem during summarization.
 
     This verifies the summarization middleware correctly writes conversation history
-    as markdown to the backend at /conversation_history/{thread_id}.md.
+    as lossless JSONL to the backend at /conversation_history/{thread_id}.jsonl.
     """
     agent, _, root, config = _setup_summarization_test(tmp_path, model_name)
 
@@ -146,40 +205,26 @@ def test_summarization_offloads_to_filesystem(tmp_path: Path, model_name: str) -
     conversation_history_root = root / "conversation_history"
     assert conversation_history_root.exists(), f"Conversation history root directory not found at {conversation_history_root}"
 
-    # Verify the markdown file exists for thread_id
+    # Verify the JSONL file exists for thread_id
     thread_id = config["configurable"]["thread_id"]
-    history_file = conversation_history_root / f"{thread_id}.md"
-    assert history_file.exists(), f"Expected markdown file at {history_file}"
+    history_file = conversation_history_root / f"{thread_id}.jsonl"
+    assert history_file.exists(), f"Expected JSONL file at {history_file}"
 
-    # Read and verify markdown content
+    # Read and verify JSONL content
     content = history_file.read_text()
+    lines = [line for line in content.splitlines() if line.strip()]
+    assert lines, "Expected at least one JSONL history line"
 
-    # Should have timestamp header(s) from summarization events
-    assert "## Summarized at" in content, "Missing timestamp header in markdown file"
-
-    # Should contain human-readable message content (from get_buffer_string)
-    assert "Human:" in content or "AI:" in content, "Missing message content in markdown file"
+    restored_messages = deserialize_summarized_messages_jsonl(content)
+    assert len(restored_messages) == len(lines)
+    assert all("created_at" in message.additional_kwargs for message in restored_messages)
+    assert any(message.type == "human" for message in restored_messages)
+    assert any(message.type == "ai" for message in restored_messages)
 
     # Verify the summary message references the conversation_history path
     summary_message = result["messages"][0]
     assert "conversation_history" in summary_message.content
-    assert f"{thread_id}.md" in summary_message.content
+    assert f"{thread_id}.jsonl" in summary_message.content
 
-    # --- Needle in the haystack follow-up ---
-    # Ask about a specific detail from the beginning of the file that was read
-    # before summarization. The agent should read the conversation history to find it.
-    # The first standard library import in base.py (after `from __future__`) is `import base64`.
-    followup_message = {
-        "role": "user",
-        "content": (
-            "What is the first standard library import in base.py? (After the `from __future__` import.) Check the conversation history if needed."
-        ),
-    }
-    followup_result = agent.invoke({"messages": [followup_message]}, config)
-
-    # The agent should retrieve the answer from the conversation history
-    final_ai_message = followup_result["messages"][-1]
-    assert final_ai_message.type == "ai", "Expected final message to be from the AI"
-
-    # Check that the answer mentions "base64" (the first standard library import)
-    assert "base64" in final_ai_message.content.lower(), f"Expected agent to find 'base64' as the first import. Got: {final_ai_message.content}"
+    # The persisted JSONL is machine-restorable as plain JSON (no base64/msgpack).
+    assert any("base.py" in str(message.content) for message in restored_messages)

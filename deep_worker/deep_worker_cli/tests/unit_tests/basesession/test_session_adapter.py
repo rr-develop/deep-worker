@@ -44,6 +44,33 @@ class TestMapAgentStatus:
         """Test mapping SHUTDOWN to UNKNOWN."""
         assert map_agent_status(AgentStatus.SHUTDOWN) == SessionStatus.UNKNOWN
 
+    def test_interrupted_to_interrupted(self):
+        """Test mapping INTERRUPTED to INTERRUPTED.
+
+        ``INTERRUPTED`` is a distinct first-class state in the
+        BaseSession protocol: an agent paused mid-turn by a user
+        interrupt, awaiting the user's next message (typically a
+        correction). Distinct from ``WAITING_INPUT`` which is the
+        in-turn tool-running state.
+        """
+        assert (
+            map_agent_status(AgentStatus.INTERRUPTED)
+            == SessionStatus.INTERRUPTED
+        )
+
+
+class TestSessionStatusEnum:
+    """``SessionStatus.INTERRUPTED`` is exposed over RPyC to dwcli so the
+    CLI can render an interrupted agent distinctly."""
+
+    def test_interrupted_value_exists(self) -> None:
+        assert hasattr(SessionStatus, "INTERRUPTED"), (
+            "SessionStatus must define an INTERRUPTED member"
+        )
+
+    def test_interrupted_value_string(self) -> None:
+        assert SessionStatus.INTERRUPTED.value == "interrupted"
+
 
 class TestGetSessionInfo:
     """Tests for converting AgentProcess to SessionInfo."""

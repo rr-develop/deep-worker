@@ -73,13 +73,13 @@ def test_project_memory_tool_success() -> None:
     """Test project_memory tool with successful search results."""
     # Mock runtime with state containing working_dir
     runtime = SimpleNamespace(
-        state={"working_dir": "/path/to/project"},
+        state={"working_dir": "/path/to/test_project"},
         tool_call_id="test_call_1",
     )
 
     # Mock SearchResult
     mock_result = SimpleNamespace(
-        file_path="/path/to/project/src/auth.py",
+        file_path="/path/to/test_project/src/auth.py",
         score=0.892,
         language="python",
         node_type="parent",
@@ -98,14 +98,14 @@ def test_project_memory_tool_success() -> None:
         # Verify search was called correctly
         mock_search.assert_called_once_with(
             "authentication implementation",
-            repo_path=Path("/path/to/project"),
+            repo_path=Path("/path/to/test_project"),
             top_k=5,
         )
 
         # Verify output format
         assert "Project Memory: 'authentication implementation'" in result
         assert "Result 1 (score=0.892) [python]" in result
-        assert "File: /path/to/project/src/auth.py" in result
+        assert "File: /path/to/test_project/src/auth.py" in result
         assert "Type: parent" in result
         assert "def authenticate(user, password):" in result
 
@@ -115,7 +115,7 @@ def test_project_memory_tool_index_not_found() -> None:
     from semantic_search.exceptions import IndexNotFoundError
 
     runtime = SimpleNamespace(
-        state={"working_dir": "/path/to/no-index-project"},
+        state={"working_dir": "/path/to/no_index"},
         tool_call_id="test_call_2",
     )
 
@@ -129,14 +129,14 @@ def test_project_memory_tool_index_not_found() -> None:
 
         # Should return error message with "Error:" prefix
         assert "Error: Project memory not available." in result
-        assert "/path/to/no-index-project" in result
+        assert "/path/to/no_index" in result
         assert "does not have a semantic search index" in result
 
 
 def test_project_memory_tool_no_results() -> None:
     """Test project_memory tool when search returns no results."""
     runtime = SimpleNamespace(
-        state={"working_dir": "/path/to/project"},
+        state={"working_dir": "/path/to/test_project"},
         tool_call_id="test_call_3",
     )
 
@@ -157,7 +157,7 @@ def test_project_memory_tool_no_results() -> None:
 def test_project_memory_tool_invalid_top_k() -> None:
     """Test project_memory tool with invalid top_k parameter."""
     runtime = SimpleNamespace(
-        state={"working_dir": "/path/to/project"},
+        state={"working_dir": "/path/to/test_project"},
         tool_call_id="test_call_4",
     )
 
@@ -331,8 +331,16 @@ def test_middleware_sets_working_dir_in_state() -> None:
         assert state_update["working_dir"] == str(Path(tmpdir))
 
 
-def test_middleware_no_state_update_without_index() -> None:
-    """Test middleware doesn't update state when index is missing."""
+def test_middleware_sets_working_dir_even_without_index() -> None:
+    """Test middleware ALWAYS sets working_dir, even when the index is missing.
+
+    This guards the intentional behaviour documented in
+    ``ProjectMemoryMiddleware.before_agent`` ("CRITICAL FIX"): working_dir
+    must be set regardless of index existence so tools/agents never fall
+    back to ``Path.cwd()`` (often ``/`` for daemon processes). The earlier
+    expectation that ``before_agent`` returns ``None`` without an index
+    was reverted by that fix.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         # No index
         middleware = ProjectMemoryMiddleware(working_dir=Path(tmpdir))
@@ -342,5 +350,6 @@ def test_middleware_no_state_update_without_index() -> None:
 
         state_update = middleware.before_agent(state, runtime)
 
-        # Should return None (no state update)
-        assert state_update is None
+        # working_dir is set unconditionally, independent of index presence
+        assert state_update is not None
+        assert state_update["working_dir"] == str(Path(tmpdir))

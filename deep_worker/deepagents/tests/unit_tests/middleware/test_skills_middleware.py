@@ -932,7 +932,7 @@ def test_before_agent_loads_skills(tmp_path: Path) -> None:
     )
 
     # Call before_agent
-    result = middleware.before_agent({}, None, {})  # type: ignore
+    result = middleware.before_agent({}, None)  # type: ignore
 
     assert result is not None
     assert "skills_metadata" in result
@@ -973,7 +973,7 @@ def test_before_agent_skill_override(tmp_path: Path) -> None:
     )
 
     # Call before_agent
-    result = middleware.before_agent({}, None, {})  # type: ignore
+    result = middleware.before_agent({}, None)  # type: ignore
 
     assert result is not None
     assert len(result["skills_metadata"]) == 1
@@ -1004,7 +1004,7 @@ def test_before_agent_empty_registries(tmp_path: Path) -> None:
         sources=sources,
     )
 
-    result = middleware.before_agent({}, None, {})  # type: ignore
+    result = middleware.before_agent({}, None)  # type: ignore
 
     assert result is not None
     assert result["skills_metadata"] == []
@@ -1088,7 +1088,7 @@ def test_skills_middleware_with_state_backend_factory() -> None:
         config={},
     )
 
-    backend = middleware._get_backend({"messages": [], "files": {}}, runtime, {})
+    backend = middleware._get_backend({"messages": [], "files": {}}, runtime)
     assert isinstance(backend, StateBackend)
     assert backend.runtime is not None
 
@@ -1120,7 +1120,7 @@ def test_skills_middleware_with_store_backend_factory() -> None:
         config={},
     )
 
-    backend = middleware._get_backend({"messages": [], "files": {}}, runtime, {})
+    backend = middleware._get_backend({"messages": [], "files": {}}, runtime)
     assert isinstance(backend, StoreBackend)
     assert backend.runtime is not None
 
@@ -1284,21 +1284,21 @@ def test_before_agent_skips_loading_if_metadata_present(tmp_path: Path) -> None:
         }
     ]
     state_with_metadata = {"skills_metadata": existing_metadata}
-    result = middleware.before_agent(state_with_metadata, None, {})  # type: ignore
+    result = middleware.before_agent(state_with_metadata, None)  # type: ignore
 
     # Should return None, not load new skills
     assert result is None
 
     # Case 2: State has empty list for skills_metadata
     state_with_empty_list = {"skills_metadata": []}
-    result = middleware.before_agent(state_with_empty_list, None, {})  # type: ignore
+    result = middleware.before_agent(state_with_empty_list, None)  # type: ignore
 
     # Should still return None and not reload
     assert result is None
 
     # Case 3: State does NOT have skills_metadata key
     state_without_metadata = {}
-    result = middleware.before_agent(state_without_metadata, None, {})  # type: ignore
+    result = middleware.before_agent(state_without_metadata, None)  # type: ignore
 
     # Should load skills and return update
     assert result is not None
@@ -1449,7 +1449,8 @@ def test_skills_middleware_with_store_backend_assistant_id() -> None:
 
     # Test: assistant-123 can read its own skill
     config_1 = {"metadata": {"assistant_id": "assistant-123"}}
-    result_1 = middleware.before_agent({}, runtime, config_1)  # type: ignore
+    runtime.config = config_1
+    result_1 = middleware.before_agent({}, runtime)  # type: ignore
 
     assert result_1 is not None
     assert len(result_1["skills_metadata"]) == 1
@@ -1458,7 +1459,8 @@ def test_skills_middleware_with_store_backend_assistant_id() -> None:
 
     # Test: assistant-456 cannot see assistant-123's skill (different namespace)
     config_2 = {"metadata": {"assistant_id": "assistant-456"}}
-    result_2 = middleware.before_agent({}, runtime, config_2)  # type: ignore
+    runtime.config = config_2
+    result_2 = middleware.before_agent({}, runtime)  # type: ignore
 
     assert result_2 is not None
     assert len(result_2["skills_metadata"]) == 0  # No skills in assistant-456's namespace yet
@@ -1472,7 +1474,8 @@ def test_skills_middleware_with_store_backend_assistant_id() -> None:
     )
 
     # Test: assistant-456 can read its own skill
-    result_3 = middleware.before_agent({}, runtime, config_2)  # type: ignore
+    runtime.config = config_2
+    result_3 = middleware.before_agent({}, runtime)  # type: ignore
 
     assert result_3 is not None
     assert len(result_3["skills_metadata"]) == 1
@@ -1480,7 +1483,8 @@ def test_skills_middleware_with_store_backend_assistant_id() -> None:
     assert result_3["skills_metadata"][0]["description"] == "Skill for assistant 2"
 
     # Test: assistant-123 still only sees its own skill (no cross-contamination)
-    result_4 = middleware.before_agent({}, runtime, config_1)  # type: ignore
+    runtime.config = config_1
+    result_4 = middleware.before_agent({}, runtime)  # type: ignore
 
     assert result_4 is not None
     assert len(result_4["skills_metadata"]) == 1
@@ -1506,7 +1510,8 @@ def test_skills_middleware_with_store_backend_no_assistant_id() -> None:
     )
 
     # Test: empty config accesses default namespace
-    result_1 = middleware.before_agent({}, runtime, {})  # type: ignore
+    runtime.config = {}
+    result_1 = middleware.before_agent({}, runtime)  # type: ignore
 
     assert result_1 is not None
     assert len(result_1["skills_metadata"]) == 1
@@ -1515,7 +1520,8 @@ def test_skills_middleware_with_store_backend_no_assistant_id() -> None:
 
     # Test: config with metadata but no assistant_id also uses default namespace
     config_with_other_metadata = {"metadata": {"some_other_key": "value"}}
-    result_2 = middleware.before_agent({}, runtime, config_with_other_metadata)  # type: ignore
+    runtime.config = config_with_other_metadata
+    result_2 = middleware.before_agent({}, runtime)  # type: ignore
 
     assert result_2 is not None
     assert len(result_2["skills_metadata"]) == 1
@@ -1542,7 +1548,8 @@ async def test_skills_middleware_with_store_backend_assistant_id_async() -> None
 
     # Test: assistant-123 can read its own skill
     config_1 = {"metadata": {"assistant_id": "assistant-123"}}
-    result_1 = await middleware.abefore_agent({}, runtime, config_1)  # type: ignore
+    runtime.config = config_1
+    result_1 = await middleware.abefore_agent({}, runtime)  # type: ignore
 
     assert result_1 is not None
     assert len(result_1["skills_metadata"]) == 1
@@ -1551,7 +1558,8 @@ async def test_skills_middleware_with_store_backend_assistant_id_async() -> None
 
     # Test: assistant-456 cannot see assistant-123's skill (different namespace)
     config_2 = {"metadata": {"assistant_id": "assistant-456"}}
-    result_2 = await middleware.abefore_agent({}, runtime, config_2)  # type: ignore
+    runtime.config = config_2
+    result_2 = await middleware.abefore_agent({}, runtime)  # type: ignore
 
     assert result_2 is not None
     assert len(result_2["skills_metadata"]) == 0  # No skills in assistant-456's namespace yet
@@ -1565,7 +1573,8 @@ async def test_skills_middleware_with_store_backend_assistant_id_async() -> None
     )
 
     # Test: assistant-456 can read its own skill
-    result_3 = await middleware.abefore_agent({}, runtime, config_2)  # type: ignore
+    runtime.config = config_2
+    result_3 = await middleware.abefore_agent({}, runtime)  # type: ignore
 
     assert result_3 is not None
     assert len(result_3["skills_metadata"]) == 1
@@ -1573,7 +1582,8 @@ async def test_skills_middleware_with_store_backend_assistant_id_async() -> None
     assert result_3["skills_metadata"][0]["description"] == "Async skill for assistant 2"
 
     # Test: assistant-123 still only sees its own skill (no cross-contamination)
-    result_4 = await middleware.abefore_agent({}, runtime, config_1)  # type: ignore
+    runtime.config = config_1
+    result_4 = await middleware.abefore_agent({}, runtime)  # type: ignore
 
     assert result_4 is not None
     assert len(result_4["skills_metadata"]) == 1

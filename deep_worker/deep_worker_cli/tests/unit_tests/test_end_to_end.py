@@ -2,7 +2,7 @@
 
 CRITICAL: ALWAYS TEST LOCAL REPOSITORY CODE
 ============================================
-These tests MUST use code from deep_worker/deepagents.
+These tests MUST use code from /path/to/project/deepagents.
 conftest.py ensures sys.path is configured correctly.
 
 NEVER test against installed packages from site-packages!
@@ -26,6 +26,7 @@ from langchain_core.runnables import Runnable
 from langchain_core.tools import BaseTool, tool
 
 from deep_worker_cli.agent import create_cli_agent
+from deep_worker_cli.summaries import PrivateSummariesBackend
 
 
 @tool(description="Sample tool")
@@ -158,13 +159,12 @@ class TestDeepAgentsCLIEndToEnd:
             assert "Task completed successfully!" in final_ai_message.content
 
     def test_cli_agent_summarizes(self, tmp_path: Path, monkeypatch: "pytest.MonkeyPatch") -> None:
-        """Test summarization offloads to <data-root>/<agent>/summaries/.
+        """Test summarization offloads to <agent-data-dir>/<agent>/summaries/.
 
         Per DESIGN_SUMMARIZATION_PERSISTENT_STORAGE.md, the offload target is
-        a real on-disk path rooted at the user's home directory — not an
-        in-memory virtual backend path. We monkeypatch HOME so the write
-        lands under tmp_path, then check the file and its header content
-        directly on disk.
+        a real on-disk path rooted at $HOME — not an in-memory virtual backend
+        path. We monkeypatch HOME so the write lands under tmp_path, then
+        check the file and its header content directly on disk.
         """
         monkeypatch.setenv("HOME", str(tmp_path))
         with mock_settings(tmp_path):
@@ -221,12 +221,20 @@ class TestDeepAgentsCLIEndToEnd:
             assert summaries_dir.is_dir(), (
                 f"summaries dir was not created at {summaries_dir}"
             )
-            md_files = list(summaries_dir.glob("*.md"))
-            assert md_files, f"no summary .md files under {summaries_dir}"
-            body = md_files[0].read_text()
-            assert "## Summarized at " in body, (
-                f"no summarization section header in {md_files[0]}"
-            )
+            jsonl_files = list(summaries_dir.glob("*.jsonl"))
+            assert jsonl_files, f"no summary .jsonl files under {summaries_dir}"
+            assert oct(summaries_dir.stat().st_mode & 0o777) == "0o700"
+            summary_file = jsonl_files[0]
+            assert oct(summary_file.stat().st_mode & 0o777) == "0o600"
+            body = summary_file.read_text()
+            # JSONL format: each line is valid JSON
+            assert body.strip(), f"summary file is empty: {summary_file}"
+            first_line = body.splitlines()[0]
+            import json
+            data = json.loads(first_line)
+            assert data.get("schema_version") == 4
+            assert data.get("kind") == "deepagents.summarization_history.message"
+            assert "summarized_at" in data
 
     def test_cli_agent_with_fake_llm_with_tools(self, tmp_path: Path) -> None:
         """Test CLI agent with tools using a fake LLM model.
@@ -425,5 +433,7 @@ class TestDeepAgentsCLIEndToEnd:
                 project_memory_dir=tmp_path,
             )
 
-            assert isinstance(backend, CompositeBackend)
-            assert isinstance(backend.default, FilesystemBackend)
+            assert isinstance(backend, PrivateSummariesBackend)
+            inner_backend = backend._backend
+            assert isinstance(inner_backend, CompositeBackend)
+            assert isinstance(inner_backend.default, FilesystemBackend)

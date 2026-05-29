@@ -291,24 +291,74 @@ Use this tool to run commands, scripts, tests, builds, and other shell operation
 - execute: run a shell command in the sandbox (returns output and exit code)"""
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# 🛑 PROTECTED INVARIANT — DO NOT BREAK (the 2026-05-28 execute-unavailable incident)
+# ═══════════════════════════════════════════════════════════════════════════
+# `_supports_execution` decides whether the `execute` shell tool is EXPOSED to
+# the model: (a)wrap_model_call FILTERS `execute` out of request.tools when this
+# returns False. If the backend is wrapped in a transparent proxy
+# (e.g. deep_worker's PrivateSummariesBackend → CompositeBackend → sandbox),
+# a bare `isinstance(backend, CompositeBackend)` check returns False and the
+# model silently loses `execute` (the 2026-05-28 regression, commit
+# 9b8b570). RULES for anyone editing this:
+#   1. Always go through `_unwrap_proxy_backend` before the isinstance checks.
+#   2. NEVER narrow it back to a bare CompositeBackend check.
+#   3. A new backend wrapper MUST expose its inner backend via `_backend`
+#      (the convention this unwrap follows) or update _unwrap_proxy_backend.
+#   4. Mirror any change in deep_worker_cli `_get_sandbox_backend` (same invariant).
+# Symptom of breakage: agent says "I have no execute tool".
+# Covered by tests/unit_tests/test_supports_execution_unwrap.py.
+# ═══════════════════════════════════════════════════════════════════════════
+def _unwrap_proxy_backend(backend: object) -> object:
+    """Peel transparent proxy wrappers to reach the wrapped backend.
+
+    Some backends are proxies that delegate to an inner backend held in
+    ``_backend`` (e.g. deep_worker's ``PrivateSummariesBackend``). Such a proxy
+    subclasses ``BackendProtocol`` — NOT ``CompositeBackend``/sandbox — so the
+    ``isinstance`` checks below cannot see through it. We follow the
+    ``_backend`` chain so ``proxy(composite(sandbox))`` is still recognised as
+    execution-capable; otherwise the ``execute`` tool is wrongly filtered out
+    of the model's toolset entirely. Duck-typed (no import of the concrete
+    proxy type — keeps deepagents independent). Iterative + visited-set so a
+    cyclic wrapper can never spin. See a related internal incident
+    analysis (not included here).
+    """
+    seen: set[int] = set()
+    current = backend
+    while (
+        not isinstance(current, (CompositeBackend, SandboxBackendProtocol))
+        and hasattr(current, "_backend")
+        and id(current) not in seen
+    ):
+        seen.add(id(current))
+        inner = getattr(current, "_backend", None)
+        if inner is None or inner is current:
+            break
+        current = inner
+    return current
+
+
 def _supports_execution(backend: BackendProtocol) -> bool:
     """Check if a backend supports command execution.
 
-    For CompositeBackend, checks if the default backend supports execution.
-    For other backends, checks if they implement SandboxBackendProtocol.
+    Peels transparent proxy wrappers (``_backend`` chain) first, then:
+    for CompositeBackend, checks if the default backend supports execution;
+    for other backends, checks if they implement SandboxBackendProtocol.
 
     Args:
-        backend: The backend to check.
+        backend: The backend to check (possibly proxy- and/or composite-wrapped).
 
     Returns:
         True if the backend supports execution, False otherwise.
     """
-    # For CompositeBackend, check the default backend
-    if isinstance(backend, CompositeBackend):
-        return isinstance(backend.default, SandboxBackendProtocol)
+    resolved = _unwrap_proxy_backend(backend)
+
+    # For CompositeBackend, check the default backend (also proxy-unwrapped).
+    if isinstance(resolved, CompositeBackend):
+        return isinstance(_unwrap_proxy_backend(resolved.default), SandboxBackendProtocol)
 
     # For other backends, use isinstance check
-    return isinstance(backend, SandboxBackendProtocol)
+    return isinstance(resolved, SandboxBackendProtocol)
 
 
 # Tools that should be excluded from the large result eviction logic.

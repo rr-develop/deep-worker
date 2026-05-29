@@ -6,15 +6,18 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 
-#: Relative name of the per-agent data directory inside the home dir.
-_AGENT_DATA_DIR = Path("~/.deep_worker").name  # hidden per-agent data dir
-
 import aiosqlite
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from rich.table import Table
 
 from deep_worker_cli.config import COLORS, console
+from deep_worker_cli.storage_paths import (
+    agent_name_from_thread_id,
+    ensure_private_file,
+    iter_thread_db_paths,
+    threads_db_path,
+)
 
 # Patch aiosqlite.Connection to add is_alive() method required by
 # langgraph-checkpoint>=2.1.0
@@ -72,11 +75,7 @@ def get_db_path(agent_name: str | None = None) -> Path:
     Returns:
         Path to the SQLite database file.
     """
-    db_dir = Path.home() / ".deepagents"
-    db_dir.mkdir(parents=True, exist_ok=True)
-    if agent_name is not None:
-        return db_dir / f"sessions_{agent_name}.db"
-    return db_dir / "sessions.db"
+    return threads_db_path(agent_name)
 
 
 def _agent_name_from_thread_id(thread_id: str) -> str:
@@ -89,7 +88,7 @@ def _agent_name_from_thread_id(thread_id: str) -> str:
 
     See ``_migrate_from_global_db`` (same mapping).
     """
-    return thread_id.split(":", 1)[0]
+    return agent_name_from_thread_id(thread_id)
 
 
 def iter_all_db_paths() -> list[Path]:
@@ -105,13 +104,16 @@ def iter_all_db_paths() -> list[Path]:
     restrict discovery to that directory.
     """
     legacy = get_db_path(None)
-    db_dir = legacy.parent
-    if not db_dir.exists():
-        return []
-    paths: list[Path] = sorted(db_dir.glob("sessions_*.db"))
-    if legacy.exists() and legacy not in paths:
-        paths.append(legacy)
-    return paths
+    default_legacy = Path.home() / ".deepagents" / "sessions.db"
+    if legacy != default_legacy:
+        db_dir = legacy.parent
+        if not db_dir.exists():
+            return []
+        paths: list[Path] = sorted(db_dir.glob("sessions_*.db"))
+        if legacy.exists() and legacy not in paths:
+            paths.append(legacy)
+        return paths
+    return iter_thread_db_paths()
 
 
 def _resolve_db_path_for_thread(thread_id: str) -> Path | None:
@@ -159,8 +161,8 @@ async def list_threads(
 ) -> list[dict]:
     """List threads from checkpoints table.
 
-    Iterates across every per-agent ``sessions_*.db`` file plus the
-    legacy global ``sessions.db`` and merges results, so offline
+    Iterates across every ``sessions_*.db`` file in the agent data directory
+    plus the legacy global ``sessions.db`` and merges results, so offline
     threads of all agents are visible (not only those in the legacy
     global DB).
 
@@ -611,6 +613,7 @@ async def get_checkpointer(agent_name: str | None = None) -> AsyncIterator["Delt
         _migrate_from_global_db(agent_name, db_path)
 
     async with DeltaSqliteCheckpointer.from_conn_string(str(db_path)) as checkpointer:
+        ensure_private_file(db_path)
         yield checkpointer
 
 
@@ -790,13 +793,13 @@ async def clean_agent_history(
     This removes:
     - All checkpoints/threads from sessions.db for this agent
     - All writes from sessions.db for this agent's threads
-    - The agent's data directory
-    - The agent's log files
+    - Agent data directory (under the user's home)
+    - Agent log files (under the user's home)
 
     This does NOT remove:
-    - User configuration (the agent's AGENTS.md)
-    - User skills (the agent's skills directory)
-    - User subagents (the agent's subagents directory)
+    - User configuration (AGENTS.md under the agent's data directory)
+    - User skills (under the agent's data directory)
+    - User subagents (under the agent's data directory)
 
     Args:
         agent_name: Name of the agent to clean
@@ -904,14 +907,14 @@ async def clean_agent_history(
             pass
 
     # 3. Remove agent data directory
-    data_dir = home_dir / _AGENT_DATA_DIR / agent_name
+    data_dir = home_dir / Path("~/.deep_worker").name / agent_name
     data_dir_removed = False
     if data_dir.exists():
         shutil.rmtree(data_dir)
         data_dir_removed = True
 
     # 4. Remove log files
-    log_dir = home_dir / _AGENT_DATA_DIR / "logs"
+    log_dir = home_dir / Path("~/.deep_worker").name / "logs"
     log_files_removed = 0
     if log_dir.exists():
         for log_file in log_dir.glob(f"{agent_name}.*"):
@@ -930,7 +933,7 @@ async def clean_agent_history(
             f"  [dim]- Removed {log_files_removed} log file(s)[/dim]"
         )
     console.print(
-        f"  [dim]- Preserved user config for agent '{agent_name}'[/dim]"
+        f"  [dim]- Preserved user config under the agent's data directory[/dim]"
     )
 
 
@@ -1171,7 +1174,7 @@ async def get_thread_history(
                 "error": (
                     f"Thread '{thread_id}' not found: no session database "
                     f"exists (looked for sessions_<agent>.db and "
-                    f"the legacy global sessions.db)."
+                    f"legacy sessions.db under the agent data directory)."
                 ),
             }
         db_path = str(resolved)
@@ -1241,7 +1244,7 @@ async def remove_threads_before(
     """Remove all threads older than the specified date.
 
     When ``db_path`` is not provided, the operation is applied to every
-    per-agent ``sessions_<name>.db`` file **and** the
+    per-agent ``sessions_<name>.db`` file in the agent data directory **and** the
     legacy global ``sessions.db``.  Counts are summed across all files.
 
     Args:
@@ -1371,3 +1374,81 @@ async def remove_threads_before(
         "checkpoints_deleted": checkpoints_total,
         "writes_deleted": writes_total,
     }
+
+
+async def import_history(
+    agent_name: str,
+    messages: list,
+    *,
+    replace: bool = False,
+) -> int:
+    """Write an imported message list into the agent's per-agent SQLite DB.
+
+    This is the injection point for ``--import-claude``
+    (DESIGN_IMPORT_CLAUDE_SESSION.md §4): the parsed Claude transcript becomes
+    the agent's conversation history (its *memory*). The messages land in
+    the per-agent session database (``sessions_<agent>.db``) so
+    ``deep-worker --history <agent>``
+    shows them and the agent sees them on its first turn — independent of which
+    provider the agent later runs under.
+
+    We write via a MINIMAL LangGraph graph (just the ``messages`` channel with
+    the standard ``add_messages`` reducer) compiled with the per-agent
+    checkpointer, then ``aupdate_state``. This produces a checkpoint LangGraph
+    reads back correctly (verified against the existing offline read path
+    ``get_thread_history``) WITHOUT constructing any provider model — no API
+    keys, no network, no inference. The real agent reads only the ``messages``
+    channel from this checkpoint; its other state channels default to empty on
+    first run.
+
+    Args:
+        agent_name: target agent (its thread_id is the agent name).
+        messages: the parsed ``list[BaseMessage]`` to import.
+        replace: if the agent already has history, ``False`` refuses (so two
+            conversations are never silently spliced); ``True`` wipes the
+            existing per-agent DB first.
+
+    Returns:
+        The number of messages written.
+
+    Raises:
+        ValueError: ``messages`` is empty, or history already exists and
+            ``replace`` is ``False``.
+    """
+    from typing import Annotated, TypedDict  # noqa: PLC0415
+
+    from langgraph.graph import END, START, StateGraph  # noqa: PLC0415
+    from langgraph.graph.message import add_messages  # noqa: PLC0415
+
+    if not messages:
+        raise ValueError("Nothing to import: the message list is empty.")
+
+    # Guard against clobbering an existing conversation.
+    existing = await get_thread_history(agent_name, agent_name=agent_name)
+    has_history = bool(existing.get("success") and existing.get("messages"))
+    if has_history:
+        if not replace:
+            raise ValueError(
+                f"Agent '{agent_name}' already has conversation history. "
+                f"Pass --clean to replace it (import refuses to splice two "
+                f"conversations together)."
+            )
+        # replace=True: wipe the per-agent DB first.
+        await clean_agent_history_db_only(agent_name)
+
+    class _ImportState(TypedDict):
+        messages: Annotated[list, add_messages]
+
+    builder = StateGraph(_ImportState)
+    builder.add_node("noop", lambda _state: {})
+    builder.add_edge(START, "noop")
+    builder.add_edge("noop", END)
+
+    async with get_checkpointer(agent_name=agent_name) as checkpointer:
+        graph = builder.compile(checkpointer=checkpointer)
+        config = {
+            "configurable": {"thread_id": agent_name, "checkpoint_ns": ""}
+        }
+        await graph.aupdate_state(config, {"messages": messages})
+
+    return len(messages)

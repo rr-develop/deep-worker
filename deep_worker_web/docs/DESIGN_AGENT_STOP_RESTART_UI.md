@@ -1,12 +1,12 @@
-# Design: Agent Selection, Stop & Restart in deep_worker_web
+# Design: Agent Selection, Stop & Restart in the Web App
 
 **Status: ✅ IMPLEMENTED**
 
 ## Overview
 
-Add multi-select agent management to deep_worker_web UI, inspired by the
-general-purpose web application's session management. Users can select one or more agents and stop or restart
-them via toolbar buttons.
+Add multi-select agent management to the web app UI, inspired by the legacy
+web app's session management. Users can select one or more agents and stop or
+restart them via toolbar buttons.
 
 ## Current State
 
@@ -71,7 +71,7 @@ Restart an agent using saved `launch_config` from `session_metadata.json`.
 If body is empty or `{}`, uses saved parameters as-is (like `--restart`).
 
 **Behavior:**
-1. Load `launch_config` from `~/.deep_worker/{name}/session_metadata.json`
+1. Load `launch_config` from `<agent-data-dir>/{name}/session_metadata.json`
 2. If no `launch_config` → 404 with message
 3. If agent is running + status `"running"` → 409 Conflict
 4. If agent is running + idle/waiting/error → stop it first (SIGTERM + wait)
@@ -151,17 +151,17 @@ Existing events that will fire naturally:
 ┌─────────────────────────────────────┐
 │ Agents                    [toolbar] │
 │ ┌─────────────────────────────────┐ │
-│ │ [☑] agent-one   ● idle         │ │
+│ │ [☑] agent_a     ● idle         │ │
 │ │     claude-code / opus          │ │
-│ │     /path/to/project-a          │ │
+│ │     /path/to/project            │ │
 │ ├─────────────────────────────────┤ │
-│ │ [☐] agent-two   ● running      │ │
+│ │ [☐] agent_b     ● running      │ │
 │ │     claude-code / opus          │ │
-│ │     /path/to/project-b          │ │
+│ │     /path/to/other              │ │
 │ ├─────────────────────────────────┤ │
-│ │ [☑] agent-three ● idle         │ │
-│ │     deepseek / deepseek-chat    │ │
-│ │     /path/to/project-c          │ │
+│ │ [☑] agent_c     ● idle         │ │
+│ │     deepseek / deepseek-v4-flash    │ │
+│ │     /path/to/dev-tree           │ │
 │ └─────────────────────────────────┘ │
 │                                     │
 │ [⏹ Stop Selected] [🔄 Restart]     │
@@ -169,7 +169,7 @@ Existing events that will fire naturally:
 └─────────────────────────────────────┘
 ```
 
-**Interaction model (inspired by the general-purpose web application):**
+**Interaction model (inspired by the legacy web app):**
 
 - **Checkbox** on each agent item — toggles selection
 - **Click on agent name/row** (not checkbox) — opens agent interaction panel (existing behavior)
@@ -190,7 +190,7 @@ Add stop/restart buttons to the existing agent header:
 
 ```
 ┌──────────────────────────────────────────────────┐
-│ agent-one                                        │
+│ agent_a                                         │
 │ claude-code / opus  ● idle                       │
 │ [📜 Dialog] [⏹ Stop] [🔄 Restart] [⏹ Stop TM]  │
 └──────────────────────────────────────────────────┘
@@ -235,9 +235,9 @@ The service methods reuse:
 | SIGTERM timeout | 500 | Toast: "Agent didn't stop in time. Check manually." |
 | Subprocess spawn failure | 500 | Toast: "Failed to restart agent. Check logs." |
 
-### 6. Reused Patterns
+### 6. Legacy Web App Pattern Reuse
 
-| Web application pattern | Adapted for deep_worker_web |
+| Legacy web app pattern | Adapted for the web app |
 |---|---|
 | Session checkboxes + `closeSessions()` | Agent checkboxes + `stopAgents()` / `restartAgents()` |
 | `POST /api/sessions/close` batch endpoint | `POST /api/agents/batch` |

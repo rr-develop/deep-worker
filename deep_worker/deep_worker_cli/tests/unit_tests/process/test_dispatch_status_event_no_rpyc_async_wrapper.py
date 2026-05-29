@@ -12,11 +12,14 @@ returned coroutine, the peer emits the telltale
 
 and no status_change reaches the UI.
 
-A plain ``await on_message(payload_str)`` on an async-flagged netref
+A plain ``on_message(payload_str)`` on an async-flagged netref
 routes via ``HANDLE_ASYNC_CALL`` on its own, which the peer's
 ``_dispatch_request_async`` awaits correctly. The reentrance concern
-is already solved by the outer ``asyncio.create_task(_push(...))``,
-which removes us from the current RPC dispatch frame.
+is already solved by handing the awaitable to ``fire_and_forget_async``
+(2026-05-20), which schedules the dispatch on a fresh Task and so
+removes us from the current RPC dispatch frame. The companion file
+``test_dispatch_status_event_fire_and_forget.py`` covers the
+hung-subscriber / leak / timeout invariants of that wiring.
 """
 
 from __future__ import annotations
@@ -79,8 +82,14 @@ async def test_dispatch_status_event_does_not_wrap_with_rpyc_async() -> None:
 
 @pytest.mark.asyncio
 async def test_dispatch_status_event_awaits_async_callback_coroutine() -> None:
-    """The push must actually await the subscriber's coroutine —
-    no fire-and-forget shortcuts that leak un-awaited coroutines.
+    """The dispatched push must drive the subscriber's coroutine
+    to completion — no stranded "coroutine was never awaited" warnings.
+
+    Since 2026-05-20 the dispatch goes through ``fire_and_forget_async``
+    (see ``test_dispatch_status_event_fire_and_forget.py``), but the
+    contract is the same from the subscriber's perspective: when the
+    subscriber's ``on_message`` returns normally, its body has run end
+    to end and we have a JSON-decodable payload to inspect.
     """
     agent = _make_bare_agent_process()
     delivered: list[str] = []

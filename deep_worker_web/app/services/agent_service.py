@@ -18,6 +18,38 @@ CRITICAL ARCHITECTURAL PRINCIPLES:
    ``await async_connect(host, port, ...)`` (natively non-blocking) and
    closed via ``await conn.aclose()``. Status queries, message sends, and
    all other RPyC operations MUST go through fire_and_forget_async.
+6. ONE CONNECTION PER (CLIENT, AGENT) PAIR — NO DUPLICATES.
+   The rule is about *duplicate* connections, NOT about how many
+   distinct clients may talk to one agent.
+
+   * Two or more independent clients (separate web servers, separate
+     ``dwcli`` invocations, a web server AND a TaskManager, etc.)
+     MAY connect to the same agent concurrently. The agent's
+     ``AsyncioServer`` is explicitly designed to accept multiple
+     concurrent clients — that is a supported configuration, not a
+     forbidden one. This module imposes NO single-client cap on the
+     agent side.
+
+   * What IS forbidden is a single client opening more than one
+     ``rpyc.Connection`` to the *same* agent. Within one
+     ``AgentService`` instance, ``self._connections[agent_name]``
+     MUST hold at most one connection at any time. All concurrent
+     API requests routed through this service for that agent
+     (``/agents/<n>``, ``/status``, ``/history``, ``/message``,
+     ``/interrupt``, ...) MUST multiplex over that single
+     connection. RPyC supports many in-flight async calls per
+     connection, so duplicating connections from the same client
+     buys nothing and only wastes a port plus doubles handshake
+     load on the agent.
+
+   * Operationally this means connection establishment in this
+     service is effectively single-flight per agent name: concurrent
+     ``connect_to_agent(<name>)`` callers from the SAME
+     ``AgentService`` instance must end up sharing one in-progress
+     connect, not racing independent ``async_connect`` calls. A
+     different ``AgentService`` (or any other RPyC client process)
+     opening its own connection in parallel is fine — that is a
+     different (client, agent) pair.
 """
 
 import asyncio
@@ -36,7 +68,7 @@ from app.utils.supervisor import supervise
 # ============================================================================
 # Import rpyc from the rpyc_async source directory to ensure AsyncioServer support
 # ============================================================================
-_rpyc_async_path = Path("rpyc_async")
+_rpyc_async_path = Path("/path/to/rpyc_async")
 if _rpyc_async_path.exists() and str(_rpyc_async_path) not in sys.path:
     sys.path.insert(0, str(_rpyc_async_path))
 
@@ -129,7 +161,7 @@ class AgentService:
             # docs/DESIGN_DEV_FLAG.md.
             #
             # __file__ here =
-            #   deep_worker_web/app/services/agent_service.py
+            #   <TREE>/<web-app-dir>/app/services/agent_service.py
             # parent x3 = <TREE>.
             _tree_root = Path(__file__).resolve().parent.parent.parent.parent
             deep_worker_path = (
@@ -160,6 +192,14 @@ class AgentService:
         # Message callback services for RPyC subscriptions
         # (agent_name -> callback service instance)
         self._callback_services: dict[str, Any] = {}
+
+        # Process identity the live connection/subscription was established
+        # against (agent_name -> (pid, rpyc_port)). Used to detect an
+        # ungraceful restart: rpyc's ``_closed`` flag is NOT flipped when the
+        # peer dies abruptly and respawns on a new port, so we compare the
+        # registry's current identity against this to know the held connection
+        # is stale. See DESIGN_SUBSCRIPTION_AND_DELIVERY_FIX.md (Bug 1).
+        self._conn_identity: dict[str, tuple[int, int]] = {}
 
         # Message callbacks (for WebSocket broadcasting)
         # Each callback is an async function that receives message dict
@@ -236,8 +276,54 @@ class AgentService:
                 working_dir=proc_info.working_dir,
                 started_at=proc_info.started_at,
             )
+            # Seed status + error_message from the agent's persisted
+            # session_metadata.json. This is the DURABLE source: it
+            # survives even when the agent's live in-memory status has
+            # diverged (e.g. error persisted to disk but exposed_get_status
+            # reverted to idle — an incident observed 2026-05-20), so the web
+            # UI shows the error detail on PAGE LOAD instead of an
+            # error-with-no-explanation. The live RPyC poll later refreshes
+            # this; the disk read just guarantees the snapshot is never
+            # blank on the error cause.
+            self._seed_status_from_metadata(agent_info)
             self._agents[proc_info.name] = agent_info
             logger.debug(f"Registered agent: {proc_info.name} (PID {proc_info.pid}, port {proc_info.rpyc_port})")
+
+    def _seed_status_from_metadata(self, info: AgentInfo) -> None:
+        """Best-effort: fill ``status`` + ``error_message`` from the
+        agent's ``<agent-data-dir>/<name>/session_metadata.json``.
+
+        Never raises — a missing/corrupt file just leaves the defaults.
+        """
+        import json  # local import — matches this module's convention
+        try:
+            meta_file = (
+                Path.home() / Path("~/.deep_worker").name / info.name / "session_metadata.json"
+            )
+            if not meta_file.exists():
+                return
+            data = json.loads(meta_file.read_text())
+            status_str = data.get("status")
+            if status_str:
+                try:
+                    info.status = self._convert_status(status_str)
+                except Exception:  # noqa: BLE001 — unknown value → keep default
+                    pass
+            err = data.get("error_message")
+            # Only attach the error text when the persisted state is an
+            # error; otherwise leave it None so a stale message can't
+            # linger on a recovered agent.
+            if info.status == AgentStatus.ERROR and err:
+                info.error_message = err
+            else:
+                info.error_message = None
+            raw_status_metadata = data.get("status_metadata")
+            if info.status == AgentStatus.IDLE and isinstance(raw_status_metadata, dict):
+                info.status_metadata = raw_status_metadata
+            else:
+                info.status_metadata = None
+        except Exception:  # noqa: BLE001 — disk read must never break discover
+            logger.debug("could not seed status from metadata for %s", info.name, exc_info=True)
 
     async def list_agents(self) -> list[AgentInfo]:
         """Get list of all known agents.
@@ -261,9 +347,9 @@ class AgentService:
     async def is_connected(self, agent_name: str) -> bool:
         """Check if we have an active RPyC connection to an agent.
 
-        Defence-in-depth against the AsyncResult leak seen in an earlier
-        internal incident: a Connection whose channel is torn down already
-        has ``conn._closed = True``
+        Defence-in-depth against the AsyncResult leak documented in
+        a related internal incident analysis (not included here): a Connection
+        whose channel is torn down already has ``conn._closed = True``
         (rpyc maintains this flag itself — no probe / round-trip /
         polling needed). Treat such a Connection as not-connected and
         evict it from ``_connections`` so the next caller triggers a
@@ -284,6 +370,21 @@ class AgentService:
         conn = self._connections.get(agent_name)
         if conn is None:
             return False
+
+        # Identity check FIRST: an ungraceful restart respawns the agent on a
+        # new (pid, rpyc_port) WITHOUT flipping the old connection's
+        # ``_closed`` flag. If the registry's current identity differs from the
+        # one this connection was opened against, the held connection points at
+        # a dead process — evict everything so the next connect_to_agent dials
+        # the new port and resubscribes. See
+        # DESIGN_SUBSCRIPTION_AND_DELIVERY_FIX.md (Bug 1).
+        recorded = self._conn_identity.get(agent_name)
+        if recorded is not None:
+            current = self._registry_identity(agent_name)
+            if current is not None and current != recorded:
+                self._evict_connection(agent_name)
+                return False
+
         # rpyc maintains ``_closed`` as a strict ``bool`` and only
         # flips it to ``True`` on real teardown (see
         # ``Connection.close`` / ``aclose`` in rpyc_async). Use an
@@ -292,9 +393,56 @@ class AgentService:
         # do not get evicted on every probe — only a genuine
         # ``conn._closed = True`` triggers eviction.
         if getattr(conn, "_closed", False) is True:
-            self._connections.pop(agent_name, None)
+            self._evict_connection(agent_name)
             return False
         return True
+
+    def _record_conn_identity(
+        self, agent_name: str, *, pid: int, rpyc_port: int
+    ) -> None:
+        """Remember the (pid, rpyc_port) the live connection was opened
+        against, so a later restart (new identity) is detected as stale."""
+        self._conn_identity[agent_name] = (pid, rpyc_port)
+
+    def _registry_identity(self, agent_name: str) -> tuple[int, int] | None:
+        """Current (pid, rpyc_port) for ``agent_name`` from in-memory
+        discovery state, or None if unknown."""
+        info = self._agents.get(agent_name)
+        if info is None:
+            return None
+        try:
+            return (int(info.pid), int(info.rpyc_port))
+        except (TypeError, ValueError, AttributeError):
+            return None
+
+    def _evict_connection(self, agent_name: str) -> None:
+        """Drop all local state for a stale/dead connection without any RPC
+        (the peer is gone; touching the netref would just hang/raise). The
+        next connect_to_agent makes a clean connection + subscription.
+
+        CRITICAL — take the connection's asyncio reader OFF the loop before
+        dropping our last reference. The rpyc Connection registers an
+        ``add_reader`` callback on the running uvloop; that callback closes
+        over the Connection, so merely ``pop``-ing it from these dicts does
+        NOT free it — the reader stays armed forever. Once the agent's fd is
+        recycled by uvicorn's own transport, the orphaned reader fires on a
+        foreign fd, ``remove_reader`` then raises 'fd is used by transport',
+        and the loop spins at ~100% CPU serving zero recv (the 7887 spin,
+        2026-05-27). ``disable_asyncio_serving()`` is synchronous, does no
+        RPC/IO, and unregisters the reader — exactly what the "peer is gone"
+        path needs."""
+        conn = self._connections.pop(agent_name, None)
+        if conn is not None:
+            try:
+                conn.disable_asyncio_serving()
+            except Exception:
+                logger.debug(
+                    "disable_asyncio_serving during evict of %s failed",
+                    agent_name, exc_info=True,
+                )
+        self._roots.pop(agent_name, None)
+        self._callback_services.pop(agent_name, None)
+        self._conn_identity.pop(agent_name, None)
 
     def get_root(self, agent_name: str) -> Any | None:
         """Get RPyC root proxy for an agent.
@@ -309,12 +457,48 @@ class AgentService:
 
     async def connect_to_agent(self, agent_name: str) -> bool:
         """Establish RPyC connection to an agent.
-        
-        This connects to the agent's RPyC server and subscribes to message callbacks.
-        
+
+        This connects to the agent's RPyC server and subscribes to
+        message callbacks.
+
+        Concurrency contract — ONE CONNECTION PER (CLIENT, AGENT) PAIR
+        ---------------------------------------------------------------
+        Per principle 6 in the module docstring, this coroutine is
+        the *only* path that may create or replace
+        ``self._connections[agent_name]`` *within this AgentService
+        instance*. Callers inside this instance issuing parallel
+        requests for the same agent MUST share the one connection
+        held in ``self._connections[agent_name]`` — they do not each
+        get their own. RPyC multiplexes many in-flight async calls
+        over a single connection, so duplicating connections from
+        the same client is forbidden.
+
+        This rule does NOT forbid *other* clients (a different
+        ``AgentService`` instance, another web server, a ``dwcli``
+        process, etc.) from connecting to the same agent at the same
+        time — those are separate (client, agent) pairs and the
+        agent's ``AsyncioServer`` accepts them.
+
+        Today the fast path
+        (``if await self.is_connected(...): return True``) and the
+        write
+        (``self._connections[agent_name] = conn``) form a
+        check-then-act window. A future change MUST add a per-agent
+        single-flight gate (e.g. ``asyncio.Lock`` keyed by
+        ``agent_name`` or an in-flight ``asyncio.Task`` dedup map)
+        before this code is exercised by genuinely concurrent
+        first-callers in production. Until that lands, callers that
+        intentionally fan out to multiple handlers (the web UI's
+        parallel `/status` + `/history` + `/agent` queries, the
+        ``test_concurrent_requests_to_agent`` integration test, etc.)
+        MUST warm the connection with one sequential call before
+        issuing the parallel batch — see
+        ``tests/integration/test_api_agents_integration.py::TestAgentsAPIWithRealAgent::test_concurrent_requests_to_agent``
+        for the pattern.
+
         Args:
             agent_name: Name of the agent to connect to.
-            
+
         Returns:
             True if connection successful, False otherwise.
         """
@@ -349,7 +533,16 @@ class AgentService:
             # Store connection and root
             self._connections[agent_name] = conn
             self._roots[agent_name] = root
-            
+            # Pin the process identity this connection is bound to, so a later
+            # ungraceful restart (new pid/port) is detected as stale by
+            # is_connected. See DESIGN_SUBSCRIPTION_AND_DELIVERY_FIX.md (Bug 1).
+            try:
+                self._record_conn_identity(
+                    agent_name, pid=int(agent.pid), rpyc_port=int(agent.rpyc_port)
+                )
+            except (TypeError, ValueError):
+                pass
+
             # Subscribe to agent messages
             await self._subscribe_to_agent(agent_name, root)
 
@@ -460,6 +653,7 @@ class AgentService:
                 del self._roots[agent_name]
             if agent_name in self._callback_services:
                 del self._callback_services[agent_name]
+            self._conn_identity.pop(agent_name, None)
 
     async def _subscribe_to_agent(self, agent_name: str, root: Any) -> None:
         """Subscribe to message callbacks from an agent using fire-and-forget pattern.
@@ -549,20 +743,28 @@ class AgentService:
                 metadata = response.get("metadata", {})
                 provider = metadata.get("provider")
                 model = metadata.get("model")
+                raw_status_metadata = metadata.get("status_metadata")
 
                 if agent_name in self._agents:
+                    info = self._agents[agent_name]
                     if provider:
-                        self._agents[agent_name].provider = provider
+                        info.provider = provider
                     if model:
-                        self._agents[agent_name].model = model
+                        info.model = model
+                    info.status_metadata = (
+                        raw_status_metadata
+                        if isinstance(raw_status_metadata, dict)
+                        else None
+                    )
                     logger.info(f"Fetched metadata for {agent_name}: {provider}/{model}")
 
                     # Broadcast metadata update so frontend picks it up
                     await self._broadcast_message({
                         "type": "agent_metadata",
                         "agent_name": agent_name,
-                        "provider": self._agents[agent_name].provider,
-                        "model": self._agents[agent_name].model,
+                        "provider": info.provider,
+                        "model": info.model,
+                        "status_metadata": info.status_metadata,
                     })
 
         async def on_error(exc: BaseException) -> None:
@@ -619,6 +821,24 @@ class AgentService:
                         "agent_name": agent_name,
                         "status": status_str,
                     }
+                    # Forward the agent's error message so the UI's
+                    # persistent error panel can show it on the polling
+                    # path too (not only the subscribe-push path). The
+                    # agent's exposed_get_status returns the human-
+                    # readable cause under the "error" key when
+                    # status == "error" (incident observed 2026-05-20).
+                    err = response.get("error")
+                    if status_str == "error" and err:
+                        broadcast_msg["error_message"] = err
+                        # Persist into the AgentInfo mirror so
+                        # GET /api/agents (page load) and a UI re-select
+                        # carry the error detail — not only the live WS
+                        # push. Incident observed 2026-05-20.
+                        info.error_message = err
+                    else:
+                        # Recovered (or no error) → clear so a stale
+                        # error panel doesn't linger after recovery.
+                        info.error_message = None
                     # Include task_manager fields only if present in response.
                     # Also mirror into AgentInfo so ``GET /api/agents`` is
                     # synced and frontend reconnects see the TM row.
@@ -687,6 +907,17 @@ class AgentService:
                 await on_error(Exception(f"Invalid response format: {response_str}"))
                 return
 
+            # A user-initiated interrupt comes back as a clean
+            # ``{"success": False, "interrupted": True}`` result (NOT a
+            # remote exception — see exposed_invoke_agent). It is not an
+            # error and not a real response: the agent already broadcast
+            # ``agent_interrupted``. Do NOT show a "processed
+            # successfully" toast and do NOT broadcast an agent_response
+            # for it (2026-05-20 interrupt-as-error fix).
+            if isinstance(response, dict) and response.get("interrupted"):
+                logger.info(f"Agent {agent_name} invocation interrupted by user")
+                return
+
             logger.info(f"Agent {agent_name} responded successfully")
             logger.debug(f"Response type: {type(response)}, value: {response}")
 
@@ -705,7 +936,7 @@ class AgentService:
             if not isinstance(response_text, (str, int, float, bool, type(None))):
                 response_text = str(response_text)
 
-            logger.debug(f"Extracted response_text: {response_text[:200]}")
+            logger.debug(f"Extracted response_text: {str(response_text)[:200]}")
 
             # Broadcast success to WebSocket clients
             await self._broadcast_message({
@@ -836,6 +1067,33 @@ class AgentService:
                 error_callback=on_error,
                 name=f"tm_toggle_{agent_name}",
             )
+
+            # CRITICAL: propagate the new disabled state to ALL caches and
+            # clients NOW — do not wait for the next status poll.
+            #
+            # The agent process flips ``task_manager.disabled`` itself, but
+            # it does NOT push a status_change for it. If we only fire the
+            # RPyC call and return, the web AgentInfo mirror and every
+            # connected browser keep the stale value. Symptom (user report
+            # 2026-05-20): uncheck TM, switch agents, switch back → the box
+            # is checked again, because the JS cache was never told.
+            #
+            # ``disabled = not enabled``. We update the in-memory mirror so
+            # GET /api/agents and a UI re-select read the truth, and
+            # broadcast ``agent_status`` so every client updates live. The
+            # agent remains the source of truth — the next poll merely
+            # confirms what we already published.
+            disabled = not enabled
+            info = self._agents.get(agent_name)
+            if info is not None:
+                info.task_manager_disabled = disabled
+                info.has_task_manager = True
+            await self._broadcast_message({
+                "type": "agent_status",
+                "agent_name": agent_name,
+                "status": info.status.value if info is not None else "idle",
+                "task_manager_disabled": disabled,
+            })
         except Exception as e:
             return {"success": False, "error": str(e)}
 
@@ -1367,6 +1625,12 @@ class AgentService:
                 "agent_name": agent_name,
                 "status": status_str,
             }
+            raw_status_metadata = plain_msg.get("status_metadata")
+            status_metadata = (
+                raw_status_metadata if isinstance(raw_status_metadata, dict) else None
+            )
+            if status_metadata is not None:
+                broadcast["status_metadata"] = status_metadata
             # Mirror into AgentInfo cache so REST callers see the
             # new state immediately. ``_convert_status`` maps the
             # agent's enum to our web enum; unknown values fall
@@ -1382,6 +1646,22 @@ class AgentService:
                         agent_name,
                         exc_info=True,
                     )
+                info.status_metadata = status_metadata
+
+            metadata_broadcast: dict[str, Any] | None = None
+            provider = plain_msg.get("provider")
+            model = plain_msg.get("model")
+            if info is not None and (provider or model):
+                if provider:
+                    info.provider = str(provider)
+                if model:
+                    info.model = str(model)
+                metadata_broadcast = {
+                    "type": "agent_metadata",
+                    "agent_name": agent_name,
+                    "provider": info.provider,
+                    "model": info.model,
+                }
 
             # TaskManager fields: only propagate when the agent
             # actually sent them.
@@ -1407,6 +1687,8 @@ class AgentService:
                 broadcast["error_message"] = error_message
 
             await self._broadcast_message(broadcast)
+            if metadata_broadcast is not None:
+                await self._broadcast_message(metadata_broadcast)
             return
 
         if msg_type == "approval_request":
@@ -1429,6 +1711,23 @@ class AgentService:
                 "agent_name": agent_name,
                 "approval_id": plain_msg.get("approval_id"),
                 "decision": plain_msg.get("decision"),
+            })
+            return
+
+        if msg_type == "channel_quarantined":
+            # A client RPyC channel to the agent was flooded and put into
+            # quarantine. This is a non-blocking WARNING: the agent keeps
+            # working and its status is unchanged. Forward as a dedicated
+            # top-level event so the frontend can show a warning banner
+            # WITHOUT touching the agent's displayed status / error panel.
+            # Incident observed 2026-05-22.
+            await self._broadcast_message({
+                "type": "channel_quarantined",
+                "agent_name": agent_name,
+                "level": "warning",
+                "connid": plain_msg.get("connid"),
+                "peer": plain_msg.get("peer"),
+                "content": plain_msg.get("content"),
             })
             return
 
@@ -1581,10 +1880,21 @@ class AgentService:
                 "agent_name": name,
             })
 
-        # Already-known agents: reconnect only when we've lost the
-        # connection. NO periodic get_status poll — status updates flow
-        # through the subscribe channel.
+        # Already-known agents: refresh the in-memory pid/rpyc_port from the
+        # registry FIRST, then reconnect only when we've lost the connection.
+        # The refresh is what lets identity-aware ``is_connected`` notice an
+        # ungraceful restart (same name, new pid/port): without it the stale
+        # ``_agents[name]`` still matches the recorded connection identity and
+        # the dead channel would never be evicted. NO periodic get_status poll
+        # — status updates flow through the subscribe channel.
+        # See DESIGN_SUBSCRIPTION_AND_DELIVERY_FIX.md (Bug 1).
+        proc_by_name = {a.name: a for a in current_agents}
         for name in known_names & current_names:
+            proc_info = proc_by_name.get(name)
+            info = self._agents.get(name)
+            if proc_info is not None and info is not None:
+                info.pid = proc_info.pid
+                info.rpyc_port = proc_info.rpyc_port
             if not await self.is_connected(name):
                 logger.debug(f"Attempting to reconnect to {name}")
                 supervise(
@@ -1595,14 +1905,14 @@ class AgentService:
     async def monitor_agents(self) -> None:
         """Event-driven agent-registry monitor.
 
-        Watches ``/tmp`` (the directory containing
-        ``deep_worker_registry.json``) via ``inotify`` + ``loop.add_reader``.
-        The registry file is rewritten atomically with ``write + rename``,
-        which we observe as ``IN_MOVED_TO`` / ``IN_CREATE`` on the parent
-        dir. On every such event we re-read the file and reconcile in
+        Watches the registry file directly (``IN_CLOSE_WRITE | IN_DELETE_SELF``)
+        and its parent directory for atomic renames (``IN_MOVED_TO`` only).
+        On every relevant event we re-read the file and reconcile in
         ``_reconcile_from_registry``.
 
         No ``asyncio.sleep``-polling, no periodic status RPC.
+        No wakeup on unrelated filesystem activity — the directory watch
+        is restricted to ``IN_MOVED_TO`` (rename) only.
 
         If inotify is unavailable (non-Linux), we fall back to a single
         long-period safety tick (``loop.call_later(60s)``) that just
@@ -1631,11 +1941,9 @@ class AgentService:
 
                 libc_name = ctypes.util.find_library("c")
                 libc = ctypes.CDLL(libc_name or "libc.so.6", use_errno=True)
-                IN_MOVED_TO = 0x00000080
-                IN_CREATE = 0x00000100
                 IN_CLOSE_WRITE = 0x00000008
-                IN_MODIFY = 0x00000002
-                IN_DELETE = 0x00000200
+                IN_MOVED_TO = 0x00000080
+                IN_DELETE_SELF = 0x00000400
                 O_NONBLOCK = os.O_NONBLOCK
 
                 inotify_init1 = libc.inotify_init1
@@ -1653,24 +1961,37 @@ class AgentService:
                 watch_dir = Path(registry_file).parent
                 watch_dir.mkdir(parents=True, exist_ok=True)
                 registry_basename = Path(registry_file).name.encode()
+                registry_tmp_basename = registry_basename + b".tmp"
 
                 fd = inotify_init1(O_NONBLOCK)
                 if fd < 0:
                     raise OSError(ctypes.get_errno(), "inotify_init1 failed")
-                mask = (
-                    IN_MOVED_TO | IN_CREATE | IN_CLOSE_WRITE | IN_MODIFY | IN_DELETE
-                )
-                wd = inotify_add_watch(fd, str(watch_dir).encode(), mask)
-                if wd < 0:
+
+                # Watch the directory for atomic rename (write .tmp → rename .json).
+                # Only IN_MOVED_TO — no IN_CREATE / IN_CLOSE_WRITE / IN_MODIFY / IN_DELETE,
+                # so we do NOT wake on every temp-file write in /tmp.
+                dir_wd = inotify_add_watch(fd, str(watch_dir).encode(), IN_MOVED_TO)
+                if dir_wd < 0:
                     os.close(fd)
-                    raise OSError(ctypes.get_errno(), "inotify_add_watch failed")
+                    raise OSError(ctypes.get_errno(), "inotify_add_watch(/tmp) failed")
+
+                # Watch the registry file directly for close-write (non-atomic write)
+                # and delete-self (inode replaced by atomic rename, triggers re-arm).
+                file_wd = inotify_add_watch(
+                    fd,
+                    str(registry_file).encode(),
+                    IN_CLOSE_WRITE | IN_DELETE_SELF,
+                )
+                # ENOENT means the file doesn't exist yet — that's OK,
+                # the dir watch will catch the first atomic rename.
+                _ENOENT = 2  # os.errno.ENOENT
+                if file_wd < 0 and ctypes.get_errno() != _ENOENT:
+                    os.close(fd)
+                    raise OSError(ctypes.get_errno(), "inotify_add_watch(registry.json) failed")
+
                 inotify_fd = fd
 
                 # Debounced reconcile: one pending reconcile at a time.
-                # Multiple inotify events (IN_CREATE + IN_MODIFY +
-                # IN_CLOSE_WRITE + IN_MOVED_TO arriving for the same
-                # ``write+rename`` atomic update) collapse into exactly
-                # one ``_reconcile_from_registry`` run.
                 reconcile_pending = False
                 reconcile_task: asyncio.Task[None] | None = None
 
@@ -1681,9 +2002,6 @@ class AgentService:
 
                 async def _debounced_reconcile() -> None:
                     nonlocal reconcile_pending, reconcile_task
-                    # Coalesce bursts: yield once so any further events
-                    # within the same tick set reconcile_pending=False
-                    # without scheduling a duplicate task.
                     await asyncio.sleep(0)
                     reconcile_pending = False
                     reconcile_task = None
@@ -1694,11 +2012,39 @@ class AgentService:
                             "Registry reconcile failed: %s", exc, exc_info=True
                         )
 
+                def _rearm_file_watch() -> None:
+                    """Re-arm the inotify watch on the registry file.
+
+                    After an atomic rename (write .tmp → rename .json) the old
+                    inode is gone and its watch fires IN_DELETE_SELF +
+                    IN_IGNORED.  We need a fresh watch on whatever inode the
+                    path points to now.
+                    """
+                    nonlocal file_wd
+                    try:
+                        new_wd = inotify_add_watch(
+                            inotify_fd,
+                            str(registry_file).encode(),
+                            IN_CLOSE_WRITE | IN_DELETE_SELF,
+                        )
+                        if new_wd >= 0:
+                            file_wd = new_wd
+                    except Exception:
+                        pass  # file may not exist yet; the dir watch covers it.
+
                 def _on_inotify_event() -> None:
-                    """Kernel says *something* changed in watch_dir. Filter
-                    events to only those on the registry file (+ its
-                    ``.tmp`` sibling used by atomic rename), then schedule
-                    a single debounced reconcile.
+                    """Kernel says something changed in watch_dir OR on the
+                    registry file itself.
+
+                    Two independent watches:
+                    * ``dir_wd`` — directory ``/tmp`` with ``IN_MOVED_TO``
+                      (atomic rename).
+                    * ``file_wd`` — the registry file itself with
+                      ``IN_CLOSE_WRITE | IN_DELETE_SELF`` (direct write or
+                      inode replaced).
+
+                    When ``file_wd`` fires ``IN_DELETE_SELF`` (inode unlinked
+                    by rename) we re-arm on the new inode.
 
                     CRITICAL: this is a ``loop.add_reader`` callback — if
                     it raises, asyncio removes the reader and the whole
@@ -1710,6 +2056,7 @@ class AgentService:
                     nonlocal reconcile_pending, reconcile_task
                     try:
                         matched = False
+                        rearm = False
                         try:
                             while True:
                                 try:
@@ -1726,15 +2073,30 @@ class AgentService:
                                         offset + _header.size : offset + _header.size + name_len
                                     ].rstrip(b"\x00")
                                     offset += _header.size + name_len
-                                    # We care about the registry file and the
-                                    # temp used by atomic write-rename.
-                                    if name == registry_basename or name == registry_basename + b".tmp":
+
+                                    # ── File watch (close-write / delete-self) ──
+                                    if _wd == file_wd:
+                                        if _mask & IN_CLOSE_WRITE:
+                                            matched = True
+                                        if _mask & IN_DELETE_SELF:
+                                            # Inode replaced by atomic rename —
+                                            # re-arm on the new inode.
+                                            rearm = True
+                                            matched = True
+                                        # File watches have no name field (name is empty).
+                                        continue
+
+                                    # ── Directory watch (IN_MOVED_TO) ──
+                                    if name == registry_basename or name == registry_tmp_basename:
                                         matched = True
                         except OSError:
                             # Expected on a torn-down fd; skip this tick.
                             return
                         if not matched:
                             return
+                        # Re-arm file watch if the old inode was replaced by rename.
+                        if rearm:
+                            _rearm_file_watch()
                         # Debounce — one task per burst.
                         if reconcile_pending:
                             return
@@ -1756,8 +2118,9 @@ class AgentService:
                 assert inotify_fd is not None
                 loop.add_reader(inotify_fd, _on_inotify_event)
                 logger.info(
-                    f"Inotify watcher installed on {watch_dir} "
-                    f"(fd={inotify_fd}, watching {registry_basename.decode()})"
+                    f"Inotify watcher installed: dir={watch_dir} (IN_MOVED_TO), "
+                    f"file={registry_basename.decode()} (IN_CLOSE_WRITE|IN_DELETE_SELF), "
+                    f"fd={inotify_fd}"
                 )
             except (OSError, AttributeError) as exc:
                 logger.warning(

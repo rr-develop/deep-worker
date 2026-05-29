@@ -63,9 +63,14 @@ def slow_tool_agent(request):
         def test_something(slow_tool_agent):
             # Will reuse existing agent if running, won't kill it
 
-    Working directory is /tmp to prevent junk files in the source tree.
+    Working directory is /tmp to prevent junk files in the repository tree.
+
+    Cleanup policy: passed → terminate, failed → preserve for debug.
+    The reuse marker is honoured first — a reused agent is treated as
+    pre-existing and never terminated.
     """
     from deep_worker_cli.process.registry import ProcessRegistry
+    from .conftest import register_test_agent
 
     agent_name = _SLOW_TOOL_AGENT_NAME
     agent_process = None
@@ -176,10 +181,20 @@ def slow_tool_agent(request):
             "Check that 'deep-worker' is installed and working."
         )
 
+    register_test_agent(agent_name, request.node, created_by_fixture=True)
+
     yield agent_name
 
-    # Teardown: kill agent
-    logger.info(f"Tearing down agent '{agent_name}'")
+    # Teardown: passed → terminate, failed → preserve.
+    rep_call = getattr(request.node, "rep_call", None)
+    if rep_call is not None and not rep_call.passed:
+        logger.warning(
+            f"Test FAILED → preserving agent '{agent_name}' for debugging. "
+            f"Connect with: dwcli {agent_name}"
+        )
+        return
+
+    logger.info(f"Test passed → terminating agent '{agent_name}'")
     if agent_process and agent_process.poll() is None:
         try:
             agent_process.terminate()

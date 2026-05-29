@@ -109,6 +109,22 @@ Do not initiate agent-to-agent conversations on your own, do not broadcast to mu
 
 **Result shape.** The tool returns a dict. On success: `{"success": true, "target_agent": "<name>", "delivered_content": "<you> -> <name> :> <message>"}`. On failure: `{"success": false, "error": "<code>", "message": "<explanation>"}`. Possible error codes: `invalid_argument`, `self_send_forbidden`, `agent_not_found`, `connection_failed`. The tool never raises — always check `success` in the returned dict.
 
+### restart_agent — Agent Restart Tool
+
+Restart or ensure a named deep-worker agent is running through the same lifecycle as `deep-worker --restart <agent_name>`.
+
+Signature: `restart_agent(agent_name)`.
+
+**Usage policy (IMPORTANT — follow strictly).** Do NOT use this tool by default. Use it ONLY when one of the following is true:
+
+1. The human user explicitly asks you to restart an agent.
+2. The human user explicitly asks you to ensure an agent is running.
+3. A documented or user-provided procedure explicitly requires a named agent to be in a running state.
+
+Do not use it for speculative cleanup, optimization, or autonomous process management. Never use it to restart yourself.
+
+**Result shape.** The tool returns a dict. `success=true` with `already_running=true` means the target was already alive and no restart was performed. Failures use structured `error` values such as `invalid_argument`, `self_restart_forbidden`, `command_unavailable`, `no_launch_config`, `actively_running`, `restart_failed`, or `restart_timeout`.
+
 ## Code References
 When referencing code, use format: `file_path:line_number`
 

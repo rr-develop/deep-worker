@@ -236,7 +236,42 @@ class TestAgentsAPIWithRealAgent:
         asyncio.run(service.shutdown())
 
     def test_concurrent_requests_to_agent(self, app: FastAPI) -> None:
-        """Test handling concurrent API requests to same agent."""
+        """Three concurrent API requests must multiplex over ONE RPyC connection.
+
+        Architectural rule this test pins (see
+        ``app/services/agent_service.py`` — ``CRITICAL ARCHITECTURAL
+        PRINCIPLES`` block, principle "ONE CONNECTION PER (CLIENT,
+        AGENT) PAIR"): a single ``AgentService`` instance MUST hold
+        at most one ``rpyc.Connection`` to any given agent. Parallel
+        API requests routed through this same service for the same
+        agent (``/``, ``/status``, ``/history``, ...) share that one
+        connection — RPyC supports many in-flight async calls per
+        connection, so duplicating connections from the same client
+        is forbidden.
+
+        The rule constrains only THIS client's behaviour — a
+        different ``AgentService`` instance (or any other RPyC
+        client) may legitimately connect to the same agent in
+        parallel; the agent's ``AsyncioServer`` is designed to
+        accept multiple distinct clients.
+
+        How the test enforces it:
+
+        * Open the connection up-front with one sequential warm-up
+          call (``GET /status``). After this call returns,
+          ``service._connections[name]`` holds the single
+          ``rpyc.Connection`` to the agent.
+        * Then fire the three concurrent ``GET``s through the same
+          ``AsyncClient``. Every handler hits the hot path of
+          ``connect_to_agent`` (``is_connected() == True``) and reuses
+          the existing connection. No second ``async_connect`` is
+          issued, no race against the agent's ``AsyncioServer``.
+
+        Do NOT remove the warm-up: without it the cold ``/status``
+        and cold ``/history`` handlers race in ``connect_to_agent``
+        and open two RPyC sessions to the same agent — exactly what
+        this test exists to forbid.
+        """
         with agent_fixture() as agent_info:
             registry = ProcessRegistry()
             service = AgentService(registry=registry)
@@ -247,7 +282,19 @@ class TestAgentsAPIWithRealAgent:
 
             async def run_test() -> None:
                 async with AsyncClient(transport=transport, base_url="http://test") as client:
-                    # Make multiple concurrent requests
+                    # Warm-up: open the ONE per-agent RPyC connection
+                    # before fanning out. See docstring for the rule
+                    # this enforces.
+                    warmup = await client.get(
+                        f"/api/agents/{agent_info.name}/status"
+                    )
+                    assert warmup.status_code == 200, (
+                        f"warm-up call must succeed before parallel "
+                        f"fan-out; got {warmup.status_code}"
+                    )
+
+                    # Now fan out — all three handlers must share the
+                    # single connection established by the warm-up.
                     tasks = [
                         client.get(f"/api/agents/{agent_info.name}"),
                         client.get(f"/api/agents/{agent_info.name}/status"),
@@ -259,6 +306,21 @@ class TestAgentsAPIWithRealAgent:
                     # All should succeed
                     for response in responses:
                         assert response.status_code == 200
+
+                    # Defence-in-depth: assert the service really has
+                    # exactly one connection for this agent — if a
+                    # future regression re-introduces duplicate
+                    # connections, this assertion catches it before
+                    # the flake comes back.
+                    assert agent_info.name in service._connections, (
+                        "warm-up did not register a connection for the agent"
+                    )
+                    # ``_connections`` is a dict keyed by agent name —
+                    # mere presence with that single key already
+                    # encodes the "one connection per agent"
+                    # invariant; assert the value is not None as a
+                    # sanity check.
+                    assert service._connections[agent_info.name] is not None
 
             asyncio.run(run_test())
             asyncio.run(service.shutdown())

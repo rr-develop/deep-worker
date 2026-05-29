@@ -1,11 +1,41 @@
 """Unit tests for AgentProcess checkpointer selection logic."""
 
 import asyncio
+import logging
 import pytest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch, ANY
 from deep_worker_cli.agent_config_pkg.agent_config import AgentConfig
 from deep_worker_cli.process.agent_process import AgentProcess
+
+
+@pytest.fixture(autouse=True)
+def _restore_package_logger():
+    """Isolate the global ``deep_worker_cli`` logger mutated by
+    ``AgentProcess.start()``.
+
+    ``AgentProcess.start()`` configures the real package logger
+    (``logging.getLogger("deep_worker_cli")``): it attaches a stderr
+    handler and raises the level to INFO so ``log_token_usage()`` output
+    is visible in a real agent process (see agent_process.py ~line 575).
+    That is correct PRODUCTION behaviour, but in-process tests that drive
+    ``start()`` leak it into the shared interpreter. Child loggers
+    (``deep_worker_cli.file_ops`` / ``.clipboard`` / ``.image_utils``)
+    then inherit the INFO effective level, and later tests that assert on
+    DEBUG-level records via ``caplog`` (e.g. test_exception_handling.py)
+    silently capture nothing and fail. Snapshot the level + handlers and
+    restore them after each test so the side effect cannot escape.
+    """
+    pkg_logger = logging.getLogger("deep_worker_cli")
+    saved_level = pkg_logger.level
+    saved_handlers = list(pkg_logger.handlers)
+    try:
+        yield
+    finally:
+        pkg_logger.setLevel(saved_level)
+        for handler in list(pkg_logger.handlers):
+            if handler not in saved_handlers:
+                pkg_logger.removeHandler(handler)
 
 
 async def _run_start_until_create_cli_agent(process: AgentProcess, mock_create) -> None:

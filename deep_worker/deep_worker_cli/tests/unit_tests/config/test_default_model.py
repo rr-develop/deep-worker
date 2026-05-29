@@ -18,7 +18,7 @@ class TestGetDefaultModelName:
     def test_deepseek_default(self):
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("DEEPSEEK_MODEL", None)
-            assert get_default_model_name("deepseek") == "deepseek-chat"
+            assert get_default_model_name("deepseek") == "deepseek-v4-flash"
 
     def test_deepseek_env_override(self):
         with patch.dict(os.environ, {"DEEPSEEK_MODEL": "deepseek-v3"}):

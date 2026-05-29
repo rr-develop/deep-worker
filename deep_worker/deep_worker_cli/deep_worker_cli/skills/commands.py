@@ -418,11 +418,14 @@ def _create(skill_name: str, agent: str, project: bool = False) -> None:
         return
 
     # Create skill directory
-    skill_dir.mkdir(parents=True, exist_ok=True)
+    from deep_worker_cli.storage_paths import ensure_private_dir, ensure_private_file
+
+    ensure_private_dir(skill_dir)
 
     template = _generate_template(skill_name)
     skill_md = skill_dir / "SKILL.md"
     skill_md.write_text(template)
+    ensure_private_file(skill_md)
 
     checkmark = get_glyphs().checkmark
     console.print(

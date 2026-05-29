@@ -672,9 +672,19 @@ def _spawn_subprocess(
         "python3", "-m", "deep_worker_cli.cli.agent_command",
         agent_name,
         "--provider", provider or config.get("provider", "deepseek"),
-        "--model", model or config.get("model", "unknown"),
         "--dir", config.get("working_dir", "."),
     ]
+    # Resolve the model: explicit arg wins, else the saved config value.
+    # ``"unknown"`` is the legacy poison sentinel — NEVER a real model —
+    # so treat it (and an empty/None value) as "no model specified" and
+    # omit ``--model`` entirely. The agent then picks its provider
+    # default (codex CLI chooses its own current default). Passing
+    # ``--model unknown`` is exactly what sent an agent to ERROR with a
+    # Codex HTTP 400 on every web restart (observed 2026-05-20).
+    resolved_model = model if model is not None else config.get("model")
+    if isinstance(resolved_model, str) and resolved_model.strip() and \
+            resolved_model.strip().lower() != "unknown":
+        cmd += ["--model", resolved_model]
     if config.get("skip_permissions"):
         cmd.append("-sp")
     if config.get("task_manager"):
@@ -686,28 +696,52 @@ def _spawn_subprocess(
     if clean:
         cmd.append("--clean")
 
-    # Tree-local PYTHONPATH: spawn agents using the SAME codebase the web
-    # server lives in. The production-tree web → prod agents, the dev-tree
-    # web → dev agents.  Hard-coding the prod path
-    # here used to silently spawn prod agents from the dev web server,
-    # defeating operational isolation.  See docs/DESIGN_DEV_FLAG.md.
+    # Which codebase to relaunch the agent on?
     #
-    # __file__ here =
-    #   deep_worker_web/app/routers/agents.py
-    # parent x3 =
-    #   <TREE>
-    _tree_root = Path(__file__).resolve().parent.parent.parent.parent
+    # The agent's ORIGINAL tree is authoritative, NOT the web server's. An
+    # agent launched with ``--dev`` (dev codebase) must be RESTARTED on the
+    # dev codebase even when the restart is driven by the PROD web UI (:7887),
+    # and vice-versa. We persist that choice as ``launch_config['dev_tree']``
+    # (build_launch_config), so honor it here. Previously this hard-coded the
+    # tree to the web server's OWN checkout (``__file__``), so restarting a
+    # ``--dev`` agent from the prod web UI silently dropped ``--dev`` and
+    # respawned it on prod — the bug this fixes (2026-05-23). It also meant the
+    # dev web server stamped DEEP_WORKER_DEV_TREE=1 onto EVERY agent it spawned,
+    # even non-dev ones. The CLI ``deep-worker --restart`` launcher already
+    # auto-detects dev_tree; this brings the web path in line. See
+    # docs/DESIGN_DEV_FLAG.md.
+    #
+    # __file__ here = <WEB_TREE>/<web-app-dir>/app/routers/agents.py;
+    # parent x4 = <WEB_TREE> — the fallback tree for non-dev agents (prod when
+    # the web server runs from the production tree).
+    _web_tree_root = Path(__file__).resolve().parent.parent.parent.parent
+    if config.get("dev_tree"):
+        # DEEP_WORKER_DEV_TREE_ROOT_OVERRIDE mirrors the bash launcher's
+        # testing hook so tests don't need a real dev tree on disk.
+        _tree_root = Path(
+            os.environ.get(
+                "DEEP_WORKER_DEV_TREE_ROOT_OVERRIDE", "/path/to/dev-tree"
+            )
+        )
+    else:
+        _tree_root = _web_tree_root
     env = os.environ.copy()
     env["PYTHONPATH"] = ":".join([
         str(_tree_root / "deep_worker" / "deep_worker_cli"),
         str(_tree_root / "deep_worker" / "deepagents"),
-        "rpyc_async",
+        "/path/to/rpyc_async",
     ])
     env["DEEP_WORKER_ORIGINAL_CWD"] = config.get("working_dir", ".")
-    # Mark the spawned agent as belonging to this tree.  build_launch_config
-    # reads DEEP_WORKER_DEV_TREE=1 to persist dev_tree in session_metadata.
-    if _tree_root == Path("/path/to/dev-tree"):
+    # Mark the spawned agent as a dev-tree agent iff it actually IS one (its
+    # persisted dev_tree), NOT merely because this web server runs from the
+    # dev checkout. build_launch_config reads DEEP_WORKER_DEV_TREE=1 to
+    # re-persist dev_tree across the restart. Setting it for a dev agent
+    # restarted from prod (and clearing any inherited marker for a non-dev
+    # agent) is what keeps dev_tree stable across restarts.
+    if config.get("dev_tree"):
         env["DEEP_WORKER_DEV_TREE"] = "1"
+    else:
+        env.pop("DEEP_WORKER_DEV_TREE", None)
     env["DEEP_WORKER_TREE_ROOT"] = str(_tree_root)
 
     logger.info(f"Spawning agent: {' '.join(cmd)}")

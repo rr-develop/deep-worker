@@ -148,3 +148,95 @@ def test_tm_row_hidden_when_agent_has_no_task_manager(page: Page) -> None:
         """() => handleAgentTerminated({type: 'agent_terminated',
                                          agent_name: 'test_no_tm'})"""
     )
+
+
+@pytest.mark.ui
+def test_tm_disable_persists_across_agent_reselect(page: Page) -> None:
+    """Regression (user report 2026-05-20): unchecking the TM box must
+    STICK when the user switches to another agent and back.
+
+    Before the fix, ``toggleTaskManager`` POSTed the new state but never
+    updated the local ``agents[name].task_manager_disabled`` cache; a
+    later ``selectAgent`` then re-read the stale cache and re-checked the
+    box. This test drives the exact UX flow through the real handlers:
+    select A → uncheck → select B → select A → assert box still
+    unchecked.
+    """
+    if not _server_is_up():
+        pytest.skip("deep_worker_web server not running on 127.0.0.1:7887")
+
+    page.goto(f"{BASE_URL}/static/index.html")
+    page.wait_for_function(
+        """() => {
+            const el = document.getElementById('agent-list');
+            return el && !(el.textContent || '').includes('Loading agents...');
+        }""",
+        timeout=10_000,
+    )
+
+    # Two synthetic agents, both WITH a TaskManager. Stub fetch so the
+    # toggle POST does not depend on a live RPyC agent.
+    page.evaluate(
+        """() => {
+            window.__origFetch = window.fetch;
+            window.fetch = async (url, opts) => {
+                if (String(url).includes('/task-manager/toggle')) {
+                    return { ok: true, json: async () => ({success: true}) };
+                }
+                return window.__origFetch(url, opts);
+            };
+            for (const nm of ['test_tm_persist_A', 'test_tm_persist_B']) {
+                handleAgentDiscovered({type: 'agent_discovered', agent: {
+                    name: nm, pid: 1, status: 'idle', provider: 'codex',
+                    model: 'gpt-5.5', rpyc_port: 1, working_dir: '/tmp',
+                    started_at: new Date().toISOString(),
+                    has_task_manager: true, task_manager_active: false,
+                    task_manager_disabled: false,
+                }});
+                handleAgentStatus({type: 'agent_status', agent_name: nm,
+                    status: 'idle', task_manager_active: false,
+                    task_manager_disabled: false});
+            }
+        }"""
+    )
+    page.wait_for_timeout(200)
+
+    # Select A; box starts checked (TM enabled).
+    page.evaluate("selectAgent('test_tm_persist_A')")
+    page.wait_for_timeout(150)
+    assert page.locator("#tm-enabled-checkbox").evaluate("el => el.checked") is True
+
+    # User unchecks → toggleTaskManager(false).
+    page.evaluate(
+        """() => {
+            const cb = document.getElementById('tm-enabled-checkbox');
+            cb.checked = false;
+            toggleTaskManager(false);
+        }"""
+    )
+    page.wait_for_timeout(200)
+
+    # Switch to B, then back to A.
+    page.evaluate("selectAgent('test_tm_persist_B')")
+    page.wait_for_timeout(150)
+    page.evaluate("selectAgent('test_tm_persist_A')")
+    page.wait_for_timeout(200)
+
+    # THE ASSERTION: the box must still be unchecked.
+    checked = page.locator("#tm-enabled-checkbox").evaluate("el => el.checked")
+    assert checked is False, (
+        "TM disable must persist across agent re-select; the box was "
+        "re-checked (the 2026-05-20 regression)"
+    )
+    # And the local cache must carry the disabled flag.
+    cached = page.evaluate("agents['test_tm_persist_A'].task_manager_disabled")
+    assert cached is True
+
+    # Cleanup synthetic agents + restore fetch.
+    page.evaluate(
+        """() => {
+            handleAgentTerminated({type:'agent_terminated', agent_name:'test_tm_persist_A'});
+            handleAgentTerminated({type:'agent_terminated', agent_name:'test_tm_persist_B'});
+            if (window.__origFetch) window.fetch = window.__origFetch;
+        }"""
+    )

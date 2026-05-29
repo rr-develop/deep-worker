@@ -48,10 +48,10 @@ logger = logging.getLogger(__name__)
 _AGENT_NAME = "test_tm_progress"
 
 _TEST_PROMPT = (
-    "A test. If you are asked to finish the task completely or partially, "
-    "then you must first answer that you have completed the task by 30% (and wait for the next request), "
-    "then by 50% (and wait for the next request), then by 70% (and wait for the next request) "
-    "and then that you have completed the task completely. Finish this test task."
+    "Test. If you are asked to complete a task fully or partially, "
+    "you must first reply that you completed the task at 30% (and wait for the next request), "
+    "then 50% (and wait for the next request), then 70% (and wait for the next request) "
+    "then that you completed the task fully. Complete this test task."
 )
 
 
@@ -61,18 +61,15 @@ _TEST_PROMPT = (
 
 
 @pytest.fixture
-def tm_progress_agent():
+def tm_progress_agent(request: pytest.FixtureRequest):
     """Start a fresh agent with TaskManager for progress tracking test.
 
-    This fixture:
-    1. Kills any existing agent with the test name
-    2. Cleans up data directories
-    3. Starts the agent with --skip-permissions and -tm flags
-    4. Waits for the agent to register
-    5. Yields the agent name
-    6. Kills the agent on teardown
+    Cleanup policy: passed → terminate, failed → preserve for debug.
+    The session-finish sweeper in ``conftest.py`` is the safety net for
+    cases where the yield-teardown never runs.
     """
     from deep_worker_cli.process.registry import ProcessRegistry
+    from .conftest import register_test_agent
 
     agent_name = _AGENT_NAME
     agent_process = None
@@ -139,11 +136,22 @@ def tm_progress_agent():
             "Check that 'deep-worker' is installed and working."
         )
 
+    # Register with session-finish sweeper (safety net for SIGKILL'd pytest).
+    register_test_agent(agent_name, request.node, created_by_fixture=True)
+
     # 5. Yield for test
     yield agent_name
 
-    # 6. Teardown
-    logger.info(f"Tearing down agent '{agent_name}'")
+    # 6. Teardown: passed → terminate, failed → preserve.
+    rep_call = getattr(request.node, "rep_call", None)
+    if rep_call is not None and not rep_call.passed:
+        logger.warning(
+            f"Test FAILED → preserving agent '{agent_name}' for debugging. "
+            f"Connect with: dwcli {agent_name}"
+        )
+        return
+
+    logger.info(f"Test passed → terminating agent '{agent_name}'")
     if agent_process and agent_process.poll() is None:
         try:
             agent_process.terminate()
@@ -262,7 +270,7 @@ ANSWER THESE QUESTIONS:
 1. Does the screenshot show progress at 30%? (Yes/No + quote)
 2. Does the screenshot show progress at 50%? (Yes/No + quote)
 3. Does the screenshot show progress at 70%? (Yes/No + quote)
-4. Does the screenshot show final completion (100% or "completely")? (Yes/No + quote)
+4. Does the screenshot show final completion (100% or "fully")? (Yes/No + quote)
 5. Does the screenshot show TaskManager corrective prompts ("TaskManager:>")? (Yes/No + count)
 6. Is the final completion message visible at the bottom of the screen? (Yes/No)
 
@@ -310,7 +318,7 @@ def _simple_text_analysis(screen_text: str) -> str:
     else:
         findings.append("✗ Missing 70% progress")
 
-    if "100%" in screen_text or "completely" in screen_text or "completed" in screen_text:
+    if "100%" in screen_text or "fully" in screen_text or "completed" in screen_text:
         findings.append("✓ Found completion (100%)")
     else:
         findings.append("✗ Missing completion marker")
@@ -337,7 +345,7 @@ def _is_progress_test_successful(analysis: str) -> bool:
 
     # Check for critical markers
     required_markers = ["30%", "50%", "70%"]
-    completion_markers = ["100%", "completely", "completed"]
+    completion_markers = ["100%", "fully", "completed"]
 
     has_all_progress = all(marker in analysis_lower for marker in required_markers)
     has_completion = any(marker in analysis_lower for marker in completion_markers)

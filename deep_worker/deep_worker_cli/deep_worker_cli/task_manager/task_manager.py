@@ -43,6 +43,26 @@ class TaskManager:
         - Background async task: Manager agent evaluates task completion
         - Communication: Direct async calls (no queues, no threads)
 
+    Manager bound tool set (all providers):
+        - ``web_search`` (universal ``web_search_delegation_tool``):
+          read-only web search via Claude Code SDK; no API key.
+        - ``fetch_url``: fetch a known URL and return its content as
+          markdown. Both are advertised by name in
+          ``TASK_MANAGER_SYSTEM_PROMPT`` so the model knows when to
+          reach for them.
+        - When ``config.provider == "codex"``: also the eight
+          ``codex_provider.native_tools.NATIVE_TOOLS`` passthrough
+          tools, so a native Codex tool call during a manager turn
+          does not crash it. See
+          ``codex_provider/docs/DESIGN_NATIVE_TOOL_PASSTHROUGH.md``.
+
+    Manager bound tool set deliberately omits:
+        - ``http_request`` (POST/PUT/DELETE — unnecessary write surface
+          for an evaluator).
+        - ``send_message_to_agent`` (autonomous peer messaging — outside
+          the evaluator role).
+        - ``read_image`` (not a web tool; image inspection out of scope).
+
     Example:
         >>> tm = TaskManager(agent_name="my_agent", config=config, session_manager=sm)
         >>> await tm.start()
@@ -196,9 +216,14 @@ class TaskManager:
             # Create model using same provider and model as subordinate agent.
             # This ensures TaskManager uses the same AI backend (e.g. claude-code)
             # as the main agent, not auto-detected DeepSeek.
+            # Pass user=f"{self.agent_name}:tm" for KV-cache isolation so the
+            # TaskManager thread does NOT share a cache with the main agent
+            # thread — they have different system prompts and conversation
+            # prefixes, so sharing the cache would cause mutual eviction.
             model = create_model(
                 provider=self.config.provider,
                 model_name=self.config.model,
+                user=f"{self.agent_name}:tm",
             )
 
             # Set working_dir on model for providers that need it (e.g. claude-code
@@ -211,6 +236,51 @@ class TaskManager:
             # Get project_memory_dir from config (required by create_cli_agent)
             project_memory_dir = Path(self.config.working_dir)
 
+            # ---- Web tools (all providers) ----
+            # The manager needs to verify factual claims the subordinate
+            # made and to read documentation/specs by URL when the
+            # subordinate's solution should match an external reference.
+            # Two read-only web tools are enough for that:
+            #
+            #   web_search_delegation_tool — universal web search via
+            #       Claude Code SDK; no extra API key required, works
+            #       with every provider.
+            #   fetch_url                  — fetch a known URL and
+            #       return its content as markdown.
+            #
+            # We deliberately omit ``http_request`` (supports POST/PUT/
+            # DELETE — unnecessary write surface for an evaluator role)
+            # and ``send_message_to_agent`` (would give the manager
+            # autonomous peer-to-peer agent messaging, outside its
+            # role). The TASK_MANAGER_SYSTEM_PROMPT advertises these
+            # tools by name so the model knows to use them when needed.
+            from deep_worker_cli.tools import (
+                fetch_url,
+                web_search_delegation_tool,
+            )
+            manager_tools: list[Any] = [
+                web_search_delegation_tool,
+                fetch_url,
+            ]
+
+            # ---- Provider-specific tool wiring (codex native passthrough) ----
+            # Mirrors the main-agent path in ``agent_process.py``: when
+            # the subordinate runs against Codex CLI, the manager runs
+            # against it too (same ``create_model`` call above), and the
+            # same set of native passthrough tools is required. Codex
+            # hard-codes a handful of native tools that no ``--disable``
+            # flag strips (``apply_patch``, ``update_plan``,
+            # ``view_image``, ``request_user_input``,
+            # ``list_mcp_resources*``). If the model invokes any of them
+            # in the manager turn and the matching BaseTool is not in
+            # the bound tool set, LangGraph's ToolNode raises
+            # ``Tool '<name>' not found`` and the manager turn dies.
+            # See codex_provider/docs/DESIGN_NATIVE_TOOL_PASSTHROUGH.md
+            # and ``deep_worker_cli/process/agent_process.py:475-477``.
+            if self.config.provider == "codex":
+                from codex_provider.native_tools import NATIVE_TOOLS
+                manager_tools.extend(NATIVE_TOOLS)
+
             # Create manager agent with TaskManager system prompt
             # CRITICAL: Use colon ':' not underscore '_' to avoid conflicts
             # with agent names that contain '_tm' suffix
@@ -218,6 +288,7 @@ class TaskManager:
                 model=model,
                 assistant_id=f"{self.agent_name}:tm",  # Colon separator
                 system_prompt=TASK_MANAGER_SYSTEM_PROMPT,
+                tools=manager_tools or None,
                 auto_approve=True,  # Manager doesn't need approvals
                 enable_memory=False,  # Manager doesn't need memory
                 enable_skills=False,  # Manager doesn't use skills
@@ -345,6 +416,12 @@ class TaskManager:
                 return f"TaskManager:> {message}"
 
         except Exception as e:
+            # Let a usage/session-limit error propagate (see
+            # _evaluate_with_manager): the agent must surface ERROR, not
+            # silently end the TaskManager loop. Incident observed 2026-05-21.
+            if type(e).__name__ == "ClaudeUsageLimitError":
+                self.state = 'inactive'
+                raise
             logger.exception(f"[TaskManager] Error during evaluation: {e}")
             self.state = 'inactive'
             return None
@@ -405,9 +482,25 @@ class TaskManager:
 
             logger.debug(f"[TaskManager] Manager agent responded with {len(content)} chars")
 
+            # Log token usage with cache info for DeepSeek monitoring
+            try:
+                from deep_worker_cli.utils import log_token_usage
+                last = messages[-1]
+                rm = getattr(last, 'response_metadata', None) or {}
+                log_token_usage(logger, f"{self.agent_name}:tm", rm, "tm")
+            except Exception:
+                pass
+
             return content
 
         except Exception as e:
+            # A usage/session-limit hit must NOT be swallowed into None — that
+            # made the evaluation fail silently and the agent settle to idle
+            # with no error (incident observed 2026-05-21). Let it propagate so the
+            # invoke path transitions the agent to ERROR with a clear message.
+            # Detected by class name to keep this module provider-agnostic.
+            if type(e).__name__ == "ClaudeUsageLimitError":
+                raise
             logger.exception(f"[TaskManager] Error invoking manager agent: {e}")
             return None
 

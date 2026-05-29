@@ -1,5 +1,7 @@
 """Callback handler for tracking agent status during tool execution."""
 
+import sys
+from datetime import UTC, datetime
 from typing import Any, Dict, List, Optional
 from uuid import UUID
 from langchain_core.callbacks import AsyncCallbackHandler
@@ -78,5 +80,12 @@ class StatusTrackingCallback(AsyncCallbackHandler):
             tags: Tags
             **kwargs: Additional arguments
         """
+        fields = [f"error={error}", f"run_id={run_id}"]
+        if parent_run_id is not None:
+            fields.append(f"parent_run_id={parent_run_id}")
+        print(
+            f"[{datetime.now(UTC).isoformat(timespec='microseconds')}] [TOOL_ERROR] {' '.join(fields)}",
+            file=sys.stderr,
+        )
         if self.session_manager:
             await self.session_manager.set_status(AgentStatus.ERROR)

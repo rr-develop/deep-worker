@@ -24,7 +24,6 @@ import asyncio
 import contextlib
 import logging
 import os
-import socket
 from typing import Any
 
 from codex_provider.custom_types import (
@@ -61,6 +60,9 @@ class ProxyMCPServer:
         self._host = host
         self._call_counter = 0
         self.pending_calls: dict[str, PendingCallInternal] = {}
+        self._pending_waiters: list[
+            tuple[asyncio.Future[None], str | None, dict[str, Any] | None]
+        ] = []
         # Per-PID server name so concurrent deep-worker agents don't
         # clobber each other in ``~/.codex/config.toml``.
         self.server_name = f"deepworker_{os.getpid()}"
@@ -106,6 +108,36 @@ class ProxyMCPServer:
             for call_id, info in self.pending_calls.items()
         ]
 
+    async def wait_for_pending_calls(
+        self,
+        *,
+        tool_name: str | None = None,
+        arguments: dict[str, Any] | None = None,
+        timeout: float = 30.0,
+    ) -> list[PendingCall]:
+        """Wait until a matching pending call exists, without polling.
+
+        ``CodexChatModel`` calls this after seeing ``item.started`` on the
+        Codex JSONL stream. The HTTP MCP handler may register the pending call
+        either before or after that stdout event. This method handles both
+        orders: return immediately for an existing match, otherwise park on a
+        Future that ``_handle_tool_call`` resolves when it creates a matching
+        pending call.
+        """
+        existing = self._matching_pending_calls(tool_name, arguments)
+        if existing:
+            return existing
+
+        fut = asyncio.get_running_loop().create_future()
+        waiter = (fut, tool_name, arguments)
+        self._pending_waiters.append(waiter)
+        try:
+            await asyncio.wait_for(fut, timeout=timeout)
+            return self._matching_pending_calls(tool_name, arguments)
+        finally:
+            with contextlib.suppress(ValueError):
+                self._pending_waiters.remove(waiter)
+
     def resolve_call(self, call_id: str, result: MCPResult) -> None:
         """Set the Future for ``call_id`` to ``result``. The awaiting MCP
         handler unblocks and returns the value to Codex CLI. Idempotent /
@@ -116,6 +148,39 @@ class ProxyMCPServer:
         fut = info["future"]
         if not fut.done():
             fut.set_result(result)
+
+    def _matching_pending_calls(
+        self,
+        tool_name: str | None,
+        arguments: dict[str, Any] | None,
+    ) -> list[PendingCall]:
+        out: list[PendingCall] = []
+        for call_id, info in self.pending_calls.items():
+            if tool_name is not None and info["name"] != tool_name:
+                continue
+            if arguments is not None and info["args"] != arguments:
+                continue
+            out.append({"id": call_id, "name": info["name"], "args": info["args"]})
+        return out
+
+    def _wake_matching_pending_waiters(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+    ) -> None:
+        for fut, wanted_tool, wanted_args in list(self._pending_waiters):
+            if fut.done():
+                continue
+            if wanted_tool is not None and wanted_tool != tool_name:
+                continue
+            if wanted_args is not None and wanted_args != arguments:
+                continue
+            fut.set_result(None)
+
+    def _wake_all_pending_waiters(self) -> None:
+        for fut, _wanted_tool, _wanted_args in list(self._pending_waiters):
+            if not fut.done():
+                fut.set_result(None)
 
     # ------------------------------------------------------------------
     # The actual tool handler — used both by the live MCP server and
@@ -135,6 +200,7 @@ class ProxyMCPServer:
 
         fut: asyncio.Future[MCPResult] = asyncio.get_event_loop().create_future()
         self.pending_calls[call_id] = {"future": fut, "name": tool_name, "args": args}
+        self._wake_matching_pending_waiters(tool_name, args)
 
         try:
             result = await asyncio.wait_for(fut, timeout=self._timeout)
@@ -150,10 +216,12 @@ class ProxyMCPServer:
         finally:
             self.pending_calls.pop(call_id, None)
 
-    # Test-only alias so tests can drive the handler without going through
-    # the HTTP transport. Production code path goes through ``_handle_call_tool``
-    # registered as MCP ``call_tool``.
-    async def _call_tool_for_test(
+    # Public test-only alias so tests can drive the handler without going
+    # through the HTTP transport. Production code path goes through
+    # ``_handle_tool_call`` registered as MCP ``call_tool``.
+    # (Public name avoids pyright's ``reportPrivateUsage`` in the test
+    # module; this is for tests only.)
+    async def call_tool_for_test(
         self, tool_name: str, args: dict[str, Any]
     ) -> list[dict[str, Any]]:
         return await self._handle_tool_call(tool_name, args)
@@ -207,32 +275,40 @@ class ProxyMCPServer:
         from starlette.applications import Starlette
         from starlette.routing import Mount
 
-        async def asgi_handler(scope, receive, send):  # noqa: ANN001
+        # ASGI handler signature: ``(scope, receive, send)`` where each
+        # is a callable / mapping per the ASGI spec. We re-export them
+        # as ``Any`` because the typing surface for ASGI is awkward
+        # (per-protocol scope dicts, async-callable typing differences)
+        # and we don't add value pinning it strictly here.
+        async def asgi_handler(scope: Any, receive: Any, send: Any) -> None:
             await session_manager.handle_request(scope, receive, send)
 
         starlette_app = Starlette(
             routes=[Mount("/mcp", app=asgi_handler)],
         )
 
-        # Pick a free port deterministically (bind 0, read assigned, release).
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.bind((self._host, 0))
-        self._port = sock.getsockname()[1]
-        sock.close()
-
         # Spawn uvicorn as an asyncio task — in-process, no external
-        # subprocess.
+        # subprocess. Use port=0 so the OS atomically allocates a free port;
+        # after startup we read the actual bound port from uvicorn's server.
         import uvicorn
+
+        started_event = asyncio.Event()
+
+        class _StartedServer(uvicorn.Server):
+            async def startup(self, sockets: Any = None) -> None:
+                await super().startup(sockets=sockets)
+                if self.started:
+                    started_event.set()
 
         config = uvicorn.Config(
             app=starlette_app,
             host=self._host,
-            port=self._port,
+            port=0,
             log_level="warning",
             access_log=False,
             lifespan="off",  # we manage session_manager lifespan ourselves
         )
-        self._uvicorn_server = uvicorn.Server(config)
+        self._uvicorn_server = _StartedServer(config)
 
         # The session manager itself is an async context manager; we
         # enter it for the lifetime of the server.
@@ -243,12 +319,30 @@ class ProxyMCPServer:
             self._uvicorn_server.serve(), name=f"proxy-mcp-{self.server_name}"
         )
 
-        # Wait briefly until uvicorn signals it is ready. Uvicorn sets
-        # ``started`` on its Server object once the listener is bound.
-        for _ in range(50):  # up to 5 seconds, in 100ms slices
-            if getattr(self._uvicorn_server, "started", False):
-                break
-            await asyncio.sleep(0.1)
+        # Event-driven readiness wait: no sleep-loop. Either uvicorn startup
+        # sets the event, the server task exits early, or we time out.
+        started_waiter = asyncio.create_task(started_event.wait())
+        try:
+            done, _pending = await asyncio.wait(
+                {started_waiter, self._server_task},
+                timeout=5.0,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if started_waiter not in done:
+                if self._server_task in done:
+                    await self._server_task
+                    raise RuntimeError("ProxyMCPServer uvicorn task exited before startup")
+                raise TimeoutError("ProxyMCPServer uvicorn startup timed out")
+        finally:
+            started_waiter.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await started_waiter
+
+        servers = getattr(self._uvicorn_server, "servers", None) or []
+        sockets = getattr(servers[0], "sockets", None) if servers else None
+        if not sockets:
+            raise RuntimeError("ProxyMCPServer could not determine uvicorn port")
+        self._port = int(sockets[0].getsockname()[1])
 
     async def stop(self) -> None:
         """Stop the listener; cancel any pending Futures with a timeout
@@ -257,7 +351,7 @@ class ProxyMCPServer:
             return
         # Resolve all pending Futures with a "server stopping" message so
         # awaiting handlers don't leak.
-        for call_id, info in list(self.pending_calls.items()):
+        for _call_id, info in list(self.pending_calls.items()):
             fut = info["future"]
             if not fut.done():
                 fut.set_result({
@@ -265,6 +359,7 @@ class ProxyMCPServer:
                     "is_error": True,
                 })
         self.pending_calls.clear()
+        self._wake_all_pending_waiters()
 
         # Ask uvicorn to exit
         if self._uvicorn_server is not None:
@@ -291,7 +386,9 @@ class ProxyMCPServer:
 # ---------------------------------------------------------------------------
 # Process-global singleton accessor
 # ---------------------------------------------------------------------------
-_GLOBAL_PROXY: ProxyMCPServer | None = None
+# Lowercase module-private name — pyright treats ALL_CAPS as ``Final``
+# and refuses reassignment, but we need lazy construction.
+_global_proxy: ProxyMCPServer | None = None
 
 
 def get_global_proxy_mcp_server(
@@ -304,9 +401,9 @@ def get_global_proxy_mcp_server(
     module scope. If ``tools_metadata`` is provided, the proxy's tool
     set is hot-swapped to that list (no restart).
     """
-    global _GLOBAL_PROXY
-    if _GLOBAL_PROXY is None:
-        _GLOBAL_PROXY = ProxyMCPServer(tools_metadata or [])
+    global _global_proxy
+    if _global_proxy is None:
+        _global_proxy = ProxyMCPServer(tools_metadata or [])
     elif tools_metadata is not None:
-        _GLOBAL_PROXY.update_tools(tools_metadata)
-    return _GLOBAL_PROXY
+        _global_proxy.update_tools(tools_metadata)
+    return _global_proxy

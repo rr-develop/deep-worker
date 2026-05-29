@@ -172,9 +172,33 @@ class TestAgentServiceMessageNotification:
         """
         Verify _notify_subscribers sends message to all subscribers.
 
-        This is the correct place for notifications - called from _handle_invoke
-        via notify_callback to broadcast ALL messages to ALL clients.
+        This is the correct place for notifications — called from
+        ``_handle_invoke`` via ``notify_callback`` to broadcast ALL
+        messages to ALL clients.
+
+        Production wire contract (see agent_service.py:1201-1219):
+
+        - ``_notify_subscribers`` JSON-serialises the message dict ONCE
+          on the agent side via ``json.dumps(message, default=str)``,
+          then ``await subscriber.on_message(payload_str)`` — the
+          subscriber receives a plain JSON string and does
+          ``json.loads`` on its side. This avoids RPyC netref
+          traversal, ``sync_request()`` from the subscriber's async
+          loop, and remote-object leaks (see
+          docs/DESIGN_AGENT_SERVICE_MEMORY_FIX.md F2).
+
+        Test therefore asserts:
+        1. ``on_message`` is called exactly once per subscriber.
+        2. The argument is the JSON-serialised string, NOT the
+           original dict.
+
+        ``on_message`` must be an ``AsyncMock`` so ``await
+        subscriber.on_message(...)`` resolves cleanly — using
+        ``MagicMock`` for it makes ``await`` raise "MagicMock can't
+        be used in 'await' expression" inside the production code's
+        try/except, which would silently swallow the call.
         """
+        import json
         from deep_worker_cli.rpyc_service.agent_service import AgentService
 
         service = AgentService()
@@ -187,7 +211,9 @@ class TestAgentServiceMessageNotification:
         # across connections) — see agent_service.py ~line 521/1069.
         # We inject a stub AgentProcess carrying a set.
         mock_sub1 = MagicMock()
+        mock_sub1.on_message = AsyncMock()
         mock_sub2 = MagicMock()
+        mock_sub2.on_message = AsyncMock()
 
         stub_agent_process = MagicMock()
         stub_agent_process._message_subscribers = {mock_sub1, mock_sub2}
@@ -197,9 +223,13 @@ class TestAgentServiceMessageNotification:
         test_message = {"type": "user", "content": "Test", "role": "user"}
         await service._notify_subscribers(test_message)
 
-        # Verify all subscribers received message
-        mock_sub1.on_message.assert_called_once_with(test_message)
-        mock_sub2.on_message.assert_called_once_with(test_message)
+        # Production JSON-serialises the message dict ONCE before
+        # dispatching to every subscriber.
+        expected_payload = json.dumps(test_message, default=str)
+
+        # Verify all subscribers received the JSON payload exactly once.
+        mock_sub1.on_message.assert_called_once_with(expected_payload)
+        mock_sub2.on_message.assert_called_once_with(expected_payload)
 
 
 class TestArchitecturePrinciple:

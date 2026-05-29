@@ -420,11 +420,13 @@ PROVIDER_CONTEXT_LIMITS: dict[str, int] = {
     "claude-3-sonnet": 200_000,
     "claude-3-haiku": 200_000,
     # DeepSeek models
-    "deepseek-chat": 128_000,  # V3.2 API
-    "deepseek-reasoner": 128_000,  # V3.2 API
+    "deepseek-chat": 128_000,  # V3.2 API (legacy alias)
+    "deepseek-reasoner": 128_000,  # V3.2 API (legacy alias)
     "deepseek-v3": 128_000,
     "deepseek-v3.1": 128_000,
     "deepseek-v3.2": 128_000,
+    "deepseek-v4-flash": 1_000_000,  # 1M context
+    "deepseek-v4-pro": 1_000_000,  # 1M context
     "deepseek-coder-v2": 128_000,
     "deepseek-r1": 64_000,  # R1 has smaller context
     # OpenAI models
@@ -836,10 +838,10 @@ class Settings:
 
     @property
     def user_deepagents_dir(self) -> Path:
-        """Get the base user-level .deepagents directory.
+        """Get the base user-level data directory.
 
         Returns:
-            Path to ~/.deepagents
+            Path to the user-level data directory
         """
         return Path.home() / ".deepagents"
 
@@ -853,9 +855,12 @@ class Settings:
             agent_name: Name of the agent
 
         Returns:
-            Path to ~/.deepagents/{agent_name}/AGENTS.md
+            Path to the agent data AGENTS.md file. For storage v3 this is
+            the AGENTS.md file under the agent's data directory; legacy v2
+            agents keep using the AGENTS.md file in the agent root directory.
         """
-        return Path.home() / ".deepagents" / agent_name / "AGENTS.md"
+        from deep_worker_cli.storage_paths import deepagents_data_dir
+        return deepagents_data_dir(agent_name, create=False) / "AGENTS.md"
 
     def get_project_agent_md_path(self) -> Path | None:
         """Get project-level AGENTS.md path.
@@ -889,7 +894,9 @@ class Settings:
             agent_name: Name of the agent
 
         Returns:
-            Path to ~/.deepagents/{agent_name}
+            Path to the agent data directory. For storage v3 this is
+            the data subdirectory under the agent's data directory; legacy
+            v2 agents keep using the agent root directory.
 
         Raises:
             ValueError: If the agent name contains invalid characters.
@@ -900,7 +907,8 @@ class Settings:
                 "contain letters, numbers, hyphens, underscores, colons, and spaces."
             )
             raise ValueError(msg)
-        return Path.home() / ".deepagents" / agent_name
+        from deep_worker_cli.storage_paths import deepagents_data_dir
+        return deepagents_data_dir(agent_name, create=False)
 
     def ensure_agent_dir(self, agent_name: str) -> Path:
         """Ensure the global agent directory exists and return its path.
@@ -909,7 +917,9 @@ class Settings:
             agent_name: Name of the agent
 
         Returns:
-            Path to ~/.deepagents/{agent_name}
+            Path to the agent data directory. For storage v3 this is
+            the data subdirectory under the agent's data directory; legacy
+            v2 agents keep using the agent root directory.
 
         Raises:
             ValueError: If the agent name contains invalid characters.
@@ -920,8 +930,8 @@ class Settings:
                 "contain letters, numbers, hyphens, underscores, colons, and spaces."
             )
             raise ValueError(msg)
-        agent_dir = self.get_agent_dir(agent_name)
-        agent_dir.mkdir(parents=True, exist_ok=True)
+        from deep_worker_cli.storage_paths import deepagents_data_dir
+        agent_dir = deepagents_data_dir(agent_name, create=True)
         return agent_dir
 
     def ensure_project_deepagents_dir(self) -> Path | None:
@@ -944,7 +954,7 @@ class Settings:
             agent_name: Name of the agent
 
         Returns:
-            Path to ~/.deepagents/{agent_name}/skills/
+            Path to the user-level skills directory for the agent
         """
         return self.get_agent_dir(agent_name) / "skills"
 
@@ -955,11 +965,12 @@ class Settings:
             agent_name: Name of the agent
 
         Returns:
-            Path to ~/.deepagents/{agent_name}/skills/
+            Path to the user-level skills directory for the agent
         """
-        skills_dir = self.get_user_skills_dir(agent_name)
-        skills_dir.mkdir(parents=True, exist_ok=True)
-        return skills_dir
+        from deep_worker_cli.storage_paths import deepagents_data_dir, ensure_private_dir
+
+        agent_dir = deepagents_data_dir(agent_name, create=True)
+        return ensure_private_dir(agent_dir / "skills")
 
     def get_project_skills_dir(self) -> Path | None:
         """Get project-level skills directory path.
@@ -992,7 +1003,7 @@ class Settings:
             agent_name: Name of the CLI agent (e.g., "deepagents")
 
         Returns:
-            Path to ~/.deepagents/{agent_name}/agents/
+            Path to the user-level agents directory for the agent
         """
         return self.get_agent_dir(agent_name) / "agents"
 
@@ -1371,7 +1382,7 @@ def _detect_provider(model_name: str) -> str | None:
 # Provider → (env_var, hardcoded_default) mapping.
 # Single source of truth for default model names.
 _PROVIDER_DEFAULT_MODELS: dict[str, tuple[str | None, str | None]] = {
-    "deepseek": ("DEEPSEEK_MODEL", "deepseek-chat"),
+    "deepseek": ("DEEPSEEK_MODEL", "deepseek-v4-flash"),
     "openai": ("OPENAI_MODEL", "gpt-5.2"),
     "anthropic": ("ANTHROPIC_MODEL", "claude-sonnet-4-5-20250929"),
     "google": ("GOOGLE_MODEL", "gemini-3-pro-preview"),
@@ -1411,6 +1422,7 @@ def create_model(
     *,
     provider: str | None = None,
     model_name: str | None = None,
+    user: str | None = None,
 ) -> BaseChatModel:
     """Create the appropriate model based on provider and model name.
 
@@ -1421,6 +1433,11 @@ def create_model(
                  If None, auto-detects based on available API keys or model name.
         model_name: Model name (e.g., "deepseek-chat", "gpt-4o", "sonnet", "haiku", "opus")
                    If None, uses environment variable or provider default.
+        user: Optional user identifier for API-level KV-cache isolation
+              (e.g. DeepSeek's ``user_id``). Passed via ``model_kwargs``.
+              When set, different users get separate KV caches so that
+              concurrent agents do not evict each other's prefixed cache
+              entries. See DESIGN_CACHE_USER_ID_AND_MODEL_UPDATE.md.
 
     Returns:
         ChatModel instance (OpenAI, Anthropic, Google, or ClaudeCode)
@@ -1528,19 +1545,18 @@ def create_model(
     # DO NOT CHANGE THE PROVIDER PRIORITY ORDER!
     # DO NOT REMOVE THE has_deepseek CHECK!
     #
-    # This code is used by the OLD entry point main.py (python3 -m deep_worker_cli.main),
-    # which must NOT be used for testing or production!
+    # This code is used by the OLD main.py entry point (python3 -m deep_worker_cli.main)
+    # which MUST NOT be used for testing or production!
     #
-    # The ONLY CORRECT way to launch:
+    # THE ONLY CORRECT way to launch:
     # ✅ deep-worker [agent-name]  - the command installed by the package entry point
     #
-    # INCORRECT (DO NOT USE):
+    # WRONG (DO NOT USE):
     # ❌ python3 -m deep_worker_cli.main
     # ❌ python3 -m deep_worker_cli.cli.main
     #
-    # The deep-worker command uses agent_command.py, which explicitly sets
-    # provider="deepseek" by default, so it now PASSES the provider explicitly
-    # to create_model().
+    # The deep-worker command uses agent_command.py which explicitly sets provider="deepseek"
+    # by default, so it now PASSES the provider explicitly to create_model().
     #
     # See: DEEPSEEK_PROVIDER.md for details
     # ============================================================================
@@ -1584,14 +1600,43 @@ def create_model(
     # Create the model
     model: BaseChatModel
     if provider == "deepseek":
-        # Deepseek uses OpenAI-compatible API
-        from langchain_openai import ChatOpenAI
+        # ⚠️ Use ChatDeepSeek, NOT a bare ChatOpenAI.
+        #
+        # The default deepseek model (deepseek-v4-flash) is a THINKING /
+        # reasoning model: it returns ``reasoning_content`` alongside
+        # ``content``, and DeepSeek's API REQUIRES that ``reasoning_content``
+        # be passed BACK on every subsequent turn. A plain ``ChatOpenAI`` does
+        # not understand that non-standard field, so it dropped it on the
+        # round-trip and the next call was rejected with:
+        #   400 - "The `reasoning_content` in the thinking mode must be passed
+        #          back to the API."
+        # → the agent crashed to ERROR (incident observed 2026-05-22). We use
+        # ``ReasoningChatDeepSeek`` (subclass of ``langchain_deepseek``'s
+        # ``ChatDeepSeek``): ChatDeepSeek READS reasoning_content inbound but
+        # its 1.0.1 ``_get_request_payload`` does NOT re-send it outbound, so
+        # the 400 still fired on multi-step turns. Our subclass re-injects
+        # reasoning_content onto outgoing assistant messages, closing the loop.
+        # DO NOT revert to bare ChatDeepSeek (let alone ChatOpenAI) until the
+        # upstream library re-sends reasoning_content itself.
+        from deep_worker_cli.deepseek_model import ReasoningChatDeepSeek
 
-        model = ChatOpenAI(
-            model=model_name,
-            base_url="https://api.deepseek.com",
-            api_key=settings.deepseek_api_key,
-        )
+        ds_kwargs: dict[str, Any] = {
+            "model": model_name,
+            "api_base": "https://api.deepseek.com",
+            "api_key": settings.deepseek_api_key,
+        }
+        if user is not None:
+            # Pass user_id for KV-cache isolation (DeepSeek API).
+            # Different values (e.g. "agent_name" vs "agent_name:tm")
+            # get separate caches so concurrent threads don't evict
+            # each other's prefix-cache entries.
+            #
+            # NOTE: only set model_kwargs when there IS a user — ChatDeepSeek
+            # rejects ``model_kwargs=None`` (it iterates the dict), unlike the
+            # old ChatOpenAI path which tolerated None.
+            ds_kwargs["model_kwargs"] = {"user": user}
+
+        model = ReasoningChatDeepSeek(**ds_kwargs)
     elif provider == "openai":
         from langchain_openai import ChatOpenAI
 
@@ -1655,7 +1700,7 @@ def create_model(
         # ============================================================================
         # CRITICAL: CLAUDE_CODE_PROVIDER MUST BE IMPORTED FROM SOURCE CODE!
         # ============================================================================
-        # Import claude_code_provider from the local source tree.
+        # Import claude_code_provider from the repository root (this project)
         # This is a local package that provides LangChain wrapper for Claude Code SDK
         # ============================================================================
         _repo_root = Path(__file__).parent.parent.parent.parent

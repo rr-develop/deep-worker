@@ -22,6 +22,7 @@ from deepagents.backends import StateBackend
 from deepagents.backends.protocol import BackendFactory, BackendProtocol
 from deepagents.middleware.filesystem import FilesystemMiddleware
 from deepagents.middleware.memory import MemoryMiddleware
+from deepagents.middleware.message_timestamps import MessageTimestampMiddleware
 from deepagents.middleware.patch_tool_calls import PatchToolCallsMiddleware
 from deepagents.middleware.skills import SkillsMiddleware
 from deepagents.middleware.subagents import (
@@ -175,6 +176,7 @@ def create_deep_agent(
     gp_middleware: list[AgentMiddleware[Any, Any, Any]] = [
         TodoListMiddleware(),
         FilesystemMiddleware(backend=backend),
+        MessageTimestampMiddleware(),
         SummarizationMiddleware(
             model=model,
             backend=backend,
@@ -217,6 +219,7 @@ def create_deep_agent(
             subagent_middleware: list[AgentMiddleware[Any, Any, Any]] = [
                 TodoListMiddleware(),
                 FilesystemMiddleware(backend=backend),
+                MessageTimestampMiddleware(),
                 SummarizationMiddleware(
                     model=subagent_model,
                     backend=backend,
@@ -257,6 +260,7 @@ def create_deep_agent(
     deepagent_middleware.extend(
         [
             FilesystemMiddleware(backend=backend),
+            MessageTimestampMiddleware(),
             SubAgentMiddleware(
                 backend=backend,
                 subagents=all_subagents,

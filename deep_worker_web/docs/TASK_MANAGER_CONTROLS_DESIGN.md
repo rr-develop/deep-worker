@@ -355,7 +355,7 @@ async function resetTaskManager() {
 │                                                          │
 │  ☑ TaskManager   [🔄 Reset TM]                          │
 │                                                          │
-│  Provider: deepseek  Model: deepseek-chat                │
+│  Provider: deepseek  Model: deepseek-v4-flash                │
 ├─────────────────────────────────────────────────────────┤
 │ Last Response / Approval Panel / etc.                    │
 └─────────────────────────────────────────────────────────┘

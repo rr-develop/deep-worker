@@ -26,6 +26,7 @@ class TestAgentStatus:
         assert AgentStatus.RUNNING == "running"
         assert AgentStatus.WAITING_INPUT == "waiting_input"
         assert AgentStatus.WAITING_APPROVAL == "waiting_approval"
+        assert AgentStatus.INTERRUPTED == "interrupted"
         assert AgentStatus.ERROR == "error"
         assert AgentStatus.SHUTDOWN == "shutdown"
 

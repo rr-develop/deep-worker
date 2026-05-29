@@ -20,31 +20,44 @@ from deep_worker_cli.sessions import _migrate_from_global_db, get_db_path
 class TestPerAgentDb:
     """Verify that get_db_path returns per-agent paths."""
 
-    def test_get_db_path_with_agent_name(self) -> None:
+    def test_get_db_path_with_agent_name(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """get_db_path(agent_name) must return agent-specific path."""
-        path = get_db_path(agent_name="demo_site")
-        assert path.name == "sessions_demo_site.db", (
-            f"Expected sessions_demo_site.db, got {path.name}"
+        monkeypatch.setenv("HOME", str(tmp_path))
+        path = get_db_path(agent_name="agent_a")
+        assert path.name == "threads.db", (
+            f"Expected threads.db, got {path.name}"
         )
 
-    def test_get_db_path_different_agents_different_files(self) -> None:
+    def test_get_db_path_different_agents_different_files(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """Different agents must get different DB files."""
+        monkeypatch.setenv("HOME", str(tmp_path))
         path_a = get_db_path(agent_name="agent_a")
         path_b = get_db_path(agent_name="agent_b")
         assert path_a != path_b
-        assert "agent_a" in path_a.name
-        assert "agent_b" in path_b.name
+        assert "agent_a" in str(path_a)
+        assert "agent_b" in str(path_b)
 
-    def test_get_db_path_without_agent_name_returns_global(self) -> None:
+    def test_get_db_path_without_agent_name_returns_global(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """Backward compat: no agent_name returns the global sessions.db."""
+        monkeypatch.setenv("HOME", str(tmp_path))
         path = get_db_path()
         assert path.name == "sessions.db"
 
-    def test_get_db_path_same_directory(self) -> None:
-        """All DB files should be in the same directory."""
+    def test_get_db_path_same_directory(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Global legacy and v3 agent DB files use different roots."""
+        monkeypatch.setenv("HOME", str(tmp_path))
         global_path = get_db_path()
         agent_path = get_db_path(agent_name="test_agent")
-        assert global_path.parent == agent_path.parent
+        assert global_path.parent.name == ".deepagents"
+        assert agent_path.parent.name == "test_agent"
 
 
 class TestMigrateFromGlobalDb:

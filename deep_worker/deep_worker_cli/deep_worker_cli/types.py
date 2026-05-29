@@ -8,11 +8,33 @@ from typing import Any
 
 
 class AgentStatus(str, Enum):
-    """Status of an agent process."""
+    """Status of an agent process.
+
+    Values:
+        IDLE          — Turn finished cleanly, agent ready for the next
+                        user message.
+        RUNNING       — Agent actively processing a turn (LLM thinking
+                        or LangGraph routing between nodes).
+        WAITING_INPUT — Inside a running turn, currently awaiting a
+                        tool's output. Despite the name, this is NOT
+                        "waiting for the user" — it is "waiting for an
+                        in-flight tool to return". (Set by
+                        ``StatusTrackingCallback.on_tool_start``.)
+        INTERRUPTED   — User cancelled the current turn via the
+                        Interrupt control. Agent is alive and waiting
+                        for the user's next message — typically a
+                        correction. Distinct from WAITING_INPUT so the
+                        UI can render it in a "needs user attention"
+                        colour. (Set by ``AgentProcess._handle_invoke``
+                        in the ``except asyncio.CancelledError`` branch.)
+        ERROR         — Agent invocation failed; ``error_message`` set.
+        SHUTDOWN      — Agent process is shutting down or has shut down.
+    """
 
     IDLE = "idle"
     RUNNING = "running"
     WAITING_INPUT = "waiting_input"
+    INTERRUPTED = "interrupted"
     ERROR = "error"
     SHUTDOWN = "shutdown"
 

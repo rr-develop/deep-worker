@@ -11,6 +11,22 @@ from pathlib import Path
 from deep_worker_cli.agent_config_pkg.agent_config import AgentConfig
 from deep_worker_cli.process.agent_process import AgentProcess
 
+# Claude-session import (DESIGN_IMPORT_CLAUDE_SESSION.md). The provider lives at
+# <repo-root>/claude_code_provider/ and is NOT importable until the repo root is
+# on sys.path — exactly the bootstrap ``tools.py`` does for web_search. A plain
+# top-level ``from claude_code_provider...`` import here breaks EVERY invocation
+# of ``deep-worker`` (even ``--help``), because the CLI module is imported
+# before any sys.path setup runs. Add the repo root first, THEN import, so the
+# names exist as module globals (tests patch
+# ``agent_command.parse_claude_transcript`` / ``resolve_transcript_path``).
+_repo_root = Path(__file__).resolve().parents[4]  # .../<repo>/  (cli→cli_pkg→pkg→deep_worker→repo)
+if (_repo_root / "claude_code_provider").exists() and str(_repo_root) not in sys.path:
+    sys.path.insert(0, str(_repo_root))
+from claude_code_provider.session_import import (  # noqa: E402
+    parse_claude_transcript,
+    resolve_transcript_path,
+)
+
 
 # ---------------------------------------------------------------------------
 # Restart helpers
@@ -30,6 +46,29 @@ _PARSER_DEFAULTS = {
     "auto_approve_send_message": False,
     "dev_tree": False,
 }
+
+
+def normalize_model_arg(args: argparse.Namespace) -> None:
+    """Treat an explicit ``--model unknown`` as 'no model specified'.
+
+    ``"unknown"`` was never a real model name — it was the sentinel an
+    older build wrote when a provider had no default (codex). That
+    string leaked into ``cli_args`` / ``session_metadata.json`` and got
+    replayed verbatim as a real ``--model unknown`` on relaunch
+    (notably by the web restart path, which copies the saved model into
+    the spawn command line). Codex then rejected it with HTTP 400.
+
+    Normalising it to ``None`` at the single CLI chokepoint — right
+    after ``parse_args`` — covers every launch path (direct,
+    ``--restart``, web-spawned) so the provider default kicks back in.
+    Case-insensitive and defensive against a namespace with no
+    ``model`` attribute.
+
+    Mutates ``args`` in place; returns nothing.
+    """
+    model = getattr(args, "model", None)
+    if isinstance(model, str) and model.strip().lower() == "unknown":
+        args.model = None
 
 
 def _get_agent_data_dir(name: str) -> Path:
@@ -56,29 +95,99 @@ def load_launch_config(name: str) -> dict | None:
         return None
 
 
+def _explicit_cli_flags(argv: list[str] | None = None) -> set[str]:
+    """Return the set of dest-names that were EXPLICITLY passed on the CLI.
+
+    Override detection cannot rely on "value differs from the parser
+    default": the parser default for ``--provider`` is ``"deepseek"``, so a
+    user who runs ``--restart a --provider deepseek`` produces a value that
+    equals the default and would be mistaken for "flag not passed" — the
+    saved provider would silently win (incident observed 2026-05-29).
+
+    To detect presence reliably we re-parse ``argv`` with a throwaway parser
+    whose options default to ``argparse.SUPPRESS``. With SUPPRESS, a dest only
+    appears in the namespace when the flag was actually given, so the set of
+    present attributes IS the set of explicit overrides — independent of the
+    value. ``argv`` defaults to ``sys.argv[1:]`` (the real invocation).
+    """
+    if argv is None:
+        argv = sys.argv[1:]
+
+    detector = argparse.ArgumentParser(add_help=False)
+    detector.add_argument("name", nargs="?", default=argparse.SUPPRESS)
+    detector.add_argument("--provider", default=argparse.SUPPRESS)
+    detector.add_argument("--model", default=argparse.SUPPRESS)
+    detector.add_argument("--dir", default=argparse.SUPPRESS)
+    detector.add_argument("-sp", "--skip-permissions", dest="skip_permissions",
+                          action="store_true", default=argparse.SUPPRESS)
+    detector.add_argument("-tm", "--task-manager", dest="task_manager",
+                          action="store_true", default=argparse.SUPPRESS)
+    detector.add_argument("-asm", "--auto-approve-send-message",
+                          dest="auto_approve_send_message",
+                          action="store_true", default=argparse.SUPPRESS)
+    detector.add_argument("--clean", action="store_true", default=argparse.SUPPRESS)
+    detector.add_argument("--memory-only", dest="memory_only",
+                          action="store_true", default=argparse.SUPPRESS)
+    detector.add_argument("--use-sqlite", dest="use_sqlite",
+                          action="store_true", default=argparse.SUPPRESS)
+    detector.add_argument("--dev", dest="dev_tree",
+                          action="store_true", default=argparse.SUPPRESS)
+
+    # parse_known_args: ignore every other flag the real parser owns.
+    ns, _ = detector.parse_known_args(argv)
+    return set(vars(ns).keys()) - {"name"}
+
+
 def merge_restart_config(
     saved: dict,
     args: argparse.Namespace,
+    explicit: set[str] | None = None,
 ) -> argparse.Namespace:
     """Merge saved launch_config with CLI args.
 
-    Saved values are used as defaults.  Any CLI flag that differs from
-    the argparse parser default is treated as an explicit override.
+    Saved values are used as defaults. A CLI flag overrides the saved value
+    when it was EXPLICITLY passed on the command line (see ``explicit``) OR
+    when its value differs from the parser default. Relying on "differs from
+    default" alone is unsafe for ``--provider``, whose default is a real
+    provider name (``"deepseek"``): an explicit ``--provider deepseek`` would
+    otherwise be indistinguishable from "not passed" and silently dropped
+    (incident observed 2026-05-29).
+
+    When the provider is overridden but ``--model`` is NOT explicitly given,
+    the saved model is NOT inherited (it belongs to the OLD provider and would
+    boot the new provider on an incompatible model). It is reset to ``None`` so
+    ``build_launch_config`` resolves the new provider's default.
 
     ``--clean`` is NEVER inherited from saved config.
 
     Args:
         saved: The launch_config dict from session_metadata.json.
         args: Parsed CLI arguments (may contain overrides).
+        explicit: Set of dest-names explicitly passed on the CLI. When None,
+            it is derived from ``sys.argv`` via ``_explicit_cli_flags()``.
 
     Returns:
         New argparse.Namespace with effective values.
     """
+    if explicit is None:
+        explicit = _explicit_cli_flags()
+
+    def _is_override(dest: str, value, default) -> bool:
+        """A flag overrides saved config if it was explicitly passed,
+        or (for backward compatibility) if its value differs from default."""
+        return dest in explicit or value != default
+
     effective = argparse.Namespace(**vars(args))
 
     # Apply saved values as defaults
     effective.provider = saved.get("provider", _PARSER_DEFAULTS["provider"])
     effective.model = saved.get("model", _PARSER_DEFAULTS["model"])
+    # Heal legacy poison: older builds persisted an unspecified model as
+    # the literal "unknown" (incident observed 2026-05-20). Treat that
+    # as "no model specified" so the provider default kicks back in on
+    # restart instead of forwarding the bad string to the API.
+    if effective.model == "unknown":
+        effective.model = None
     effective.dir = Path(saved["working_dir"]) if saved.get("working_dir") else _PARSER_DEFAULTS["dir"]
     effective.skip_permissions = saved.get("skip_permissions", False)
     effective.task_manager = saved.get("task_manager", False)
@@ -91,31 +200,47 @@ def merge_restart_config(
     effective.clean = False  # NEVER inherit --clean
 
     # Override with explicitly provided CLI args
-    if args.provider != _PARSER_DEFAULTS["provider"]:
+    provider_overridden = _is_override(
+        "provider", args.provider, _PARSER_DEFAULTS["provider"]
+    )
+    if provider_overridden:
         effective.provider = args.provider
-    if args.model is not _PARSER_DEFAULTS["model"]:
+
+    model_explicit = _is_override("model", args.model, _PARSER_DEFAULTS["model"])
+    if model_explicit:
         effective.model = args.model
-    if args.dir is not _PARSER_DEFAULTS["dir"]:
+    elif provider_overridden and effective.provider != saved.get("provider"):
+        # Provider changed but no --model given: do NOT carry the old
+        # provider's model forward. Reset so build_launch_config() resolves
+        # the new provider's default (incident observed 2026-05-29).
+        effective.model = None
+    if _is_override("dir", args.dir, _PARSER_DEFAULTS["dir"]):
         effective.dir = args.dir
-    if args.skip_permissions != _PARSER_DEFAULTS["skip_permissions"]:
+    if _is_override("skip_permissions", args.skip_permissions,
+                    _PARSER_DEFAULTS["skip_permissions"]):
         effective.skip_permissions = args.skip_permissions
-    if args.task_manager != _PARSER_DEFAULTS["task_manager"]:
+    if _is_override("task_manager", args.task_manager,
+                    _PARSER_DEFAULTS["task_manager"]):
         effective.task_manager = args.task_manager
-    if args.clean != _PARSER_DEFAULTS["clean"]:
+    if _is_override("clean", args.clean, _PARSER_DEFAULTS["clean"]):
         effective.clean = args.clean
-    if args.memory_only != _PARSER_DEFAULTS["memory_only"]:
+    if _is_override("memory_only", args.memory_only,
+                    _PARSER_DEFAULTS["memory_only"]):
         effective.memory_only = args.memory_only
-    if args.use_sqlite != _PARSER_DEFAULTS["use_sqlite"]:
+    if _is_override("use_sqlite", args.use_sqlite,
+                    _PARSER_DEFAULTS["use_sqlite"]):
         effective.use_sqlite = args.use_sqlite
-    if (
+    if _is_override(
+        "auto_approve_send_message",
         getattr(args, "auto_approve_send_message",
-                _PARSER_DEFAULTS["auto_approve_send_message"])
-        != _PARSER_DEFAULTS["auto_approve_send_message"]
+                _PARSER_DEFAULTS["auto_approve_send_message"]),
+        _PARSER_DEFAULTS["auto_approve_send_message"],
     ):
         effective.auto_approve_send_message = args.auto_approve_send_message
-    if (
-        getattr(args, "dev_tree", _PARSER_DEFAULTS["dev_tree"])
-        != _PARSER_DEFAULTS["dev_tree"]
+    if _is_override(
+        "dev_tree",
+        getattr(args, "dev_tree", _PARSER_DEFAULTS["dev_tree"]),
+        _PARSER_DEFAULTS["dev_tree"],
     ):
         effective.dev_tree = args.dev_tree
 
@@ -135,7 +260,13 @@ def build_launch_config(args: argparse.Namespace) -> dict:
 
     model = args.model
     if model is None:
-        model = get_default_model_name(args.provider) or "unknown"
+        # Resolve the provider default. For providers with no pinned
+        # default (codex), this stays None and MUST be persisted as
+        # None — the codex CLI then picks its own current default. Do
+        # NOT coerce to "unknown": that string would be read back on
+        # restart and forwarded to CodexChatModel, which the API
+        # rejects with HTTP 400 (incident observed 2026-05-20).
+        model = get_default_model_name(args.provider)
 
     working_dir = args.dir
     if working_dir is None:
@@ -321,17 +452,41 @@ def create_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
+        "--import-claude",
+        metavar="UUID_OR_PATH",
+        dest="import_claude",
+        default=None,
+        help=(
+            "Import a Claude Code CLI session transcript (a real .jsonl, given "
+            "as a session uuid or a file path) as this agent's conversation "
+            "history, written to the agent's SQLite DB, then start the agent. "
+            "Works for any --provider. Combine with --clean to replace existing "
+            "history. See docs/DESIGN_IMPORT_CLAUDE_SESSION.md."
+        ),
+    )
+
+    parser.add_argument(
+        "--import-only",
+        action="store_true",
+        dest="import_only",
+        help=(
+            "With --import-claude: import the history and EXIT without starting "
+            "the agent (validate / prepare only)."
+        ),
+    )
+
+    parser.add_argument(
         "--dev",
         action="store_true",
         dest="dev_tree",
         help=(
-            "Run the agent using the development checkout instead of the "
-            "production checkout. The flag is normally consumed by the "
+            "Run the agent using the development codebase instead of the "
+            "production codebase. The flag is normally consumed by the "
             "bash launcher (deep-worker) BEFORE Python starts; it is also "
             "declared here so argparse does not reject it inside the dev "
             "tree after the re-exec, and so it can be persisted to "
-            "launch_config for --restart auto-detection. See the internal "
-            "design notes for the --dev flag (not included here)."
+            "launch_config for --restart auto-detection. See "
+            "docs/DESIGN_DEV_FLAG.md."
         ),
     )
 
@@ -341,6 +496,21 @@ def create_parser() -> argparse.ArgumentParser:
         help="Restart agent with parameters from previous launch. "
              "Additional options override saved values. "
              "--clean is NOT inherited; pass it explicitly if needed.",
+    )
+
+    parser.add_argument(
+        "--migrate-storage",
+        metavar="NAME",
+        dest="migrate_storage",
+        help="Migrate a stopped agent's storage to the current per-agent layout",
+    )
+
+    parser.add_argument(
+        "--to-version",
+        type=int,
+        default=3,
+        dest="to_version",
+        help="Target storage version for --migrate-storage (default: 3)",
     )
 
     parser.add_argument(
@@ -405,7 +575,7 @@ def create_parser() -> argparse.ArgumentParser:
         help=(
             "Remove conversation data older than DATE (ISO 8601 or relative "
             "like 30d, 1y). Prunes checkpoint threads AND offloaded summary "
-            "sections in the per-agent summaries directory across ALL "
+            "sections under the agent's data directory (summaries/) across ALL "
             "agents in the current $HOME (destructive and global — NEVER "
             "run in ad-hoc integration tests without an isolated HOME). "
             "If DATE resolves to a future timestamp, the command refuses "
@@ -419,8 +589,8 @@ def create_parser() -> argparse.ArgumentParser:
         action="store_true",
         dest="list_summaries",
         help=(
-            "List offloaded conversation-history files from the per-agent "
-            "summaries directory. Use --agent NAME to filter, "
+            "List offloaded conversation-history files from the agent's "
+            "data directory (summaries/). Use --agent NAME to filter, "
             "--format json for machine-readable output."
         ),
     )
@@ -463,6 +633,121 @@ def create_parser() -> argparse.ArgumentParser:
     return parser
 
 
+# ⚠️ DO NOT re-add a "seed the claude session_uuid hint" step here.
+#
+# An earlier version seeded ``claude_session_state.json`` with the imported
+# transcript's uuid so the claude-code provider would RESUME that real file.
+# That broke tool availability (observed with a live agent on 2026-05-24): the imported transcript is
+# an ORDINARY ``claude`` session created OUTSIDE deep_worker. Resuming it makes
+# the CLI restore THAT session's tool/permission configuration, which has no
+# ``mcp__deepworker__*`` tools. deep_worker only sets ``disallowed_tools`` (it
+# blocks the native Bash/Read/Edit) and never sets ``allowed_tools`` — it relies
+# on a FRESH session granting the deepworker MCP tools by default. On a resumed
+# external session that default does not apply, so the agent ends up with ~1
+# tool instead of its full set.
+#
+# Correct behaviour: import writes ONLY the SQLite history (provider-agnostic).
+# Under claude-code, with no hint, the provider starts a fresh session (full MCP
+# tools) and carries the imported memory the normal way — synthesizing OUR own
+# transcript from the LangGraph history (session_synthesis), exactly like a
+# cross-provider continuation. See DESIGN_IMPORT_CLAUDE_SESSION.md §6.
+
+
+async def handle_import_claude(args: argparse.Namespace) -> int:
+    """Import a Claude CLI session transcript into the agent's SQLite history.
+
+    Resolve ``--import-claude`` → parse → write to the agent's per-agent DB.
+    This is provider-agnostic: it writes ONLY the message history (the agent's
+    memory). It deliberately does NOT touch claude-code session state — see the
+    note above on why seeding a resume hint loses the agent's tools.
+    Returns 0 on success, non-zero on a user-facing error. Errors are printed
+    to stderr (this runs pre-daemonize so the user sees them).
+    """
+    from deep_worker_cli import sessions  # noqa: PLC0415
+
+    uuid_or_path = args.import_claude
+    cwd = str(args.dir.resolve()) if getattr(args, "dir", None) else None
+
+    # 1. Resolve the transcript file.
+    try:
+        transcript_path = resolve_transcript_path(uuid_or_path, cwd=cwd)
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    # 2. Parse to a LangGraph message history.
+    try:
+        messages = parse_claude_transcript(transcript_path)
+    except Exception as exc:  # noqa: BLE001 — surface a clean error, no trace
+        print(
+            f"Error: failed to parse Claude transcript {transcript_path}: {exc}",
+            file=sys.stderr,
+        )
+        return 1
+
+    if not messages:
+        print(
+            f"Error: no importable conversation turns found in "
+            f"{transcript_path} (no user/assistant messages).",
+            file=sys.stderr,
+        )
+        return 1
+
+    # 3/4. Write into the agent's SQLite DB (replace=clean). This is the ONLY
+    # side effect — provider-agnostic. We do NOT seed any claude-code session
+    # hint (see the note above ``handle_import_claude``).
+    replace = bool(getattr(args, "clean", False))
+    try:
+        n = await sessions.import_history(
+            args.name, messages, replace=replace
+        )
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    print(
+        f"Imported {n} message(s) from {transcript_path} into agent "
+        f"'{args.name}'."
+    )
+    return 0
+
+
+async def migrate_storage_command(args: argparse.Namespace) -> int:
+    from deep_worker_cli.process.registry import ProcessRegistry
+    from deep_worker_cli.storage_paths import (
+        CURRENT_STORAGE_VERSION,
+        migrate_agent_storage_to_v4,
+    )
+
+    agent_name = args.migrate_storage
+    if not agent_name:
+        print("Error: --migrate-storage requires an agent name", file=sys.stderr)
+        return 2
+    if args.to_version != CURRENT_STORAGE_VERSION:
+        print(
+            f"Error: unsupported target storage version {args.to_version}; "
+            f"only {CURRENT_STORAGE_VERSION} is supported",
+            file=sys.stderr,
+        )
+        return 2
+    if ProcessRegistry().lookup(agent_name):
+        print(
+            f"Error: Agent '{agent_name}' is running — stop it before migrating storage.",
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        result = migrate_agent_storage_to_v4(agent_name)
+    except Exception as exc:
+        print(f"Error migrating storage for '{agent_name}': {exc}", file=sys.stderr)
+        return 1
+
+    print(f"Migrated storage for '{agent_name}' to version {CURRENT_STORAGE_VERSION}.")
+    print(f"  Agent root: {result['agent_root']}")
+    print(f"  Threads DB: {result['threads_db']}")
+    return 0
+
+
 async def run_agent(args: argparse.Namespace) -> int:
     """Run the agent process.
 
@@ -495,9 +780,8 @@ async def run_agent(args: argparse.Namespace) -> int:
             )
 
         # Build launch_config for persistent storage
-        # This dict is saved to session_metadata.json in the agent's
-        # per-agent data directory so that launch parameters survive
-        # process termination.
+        # This dict is saved to the agent's session metadata file
+        # so that launch parameters survive process termination.
         launch_config = {
             "provider": config.provider,
             "model": config.resolved_model,
@@ -566,8 +850,8 @@ def _detach_from_session_scope(agent_name: str | None = None) -> None:
     because cgroup membership was inherited across ``fork`` and
     ``setsid`` does not touch it.
 
-    Production incident this guards against: 2026-05-08, agent
-    ``notify_agent`` died at the moment systemd deactivated the SSH
+    Production incident this guards against: 2026-05-08, an agent
+    died at the moment systemd deactivated the SSH
     session-scope of the bash that originally launched it, even
     though ``loginctl enable-linger`` was set on the user. ``linger``
     keeps ``user@UID.service`` running after SSH logout, but it
@@ -669,12 +953,65 @@ def _detach_from_session_scope(agent_name: str | None = None) -> None:
         pass
 
 
+def _reap_empty_cgroup_leaves() -> None:
+    """rmdir every EMPTY ``dwagent-*`` leaf cgroup under
+    ``user@UID.service``.
+
+    ``_detach_from_session_scope`` creates a ``dwagent-<name>-<pid>`` leaf per
+    agent and migrates the agent into it. Nothing removed those leaves when
+    the agent died: the kernel does NOT auto-reap an empty cgroup directory,
+    and systemd's user-manager does not rmdir delegated leaves either. They
+    accumulated without bound (272 stale leaves observed 2026-05-23,
+    ``nr_dying_descendants`` climbing), which made cgroup operations slower /
+    flakier under pressure — the root of the intermittent
+    ``test_daemonize_cgroup_detach`` failures.
+
+    A process on cgroup v2 cannot rmdir its OWN leaf while it lives in it (it
+    can't move back into ``user@UID.service`` — the no-internal-processes rule
+    forbids it once subtree_control is set). So we "reap the corpses": each
+    agent removes every OTHER empty dwagent leaf at startup and shutdown. Its
+    own leaf is reaped by the next agent's sweep after it dies.
+
+    Safety: only EMPTY leaves (``cgroup.procs`` has no PIDs) are removed — a
+    leaf with a live process is never touched. Best-effort: never raises;
+    individual rmdir failures (race with another reaper, momentary
+    non-emptiness) are ignored.
+    """
+    user_service = (
+        f"/sys/fs/cgroup/user.slice/user-{os.getuid()}.slice/"
+        f"user@{os.getuid()}.service"
+    )
+    try:
+        entries = os.listdir(user_service)
+    except OSError:
+        return  # no cgroup v2 / no delegation / not present — nothing to do
+    for name in entries:
+        if not name.startswith("dwagent-"):
+            continue
+        leaf = f"{user_service}/{name}"
+        procs_file = f"{leaf}/cgroup.procs"
+        try:
+            # A leaf is reapable only if it has NO processes. Reading
+            # cgroup.procs is the authoritative check (a non-empty file ==
+            # live members). os.rmdir refuses a non-empty cgroup anyway, so
+            # this is belt-and-suspenders against killing a live agent's leaf.
+            with open(procs_file) as f:
+                if f.read().strip():
+                    continue  # still has procs — leave it alone
+            os.rmdir(leaf)
+        except OSError:
+            # Not a dir, already gone, raced with another reaper, or briefly
+            # non-empty — all benign. Skip and move on.
+            continue
+
+
 def daemonize(name: str, log_dir: Path | None = None) -> None:
     """Daemonize the current process (Unix double-fork + cgroup detach).
 
     Args:
         name: Agent name for log files
-        log_dir: Directory for log files (default: the per-user log directory)
+        log_dir: Directory for log files (default: the agent's log directory
+            under its data directory)
     """
     # Set up log directory
     if log_dir is None:
@@ -710,6 +1047,14 @@ def daemonize(name: str, log_dir: Path | None = None) -> None:
     os.setsid()
     os.umask(0)
 
+    # Reap leftover empty dwagent-* leaf cgroups from agents that have since
+    # died. Nothing else removes them (kernel doesn't auto-rmdir empty cgroup
+    # dirs; systemd doesn't reap delegated leaves), so without this they leak
+    # without bound and eventually make cgroup ops flaky (2026-05-23). A
+    # process can't rmdir its own live leaf, so each agent reaps the corpses
+    # left by previous agents — including, on the next launch, our own.
+    _reap_empty_cgroup_leaves()
+
     # Detach from the launching shell's systemd cgroup (session-scope,
     # tmux-spawn-scope, app-scope, …) so that scope teardown does not
     # take the daemon down with it. See _detach_from_session_scope's
@@ -732,22 +1077,38 @@ def daemonize(name: str, log_dir: Path | None = None) -> None:
     sys.stdout.flush()
     sys.stderr.flush()
 
-    # Open log files
-    stdout_fd = os.open(str(stdout_log), os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o644)
-    stderr_fd = os.open(str(stderr_log), os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o644)
+    # IMPORTANT (fork+thread ordering): os.fork() copies ONLY the calling
+    # thread, so the writer threads MUST be created HERE — after the final
+    # fork, in the surviving daemon. Creating them before the fork would leave
+    # a dead, un-copied thread in the daemon and a full pipe would then block
+    # the agent's first write() forever.
+    from deep_worker_cli.process.log_rotation import start_pipe_writer
+
+    # Point stdout/stderr at the WRITE end of a pipe instead of straight at the
+    # log file. A per-stream daemon thread drains the pipe and appends through a
+    # RotatingLogWriter that enforces a hard 512MB-active + 1-backup cap, so the
+    # on-disk total per stream NEVER exceeds 1 GiB — enforced in-process, with no
+    # logrotate/cron needed. Captures print, logging, AND C-level writes to fd
+    # 1/2 alike. See log_rotation.py and a related internal incident analysis.
+    stdout_write_fd, _stdout_log_thread = start_pipe_writer(str(stdout_log))
+    stderr_write_fd, _stderr_log_thread = start_pipe_writer(str(stderr_log))
 
     # Redirect stdin to /dev/null
     stdin_fd = os.open(os.devnull, os.O_RDONLY)
 
-    # Duplicate file descriptors
+    # Duplicate file descriptors. fd 1/2 now hold a dup of each pipe's write
+    # end, which keeps that write end open until the process exits — so the
+    # writer threads see EOF only at teardown.
     os.dup2(stdin_fd, sys.stdin.fileno())
-    os.dup2(stdout_fd, sys.stdout.fileno())
-    os.dup2(stderr_fd, sys.stderr.fileno())
+    os.dup2(stdout_write_fd, sys.stdout.fileno())
+    os.dup2(stderr_write_fd, sys.stderr.fileno())
 
-    # Close original file descriptors
+    # Close the redundant fds. The dup'd copies on fd 0/1/2 keep stdin/stdout/
+    # stderr alive; closing these extra write-end copies still leaves fd 1/2
+    # holding a write end, so the pipes are NOT prematurely EOF'd.
     os.close(stdin_fd)
-    os.close(stdout_fd)
-    os.close(stderr_fd)
+    os.close(stdout_write_fd)
+    os.close(stderr_write_fd)
 
 
 async def remove_thread_command(thread_id: str, dry_run: bool) -> int:
@@ -889,7 +1250,7 @@ async def remove_before_command(
     """Handle --remove-before command.
 
     Prunes BOTH checkpoint threads in per-agent SQLite DBs AND offloaded
-    summary sections in the per-agent summaries directory across
+    summary sections under the agent's data directory (``summaries/``) across
     ALL agents in the current ``$HOME``.
 
     Safety guard (DESIGN_REMOVE_BEFORE_FUTURE_CUTOFF_GUARD.md): when the
@@ -944,7 +1305,8 @@ async def remove_before_command(
         )
         console.print(
             "  A future cutoff matches every existing thread and would "
-            "delete ALL agent data and ALL offloaded summary files."
+            "delete ALL data under the agents' data directory and "
+            "per-agent summaries/ subdirectories."
         )
         console.print(
             "  If you truly intend this, re-run with [bold]--force[/bold]."
@@ -1002,7 +1364,7 @@ async def remove_before_command(
 async def list_summaries_command(agent_name: str | None, fmt: str) -> int:
     """Handle --list-summaries command.
 
-    Walks the per-agent summaries directory and prints one row per
+    Walks the agent's data directory (``summaries/*.md``) and prints one row per
     offloaded thread. Offline, read-only, no RPyC, no running-agent
     dependency.
 
@@ -1063,7 +1425,7 @@ async def list_summaries_command(agent_name: str | None, fmt: str) -> int:
             f"{latest:<26.26} {size_h:>8}"
         )
     console.print("=" * 78)
-    console.print("[dim]Files live in the per-agent summaries directory.[/dim]")
+    console.print("[dim]Files live under the agent's data directory (summaries/).[/dim]")
     return 0
 
 
@@ -1086,6 +1448,14 @@ def main() -> int:
     """
     parser = create_parser()
     args = parser.parse_args()
+
+    # Heal a legacy poisoned ``--model unknown`` before any launch path
+    # reads it. See ``normalize_model_arg`` — covers direct launch,
+    # --restart, and web-spawned subprocesses alike.
+    normalize_model_arg(args)
+
+    if args.migrate_storage:
+        return asyncio.run(migrate_storage_command(args))
 
     # Handle --list option (mutually exclusive with running agent)
     if args.list_threads:
@@ -1136,6 +1506,47 @@ def main() -> int:
             file=sys.stderr
         )
         return 1
+
+    # --- --import-claude / --import-only (DESIGN_IMPORT_CLAUDE_SESSION.md) ----
+    # Combination guards first (cheap, terminal-visible).
+    if getattr(args, "import_only", False) and not getattr(args, "import_claude", None):
+        print(
+            "Error: --import-only requires --import-claude <uuid|path>.",
+            file=sys.stderr,
+        )
+        return 2
+    if getattr(args, "import_claude", None) and getattr(args, "restart", False):
+        print(
+            "Error: --import-claude cannot be combined with --restart "
+            "(restart inherits a prior history; importing into it is "
+            "ambiguous). Run the import on a fresh start instead.",
+            file=sys.stderr,
+        )
+        return 2
+
+    if getattr(args, "import_claude", None):
+        # One-shot, pre-daemonize: resolve + parse + write to the agent's
+        # SQLite DB. Errors are visible on the terminal. Refuse if the agent
+        # is currently running (we'd be writing its DB underneath it).
+        from deep_worker_cli.process.registry import ProcessRegistry as _Reg
+        if _Reg().lookup(args.name):
+            print(
+                f"Error: Agent '{args.name}' is running — stop it before "
+                f"importing history into it.",
+                file=sys.stderr,
+            )
+            return 1
+        import_rc = asyncio.run(handle_import_claude(args))
+        if import_rc != 0:
+            return import_rc
+        if getattr(args, "import_only", False):
+            # Import-and-exit: do not start the agent.
+            return 0
+        # Otherwise fall through to the normal launch below so the agent
+        # starts with the freshly-imported history. ``--clean`` already ran
+        # inside the import (replace), so clear it to avoid wiping what we
+        # just wrote during the normal launch path.
+        args.clean = False
 
     # Handle --restart option
     if getattr(args, "restart", False):
@@ -1272,7 +1683,7 @@ def main() -> int:
     daemonize(args.name)
 
     # --- Post-daemonize (grandchild only) -------------------------------
-    # Output goes to the agent's log files (<name>.{out,err}.log) from here on.
+    # Output goes to the agent's log files under its data directory from here on.
 
     if args.clean:
         # Database cleanup is the slow part (can wait up to 30s on SQLite

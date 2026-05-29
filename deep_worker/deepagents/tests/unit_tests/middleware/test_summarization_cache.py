@@ -34,42 +34,84 @@ def _load_summarization_class() -> type[Any]:
         / "deepagents" / "middleware" / "summarization.py"
     )
 
-    # Pre-load sentinel packages as empty module placeholders so the
-    # file-level ``from deepagents.backends.protocol import
-    # BackendProtocol`` can succeed without touching deepagents/__init__.
+    # POLLUTION GUARD (do not remove): this loader temporarily inserts
+    # sentinel/standalone entries into ``sys.modules`` so the isolated
+    # ``summarization.py`` can be exec'd without importing
+    # ``deepagents/__init__`` (which transitively pulls in llama_index).
+    # Those entries MUST NOT leak into the rest of the test session:
+    #
+    #   * A fake empty ``deepagents.backends`` placeholder shadows the real
+    #     package, so a later ``from deepagents.backends import
+    #     CompositeBackend`` (test_middleware.py) fails with ImportError.
+    #   * A second standalone ``deepagents.backends.protocol`` copy installs
+    #     a DUPLICATE ``BackendProtocol`` class, so later
+    #     ``isinstance(backend, BackendProtocol)`` fast-paths in
+    #     Summarization/Filesystem middleware fail and crash with
+    #     "'MockBackend' object is not callable".
+    #
+    # We snapshot every key we might touch and restore the original
+    # ``sys.modules`` state in ``finally`` once the class object has been
+    # captured. The captured class keeps working because it holds direct
+    # references to whatever it imported at exec time.
     import types
-    if "deepagents" not in sys.modules:
-        pkg = types.ModuleType("deepagents")
-        pkg.__path__ = [str(module_path.parent.parent)]  # type: ignore[attr-defined]
-        sys.modules["deepagents"] = pkg
-    if "deepagents.backends" not in sys.modules:
-        backends_pkg = types.ModuleType("deepagents.backends")
-        backends_pkg.__path__ = [  # type: ignore[attr-defined]
-            str(module_path.parent.parent / "backends")
-        ]
-        sys.modules["deepagents.backends"] = backends_pkg
 
-    # Import protocol module directly.
-    proto_path = module_path.parent.parent / "backends" / "protocol.py"
-    proto_spec = importlib.util.spec_from_file_location(
-        "deepagents.backends.protocol", str(proto_path),
+    touched_keys = (
+        "deepagents",
+        "deepagents.backends",
+        "deepagents.backends.protocol",
+        "_isolated_summarization",
     )
-    if proto_spec is None or proto_spec.loader is None:
-        raise RuntimeError(f"cannot load {proto_path}")
-    proto_mod = importlib.util.module_from_spec(proto_spec)
-    sys.modules["deepagents.backends.protocol"] = proto_mod
-    proto_spec.loader.exec_module(proto_mod)
+    saved = {k: sys.modules.get(k) for k in touched_keys}
 
-    # Now load summarization.
-    spec = importlib.util.spec_from_file_location(
-        "_isolated_summarization", str(module_path),
-    )
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"cannot load {module_path}")
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules["_isolated_summarization"] = mod
-    spec.loader.exec_module(mod)
-    return mod.SummarizationMiddleware
+    try:
+        # Pre-load sentinel packages as empty module placeholders so the
+        # file-level ``from deepagents.backends.protocol import
+        # BackendProtocol`` can succeed without touching deepagents/__init__.
+        if "deepagents" not in sys.modules:
+            pkg = types.ModuleType("deepagents")
+            pkg.__path__ = [str(module_path.parent.parent)]  # type: ignore[attr-defined]
+            sys.modules["deepagents"] = pkg
+        if "deepagents.backends" not in sys.modules:
+            backends_pkg = types.ModuleType("deepagents.backends")
+            backends_pkg.__path__ = [  # type: ignore[attr-defined]
+                str(module_path.parent.parent / "backends")
+            ]
+            sys.modules["deepagents.backends"] = backends_pkg
+
+        # Import protocol module directly — but ONLY if the canonical module
+        # has not already been imported by the rest of the test session.
+        # Reusing the canonical module avoids a duplicate ``BackendProtocol``.
+        if "deepagents.backends.protocol" in sys.modules:
+            proto_mod = sys.modules["deepagents.backends.protocol"]
+        else:
+            proto_path = module_path.parent.parent / "backends" / "protocol.py"
+            proto_spec = importlib.util.spec_from_file_location(
+                "deepagents.backends.protocol", str(proto_path),
+            )
+            if proto_spec is None or proto_spec.loader is None:
+                raise RuntimeError(f"cannot load {proto_path}")
+            proto_mod = importlib.util.module_from_spec(proto_spec)
+            sys.modules["deepagents.backends.protocol"] = proto_mod
+            proto_spec.loader.exec_module(proto_mod)
+
+        # Now load summarization.
+        spec = importlib.util.spec_from_file_location(
+            "_isolated_summarization", str(module_path),
+        )
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"cannot load {module_path}")
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["_isolated_summarization"] = mod
+        spec.loader.exec_module(mod)
+        return mod.SummarizationMiddleware
+    finally:
+        # Restore the original sys.modules state so no sentinel/standalone
+        # entry leaks into other test modules.
+        for key, original in saved.items():
+            if original is None:
+                sys.modules.pop(key, None)
+            else:
+                sys.modules[key] = original
 
 
 try:

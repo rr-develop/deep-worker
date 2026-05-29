@@ -37,6 +37,11 @@ dependencies = [
   "deepagents==0.3.12",
   "langchain==1.2.9",
   "langchain-openai==1.1.7",
+  # DeepSeek thinking models (deepseek-v4-flash) require reasoning_content to
+  # be round-tripped; we build them with ReasoningChatDeepSeek (subclass of
+  # ChatDeepSeek). Pinned exact to match the host install. See
+  # deepseek_model.py and DEEPSEEK_PROVIDER.md (incident observed 2026-05-22).
+  "langchain-deepseek==1.0.1",
   "langgraph-checkpoint-sqlite==3.0.3",
 
   # UI/Terminal
@@ -63,8 +68,8 @@ dependencies = [
   "pyperclip>=1.11.0,<2.0.0",
 
   # IPC/RPC - MIGRATED TO ASYNCIO SERVER
-  # rpyc-async provides the AsyncioServer this project talks to.
-  "rpyc-async>=1.0.0",
+  # Using rpyc_async from source (with AsyncioServer support)
+  "rpyc @ file:///path/to/rpyc_async",
 
   # Utilities
   "python-dotenv>=1.0.0,<2.0.0",
@@ -124,35 +129,41 @@ deepagents = { path = "../deepagents", editable = true }
 [tool.ty.environment]
 # ═══════════════════════════════════════════════════════════════════════════
 # extra-paths is SAFETY-CRITICAL. DO NOT REMOVE ENTRIES without replacing
-# them with a working equivalent.
+# them with a working equivalent. In particular:
 #
-# `rpyc` must resolve to the `rpyc-async` distribution, not to the plain
-# `rpyc` stub: this project uses AsyncioServer entry points that exist only
-# in rpyc-async:
-#   - `rpyc.core.async_connect.async_connect`  (async client)
-#   - `Connection.aclose()`                    (async close)
-#   - `Connection.wait_closed()`               (async close wait)
-#   - `Connection.add_close_callback(cb)`
-# If `ty` resolves `rpyc` to the plain stub it cannot find those methods and
-# the pre-commit type check blocks the commit. The correct fix is to install
-# rpyc-async, NOT to silence the type check with `# ty: ignore[...]` or
-# `# type: ignore`. Such suppressions are FORBIDDEN by policy.
+#   /path/to/rpyc_async
+#       ← MUST be present. This project talks to agents over
+#         rpyc_async's AsyncioServer and uses rpyc_async-specific
+#         entry points that do not exist in the pip/stub `rpyc`:
+#           - `rpyc.core.async_connect.async_connect`  (async client)
+#           - `Connection.aclose()`                    (async close)
+#           - `Connection.wait_closed()`               (async close wait)
+#           - `Connection.add_close_callback(cb)`
+#         Without this path, `ty` resolves `rpyc` to the pip stub,
+#         fails to find those methods, and the pre-commit type check
+#         blocks the commit. The correct fix is to keep this entry,
+#         NOT to silence the type check with `# ty: ignore[...]` or
+#         `# type: ignore`. Such suppressions are FORBIDDEN by policy
+#         (see .git/hooks/pre-commit and the deep_worker/CLAUDE.md).
 #
-# If you are tempted to bypass type checks: don't. Fix the environment here
+# If you are tempted to bypass type checks: don't. Fix the path here
 # or fix the real type error. There are no third options.
+# ═══════════════════════════════════════════════════════════════════════════
 # Paths are tree-relative (../../  = <repo>/, ../  = deep_worker/).
-# Using ../.. instead of a hard-coded absolute path means this file works
-# identically in the production tree and the developer tree. Hard-coding
-# the prod path caused `ty check` to fail in the dev tree: it would add
-# BOTH the prod deep_worker_cli (via extra-paths) and the dev
-# deep_worker_cli (via cwd) to the module-resolution path, then refuse to
-# resolve relative imports like `from .task_manager import …` because two
-# copies of the same package were visible. See docs/DESIGN_DEV_FLAG.md.
+# Using ../.. instead of hard-coded absolute repo paths means this file
+# works identically in the production tree and the developer tree.
+# Hard-coding the prod path caused
+# `ty check` to fail in the dev tree: it would add BOTH the prod
+# deep_worker_cli (via extra-paths) and the dev deep_worker_cli (via cwd)
+# to the module-resolution path, then refuse to resolve relative imports
+# like `from .task_manager import …` because two copies of the same
+# package were visible. See docs/DESIGN_DEV_FLAG.md.
 extra-paths = [
     "../..",
     "../../claude_code_provider",
     "../../semantic_search",
     "../deepagents",
+    "/path/to/rpyc_async",
 ]
 
 [tool.ty.rules]

@@ -50,6 +50,39 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+def evict_subscriber_by_identity(subscriber_set: set[Any], target: Any) -> None:
+    """Remove ``target`` from ``subscriber_set`` WITHOUT hashing/comparing it.
+
+    Subscribers are RPyC **netrefs**. Once the peer's channel dies, ANY
+    operation that crosses the wire raises ``EOFError('stream has been
+    closed')`` — and that includes ``netref.__hash__`` and ``netref.__eq__``
+    (both do a synchronous ``syncreq`` over the channel). So the obvious
+    ``subscriber_set.discard(dead_netref)`` BLOWS UP: ``set.discard`` needs
+    ``hash(dead_netref)`` → wire round-trip → ``EOFError`` again. In
+    ``_notify_subscribers`` that secondary EOFError used to escape into
+    ``_handle_invoke`` and force the agent to ERROR over a dead UI socket
+    (incident observed 2026-05-22).
+
+    The ONLY safe way to evict a dead netref is by **object identity**: we
+    iterate the set (iteration never hashes elements) and rebuild it,
+    dropping the one element that ``is`` the target. ``is`` never crosses the
+    wire. Do NOT replace this with ``discard`` / ``remove`` / ``in`` — those
+    all call ``__hash__``/``__eq__`` and will re-raise on a dead channel.
+
+    Re-adding survivors DOES hash them, and a second simultaneously-dead
+    subscriber would raise there too — so we add one at a time and skip any
+    that explode (they're dead and will be evicted on their own failed push).
+    The whole helper is best-effort and never raises.
+    """
+    survivors = [s for s in subscriber_set if s is not target]
+    subscriber_set.clear()
+    for s in survivors:
+        try:
+            subscriber_set.add(s)
+        except Exception:  # noqa: BLE001 — another dead netref; drop it too.
+            pass
+
 # Prompt for /remember command - triggers agent to review conversation and update
 # memory/skills (copied from deepagents-cli for compatibility)
 REMEMBER_PROMPT = """Review our conversation and capture valuable knowledge. Focus especially on **best practices** we discussed or discovered—these are the most important things to preserve.
@@ -81,7 +114,7 @@ Use memory when the knowledge is:
 - Something to always keep in mind
 - A simple rule or pattern
 
-**Global** (`~/.deepagents/agent/AGENTS.md`): Universal preferences across all projects
+**Global** (the global AGENTS.md under the agent's data directory): Universal preferences across all projects
 **Project** (`.deepagents/AGENTS.md`): Project-specific conventions and decisions
 
 ### → Skill for reusable workflows and methodologies
@@ -100,7 +133,7 @@ If we established best practices around a workflow or process, capture them in a
 **Example:** If we discussed best practices for code review, create a `code-review` skill that encodes those practices into a reusable workflow.
 
 ### Skill Location
-`~/.deepagents/agent/skills/<skill-name>/SKILL.md`
+`<agent-data-dir>/agent/skills/<skill-name>/SKILL.md`
 
 ### Skill Structure
 ```
@@ -358,12 +391,66 @@ class AgentService(rpyc.Service):
                         }
                 return hitl_response
 
-            response = await self._agent_process._handle_invoke(
-                {"command": "invoke", "message": message, "stream": stream},
-                connection=None,
-                notify_callback=self._notify_subscribers,
-                approval_callback=_approval_callback,
+            # ════════════════════════════════════════════════════════════
+            # DECOUPLE THE INVOKE FROM THIS RPyC DISPATCH TASK
+            # ════════════════════════════════════════════════════════════
+            # exposed_invoke_agent runs INSIDE the dispatch task of the RPyC
+            # connection that delivered it. rpyc_async's inbound-quarantine
+            # (_drain_inbound_dispatch) cancels every dispatch task on an
+            # overloaded connection — and a flood can come from a DIFFERENT
+            # client (the web client), not the one that sent this invoke. If we
+            # awaited _handle_invoke inline, that cancellation would kill the
+            # running agent turn and it would be misread as a user interrupt
+            # → spurious INTERRUPTED (observed 2026-05-22).
+            #
+            # So run _handle_invoke in a DEDICATED task and await it via
+            # asyncio.shield. If THIS dispatch task is cancelled (quarantine,
+            # client disconnect), the shield re-raises CancelledError here but
+            # the invoke task keeps running and finishes the turn; the agent's
+            # status is driven by _handle_invoke via session_manager, which
+            # every live channel + the web UI read. A genuine user interrupt
+            # goes through exposed_interrupt_agent → current_worker_task.cancel
+            # (the dedicated task), which IS surfaced through the shield as the
+            # clean "interrupted" result below.
+            invoke_task = asyncio.ensure_future(
+                self._agent_process._handle_invoke(
+                    {"command": "invoke", "message": message, "stream": stream},
+                    connection=None,
+                    notify_callback=self._notify_subscribers,
+                    approval_callback=_approval_callback,
+                )
             )
+            try:
+                response = await asyncio.shield(invoke_task)
+            except asyncio.CancelledError:
+                # Distinguish the two cancellation sources:
+                #  • invoke_task itself was cancelled  → real user interrupt
+                #    (exposed_interrupt_agent). Re-raise so the outer handler
+                #    returns the clean "interrupted" result.
+                #  • only THIS awaiter was cancelled (dispatch-task drain /
+                #    quarantine) → the invoke is STILL running. We must NOT
+                #    cancel it and NOT touch agent status. The agent keeps
+                #    working and settles its own status via session_manager.
+                if invoke_task.cancelled():
+                    raise  # real interrupt → outer CancelledError handler
+                with open("/tmp/dwcli_rpyc_service.log", "a") as f:
+                    f.write(
+                        f"[{time_mod.time():.3f}] dispatch task cancelled but "
+                        f"invoke detached and still running (channel drain/"
+                        f"quarantine) — agent keeps working\n"
+                    )
+                # Pin the detached task on the agent process so it is not
+                # garbage-collected before it finishes (it is no longer
+                # awaited by anything).
+                self._agent_process._detached_invoke_tasks.add(invoke_task)
+                invoke_task.add_done_callback(
+                    self._agent_process._detached_invoke_tasks.discard
+                )
+                # Honor the cancellation of THIS dispatch task by re-raising.
+                # The outer CancelledError handler checks invoke_task.cancelled()
+                # to tell this (channel drain — NOT a user interrupt) apart from
+                # a real interrupt, and unwinds without reporting an interrupt.
+                raise
 
             # DEBUG: Log after getting response
             with open("/tmp/dwcli_rpyc_service.log", "a") as f:
@@ -372,6 +459,38 @@ class AgentService(rpyc.Service):
 
             return json.dumps(response)
 
+        except asyncio.CancelledError:
+            # Two ways we can land here (see the shield block above):
+            #
+            # 1. CHANNEL DRAIN (NOT a user interrupt): only this dispatch
+            #    task was cancelled (rpyc inbound-quarantine /
+            #    _drain_inbound_dispatch / client disconnect) while the
+            #    invoke task keeps running. ``invoke_task`` is alive (not
+            #    cancelled). We must NOT report an interrupt and must NOT
+            #    touch agent status — the agent keeps working. Just unwind
+            #    this dispatch task by re-raising; the response goes nowhere
+            #    (the channel is gone) and the detached invoke settles its
+            #    own status via session_manager.
+            #
+            # 2. USER INTERRUPT: ``invoke_task`` itself was cancelled
+            #    (exposed_interrupt_agent → current_worker_task.cancel).
+            #    ``_handle_invoke`` already transitioned to INTERRUPTED and
+            #    broadcast ``agent_interrupted``. Return a clean structured
+            #    *interrupted* result instead of letting CancelledError cross
+            #    the RPyC boundary as a remote exception (which the web side
+            #    would mis-render as an error — user report 2026-05-20).
+            _invoke_task = locals().get("invoke_task")
+            if _invoke_task is not None and not _invoke_task.cancelled():
+                # Channel drain — agent keeps working, no interrupt reported.
+                raise
+            with open("/tmp/dwcli_rpyc_service.log", "a") as f:
+                f.write(f"[{time_mod.time():.3f}] invoke interrupted (clean)\n")
+            result = {
+                "success": False,
+                "interrupted": True,
+                "message": "Agent invocation interrupted by user",
+            }
+            return json.dumps(result)
         except asyncio.TimeoutError:
             logger.error("Agent invocation timed out")
             result = {"success": False, "error": "Agent invocation timed out"}
@@ -592,8 +711,14 @@ class AgentService(rpyc.Service):
         try:
             # Remove from SHARED subscribers set in AgentProcess
             if self._agent_process:
-                self._agent_process._message_subscribers.discard(callback)
-                # Same reasoning as in exposed_subscribe_messages above.
+                # Evict by identity (no __hash__ on the netref). Graceful
+                # unsubscribe normally happens on a live channel, but a client
+                # racing disconnect+unsubscribe could present a dead netref,
+                # and ``discard`` would then re-raise EOFError (incident
+                # observed 2026-05-22). Identity eviction is always safe.
+                evict_subscriber_by_identity(
+                    self._agent_process._message_subscribers, callback
+                )
                 logger.info(
                     "Client unsubscribed from messages (remaining: %d)",
                     len(self._agent_process._message_subscribers),
@@ -633,6 +758,19 @@ class AgentService(rpyc.Service):
                 else None
             )
 
+            config = self._agent_process.config
+            model = None
+            provider = None
+            if config:
+                provider = config.provider
+                dynamic_model = getattr(config, "dynamic_display_model", None)
+                model = config.model or dynamic_model or config.resolved_model
+
+            status_metadata = None
+            session_manager = getattr(self._agent_process, "session_manager", None)
+            if session_manager is not None:
+                status_metadata = getattr(session_manager, "status_metadata", None)
+
             metadata = {
                 "directory": str(working_dir) if working_dir else None,
                 "pid": os.getpid(),  # Current process PID
@@ -643,16 +781,9 @@ class AgentService(rpyc.Service):
                 ),
                 "rpyc_port": self._agent_process.rpyc_port,
                 "agent_type": "deep-worker",
-                "model": (
-                    self._agent_process.config.resolved_model
-                    if self._agent_process.config
-                    else None
-                ),
-                "provider": (
-                    self._agent_process.config.provider
-                    if self._agent_process.config
-                    else None
-                ),
+                "model": model,
+                "provider": provider,
+                "status_metadata": status_metadata,
             }
 
             result = {"success": True, "metadata": metadata}
@@ -1165,39 +1296,43 @@ class AgentService(rpyc.Service):
             with open("/tmp/dwcli_callback_debug.log", "a") as f:
                 f.write(f"  subscribers count: {len(subscribers)}\n")
 
-        # ========================================================================
-        # CRITICAL: RPyC Fire-and-Forget Callbacks Using rpyc.async_()
-        # ========================================================================
-        # PROBLEM: When dwcli calls invoke_agent() via RPyC async_call, it waits for
-        # the response. If invoke_agent() tries to call subscriber.on_message()
-        # synchronously (reentrant call: client->server->client), this creates a
-        # DEADLOCK because:
-        #   - Client is waiting for server response (async_call blocks)
-        #   - Server tries to call client callback synchronously
-        #   - Client cannot process callback while waiting for response
-        #   - Result: "EOFError: stream has been closed"
+        # ════════════════════════════════════════════════════════════════
+        # CRITICAL: Dispatch via fire_and_forget_async with timeout
+        # ════════════════════════════════════════════════════════════════
+        # The previous implementation awaited ``subscriber.on_message``
+        # inline. When the web peer's ``MessageCallbackService.on_message``
+        # hung (e.g. its broadcast queue was full or its WS client was
+        # dead), the agent's whole ``_handle_invoke`` flow blocked on the
+        # very first pre-flight broadcast and no user message ever
+        # reached ``ainvoke``. Production incident observed 2026-05-19
+        # (>60 min hang, 3 parked ``_dispatch_request_async`` tasks).
         #
-        # threading.Thread() does NOT fix this - RPyC netref objects are NOT thread-safe
-        # and calling them from background threads still causes "stream has been closed"!
+        # The fix: hand each ``on_message`` call to
+        # ``fire_and_forget_async`` which:
+        #   * dispatches the netref call in a fresh Task (returns
+        #     immediately — the agent continues to ``ainvoke``),
+        #   * wraps the awaitable in ``asyncio.wait_for(timeout=N)`` so
+        #     a hung peer cannot pin an ``AsyncResult`` slot on
+        #     ``Connection._request_callbacks`` forever,
+        #   * pins the Task in ``rpyc.utils.helpers._INFLIGHT`` (with
+        #     auto-discard via ``add_done_callback``) so a GC pass can't
+        #     drop a half-finished outbound RPC and leak the chain
+        #     (incidents 2026-05-08, 2026-05-11).
         #
-        # SOLUTION: Use rpyc.async_() to wrap the callback and invoke WITHOUT waiting
-        # for the result. This is RPyC's built-in fire-and-forget mechanism:
-        #   - rpyc.async_(fn) returns an async-wrapped proxy
-        #   - Calling it returns AsyncResult immediately
-        #   - We DON'T wait for the AsyncResult - true fire-and-forget
-        #   - Client's BgServingThread handles the callback asynchronously
+        # Why NOT ``rpyc.async_(...)``: that forces ``HANDLE_CALL`` (sync
+        # handler dispatch on the peer). Web's ``exposed_on_message`` is
+        # declared ``async def`` — a sync handler returns the un-awaited
+        # coroutine ("Boxing coroutine object … Did you forget to
+        # await?") and the payload silently drops. The async-flagged
+        # netref already picks ``HANDLE_ASYNC_CALL`` on its own.
         #
-        # This is the CORRECT way to do server-to-client callbacks in RPyC!
-        # Reference: RPyC docs on async_() and AsyncResult
-        # ========================================================================
+        # Why serialise once on the agent side: a netref payload forces
+        # the subscriber's async loop to walk it via ``sync_request``,
+        # which RPyC blocks with the "sync_request() from asyncio loop"
+        # guard and leaks the remote ref. See
+        # a related internal design analysis (not included here) (F2).
+        # ════════════════════════════════════════════════════════════════
 
-        # ================================================================
-        # Serialise the message ONCE, on the agent side, and ship it as a
-        # plain ``str`` across RPyC. Subscribers then do ``json.loads`` on
-        # their side — no netref traversal, no ``sync_request()`` from
-        # the subscriber's async loop, no remote-object leaks. See
-        # docs/DESIGN_AGENT_SERVICE_MEMORY_FIX.md (F2).
-        # ================================================================
         try:
             payload_str = json.dumps(message, default=str)
         except (TypeError, ValueError) as exc:
@@ -1208,20 +1343,76 @@ class AgentService(rpyc.Service):
             )
             payload_str = json.dumps({"type": "raw", "content": str(message)})
 
+        # Timeout for one outbound on_message round-trip. Overridable
+        # via env so tests can drive a tight one without sleeping for
+        # the production default. The production default is intentionally
+        # generous: a healthy WS broadcast on localhost is sub-ms, but a
+        # network-attached subscriber might legitimately need a few
+        # seconds when the peer's event loop is busy.
+        try:
+            notify_timeout = float(os.environ.get("DWCLI_NOTIFY_TIMEOUT_SEC", "10"))
+        except ValueError:
+            notify_timeout = 10.0
+
+        from rpyc.utils.helpers import fire_and_forget_async  # noqa: PLC0415
+
+        # The shared subscriber set we evict dead peers from. Eviction
+        # matters here for the same reason as in
+        # ``AgentProcess._dispatch_status_event``: ``on_disconnect`` does
+        # NOT clean up (it relies on a graceful unsubscribe that never
+        # arrives when a web client dies/restarts ungracefully). Without
+        # eviction the dead netref lingers forever and every broadcast
+        # wastes a 10 s timeout against the corpse (incident observed 2026-05-20).
+        # A live web re-subscribes on its next connect_to_agent.
+        subscriber_set = self._agent_process._message_subscribers
+
         for subscriber in subscribers:
+            subscriber_id = id(subscriber)
+
+            async def _on_error(
+                exc: BaseException,
+                _sid: int = subscriber_id,
+                _sub: Any = subscriber,
+            ) -> None:
+                # NOTE: must not touch the netref here — that would
+                # re-enter the very same dead connection. ``_sid`` is
+                # captured by value (default arg) so we don't pin the
+                # subscriber for the lifetime of this closure.
+                logger.warning(
+                    "subscriber on_message failed (id=%s): %r — evicting",
+                    _sid,
+                    exc,
+                )
+                # Evict by IDENTITY — ``set.discard(netref)`` would call
+                # ``netref.__hash__`` → wire round-trip → EOFError on a dead
+                # channel (incident observed 2026-05-22). See evict_subscriber_by_identity.
+                evict_subscriber_by_identity(subscriber_set, _sub)
+
             try:
-                rpyc_start = time_mod.time()
+                # Calling the netref synchronously returns an
+                # ``AsyncResult`` immediately (the MSG_REQUEST is on the
+                # wire by the time we hand the awaitable to
+                # ``fire_and_forget_async``). Construct the awaitable
+                # right here so a netref-level construction failure
+                # (e.g. dead conn) falls into the visible ``except``
+                # below rather than the silent background task.
+                awaitable = subscriber.on_message(payload_str)
+            except Exception as exc:  # noqa: BLE001 — defensive
+                logger.warning(
+                    "could not dispatch on_message to subscriber (id=%s): %r — evicting",
+                    subscriber_id,
+                    exc,
+                )
+                # Evict by IDENTITY — ``set.discard(netref)`` would re-raise
+                # EOFError via ``netref.__hash__`` on the dead channel, and
+                # that secondary error used to escape into _handle_invoke and
+                # force the agent to ERROR (incident observed 2026-05-22).
+                evict_subscriber_by_identity(subscriber_set, subscriber)
+                continue
 
-                # ✨ ASYNC CALLBACK: Match deepagents architecture!
-                # In deepagents, all callbacks (mount_message, etc.) are called with await.
-                # We preserve this async pattern across the RPyC boundary.
-                # With AsyncioServer, await works correctly on proxy objects!
-                await subscriber.on_message(payload_str)
-
-                rpyc_end = time_mod.time()
-                rpyc_duration_ms = (rpyc_end - rpyc_start) * 1000
-                with open("/tmp/dwcli_rpyc_timing.log", "a") as f:
-                    f.write(f"  RPyC ASYNC callback took {rpyc_duration_ms:.1f}ms\n")
-            except Exception as e:
-                # Use repr() to avoid triggering RPyC netref attribute access
-                logger.error(f"Error dispatching ASYNC callback to subscriber (id={id(subscriber)}): {e}")
+            fire_and_forget_async(
+                awaitable,
+                timeout=notify_timeout,
+                error_callback=_on_error,
+                name=f"notify-subscriber-{subscriber_id}",
+            )

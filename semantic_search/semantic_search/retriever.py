@@ -218,7 +218,23 @@ def search(
         if cached_embed is None:
             from llama_index.embeddings.huggingface import HuggingFaceEmbedding  # type: ignore[import-untyped]  # noqa: PLC0415
 
-            cached_embed = HuggingFaceEmbedding(model_name=config.embedding_model)
+            # Force STRICTLY-OFFLINE model resolution. ``local_files_only=True``
+            # is forwarded to ``SentenceTransformer`` (and thus to every
+            # ``huggingface_hub`` call), so loading the embedder performs NO
+            # network HEAD/metadata/download request — it uses only the
+            # already-cached model. This is the engine behind the agents'
+            # ``project_memory`` tool, which must never hit the network: a
+            # transient HF Hub outage previously hung an agent turn indefinitely
+            # (see docs/DESIGN_FIX_PROJECT_MEMORY_OFFLINE_MODEL_LOAD.md).
+            #
+            # Scoped, not global: this is a per-instance kwarg — it does NOT set
+            # any ``os.environ`` and does NOT affect other libraries/processes on
+            # the host. No explicit ``cache_folder`` is passed; llama_index's
+            # default cache dir already contains the model.
+            cached_embed = HuggingFaceEmbedding(
+                model_name=config.embedding_model,
+                model_kwargs={"local_files_only": True},
+            )
             _embedding_cache[config.embedding_model] = cached_embed
         embedding_model = cached_embed
 

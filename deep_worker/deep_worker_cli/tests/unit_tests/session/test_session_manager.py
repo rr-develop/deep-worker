@@ -24,6 +24,18 @@ def session_manager(temp_data_dir):
     return SessionManager(data_dir=temp_data_dir)
 
 
+def test_launch_config_storage_version_is_used_for_new_metadata(temp_data_dir):
+    manager = SessionManager(
+        data_dir=temp_data_dir,
+        launch_config={"storage_version": 2},
+    )
+
+    metadata_file = temp_data_dir / "session_metadata.json"
+    data = json.loads(metadata_file.read_text())
+    assert manager.storage_version == 2
+    assert data["storage_version"] == 2
+
+
 class TestSessionManagerInitialization:
     """Tests for SessionManager initialization."""
 

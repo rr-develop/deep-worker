@@ -1,6 +1,8 @@
 """Custom tools for the CLI agent."""
 
 import logging
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Literal
@@ -20,6 +22,7 @@ from tavily.errors import ForbiddenError, TimeoutError as TavilyTimeoutError
 
 from deep_worker_cli.config import settings
 from deep_worker_cli.exceptions import AgentNotFoundError, IPCConnectionError
+from deep_worker_cli.process.registry import ProcessRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +30,7 @@ logger = logging.getLogger(__name__)
 # CRITICAL: CLAUDE_CODE_PROVIDER MUST BE IMPORTED FROM SOURCE CODE, NOT FROM PIP/VENV!
 # ============================================================================
 # Path calculation: __file__ is at deep_worker/deep_worker_cli/deep_worker_cli/tools.py
-# .parent x4 =  (repository root)
+# .parent x4 = the repository root
 _repo_root = Path(__file__).parent.parent.parent.parent
 _claude_code_provider_path = _repo_root / "claude_code_provider"
 if not _claude_code_provider_path.exists():
@@ -310,6 +313,154 @@ def read_image(file_path: str) -> list[dict[str, Any]] | str:
         ]
     except Exception as e:
         return f"Error: Failed to read image: {e}"
+
+
+# ===========================================================================
+# AGENT RESTART TOOL
+# ===========================================================================
+
+
+class _RestartAgentArgs(BaseModel):
+    agent_name: str = Field(
+        ...,
+        description=(
+            "Registry/session name of the agent to ensure is running by "
+            "using the same lifecycle as 'deep-worker --restart <agent_name>'."
+        ),
+    )
+
+
+def _map_restart_error(stderr: str) -> str:
+    text = stderr.lower()
+    if "no previous launch configuration found" in text:
+        return "no_launch_config"
+    if "actively running" in text or "status: running" in text:
+        return "actively_running"
+    return "restart_failed"
+
+
+def make_restart_agent_tool(sender_name: str) -> BaseTool:
+    @tool(
+        "restart_agent",
+        args_schema=_RestartAgentArgs,
+    )
+    async def restart_agent(agent_name: str) -> dict[str, Any]:
+        """Restart or start a named deep-worker agent.
+
+        This tool runs the equivalent of `deep-worker --restart <agent_name>`.
+
+        Usage policy:
+        - Do NOT use this tool by default.
+        - Use it only when the human user explicitly asks to restart an agent,
+          explicitly asks to ensure an agent is running, or provides a procedure
+          that explicitly requires a named agent to be in a running state.
+        - Do not use it for speculative cleanup, optimization, or autonomous
+          process management.
+        """
+        if not isinstance(agent_name, str) or not agent_name.strip():
+            return {
+                "success": False,
+                "agent_name": "",
+                "already_running": False,
+                "error": "invalid_argument",
+                "message": "agent_name must be a non-empty string",
+            }
+
+        target = agent_name.strip()
+        if target == sender_name:
+            return {
+                "success": False,
+                "agent_name": target,
+                "already_running": False,
+                "error": "self_restart_forbidden",
+                "message": "Agents cannot restart themselves.",
+            }
+
+        registry = ProcessRegistry()
+        existing = registry.lookup(target)
+        if existing is not None:
+            return {
+                "success": True,
+                "agent_name": target,
+                "already_running": True,
+                "error": "already_running",
+                "message": f"Agent '{target}' is already running (PID {existing.pid}).",
+            }
+
+        command = shutil.which("deep-worker")
+        if command is None:
+            return {
+                "success": False,
+                "agent_name": target,
+                "already_running": False,
+                "error": "command_unavailable",
+                "message": "deep-worker command not found on PATH",
+            }
+
+        try:
+            completed = subprocess.run(
+                [command, "--restart", target],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except subprocess.TimeoutExpired as e:
+            return {
+                "success": False,
+                "agent_name": target,
+                "already_running": False,
+                "error": "restart_timeout",
+                "message": "deep-worker --restart timed out",
+                "stdout": e.stdout or "",
+                "stderr": e.stderr or "",
+            }
+
+        if completed.returncode != 0:
+            return {
+                "success": False,
+                "agent_name": target,
+                "already_running": False,
+                "error": _map_restart_error(completed.stderr),
+                "message": completed.stderr.strip() or "deep-worker --restart failed",
+                "stdout": completed.stdout,
+                "stderr": completed.stderr,
+            }
+
+        # Linux inotify + asyncio to watch the registry file for changes.
+        info = await registry.wait_for_registration(target, timeout=30)
+        if info is not None:
+            return {
+                "success": True,
+                "agent_name": target,
+                "already_running": False,
+                "message": f"Agent '{target}' restarted and registered (PID {info.pid}).",
+                "stdout": completed.stdout,
+                "stderr": completed.stderr,
+            }
+
+        info = registry.lookup(target)
+        if info is not None:
+            return {
+                "success": False,
+                "agent_name": target,
+                "already_running": False,
+                "error": "restart_timeout",
+                "message": f"Agent '{target}' did not register after restart.",
+                "stdout": completed.stdout,
+                "stderr": completed.stderr,
+            }
+
+        return {
+            "success": False,
+            "agent_name": target,
+            "already_running": False,
+            "error": "restart_timeout",
+            "message": f"Agent '{target}' did not register after restart.",
+            "stdout": completed.stdout,
+            "stderr": completed.stderr,
+        }
+
+    return restart_agent
 
 
 # ===========================================================================

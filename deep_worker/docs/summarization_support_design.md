@@ -1,53 +1,53 @@
-# Design: Support for automatic context summarization in deep-worker
+# Design: Automatic Context Summarization Support in deep-worker
 
 **Version:** 1.0
 **Date:** 2026-04-02
-**Status:** Design Document (the code was not changed)
+**Status:** Design Document (no code changes)
 **Related documents:** `context_management_analysis.md`
 
 ---
 
-## Table of contents
+## Table of Contents
 
-1. [Goal and objectives](#1-goal-and-objectives)
-2. [Context windows of various AI providers](#2-context-windows-of-various-ai-providers)
+1. [Goal and Objectives](#1-goal-and-objectives)
+2. [Context Windows of Various AI Providers](#2-context-windows-of-various-ai-providers)
 3. [Current state](#3-current-state)
-4. [Architectural design](#4-architectural-design)
-5. [Dynamic configuration per provider](#5-dynamic-configuration-per-provider)
-6. [API and configuration](#6-api-and-configuration)
-7. [Integration with the existing code](#7-integration-with-the-existing-code)
+4. [Architectural Design](#4-architectural-design)
+5. [Dynamic Per-Provider Configuration](#5-dynamic-per-provider-configuration)
+6. [API and Configuration](#6-api-and-configuration)
+7. [Integration with Existing Code](#7-integration-with-existing-code)
 8. [Testing](#8-testing)
-9. [Migration and backward compatibility](#9-migration-and-backward-compatibility)
-10. [Performance and scalability](#10-performance-and-scalability)
-11. [Security and privacy](#11-security-and-privacy)
-12. [Implementation plan](#12-implementation-plan)
+9. [Migration and Backward Compatibility](#9-migration-and-backward-compatibility)
+10. [Performance and Scalability](#10-performance-and-scalability)
+11. [Security and Privacy](#11-security-and-privacy)
+12. [Implementation Plan](#12-implementation-plan)
 
 ---
 
-## 1. Goal and objectives
+## 1. Goal and Objectives
 
 ### Goal
 
-Integrate the `SummarizationMiddleware` from the deepagents SDK into deep-worker for automatic management of the context size in long-running agent sessions.
+Integrate `SummarizationMiddleware` from the deepagents SDK into deep-worker to automatically manage context size in long-running agent sessions.
 
 ### Objectives
 
-1. **Preventing context overflow** - automatic summarization when approaching the context window limit
-2. **Support for various providers** - dynamic configuration based on the known provider limits (Claude, DeepSeek, OpenAI, etc.)
-3. **Preserving the full history** - offloading the full conversation history to the backend so that it can be reviewed
-4. **Truncating large arguments** - automatic truncation of tool call arguments in old messages
-5. **Configurability** - the ability to configure via CLI parameters and settings
-6. **Transparency for the user** - filtering the intermediate summarization messages out of the UI
+1. **Prevent context overflow** - automatic summarization when approaching the context window limit
+2. **Support various providers** - dynamic configuration based on known provider limits (Claude, DeepSeek, OpenAI, etc.)
+3. **Preserve full history** - offload the full conversation history to a backend for later review
+4. **Truncate large arguments** - automatically truncate tool call arguments in old messages
+5. **Configurability** - configurable via CLI parameters and settings
+6. **User transparency** - filter summarization intermediary messages from the UI
 
-### Non-goals
+### Non-Goals
 
 - Implementing our own summarization mechanism (we use the ready-made one from deepagents)
 - Changing the deepagents API (integration only)
-- Manual summarization on a user command (may be added later)
+- Manual summarization on user command (may be added later)
 
 ---
 
-## 2. Context windows of various AI providers
+## 2. Context Windows of Various AI Providers
 
 ### 2.1. Anthropic Claude (official documentation)
 
@@ -58,8 +58,8 @@ Integrate the `SummarizationMiddleware` from the deepagents SDK into deep-worker
 
 | Model | Context window | Notes |
 |--------|------------------|------------|
-| **Claude Opus 4.6** | 1,000,000 tokens | Requires the header `anthropic-beta: context-1m-2025-08-07` |
-| **Claude Sonnet 4.6** | 1,000,000 tokens | Requires the header `anthropic-beta: context-1m-2025-08-07` |
+| **Claude Opus 4.6** | 1,000,000 tokens | Requires header `anthropic-beta: context-1m-2025-08-07` |
+| **Claude Sonnet 4.6** | 1,000,000 tokens | Requires header `anthropic-beta: context-1m-2025-08-07` |
 | **Claude Sonnet 4.5** | 200,000 tokens | Standard window without additional headers |
 | **Claude Sonnet 4** | 200,000 tokens | |
 | **Claude Haiku 4.5** | 200,000 tokens | |
@@ -67,11 +67,11 @@ Integrate the `SummarizationMiddleware` from the deepagents SDK into deep-worker
 | **Claude 3.5 Haiku** | 200,000 tokens | |
 | **Claude 3 Opus** | 200,000 tokens | |
 
-**Key features of Claude:**
-- The 1M context is available only for Opus 4.6 and Sonnet 4.6
-- Standard token pricing, without a premium for extended context
-- Context awareness - the models track the remaining context
-- Support for up to 600 images/PDF pages (100 for the 200k models)
+**Key Claude features:**
+- 1M context is available only for Opus 4.6 and Sonnet 4.6
+- Standard per-token pricing, no premium for extended context
+- Context awareness - models track the remaining context
+- Support for up to 600 images/PDF pages (100 for 200k models)
 
 **Recommended settings for deep-worker:**
 ```python
@@ -95,28 +95,27 @@ keep=("fraction", 0.15)     # 30k tokens
 
 | Model | Context window | Notes |
 |--------|------------------|------------|
-| **DeepSeek-V3.2** | 128,000 tokens | Current API version (deepseek-chat, deepseek-reasoner) |
-| **DeepSeek-V3** | 128,000 tokens | Base model, extended from 32K to 128K |
+| **DeepSeek-V4 Flash** | 1,000,000 tokens | Recommended model (deepseek-v4-flash) |
+| **DeepSeek-V4 Pro** | 1,000,000 tokens | Flagship model (deepseek-v4-pro) |
+| **DeepSeek-V3.2** | 128,000 tokens | Previous API version (deepseek-chat, deepseek-reasoner, legacy) |
+| **DeepSeek-V3** | 128,000 tokens | Base model, expanded from 32K to 128K |
 | **DeepSeek-V3.1** | 128,000 tokens | 671B parameters (37B active) |
-| **DeepSeek-Coder-V2** | 128,000 tokens | A specialized model for code |
-| **DeepSeek-V3-0324** | 64,000 tokens | Old API version (input+output together) |
+| **DeepSeek-Coder-V2** | 128,000 tokens | Specialized code model |
+| **DeepSeek-V3-0324** | 64,000 tokens | Old API version (input+output combined) |
 | **DeepSeek-R1** | 64,000 tokens input | Up to 32k-64k output (including reasoning chains) |
 
-**Key features of DeepSeek:**
-- The V3.2 API version supports a 128K context
+**Key DeepSeek features:**
+- V4 models support 1M context
+- API version V3.2 supports 128K context
 - Older API endpoints may have a 64K limit (input+output)
-- The web/app version is testing a 1M context (not in the API yet)
-- Needle-in-a-Haystack tests show good performance at all positions up to 128K
+- Web/app version is testing 1M context (not yet in the API)
+- Needle-in-a-Haystack tests: V4 — 78.7%, V3 — ~95% at 128K
 
-**Recommended settings for deep-worker:**
+**Recommended settings for deep-worker (deepseek-v4-flash):**
 ```python
-# DeepSeek V3.2 (128K context)
-trigger=("fraction", 0.75)  # 96k tokens (conservative)
-keep=("fraction", 0.20)     # 25.6k tokens
-
-# DeepSeek older versions (64K context)
-trigger=("fraction", 0.70)  # 44.8k tokens
-keep=("fraction", 0.25)     # 16k tokens
+# DeepSeek V4 Flash (1M context)
+trigger=("fraction", 0.85)  # 850k tokens
+keep=("fraction", 0.10)     # 100k tokens
 ```
 
 ---
@@ -134,7 +133,7 @@ keep=("fraction", 0.25)     # 16k tokens
 
 ---
 
-### 2.4. Other providers
+### 2.4. Other Providers
 
 | Provider | Model | Context window |
 |-----------|--------|------------------|
@@ -145,7 +144,7 @@ keep=("fraction", 0.25)     # 16k tokens
 
 ---
 
-### 2.5. Summary table for configuration
+### 2.5. Summary Table for Configuration
 
 | Context range | Providers | Recommended trigger | Recommended keep |
 |-------------------|------------|----------------------|-------------------|
@@ -160,24 +159,24 @@ keep=("fraction", 0.25)     # 16k tokens
 **Rationale for the settings:**
 
 1. **Trigger (when to start summarization):**
-   - For large contexts (1M+): 85% - allows the context to be used to the maximum
-   - For medium ones (128k-200k): 75-80% - a balance between utilization and safety
-   - For small ones (16k-64k): 60-70% - early triggering to prevent overflow
+   - For large contexts (1M+): 85% - maximizes context utilization
+   - For medium (128k-200k): 75-80% - a balance between utilization and safety
+   - For small (16k-64k): 60-70% - early triggering to prevent overflow
 
 2. **Keep (how much to keep after summarization):**
    - For large contexts: 10% - enough for context (~100k tokens)
-   - For medium ones: 15-20% - a balance between context and compression
-   - For small ones: 25-30% - keeping enough context to keep working
+   - For medium: 15-20% - a balance between context and compression
+   - For small: 25-30% - preserving enough context to keep working
 
 ---
 
 ## 3. Current state
 
-### 3.1. What is already implemented
+### 3.1. What is Already Implemented
 
 #### A. Filtering of summarization messages (done)
 
-**Places of implementation:**
+**Implementation locations:**
 
 1. **`stream_processor.py:169-171`**
    ```python
@@ -200,7 +199,7 @@ keep=("fraction", 0.25)     # 16k tokens
        return
    ```
 
-**Conclusion:** The filtering is fully ready to work with the SummarizationMiddleware.
+**Conclusion:** Filtering is fully ready to work with SummarizationMiddleware.
 
 ---
 
@@ -217,18 +216,18 @@ composite_backend = CompositeBackend(
     default=backend,
     routes={
         "/large_tool_results/": large_results_backend,
-        "/conversation_history/": conversation_history_backend,  # READY!
+        "/conversation_history/": conversation_history_backend,  # DONE!
     },
 )
 ```
 
-**Conclusion:** The backend is ready to accept requests to save the history to `/conversation_history/`.
+**Conclusion:** The backend is ready to accept history-saving requests under `/conversation_history/`.
 
 ---
 
-#### C. Determining the model context limit (partially implemented)
+#### C. Model context limit detection (partially implemented)
 
-**`config.py:1348-1349` - extraction from the model profile:**
+**`config.py:1348-1349` - extraction from model profile:**
 
 ```python
 if isinstance(profile, dict) and isinstance(profile.get("max_input_tokens"), int):
@@ -236,32 +235,32 @@ if isinstance(profile, dict) and isinstance(profile.get("max_input_tokens"), int
 ```
 
 **Current behavior:**
-- Automatically determines `max_input_tokens` from the model profile
+- Automatically detects `max_input_tokens` from the model profile
 - Stored in `settings.model_context_limit`
-- Used to emit warnings about small contexts (<8000 tokens)
+- Used to print warnings about small contexts (<8000 tokens)
 
 **What is MISSING:**
-- Using `model_context_limit` to configure the SummarizationMiddleware
-- Dynamic selection of triggers based on the context size
-- A model → recommended summarization settings mapping
+- Using `model_context_limit` to configure SummarizationMiddleware
+- Dynamic trigger selection based on context size
+- Mapping model → recommended summarization settings
 
 ---
 
-### 3.2. What needs to be added
+### 3.2. What Needs to Be Added
 
 1. **Import SummarizationMiddleware** in `agent.py`
-2. **Add it to the middleware stack** with the correct settings
+2. **Add to the middleware stack** with the correct settings
 3. **Dynamic configuration** based on `model_context_limit`
 4. **Settings for summarization** in `config.py`
 5. **CLI parameters** in `main.py`
-6. **Tests** to verify the functionality
+6. **Tests** to verify functionality
 7. **Documentation** for users
 
 ---
 
-## 4. Architectural design
+## 4. Architectural Design
 
-### 4.1. System components
+### 4.1. System Components
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -269,7 +268,7 @@ if isinstance(profile, dict) and isinstance(profile.get("max_input_tokens"), int
 │                                                                   │
 │  ┌───────────────┐         ┌──────────────────────────────┐    │
 │  │   Settings    │────────▶│  SummarizationConfigurator   │    │
-│  │  (config.py)  │         │  (new component)             │    │
+│  │  (config.py)  │         │  (new component)            │    │
 │  └───────────────┘         └──────────────────────────────┘    │
 │         │                              │                         │
 │         │                              ▼                         │
@@ -280,12 +279,12 @@ if isinstance(profile, dict) and isinstance(profile.get("max_input_tokens"), int
 │         │                              │                         │
 │         ▼                              ▼                         │
 │  ┌─────────────────────────────────────────────────────┐        │
-│  │         create_cli_agent() in agent.py              │        │
+│  │         create_cli_agent() in agent.py               │        │
 │  │                                                      │        │
 │  │  1. Determine model_context_limit                   │        │
-│  │  2. Select the summarization settings               │        │
-│  │  3. Create the SummarizationMiddleware              │        │
-│  │  4. Add it to the middleware stack (FIRST!)         │        │
+│  │  2. Select summarization settings                   │        │
+│  │  3. Create SummarizationMiddleware                  │        │
+│  │  4. Add to the middleware stack (FIRST!)            │        │
 │  └─────────────────────────────────────────────────────┘        │
 │                          │                                       │
 │                          ▼                                       │
@@ -313,11 +312,11 @@ if isinstance(profile, dict) and isinstance(profile.get("max_input_tokens"), int
 
 ---
 
-### 4.2. New component: SummarizationConfigurator
+### 4.2. New Component: SummarizationConfigurator
 
-**Purpose:** Dynamic selection of summarization settings based on the provider and the context limit.
+**Purpose:** Dynamic selection of summarization settings based on the provider and context limit.
 
-**Location:** `deep_worker_cli/config.py` (a new function)
+**Location:** `deep_worker_cli/config.py` (new function)
 
 **API:**
 
@@ -332,9 +331,9 @@ class SummarizationConfig:
     max_arg_length: int
 
     # Additional metadata
-    context_limit: int  # The model's context limit
-    trigger_tokens: int  # The absolute trigger value in tokens
-    keep_tokens: int     # The absolute keep value in tokens
+    context_limit: int  # Model context limit
+    trigger_tokens: int  # Absolute trigger value in tokens
+    keep_tokens: int     # Absolute keep value in tokens
 
 
 def get_summarization_config(
@@ -356,7 +355,7 @@ def get_summarization_config(
     """
 ```
 
-**The logic for determining the settings:**
+**Logic for determining the settings:**
 
 ```python
 # Pseudocode
@@ -427,9 +426,9 @@ return SummarizationConfig(
 
 ### 4.3. Provider Context Map
 
-**Purpose:** Explicit definition of context limits for known models (a fallback if the model profile does not provide `max_input_tokens`).
+**Purpose:** Explicitly define context limits for known models (fallback if the model profile does not provide `max_input_tokens`).
 
-**Location:** `deep_worker_cli/config.py` (a module constant)
+**Location:** `deep_worker_cli/config.py` (module constant)
 
 **Structure:**
 
@@ -518,14 +517,14 @@ def get_model_context_limit(
 
 ---
 
-## 5. Dynamic configuration per provider
+## 5. Dynamic Per-Provider Configuration
 
-### 5.1. The settings selection algorithm
+### 5.1. Settings Selection Algorithm
 
 ```python
 # In create_cli_agent() in agent.py
 
-# Step 1: Determine the model's context limit
+# Step 1: Determine the model context limit
 model_profile = None
 if isinstance(model, BaseChatModel):
     model_profile = getattr(model, "profile", None)
@@ -543,7 +542,7 @@ summarization_config = get_summarization_config(
     override_keep=settings.summarization_keep_fraction,
 )
 
-# Step 3: Create the SummarizationMiddleware with these settings
+# Step 3: Create SummarizationMiddleware with these settings
 if settings.summarization_enabled:
     from deepagents.middleware.summarization import SummarizationMiddleware
 
@@ -557,10 +556,10 @@ if settings.summarization_enabled:
         },
     )
 
-    # IMPORTANT: Add it FIRST in the middleware stack!
+    # IMPORTANT: Add FIRST to the middleware stack!
     agent_middleware.insert(0, summarization_middleware)
 
-    # Logging of the selected settings
+    # Log the selected settings
     logger.info(
         f"Summarization enabled for {settings.model_name or 'unknown model'}: "
         f"context_limit={context_limit:,} tokens, "
@@ -573,7 +572,7 @@ if settings.summarization_enabled:
 
 ---
 
-### 5.2. Special handling of providers
+### 5.2. Special Provider Handling
 
 #### A. Claude Opus 4.6 / Sonnet 4.6 (1M context)
 
@@ -585,20 +584,20 @@ if settings.summarization_enabled:
 # In create_model() in config.py or when creating the model
 
 if model_name in ["claude-opus-4.6", "claude-sonnet-4.6"]:
-    # Check whether the header for the 1M context is set
+    # Check whether the 1M context header is set
     # If not - emit a warning or add it automatically
 
-    # Option 1: A warning
+    # Option 1: Warning
     if not os.environ.get("ANTHROPIC_BETA_HEADERS"):
         logger.warning(
             f"Model {model_name} supports 1M context window, but "
             f"anthropic-beta header not set. Add to .env:\n"
             f"ANTHROPIC_BETA_HEADERS=context-1m-2025-08-07"
         )
-        # Fall back to the 200k settings
+        # Fall back to 200k settings
         context_limit = 200_000
 
-    # Option 2: Automatically adding the header (if LangChain supports it)
+    # Option 2: Add the header automatically (if LangChain supports it)
     # model_kwargs["default_headers"] = {"anthropic-beta": "context-1m-2025-08-07"}
 ```
 
@@ -618,9 +617,9 @@ ANTHROPIC_BETA_HEADERS=context-1m-2025-08-07
 **Solution:**
 
 ```python
-# Determining the DeepSeek version from model_name
+# Determine the DeepSeek version from model_name
 if "deepseek" in model_name.lower():
-    # V3.2 API (the new version) - 128K
+    # V3.2 API (new version) - 128K
     if any(v in model_name.lower() for v in ["v3.2", "v3.1", "v3", "chat", "reasoner"]):
         context_limit = 128_000
     # Older versions or R1 - 64K
@@ -637,7 +636,7 @@ if "deepseek" in model_name.lower():
 
 ---
 
-#### C. Unknown models via OpenRouter
+#### C. Unknown Models via OpenRouter
 
 **Problem:** OpenRouter provides access to many models whose limits may be unknown.
 
@@ -649,7 +648,7 @@ if model_name and model_name.startswith("openrouter/"):
     # Try to extract the real model name
     actual_model = model_name.split("/", 1)[-1]
 
-    # Try to find it among the known models
+    # Try to find it among known models
     context_limit = get_model_context_limit(actual_model, model_profile)
 
     if context_limit == PROVIDER_CONTEXT_LIMITS["default"]:
@@ -661,7 +660,7 @@ if model_name and model_name.startswith("openrouter/"):
 
 ---
 
-## 6. API and configuration
+## 6. API and Configuration
 
 ### 6.1. Settings (config.py)
 
@@ -718,28 +717,28 @@ class Settings(BaseSettings):
         ),
     )
 
-    # Backend for storing the history
+    # Backend for saving history
     summarization_history_backend: str = Field(
         default="temp",  # "temp" or "persistent"
         description=(
             "Backend for conversation history storage. "
             "'temp' uses /tmp (cleared on reboot), "
-            "'persistent' saves to ~/.deepagents/{agent}/conversation_history/"
+            "'persistent' saves to <agent-data-dir>/{agent}/conversation_history/"
         ),
     )
 ```
 
-**Rationale for `None` for trigger/keep:**
-- `None` means "determine automatically based on the model"
+**Rationale for `None` trigger/keep:**
+- `None` means "auto-determine based on the model"
 - If an explicit value is set, it is used
-- Allows smart defaults with the option to override
+- Allows smart defaults with the ability to override
 
 ---
 
-### 6.2. CLI parameters (main.py)
+### 6.2. CLI Parameters (main.py)
 
 ```python
-# The argument group for context management
+# Argument group for context management
 context_group = parser.add_argument_group(
     "Context Management",
     "Options for managing conversation context and summarization"
@@ -781,7 +780,7 @@ context_group.add_argument(
     action="store_true",
     help=(
         "Save conversation history persistently to "
-        "~/.deepagents/{agent}/conversation_history/ instead of /tmp. "
+        "<agent-data-dir>/{agent}/conversation_history/ instead of /tmp. "
         "Useful for reviewing past conversations."
     ),
 )
@@ -806,7 +805,7 @@ if args.persistent_history:
 
 ---
 
-### 6.3. Environment variables (.env)
+### 6.3. Environment Variables (.env)
 
 ```bash
 # .env - configuration examples
@@ -814,7 +813,7 @@ if args.persistent_history:
 # Disable summarization
 SUMMARIZATION_ENABLED=false
 
-# Set the settings explicitly (overriding auto-detection)
+# Explicitly set settings (override auto-detection)
 SUMMARIZATION_TRIGGER_FRACTION=0.80
 SUMMARIZATION_KEEP_FRACTION=0.15
 SUMMARIZATION_TRUNCATE_AFTER=20
@@ -823,13 +822,13 @@ SUMMARIZATION_MAX_ARG_LENGTH=500
 # Persistent history storage
 SUMMARIZATION_HISTORY_BACKEND=persistent
 
-# For Claude Opus 4.6 / Sonnet 4.6 - activating the 1M context
+# For Claude Opus 4.6 / Sonnet 4.6 - activate 1M context
 ANTHROPIC_BETA_HEADERS=context-1m-2025-08-07
 ```
 
 ---
 
-## 7. Integration with the existing code
+## 7. Integration with Existing Code
 
 ### 7.1. Changes in agent.py
 
@@ -848,18 +847,18 @@ from deepagents.middleware.subagents import CompiledSubAgent, SubAgent
 from deepagents.middleware.summarization import SummarizationMiddleware  # ADD
 ```
 
-2. **Creating the backend for the history (lines 658-674) - CHANGE:**
+2. **Creating the history backend (lines 658-674) - CHANGE:**
 
 ```python
-# BEFORE:
+# WAS:
 conversation_history_backend = FilesystemBackend(
     root_dir=tempfile.mkdtemp(prefix="deepagents_conversation_history_"),
     virtual_mode=True,
 )
 
-# AFTER:
+# NOW:
 if settings.summarization_history_backend == "persistent":
-    # Persistent storage in ~/.deepagents/{agent}/conversation_history/
+    # Persistent storage in <agent-data-dir>/{agent}/conversation_history/
     history_dir = settings.user_deepagents_dir / assistant_id / "conversation_history"
     history_dir.mkdir(parents=True, exist_ok=True)
     conversation_history_backend = FilesystemBackend(
@@ -874,7 +873,7 @@ else:
     )
 ```
 
-3. **Adding the SummarizationMiddleware to the stack (AFTER composite_backend is created, lines 566-596):**
+3. **Adding SummarizationMiddleware to the stack (AFTER creating composite_backend, lines 566-596):**
 
 ```python
 # Build middleware stack based on enabled features
@@ -883,7 +882,7 @@ agent_middleware = []
 # ========== CONTEXT MANAGEMENT (FIRST!) ==========
 # Add SummarizationMiddleware FIRST to manage context size early
 if settings.summarization_enabled:
-    # Step 1: Determine the model's context limit
+    # Step 1: Determine the model context limit
     model_profile = None
     if isinstance(model, BaseChatModel):
         model_profile = getattr(model, "profile", None)
@@ -927,7 +926,7 @@ if settings.summarization_enabled:
 # ========== MEMORY ==========
 if enable_memory:
     memory_sources = [str(settings.get_user_agent_md_path(assistant_id))]
-    # ... the rest of the code is unchanged ...
+    # ... the rest of the code unchanged ...
 ```
 
 ---
@@ -944,7 +943,7 @@ if enable_memory:
 4. **get_summarization_config()** (function, ~line 260-350)
 5. **Settings fields for summarization** (in the Settings class, ~line 400-450)
 
-See the details in sections 4.2 and 6.1.
+See details in sections 4.2 and 6.1.
 
 ---
 
@@ -957,13 +956,13 @@ See the details in sections 4.2 and 6.1.
 1. **The `context_group` argument group** (~line 200-250)
 2. **Argument handling** in main() (~line 500-550)
 
-See the details in section 6.2.
+See details in section 6.2.
 
 ---
 
 ## 8. Testing
 
-### 8.1. Unit tests
+### 8.1. Unit Tests
 
 **File:** `tests/unit_tests/test_summarization_config.py`
 
@@ -1111,7 +1110,7 @@ class TestGetSummarizationConfig:
 
 ---
 
-### 8.2. Integration tests
+### 8.2. Integration Tests
 
 **File:** `tests/integration_tests/test_summarization_integration.py`
 
@@ -1190,7 +1189,7 @@ async def test_conversation_history_saved_to_backend(tmp_path: Path):
     )
 
     # TODO: Trigger summarization by filling context, verify history file created
-    # Expected path: ~/.deepagents/test_history/conversation_history/{thread_id}.md
+    # Expected path: <agent-data-dir>/test_history/conversation_history/{thread_id}.md
     pass
 
 
@@ -1205,7 +1204,7 @@ async def test_persistent_vs_temp_history_backend(tmp_path: Path):
         project_memory_dir=tmp_path,
         enable_shell=False,
     )
-    # TODO: Verify history goes to ~/.deepagents/test_persistent/conversation_history/
+    # TODO: Verify history goes to <agent-data-dir>/test_persistent/conversation_history/
 
     # Test 2: Temp backend
     settings.summarization_history_backend = "temp"
@@ -1221,7 +1220,7 @@ async def test_persistent_vs_temp_history_backend(tmp_path: Path):
 
 ---
 
-### 8.3. E2E tests
+### 8.3. E2E Tests
 
 **File:** `tests/e2e/test_summarization_e2e.py`
 
@@ -1268,56 +1267,56 @@ async def test_claude_opus_4_6_with_1m_context(tmp_path: Path):
 
 ---
 
-## 9. Migration and backward compatibility
+## 9. Migration and Backward Compatibility
 
-### 9.1. Backward compatibility
+### 9.1. Backward Compatibility
 
 **Requirements:**
 
-1. **Existing agents keep working** without changes
+1. **Existing agents continue to work** without changes
 2. **The new feature is enabled by default**, but can be disabled
-3. **The CLI parameters are optional** - the defaults work automatically
+3. **CLI parameters are optional** - defaults work automatically
 
 **Guarantees:**
 
 ```python
-# Agents created before the rollout:
-# - Keep working (summarization_enabled=True by default)
+# Agents created before the change:
+# - Continue to work (summarization_enabled=True by default)
 # - Get automatic smart settings based on the model
-# - Can disable it via --no-summarization
+# - Can be disabled via --no-summarization
 
 # Agents with explicit settings:
 # - Settings from .env/CLI override the automatic ones
-# - Full compatibility with the previous behavior when using --no-summarization
+# - Full compatibility with previous behavior with --no-summarization
 ```
 
 ---
 
-### 9.2. The migration path
+### 9.2. Migration Path
 
 **Phase 1: Introduction (v1.0)**
-- Summarization is enabled by default
+- Summarization enabled by default
 - Automatic settings based on the model
 - INFO logging of the selected settings
 
 **Phase 2: Optimization (v1.1)**
-- Analysis of logs and metrics from production usage
-- Adjustment of the default settings based on real data
-- Adding the `dwcli --prune-history` command (from Proposal 3)
+- Analyze logs and metrics from production usage
+- Adjust default settings based on real data
+- Add the `dwcli --prune-history` command (from Proposal 3)
 
 **Phase 3: Extension (v2.0)**
 - Support for various summarization strategies (not only fraction)
-- Configuration via a web UI / TUI
+- Configuration via web UI / TUI
 - Real-time metrics (how many tokens were saved)
 
 ---
 
-### 9.3. Notifying users
+### 9.3. User Notification
 
-**On the first run with the new version:**
+**On first launch with the new version:**
 
 ```python
-# In main() after the agent is created:
+# In main() after creating the agent:
 if settings.summarization_enabled and not settings._summarization_welcome_shown:
     console.print(
         "\n[dim]New: Automatic context management enabled! "
@@ -1329,7 +1328,7 @@ if settings.summarization_enabled and not settings._summarization_welcome_shown:
     settings._save_welcome_flag()
 ```
 
-**In the agent logs:**
+**In agent logs:**
 
 ```
 [INFO] Summarization enabled: model=claude-sonnet-4.5, context=200,000 tokens,
@@ -1338,51 +1337,51 @@ if settings.summarization_enabled and not settings._summarization_welcome_shown:
 
 ---
 
-## 10. Performance and scalability
+## 10. Performance and Scalability
 
 ### 10.1. Performance
 
-**The overhead of summarization:**
+**Summarization overhead:**
 
-1. **The LLM call for summarization:**
+1. **LLM call for summarization:**
    - An additional API call to the model
-   - Approximate time: 2-5 seconds (depends on the size of the history)
+   - Approximate time: 2-5 seconds (depends on history size)
    - Frequency: only when the trigger threshold is reached
 
-2. **Saving the history to the backend:**
+2. **Saving history to the backend:**
    - A file write operation
    - Approximate time: <100ms for a local filesystem
    - Approximate time: 200-500ms for S3/remote storage
 
 3. **Argument truncation:**
-   - An in-memory operation (very fast)
+   - In-memory operation (very fast)
    - Approximate time: <10ms for 100 messages
 
-**Overall conclusion:** Minimal overhead, noticeable only when summarization fires (rarely).
+**Overall conclusion:** Minimal overhead, noticeable only when summarization triggers (rarely).
 
 ---
 
 ### 10.2. Scalability
 
-**The size of the history on disk:**
+**History size on disk:**
 
 ```python
 # Estimated history size for 1 session:
 # - 100 messages × ~500 tokens × ~4 bytes/token = 200KB
 # - With Markdown formatting: ~300KB
 
-# For the persistent backend:
-# ~/.deepagents/{agent}/conversation_history/
+# For persistent backend:
+# <agent-data-dir>/{agent}/conversation_history/
 #   thread_001.md  (300KB)
 #   thread_002.md  (300KB)
 #   ...
 #   thread_100.md  (300KB)
 # Total: ~30MB for 100 sessions
 
-# Recommendation: Periodic cleanup of old histories (>30 days)
+# Recommendation: Periodically clean up old histories (>30 days)
 ```
 
-**The cleanup strategy (a future feature):**
+**Cleanup strategy (future feature):**
 
 ```bash
 # dwcli --cleanup-history --older-than 30d
@@ -1391,24 +1390,24 @@ if settings.summarization_enabled and not settings._summarization_welcome_shown:
 
 ---
 
-## 11. Security and privacy
+## 11. Security and Privacy
 
-### 11.1. Storing the history
+### 11.1. History Storage
 
 **Threats:**
 
-1. **Leaking confidential information** from the conversation history
-2. **Access to the history by other users** on shared systems
-3. **Storing API keys and passwords** in the conversation history
+1. **Leakage of confidential information** from conversation history
+2. **Access to history by other users** on shared systems
+3. **Storage of API keys, passwords** in conversation history
 
-**Protective measures:**
+**Protection measures:**
 
 ```python
-# 1. Restricting access permissions on the history files
+# 1. Restrict access permissions to history files
 # In FilesystemBackend for persistent storage:
 history_file.chmod(0o600)  # Only the owner can read/write
 
-# 2. A warning about confidential information
+# 2. Warning about confidential information
 # In the system prompt:
 """
 IMPORTANT: Conversation history is saved to disk for context management.
@@ -1417,18 +1416,18 @@ in your conversations. History files are stored locally with restricted
 permissions, but may be visible to system administrators.
 """
 
-# 3. An option for disabled persistent storage
+# 3. Option to disable persistent storage
 # --no-persistent-history uses only /tmp (cleared on reboot)
 ```
 
 ---
 
-### 11.2. Sanitization options (a future feature)
+### 11.2. Sanitization Options (future feature)
 
-**For v2.0: Automatic cleanup of sensitive data from the history**
+**For v2.0: Automatic removal of sensitive data from history**
 
 ```python
-# An option in settings:
+# Option in settings:
 summarization_sanitize_history: bool = True  # Remove sensitive patterns
 
 # Patterns to remove:
@@ -1442,20 +1441,20 @@ SENSITIVE_PATTERNS = [
 
 ---
 
-## 12. Implementation plan
+## 12. Implementation Plan
 
 ### Phase 1: Core Implementation (Day 1-2)
 
 **Tasks:**
 
-1. ✅ Research the providers' context limits (DeepSeek, Claude) - DONE
+1. ✅ Research provider context limits (DeepSeek, Claude) - DONE
 2. ⬜ Add `PROVIDER_CONTEXT_LIMITS` to config.py
 3. ⬜ Implement `get_model_context_limit()` in config.py
 4. ⬜ Implement `get_summarization_config()` in config.py
-5. ⬜ Add Settings fields for summarization to config.py
-6. ⬜ Add the SummarizationMiddleware import to agent.py
-7. ⬜ Integrate the SummarizationMiddleware into create_cli_agent()
-8. ⬜ Configure the persistent/temp backend for the history
+5. ⬜ Add Settings fields for summarization in config.py
+6. ⬜ Add the SummarizationMiddleware import in agent.py
+7. ⬜ Integrate SummarizationMiddleware into create_cli_agent()
+8. ⬜ Configure the persistent/temp backend for history
 
 **Estimate:** 4-6 hours
 
@@ -1465,7 +1464,7 @@ SENSITIVE_PATTERNS = [
 
 **Tasks:**
 
-1. ⬜ Add CLI parameters to main.py:
+1. ⬜ Add CLI parameters in main.py:
    - --no-summarization
    - --summarization-trigger
    - --summarization-keep
@@ -1488,7 +1487,7 @@ SENSITIVE_PATTERNS = [
 3. ⬜ Write an e2e test for the full summarization cycle
 4. ⬜ Test with DeepSeek models
 5. ⬜ Test with Claude models
-6. ⬜ Verify that message filtering works
+6. ⬜ Verify the message filtering works
 
 **Estimate:** 4-6 hours
 
@@ -1499,7 +1498,7 @@ SENSITIVE_PATTERNS = [
 **Tasks:**
 
 1. ⬜ Update the README with usage examples
-2. ⬜ Write documentation on configuration for different providers
+2. ⬜ Write setup documentation for different providers
 3. ⬜ Add a troubleshooting guide
 4. ⬜ Code review and refactoring
 5. ⬜ Performance testing
@@ -1508,7 +1507,7 @@ SENSITIVE_PATTERNS = [
 
 ---
 
-### Overall estimate
+### Overall Estimate
 
 **Implementation time:** 13-19 hours (2-3 working days)
 
@@ -1524,55 +1523,55 @@ SENSITIVE_PATTERNS = [
 
 ---
 
-## Appendix A: Usage examples
+## Appendix A: Usage Examples
 
-### A.1. Basic usage (defaults)
+### A.1. Basic Usage (defaults)
 
 ```bash
 # Summarization is enabled automatically with smart settings
 deep-worker my_agent
 
-# The logs will show:
+# Logs will show:
 # [INFO] Summarization enabled: model=claude-sonnet-4.5,
 #        context=200,000 tokens, trigger=160,000t (80%), keep=30,000t (15%)
 ```
 
 ---
 
-### A.2. Disabling summarization
+### A.2. Disabling Summarization
 
 ```bash
-# For short sessions where the context will not overflow
+# For short sessions where context will not overflow
 deep-worker my_agent --no-summarization
 ```
 
 ---
 
-### A.3. Explicit trigger configuration
+### A.3. Explicit Trigger Configuration
 
 ```bash
-# Trigger at 90% fill (very aggressive use of the context)
+# Trigger at 90% full (very aggressive context utilization)
 deep-worker my_agent --summarization-trigger 0.90
 
-# Trigger at 60% (a conservative approach)
+# Trigger at 60% (conservative approach)
 deep-worker my_agent --summarization-trigger 0.60
 ```
 
 ---
 
-### A.4. Persistent history storage
+### A.4. Persistent History Storage
 
 ```bash
-# Save the history for later review
+# Save history for later review
 deep-worker my_agent --persistent-history
 
-# The history is saved to:
-# ~/.deepagents/my_agent/conversation_history/{thread_id}.md
+# History is saved to:
+# <agent-data-dir>/my_agent/conversation_history/{thread_id}.md
 ```
 
 ---
 
-### A.5. Full customization
+### A.5. Full Customization
 
 ```bash
 # Full control over all parameters
@@ -1584,20 +1583,25 @@ deep-worker my_agent \
 
 ---
 
-### A.6. DeepSeek-specific configuration
+### A.6. DeepSeek-Specific Configuration
 
 ```bash
-# DeepSeek V3 (128K context) - the correct settings will be determined automatically
-deep-worker my_agent --model deepseek:deepseek-chat
+# DeepSeek V4 Flash (1M context) - default model, automatically determines the correct settings
+deep-worker my_agent
 
-# The logs will show:
+# Logs will show:
+# [INFO] Summarization enabled: model=deepseek-v4-flash,
+#        context=1,000,000 tokens, trigger=850,000t (85%), keep=100,000t (10%)
+
+# DeepSeek V3 (128K context) - if specified explicitly via DEEPSEEK_MODEL
+deep-worker my_agent --model deepseek-chat
 # [INFO] Summarization enabled: model=deepseek-chat,
 #        context=128,000 tokens, trigger=96,000t (75%), keep=25,600t (20%)
 ```
 
 ---
 
-### A.7. Claude Opus 4.6 with a 1M context
+### A.7. Claude Opus 4.6 with 1M Context
 
 ```bash
 # .env:
@@ -1605,7 +1609,7 @@ deep-worker my_agent --model deepseek:deepseek-chat
 
 deep-worker my_agent --model anthropic:claude-opus-4.6
 
-# The logs will show:
+# Logs will show:
 # [INFO] Summarization enabled: model=claude-opus-4.6,
 #        context=1,000,000 tokens, trigger=850,000t (85%), keep=100,000t (10%)
 ```
@@ -1614,7 +1618,7 @@ deep-worker my_agent --model anthropic:claude-opus-4.6
 
 ## Appendix B: FAQ
 
-### Q1: How can I tell that summarization has fired?
+### Q1: How do I know that summarization has triggered?
 
 **A:** Check the agent logs:
 
@@ -1628,16 +1632,16 @@ deep-worker my_agent --model anthropic:claude-opus-4.6
 
 ### Q2: Where is the full conversation history stored?
 
-**A:** It depends on the setting:
+**A:** Depends on the setting:
 
 - **Temp backend (default):** `/tmp/deepagents_conversation_history_*/`
-- **Persistent backend:** `~/.deepagents/{agent_name}/conversation_history/{thread_id}.md`
+- **Persistent backend:** `<agent-data-dir>/{agent_name}/conversation_history/{thread_id}.md`
 
 ---
 
-### Q3: Does summarization affect the quality of the answers?
+### Q3: Does summarization affect answer quality?
 
-**A:** Minimally. The full history is preserved, and summarization creates a short summary for the LLM. The agent keeps the context of the most recent messages and an understanding of the whole history via the summary.
+**A:** Minimally. The full history is saved; summarization creates a concise summary for the LLM. The agent keeps the context of recent messages and understanding of the whole history through the summary.
 
 ---
 
@@ -1645,10 +1649,10 @@ deep-worker my_agent --model anthropic:claude-opus-4.6
 
 **A:** An additional LLM call to create the summary. Approximately:
 
-- Input: 50-100k tokens (the old messages)
-- Output: 1-3k tokens (the summary)
+- Input: 50-100k tokens (old messages)
+- Output: 1-3k tokens (summary)
 
-It fires rarely (only when the context is 75-85% full).
+It triggers rarely (only when 75-85% of the context is full).
 
 ---
 
@@ -1660,10 +1664,10 @@ It fires rarely (only when the context is 75-85% full).
 SUMMARIZATION_ENABLED=false deep-worker my_agent
 ```
 
-Or create a `.env` file in the agent's directory:
+Or create a `.env` in the agent's directory:
 
 ```bash
-# ~/.deepagents/my_agent/.env
+# <agent-data-dir>/my_agent/.env
 SUMMARIZATION_ENABLED=false
 ```
 
@@ -1671,7 +1675,7 @@ SUMMARIZATION_ENABLED=false
 
 ### Q6: Are custom models supported?
 
-**A:** Yes, for unknown models a fallback is used (100K context, trigger=0.75, keep=0.20). For precise tuning, specify them explicitly:
+**A:** Yes, for unknown models a fallback is used (100K context, trigger=0.75, keep=0.20). For precise tuning, specify explicitly:
 
 ```bash
 deep-worker my_agent \
@@ -1684,9 +1688,9 @@ deep-worker my_agent \
 
 ## Conclusion
 
-This design document describes the complete integration of the SummarizationMiddleware into deep-worker with:
+This design document describes the full integration of SummarizationMiddleware into deep-worker with:
 
-1. ✅ **Automatic configuration** based on the provider and the context limit
+1. ✅ **Automatic configuration** based on the provider and context limit
 2. ✅ **Support for all major providers** (Claude, DeepSeek, OpenAI, Gemini, etc.)
 3. ✅ **Flexible configuration** via CLI, settings, and .env
 4. ✅ **Backward compatibility** with existing agents

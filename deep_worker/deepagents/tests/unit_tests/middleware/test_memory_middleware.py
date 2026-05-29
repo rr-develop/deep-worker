@@ -214,7 +214,7 @@ def test_load_memory_from_backend_single_source(tmp_path: Path) -> None:
     middleware = MemoryMiddleware(backend=backend, sources=sources)
 
     # Test before_agent loads the memory
-    result = middleware.before_agent({}, None, {})  # type: ignore
+    result = middleware.before_agent({}, None)  # type: ignore
 
     assert result is not None
     assert "memory_contents" in result
@@ -250,7 +250,7 @@ def test_load_memory_from_backend_multiple_sources(tmp_path: Path) -> None:
     middleware = MemoryMiddleware(backend=backend, sources=sources)
 
     # Test before_agent loads all memory
-    result = middleware.before_agent({}, None, {})  # type: ignore
+    result = middleware.before_agent({}, None)  # type: ignore
 
     assert result is not None
     assert "memory_contents" in result
@@ -279,7 +279,7 @@ def test_load_memory_handles_missing_file(tmp_path: Path) -> None:
     middleware = MemoryMiddleware(backend=backend, sources=sources)
 
     # Test before_agent loads only existing memory
-    result = middleware.before_agent({}, None, {})  # type: ignore
+    result = middleware.before_agent({}, None)  # type: ignore
     assert result is not None
     assert missing_path not in result["memory_contents"]
     assert user_path in result["memory_contents"]
@@ -298,7 +298,7 @@ def test_before_agent_skips_if_already_loaded(tmp_path: Path) -> None:
 
     # Pre-populate state
     state = {"memory_contents": {user_path: "Already loaded content"}}
-    result = middleware.before_agent(state, None, {})  # type: ignore
+    result = middleware.before_agent(state, None)  # type: ignore
 
     # Should return None (no update needed)
     assert result is None
@@ -310,7 +310,7 @@ def test_load_memory_with_empty_sources(tmp_path: Path) -> None:
 
     middleware = MemoryMiddleware(backend=backend, sources=[])
 
-    result = middleware.before_agent({}, None, {})  # type: ignore
+    result = middleware.before_agent({}, None)  # type: ignore
 
     assert result is not None
     assert result["memory_contents"] == {}
@@ -336,7 +336,7 @@ def test_memory_content_with_special_characters(tmp_path: Path) -> None:
         sources=[memory_path],
     )
 
-    result = middleware.before_agent({}, None, {})  # type: ignore
+    result = middleware.before_agent({}, None)  # type: ignore
 
     assert result is not None
     content = result["memory_contents"][memory_path]
@@ -366,7 +366,7 @@ def test_memory_content_with_unicode(tmp_path: Path) -> None:
         sources=[memory_path],
     )
 
-    result = middleware.before_agent({}, None, {})  # type: ignore
+    result = middleware.before_agent({}, None)  # type: ignore
 
     assert result is not None
     content = result["memory_contents"][memory_path]
@@ -391,7 +391,7 @@ def test_memory_content_with_large_file(tmp_path: Path) -> None:
         sources=[memory_path],
     )
 
-    result = middleware.before_agent({}, None, {})  # type: ignore
+    result = middleware.before_agent({}, None)  # type: ignore
 
     assert result is not None
     content = result["memory_contents"][memory_path]
@@ -589,7 +589,7 @@ def test_memory_middleware_with_state_backend_factory() -> None:
         stream_writer=lambda _: None,
     )
 
-    backend = middleware._get_backend(state, runtime, {})  # type: ignore
+    backend = middleware._get_backend(state, runtime)  # type: ignore
     assert isinstance(backend, StateBackend)
     assert backend.runtime is not None
 
@@ -615,7 +615,7 @@ def test_memory_middleware_with_store_backend_factory() -> None:
         stream_writer=lambda _: None,
     )
 
-    backend = middleware._get_backend(state, runtime, {})  # type: ignore
+    backend = middleware._get_backend(state, runtime)  # type: ignore
     assert isinstance(backend, StoreBackend)
     assert backend.runtime is not None
 
@@ -640,7 +640,8 @@ def test_memory_middleware_with_store_backend_assistant_id() -> None:
 
     # Test: assistant-123 can read its own memory
     config_1 = {"metadata": {"assistant_id": "assistant-123"}}
-    result_1 = middleware.before_agent({}, runtime, config_1)  # type: ignore
+    runtime.config = config_1
+    result_1 = middleware.before_agent({}, runtime)  # type: ignore
 
     assert result_1 is not None
     assert "/memory/AGENTS.md" in result_1["memory_contents"]
@@ -648,7 +649,8 @@ def test_memory_middleware_with_store_backend_assistant_id() -> None:
 
     # Test: assistant-456 cannot see assistant-123's memory (different namespace)
     config_2 = {"metadata": {"assistant_id": "assistant-456"}}
-    result_2 = middleware.before_agent({}, runtime, config_2)  # type: ignore
+    runtime.config = config_2
+    result_2 = middleware.before_agent({}, runtime)  # type: ignore
     assert result_2 is not None
     assert len(result_2["memory_contents"]) == 0
 
@@ -661,7 +663,8 @@ def test_memory_middleware_with_store_backend_assistant_id() -> None:
     )
 
     # Test: assistant-456 can read its own memory
-    result_3 = middleware.before_agent({}, runtime, config_2)  # type: ignore
+    runtime.config = config_2
+    result_3 = middleware.before_agent({}, runtime)  # type: ignore
 
     assert result_3 is not None
     assert "/memory/AGENTS.md" in result_3["memory_contents"]
@@ -669,7 +672,8 @@ def test_memory_middleware_with_store_backend_assistant_id() -> None:
     assert "Context for assistant 1" not in result_3["memory_contents"]["/memory/AGENTS.md"]
 
     # Test: assistant-123 still only sees its own memory (no cross-contamination)
-    result_4 = middleware.before_agent({}, runtime, config_1)  # type: ignore
+    runtime.config = config_1
+    result_4 = middleware.before_agent({}, runtime)  # type: ignore
 
     assert result_4 is not None
     assert "/memory/AGENTS.md" in result_4["memory_contents"]
@@ -696,7 +700,8 @@ def test_memory_middleware_with_store_backend_no_assistant_id() -> None:
     )
 
     # Test: empty config accesses default namespace
-    result_1 = middleware.before_agent({}, runtime, {})  # type: ignore
+    runtime.config = {}
+    result_1 = middleware.before_agent({}, runtime)  # type: ignore
 
     assert result_1 is not None
     assert "/memory/AGENTS.md" in result_1["memory_contents"]
@@ -704,7 +709,8 @@ def test_memory_middleware_with_store_backend_no_assistant_id() -> None:
 
     # Test: config with metadata but no assistant_id also uses default namespace
     config_with_other_metadata = {"metadata": {"some_other_key": "value"}}
-    result_2 = middleware.before_agent({}, runtime, config_with_other_metadata)  # type: ignore
+    runtime.config = config_with_other_metadata
+    result_2 = middleware.before_agent({}, runtime)  # type: ignore
 
     assert result_2 is not None
     assert "/memory/AGENTS.md" in result_2["memory_contents"]

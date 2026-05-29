@@ -37,6 +37,7 @@ class AgentConfig:
     max_tokens: int = 20000
     temperature: float = 1.0
     api_key: str | None = None
+    _dynamic_display_model: str | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         """Validate configuration after initialization."""
@@ -94,17 +95,50 @@ class AgentConfig:
             raise ValueError(f"max_tokens must be positive, got {self.max_tokens}")
 
     @property
-    def resolved_model(self) -> str:
+    def resolved_model(self) -> str | None:
         """Return the actual model name, resolving provider default if needed.
 
         If self.model is set, returns it directly.
-        Otherwise, uses get_default_model_name() to resolve the provider default
-        (checking env vars first, then hardcoded fallback).
+        Otherwise, uses get_default_model_name() to resolve the provider
+        default (checking env vars first, then hardcoded fallback).
+
+        Returns ``None`` when the provider has no default and the user
+        did not specify a model — this is the correct value for codex,
+        whose CLI picks its own current default when no ``--model`` is
+        passed (see ``config.py`` codex branch / DESIGN_CODEX_PROVIDER.md
+        §15 Q2). ``None`` MUST be preserved through to ``create_model``;
+        it must NOT be coerced to the literal ``"unknown"``, which the
+        Codex API rejects with HTTP 400 (incident observed 2026-05-20).
+        For display, use ``display_model`` instead.
         """
         if self.model:
             return self.model
         from deep_worker_cli.config import get_default_model_name
-        return get_default_model_name(self.provider) or "unknown"
+        return get_default_model_name(self.provider)
+
+    def set_dynamic_display_model(self, model: str | None) -> None:
+        if (
+            isinstance(model, str)
+            and model.strip()
+            and model.strip().lower() != "unknown"
+        ):
+            self._dynamic_display_model = model.strip()
+
+    @property
+    def dynamic_display_model(self) -> str | None:
+        return self._dynamic_display_model
+
+    @property
+    def display_model(self) -> str:
+        """Human-facing model label for UI / logs ONLY.
+
+        Falls back to ``"unknown"`` when no concrete model can be
+        resolved. NEVER feed this into ``create_model`` or persist it as
+        the launch_config model — that is what poisoned a live agent
+        (observed 2026-05-20). Use
+        ``resolved_model`` (which may be ``None``) for the data path.
+        """
+        return self.dynamic_display_model or self.resolved_model or "unknown"
 
     @classmethod
     def from_file(cls, config_path: Path) -> "AgentConfig":

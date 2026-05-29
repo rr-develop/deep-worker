@@ -23,9 +23,26 @@ import contextlib
 import json
 import os
 import shutil
+import sys
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
+
+
+# Marker written as the first line of the AGENTS.override.md file we drop
+# into the Codex working directory. Lets us recognise our own file on the
+# next spawn (so we never overwrite a user-authored override) and refuse
+# to delete files that were not created by us.
+DEEPWORKER_OVERRIDE_MARKER = "<!-- deepworker:codex_override v1 -->"
+
+# Filename Codex CLI 0.130.0 recognises as the per-directory override of
+# the standard AGENTS.md instructions (see ``core/src/agents_md.rs``
+# strings ``AGENTS.override.md`` / ``AGENTS.md`` in the binary). Both
+# files are surfaced to the model as the very first ``user`` message of
+# the developer turn, so anything we put in the override is read before
+# the user's actual prompt and overrides any project-level AGENTS.md.
+DEEPWORKER_OVERRIDE_FILENAME = "AGENTS.override.md"
 
 
 # ---------------------------------------------------------------------------
@@ -198,38 +215,205 @@ class ExecArgs:
     base_instructions: str | None = None      # system prompt
     additional_directories: list[str] | None = None
     idle_timeout_seconds: float | None = None
-    # Codex built-in deny-list (Q5). Each entry passed as
-    # ``--config tools.<name>=false`` (the exact key may need adjustment
-    # once we verify against the live CLI; this is the documented hook).
-    disallowed_tools: tuple[str, ...] = ()
+    # Q5: native-tool deny-list, expressed as Codex CLI 0.130+
+    # feature flags. Each entry becomes one ``--disable <feature>``
+    # argument. The previous ``--config disabled_tools=[...]`` channel
+    # is gone — Codex 0.130 ignored it (verified live via
+    # ``RUST_LOG=codex_api=trace``: the ``response.create`` payload's
+    # ``tools=[...]`` list was identical with or without it).
+    disabled_features: tuple[str, ...] = ()
+    # Q5: top-level Codex config overrides for ``-c key=value`` flags
+    # whose values are NOT feature-flag booleans. The canonical case is
+    # ``("web_search", '"disabled"')`` — Codex moved web_search out of
+    # the feature-flag namespace into a top-level string config in
+    # 0.130. Each pair becomes one ``--config <key>=<value>`` argument
+    # pair. The ``value`` half is interpolated verbatim — callers
+    # therefore quote string values themselves (``'"disabled"'``,
+    # ``'"live"'``) so the resulting argv parses as TOML.
+    config_overrides: tuple[tuple[str, str], ...] = ()
+    # Per-agent MCP server isolation (observed 2026-05-20).
+    #
+    # The agent's OWN proxy MCP server, injected per-invocation via
+    # ``--config mcp_servers.<name>.url=...``. When set, ``_build_argv``
+    # also passes ``--ignore-user-config`` so codex does NOT load the
+    # shared ``~/.codex/config.toml`` and inherit stale
+    # ``deepworker_<dead_pid>`` servers left there by other agents.
+    #
+    # The provider MUST NOT write to the global config (no
+    # ``codex mcp add``) — there is no sanctioned global MCP-server
+    # list; agents must be fully independent. See
+    # ``docs/DESIGN_CODEX_PROVIDER.md`` §"MCP server isolation".
+    #
+    # Both fields default to None so a tool-less turn (no proxy) emits
+    # no ``mcp_servers.*`` override at all.
+    mcp_server_name: str | None = None
+    mcp_server_port: int | None = None
+
+
+def _write_override_file(args: "ExecArgs") -> Path | None:
+    """Write the system prompt into ``<cwd>/AGENTS.override.md``.
+
+    Returns the path of the file we created, or ``None`` if we did not
+    create one (no working directory, no base_instructions, or a non-ours
+    file is already there).
+
+    Refuses to overwrite a file whose first line does NOT contain
+    :data:`DEEPWORKER_OVERRIDE_MARKER` — that file is the user's own
+    Codex override and we must leave it alone. In that case we log a
+    warning to stderr and the Codex turn proceeds with whatever
+    instructions the user's file carries (no harm: their override is at
+    least as important to them as ours).
+    """
+    if not args.base_instructions or not args.working_directory:
+        return None
+    target = Path(args.working_directory) / DEEPWORKER_OVERRIDE_FILENAME
+
+    if target.exists():
+        try:
+            first_line = target.open("r", encoding="utf-8").readline().rstrip("\n")
+        except OSError:
+            first_line = ""
+        if DEEPWORKER_OVERRIDE_MARKER not in first_line:
+            # Someone else's override — never touch it.
+            print(
+                f"[codex_provider] WARNING: {target} already exists and is not "
+                f"owned by deep-worker. Leaving it as-is; deep-worker's system "
+                f"prompt will NOT be delivered to this Codex turn.",
+                file=sys.stderr,
+            )
+            return None
+
+    body = (
+        f"{DEEPWORKER_OVERRIDE_MARKER}\n"
+        f"<!-- Auto-generated by codex_provider for this codex exec subprocess. -->\n"
+        f"<!-- Removed automatically when the subprocess exits. -->\n"
+        f"\n"
+        f"{args.base_instructions}\n"
+    )
+
+    try:
+        # Atomic-ish write: write to temp file then rename, so a concurrent
+        # codex process never sees a half-written override.
+        tmp = target.with_suffix(target.suffix + f".tmp.{os.getpid()}")
+        tmp.write_text(body, encoding="utf-8")
+        os.replace(tmp, target)
+    except OSError as exc:
+        print(
+            f"[codex_provider] WARNING: failed to write {target}: {exc}. "
+            f"deep-worker's system prompt will NOT be delivered to this "
+            f"Codex turn.",
+            file=sys.stderr,
+        )
+        return None
+    return target
+
+
+def _safe_remove_override_file(path: Path) -> None:
+    """Remove ``path`` iff it still carries :data:`DEEPWORKER_OVERRIDE_MARKER`.
+
+    Defensive: a concurrent codex process for a sibling deep-worker agent
+    could have rewritten the file in between our spawn and aclose. In
+    that case the file is no longer "ours" and we must leave it for that
+    other process to clean up.
+    """
+    try:
+        if not path.exists():
+            return
+        first_line = path.open("r", encoding="utf-8").readline().rstrip("\n")
+        if DEEPWORKER_OVERRIDE_MARKER not in first_line:
+            return  # someone else's content now — do not touch
+        path.unlink()
+    except OSError:
+        # Best-effort cleanup. A stale file with our marker is annoying
+        # but not catastrophic — the next spawn will overwrite it.
+        pass
 
 
 class ExecHandle:
-    """A live ``codex exec`` subprocess + its event-stream generator.
+    """A live ``codex exec`` subprocess plus the background event pump.
 
     Held by ``CodexChatModel`` between two ainvoke calls inside one
-    Codex turn (an ainvoke that returned tool_calls and the next
-    ainvoke that resolves them).
+    Codex turn. The fields beyond the raw subprocess are the
+    plumbing the event pump uses to route Codex events to two
+    destinations:
+
+    - ``ainvoke_queue`` — events ``CodexChatModel.ainvoke`` cares
+      about (thread.started, turn.started/completed/failed,
+      item.started for both proxy MCP and native, item.completed for
+      AgentMessageItem).
+    - ``native_futures`` — per-``item.id`` ``asyncio.Future`` parked
+      at ``item.started`` for native tools and resolved by the pump
+      at ``item.completed``. The matching async tool body in
+      ``codex_provider.native_tools`` awaits the future. No polling.
+
+    ``pump_task`` is the singleton asyncio Task that drains
+    ``self._events`` (the raw JSONL generator). It is created by
+    ``CodexExecRunner.spawn`` and cancelled by ``aclose``.
+
+    See ``docs/DESIGN_NATIVE_TOOL_PASSTHROUGH.md`` for the full design.
+
+    ``override_file_to_cleanup`` is the path of an ``AGENTS.override.md``
+    file that ``spawn`` dropped for this subprocess.  ``aclose``
+    removes it iff the file still carries our marker.
     """
 
     def __init__(
         self,
         process: asyncio.subprocess.Process,
         events: AsyncGenerator[ThreadEvent, None],
+        override_file_to_cleanup: Path | None = None,
     ) -> None:
         self.process = process
+        # Raw event generator — the pump is the only reader. ainvoke
+        # reads ``ainvoke_queue`` instead.
         self.events = events
+        self.override_file_to_cleanup = override_file_to_cleanup
+
+        # Filled in by ``CodexExecRunner.spawn`` after the pump is
+        # ready. Bounded queue means natural back-pressure on the
+        # rare path where Codex emits faster than ainvoke consumes.
+        self.ainvoke_queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=64)
+        # Created on native ``item.started``, resolved on the matching
+        # ``item.completed``. Tool bodies in
+        # ``codex_provider.native_tools`` await these.
+        self.native_futures: dict[str, asyncio.Future[str]] = {}
+        # The single reader of ``events``. Created by ``spawn``.
+        self.pump_task: asyncio.Task[None] | None = None
+        # Set by ``event_pump`` to the fatal stream exception (e.g.
+        # CodexProtocolError from an API rejection) so that
+        # ``CodexChatModel.ainvoke`` — which only ever observes the
+        # END_OF_STREAM sentinel on ``ainvoke_queue`` — can re-raise the
+        # real cause instead of returning an empty response and stalling
+        # the agent (observed 2026-05-20).
+        self.pump_error: BaseException | None = None
 
     async def aclose(self) -> None:
-        """Terminate the subprocess and drain the generator. Safe to call
+        """Terminate the subprocess and the event pump. Safe to call
         multiple times."""
-        # Close the generator first — this drives the ``finally`` block
-        # in ``_iter_events`` which is what actually terminates the
-        # subprocess. ``contextlib.suppress`` for the case where the
-        # generator has already finished naturally.
+        # 1) Stop the pump first so it can no longer touch
+        #    ``native_futures``. The pump's ``finally`` block releases
+        #    every still-parked future with a meaningful exception so
+        #    any awaiting tool body wakes up immediately.
+        if self.pump_task is not None and not self.pump_task.done():
+            self.pump_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, BaseException):
+                await self.pump_task
+            self.pump_task = None
+
+        # 2) Belt-and-braces: cancel any future the pump did not get to.
+        for fut in list(self.native_futures.values()):
+            if not fut.done():
+                fut.cancel()
+        self.native_futures.clear()
+
+        # 3) Drain the events generator. Pump cancellation already
+        #    drove the ``finally`` in ``_iter_events``, but we double-
+        #    close in case the pump never started.
         with contextlib.suppress(StopAsyncIteration, RuntimeError):
             await self.events.aclose()
-        # Belt-and-braces in case _iter_events never ran finally
+
+        # 4) Belt-and-braces in case ``_iter_events`` never ran its
+        #    finally block — make sure the subprocess goes down.
         if self.process.returncode is None:
             with contextlib.suppress(ProcessLookupError):
                 self.process.terminate()
@@ -239,6 +423,11 @@ class ExecHandle:
                 with contextlib.suppress(ProcessLookupError):
                     self.process.kill()
                 await self.process.wait()
+
+        # 5) Remove our AGENTS.override.md, if any.
+        if self.override_file_to_cleanup is not None:
+            _safe_remove_override_file(self.override_file_to_cleanup)
+            self.override_file_to_cleanup = None
 
 
 class CodexExecRunner:
@@ -256,6 +445,31 @@ class CodexExecRunner:
 
     def __init__(self, executable_path: str | None = None) -> None:
         self._executable_path = executable_path or _find_codex_path()
+
+    # ------------------------------------------------------------------
+    # Public test-helpers
+    #
+    # The two methods below are the only ``_build_*`` internals that
+    # we deliberately expose under a public name so tests can verify
+    # argv/env construction without importing protected attributes
+    # (pyright strict treats ``_name`` as private and would block
+    # ``runner._build_argv(...)`` in test code with reportPrivateUsage).
+    # ------------------------------------------------------------------
+    def build_argv_for_test(self, args: ExecArgs) -> list[str]:
+        """Public alias for ``_build_argv`` — for tests only.
+
+        Mirrors what ``spawn()`` passes to ``asyncio.create_subprocess_exec``.
+        Production code does not call this; ``spawn()`` calls
+        ``_build_argv`` directly.
+        """
+        return self._build_argv(args)
+
+    def build_env_for_test(self, args: ExecArgs) -> dict[str, str]:
+        """Public alias for ``_build_env`` — for tests only.
+
+        Mirrors what ``spawn()`` passes as the subprocess ``env``.
+        """
+        return self._build_env(args)
 
     # -- command building (factored out for tests) ---------------------
     def _build_argv(self, args: ExecArgs) -> list[str]:
@@ -284,6 +498,28 @@ class CodexExecRunner:
         argv.extend(["-s", args.sandbox_mode])
         argv.extend(["--config", f'approval_policy="{args.approval_policy}"'])
 
+        # ── Per-agent MCP isolation (observed 2026-05-20) ──
+        # Do NOT load the shared ``~/.codex/config.toml``. That file is
+        # global to every codex process on the host and used to
+        # accumulate one ``[mcp_servers.deepworker_<pid>]`` entry per
+        # agent ever launched (the provider wrote them via
+        # ``codex mcp add`` — that path is now removed). Loading it made
+        # every ``codex exec`` try to connect to dozens of dead ports,
+        # each hanging for the 120 s proxy timeout before failover.
+        # ``--ignore-user-config`` skips the file entirely; auth still
+        # comes from CODEX_HOME and ``resume <uuid>`` still works
+        # (sessions live in ``CODEX_HOME/sessions``, not in config.toml).
+        #
+        # DO NOT remove this without re-introducing global pollution.
+        argv.append("--ignore-user-config")
+        # Inject ONLY this agent's own proxy MCP server, per-invocation.
+        if args.mcp_server_name and args.mcp_server_port:
+            url = f"http://127.0.0.1:{args.mcp_server_port}/mcp"
+            argv.extend([
+                "--config",
+                f'mcp_servers.{args.mcp_server_name}.url="{url}"',
+            ])
+
         if args.working_directory:
             argv.extend(["--cd", args.working_directory])
 
@@ -294,17 +530,47 @@ class CodexExecRunner:
         if args.skip_git_repo_check:
             argv.append("--skip-git-repo-check")
 
-        if args.base_instructions:
-            # Codex reads base-instructions via -c override
-            argv.extend(["--config", f'base_instructions="{_escape_toml_string(args.base_instructions)}"'])
+        # NOTE: we intentionally do NOT pass ``--config base_instructions=...``
+        # here. Codex CLI 0.130.0 silently ignores that key (verified by
+        # comparing the live ``session_meta.payload.base_instructions.text``
+        # against the value we tried to set — Codex always kept its
+        # built-in default GPT-5 base prompt). The system prompt is instead
+        # injected via an ``AGENTS.override.md`` file dropped into the
+        # working directory in :meth:`spawn`; Codex reads that file and
+        # prepends its contents as a ``user`` message at the start of every
+        # turn (see ``core/src/agents_md.rs`` in the Codex binary).
+        # See ``docs/INVESTIGATION_2026_05_18_CODEX_SYSTEM_PROMPT_DELIVERY.md``
+        # for the full investigation.
 
-        # Q5: deny-list of built-in Codex tools. The actual config key
-        # was finalised against the live CLI to be ``tools.<name>=false``.
-        # This is best-effort: unknown keys are silently ignored by Codex,
-        # which is the failure mode we want — a future Codex version
-        # adding a new built-in won't break existing agents.
-        for tool_name in args.disallowed_tools:
-            argv.extend(["--config", f"tools.{tool_name}=false"])
+        # Q5: native-tool deny-list via per-feature ``--disable`` flags.
+        #
+        # Codex CLI 0.130 silently ignores the older
+        # ``--config disabled_tools=[...]`` channel — we verified live
+        # via ``RUST_LOG=codex_api=trace`` that the
+        # ``response.create`` websocket payload's ``tools=[...]`` list
+        # is identical with or without it (see Implementation note 6 in
+        # docs/DESIGN_CODEX_PROVIDER.md). The working contract is one
+        # ``--disable <feature>`` per feature whose native tools we
+        # want stripped from the API request.
+        #
+        # Mapping (verified live, ``codex features list``):
+        #   shell_tool, unified_exec  → exec_command, write_stdin
+        #   multi_agent               → spawn_agent, send_input,
+        #                               resume_agent, wait_agent,
+        #                               close_agent
+        #   image_generation          → image_generation
+        #   tool_search               → tool_search
+        #   apps, plugins             → mcp__codex_apps__*
+        for feat in args.disabled_features:
+            argv.extend(["--disable", feat])
+
+        # Top-level config overrides for keys that are NOT feature flags
+        # (e.g. ``web_search``: Codex moved it out of ``[features]``
+        # into a top-level string config in 0.130). Each pair becomes
+        # one ``--config <key>=<value>`` arg. The caller already quoted
+        # string values so the result parses as TOML.
+        for key, value in args.config_overrides:
+            argv.extend(["--config", f"{key}={value}"])
 
         # Resume subcommand comes BEFORE the prompt placeholder.
         if args.session_uuid:
@@ -315,7 +581,14 @@ class CodexExecRunner:
         return argv
 
     def _build_env(self, args: ExecArgs) -> dict[str, str]:
-        env: dict[str, str] = {k: v for k, v in os.environ.items() if v is not None}
+        # ``os.environ`` keys + values are always strings — the ``v is
+        # not None`` filter is belt-and-braces for monkey-patched
+        # environments in tests. pyright sees ``v: str`` here so the
+        # check looks redundant; keep it for the runtime safety.
+        env: dict[str, str] = {
+            k: v for k, v in os.environ.items()
+            if v is not None  # pyright: ignore[reportUnnecessaryComparison]
+        }
         # NB: we explicitly do NOT set CODEX_API_KEY when api_key is None
         # — the CLI must fall through to ~/.codex/auth.json (Q3).
         if args.api_key:
@@ -323,11 +596,35 @@ class CodexExecRunner:
         return env
 
     # -- spawn ---------------------------------------------------------
-    async def spawn(self, args: ExecArgs) -> ExecHandle:
+    async def spawn(
+        self,
+        args: ExecArgs,
+        *,
+        proxy_mcp_server_name: str | None = None,
+    ) -> ExecHandle:
         """Spawn one ``codex exec``. Returns immediately; consume events
-        via the returned handle's ``events`` async generator."""
+        via the returned handle's ``ainvoke_queue`` (the background
+        event pump fills it).
+
+        ``proxy_mcp_server_name`` is the name of the deep-worker proxy
+        MCP server registered with this codex subprocess (typically
+        ``deepworker_<pid>``). The pump uses it to discriminate
+        between OUR proxy mcp_tool_call events (which need
+        ainvoke-level handling) and OTHER MCP server events (passed
+        through to ainvoke as-is). When ``None`` (e.g. in tests that
+        do not exercise the proxy path) the pump treats every MCP
+        event as "not ours" — safe default.
+        """
+        # Local import — event_pump depends on exec_runner so we
+        # import lazily to avoid a circular module at load time.
+        from codex_provider.event_pump import event_pump
+
         argv = self._build_argv(args)
         env = self._build_env(args)
+
+        # Drop AGENTS.override.md with our system prompt into the working
+        # directory BEFORE spawning codex, so the very first turn sees it.
+        override_file = _write_override_file(args)
 
         process = await asyncio.create_subprocess_exec(
             self._executable_path,
@@ -342,6 +639,8 @@ class CodexExecRunner:
         # Write prompt to stdin and close it — Codex reads until EOF on
         # ``-``. No back-pressure issues: prompts are small (delta only).
         if process.stdin is None:
+            if override_file is not None:
+                _safe_remove_override_file(override_file)
             with contextlib.suppress(ProcessLookupError):
                 process.kill()
             raise RuntimeError("codex exec has no stdin")
@@ -352,7 +651,22 @@ class CodexExecRunner:
             process.stdin.close()
 
         events = self._iter_events(process, args.idle_timeout_seconds)
-        return ExecHandle(process=process, events=events)
+        handle = ExecHandle(
+            process=process,
+            events=events,
+            override_file_to_cleanup=override_file,
+        )
+        # Spawn the background event pump — the single reader of
+        # ``handle.events``. It fills ``handle.ainvoke_queue`` and
+        # ``handle.native_futures`` event-driven (no polling).
+        handle.pump_task = asyncio.create_task(
+            event_pump(
+                handle,
+                proxy_mcp_server_name=proxy_mcp_server_name or "",
+            ),
+            name=f"codex-event-pump-{process.pid}",
+        )
+        return handle
 
     async def _iter_events(
         self,
@@ -408,9 +722,3 @@ def _find_codex_path() -> str:
     )
 
 
-def _escape_toml_string(s: str) -> str:
-    """Minimal TOML-string escape for use inside ``--config key="..."``.
-    Newlines/quotes are the only chars Codex's TOML parser will choke on
-    inside a basic string. For multi-line system prompts the caller may
-    prefer to truncate or use a file."""
-    return s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")

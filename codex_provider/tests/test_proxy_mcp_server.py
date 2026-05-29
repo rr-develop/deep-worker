@@ -82,7 +82,7 @@ class TestCallToolParkingFuture:
 
         # Drive the handler in the background — it should not return
         # until we resolve the Future.
-        task = asyncio.create_task(srv._call_tool_for_test("read_file", {"path": "/tmp/x"}))
+        task = asyncio.create_task(srv.call_tool_for_test("read_file", {"path": "/tmp/x"}))
         # Yield control so the task gets to schedule its Future and park
         await asyncio.sleep(0)
         assert srv.has_pending_calls()
@@ -106,7 +106,7 @@ class TestCallToolParkingFuture:
         self, metadata: list[ToolMetadata]
     ) -> None:
         srv = ProxyMCPServer(metadata, timeout=0.1)  # 100 ms
-        result = await srv._call_tool_for_test("read_file", {"path": "/tmp/x"})
+        result = await srv.call_tool_for_test("read_file", {"path": "/tmp/x"})
         # On timeout the handler returns an is_error block, NOT raises.
         # This way Codex sees a tool-error and continues.
         assert any(block.get("type") == "text" and "timeout" in block.get("text", "").lower()
@@ -118,6 +118,52 @@ class TestCallToolParkingFuture:
         srv = ProxyMCPServer(metadata)
         # Should not raise; no Future exists.
         srv.resolve_call("does_not_exist", {"content": []})
+
+    async def test_wait_for_pending_calls_returns_existing_call(
+        self, metadata: list[ToolMetadata]
+    ) -> None:
+        srv = ProxyMCPServer(metadata, timeout=5.0)
+
+        task = asyncio.create_task(srv.call_tool_for_test("read_file", {"path": "/tmp/x"}))
+        await asyncio.sleep(0)
+
+        pending = await srv.wait_for_pending_calls(
+            tool_name="read_file",
+            arguments={"path": "/tmp/x"},
+            timeout=0.1,
+        )
+
+        assert len(pending) == 1
+        assert pending[0]["name"] == "read_file"
+        assert pending[0]["args"] == {"path": "/tmp/x"}
+
+        srv.resolve_call(pending[0]["id"], {"content": [{"type": "text", "text": "ok"}]})
+        await task
+
+    async def test_wait_for_pending_calls_is_woken_by_handler(
+        self, metadata: list[ToolMetadata]
+    ) -> None:
+        srv = ProxyMCPServer(metadata, timeout=5.0)
+
+        waiter = asyncio.create_task(srv.wait_for_pending_calls(
+            tool_name="write_file",
+            arguments={"path": "/tmp/x", "content": "hello"},
+            timeout=1.0,
+        ))
+        await asyncio.sleep(0)
+
+        task = asyncio.create_task(srv.call_tool_for_test(
+            "write_file",
+            {"path": "/tmp/x", "content": "hello"},
+        ))
+
+        pending = await waiter
+        assert len(pending) == 1
+        assert pending[0]["name"] == "write_file"
+        assert pending[0]["args"] == {"path": "/tmp/x", "content": "hello"}
+
+        srv.resolve_call(pending[0]["id"], {"content": [{"type": "text", "text": "ok"}]})
+        await task
 
 
 @pytest.mark.asyncio

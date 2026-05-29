@@ -13,20 +13,29 @@ from pydantic import BaseModel, Field
 
 class AgentStatus(str, Enum):
     """Status of a deep-worker agent.
-    
+
     These statuses represent the current state of an agent process:
-    - IDLE: Agent is waiting for user input
-    - RUNNING: Agent is actively processing a task
-    - WAITING_INPUT: Agent is waiting for user input (interactive prompt)
-    - WAITING_APPROVAL: Agent is waiting for user approval (e.g., tool execution)
-    - ERROR: Agent encountered an error
-    - SHUTDOWN: Agent is shutting down or has shut down
+    - IDLE: Turn finished cleanly; agent ready for the next user message.
+    - RUNNING: Agent actively processing a turn.
+    - WAITING_INPUT: Inside a running turn, awaiting an in-flight tool's
+      output. Despite the name, this is NOT "waiting for the user" — it
+      is "waiting for the tool". Legacy name retained for wire
+      compatibility.
+    - WAITING_APPROVAL: Reserved; agent is waiting for user approval
+      (e.g., HITL tool execution). Not currently emitted by the CLI.
+    - INTERRUPTED: User cancelled the current turn via the Interrupt
+      control. Agent is alive and awaits the user's next message —
+      typically a correction. UI renders this in amber to distinguish
+      it from WAITING_INPUT.
+    - ERROR: Agent encountered an error.
+    - SHUTDOWN: Agent is shutting down or has shut down.
     """
 
     IDLE = "idle"
     RUNNING = "running"
     WAITING_INPUT = "waiting_input"
     WAITING_APPROVAL = "waiting_approval"
+    INTERRUPTED = "interrupted"
     ERROR = "error"
     SHUTDOWN = "shutdown"
 
@@ -78,6 +87,22 @@ class AgentInfo(BaseModel):
         default=None, description="TaskManager disabled flag (user-toggled off)"
     )
 
+    # Human-readable failure cause when ``status == ERROR``. Carried in
+    # /api/agents, the single-agent endpoint, and the agent_discovered
+    # snapshot so the web UI's persistent error panel can show the
+    # detail on PAGE LOAD — not only via a live WebSocket push (which a
+    # browser that loaded after the error transition would miss). The
+    # value is sourced from the agent's get_status ``error`` field (with
+    # a session_metadata.json fallback). Incident observed 2026-05-20.
+    error_message: str | None = Field(
+        default=None,
+        description="Failure cause when status is error (None otherwise)",
+    )
+    status_metadata: dict[str, Any] | None = Field(
+        default=None,
+        description="Optional metadata explaining the current base status",
+    )
+
 
 class AgentStatusInfo(BaseModel):
     """Detailed status information for a deep-worker agent.
@@ -108,6 +133,10 @@ class AgentStatusInfo(BaseModel):
     )
     task_manager_active: bool = Field(
         False, description="Whether TaskManager is currently running"
+    )
+    status_metadata: dict[str, Any] | None = Field(
+        default=None,
+        description="Optional metadata explaining the current base status",
     )
 
 

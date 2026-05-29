@@ -22,7 +22,7 @@ import sys
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Generator, Optional
+from typing import Any, Generator, Optional
 
 from deep_worker_cli.agent_config_pkg.agent_config import AgentConfig
 from deep_worker_cli.client.agent_client import AgentClient
@@ -93,12 +93,30 @@ def _terminate_agent(agent_info: AgentFixtureInfo, force: bool = False) -> None:
 
 
 def _cleanup_agent_files(agent_info: AgentFixtureInfo) -> None:
-    """Clean up agent PID files.
+    """Remove on-disk artefacts a passed-test agent left behind.
+
+    Two locations:
+
+    1. ``/tmp/deep_worker_<agent_name>.pid`` — the PID lockfile.
+    2. ``<agent-data-dir>/<agent_name>/`` — the ``SessionManager.data_dir``
+       default (see ``AgentProcess.__init__``:
+       ``self.data_dir = data_dir or (Path("~/.deep_worker").expanduser() / name)``).
+       Holds ``session_metadata.json`` and conversation summaries.
+       Used to be left on disk by every passed test, accumulating
+       hundreds of stale directories per machine over time.
+
+    Safety: ``AgentFixtureInfo.agent_name`` is pydantic-validated
+    against ``^test_[a-z0-9_]+$`` at construction (see ``models.py``),
+    so by the time this helper runs the name is guaranteed to be a
+    test name. There is no path through which a production agent
+    name could reach this code.
 
     Args:
-        agent_info: Agent information
+        agent_info: Agent information (pydantic-validated test name).
     """
-    # Remove PID file if we know where it is
+    import shutil  # local import — only used on teardown
+
+    # 1. Remove PID file if we know where it is
     pid_file = Path(f"/tmp/deep_worker_{agent_info.agent_name}.pid")
     if pid_file.exists():
         try:
@@ -106,6 +124,18 @@ def _cleanup_agent_files(agent_info: AgentFixtureInfo) -> None:
             logger.debug(f"Removed PID file: {pid_file}")
         except OSError as e:
             logger.warning(f"Failed to remove PID file {pid_file}: {e}")
+
+    # 2. Remove the agent's persistent data directory. The agent
+    #    process created this in AgentProcess.__init__ for its
+    #    SessionManager. Best-effort: a missing dir is fine (agent
+    #    may not have reached the SessionManager init phase).
+    data_dir = Path.home() / Path("~/.deep_worker").name / agent_info.agent_name
+    if data_dir.exists():
+        try:
+            shutil.rmtree(data_dir, ignore_errors=False)
+            logger.debug(f"Removed agent data dir: {data_dir}")
+        except OSError as e:
+            logger.warning(f"Failed to remove data dir {data_dir}: {e}")
 
 
 def _get_existing_agent(agent_name: str, registry: ProcessRegistry) -> Optional[AgentFixtureInfo]:
@@ -137,10 +167,11 @@ def _get_existing_agent(agent_name: str, registry: ProcessRegistry) -> Optional[
 def _agent_process_entry_point(
     agent_name: str,
     working_dir: Path,
-    model: str,
+    model: Optional[str],
     provider: str,
     skip_permissions: bool,
     api_key: Optional[str],
+    enable_task_manager: bool = False,
 ) -> None:
     """Entry point for agent subprocess - runs agent.start() in its own event loop."""
     import asyncio
@@ -150,10 +181,16 @@ def _agent_process_entry_point(
     # ============================================================================
     # CRITICAL: Ensure local deepagents code is used instead of system package
     # ============================================================================
-    # Tests must import the repository copy, not any installed sibling.
-    repo_base = Path(__file__).resolve().parents[3]
+    # This host should ALWAYS use code from the LOCAL repository (not
+    # system-installed packages). We detect the repository root from the
+    # agent_fixture.py path: going up 4 dirs from
+    #   .../<tree>/deep_worker/deep_worker_cli/tests/integration_ai/
+    # gives us the tree root (the production tree or the developer tree).
+    # ============================================================================
+    _fixture_path = Path(__file__).resolve()
+    repo_base = _fixture_path.parents[3] / "deep_worker"
     cli_package_path = str(repo_base / "deep_worker_cli")
-    deepagents_path = f"{repo_base}/deepagents"
+    deepagents_path = str(repo_base / "deepagents")
 
     # Insert at beginning to override system packages
     if cli_package_path not in sys.path:
@@ -166,13 +203,16 @@ def _agent_process_entry_point(
         if provider == "deepseek":
             os.environ["OPENAI_API_KEY"] = api_key
             os.environ["OPENAI_BASE_URL"] = "https://api.deepseek.com"
-            os.environ["OPENAI_MODEL"] = model
+            if model:
+                os.environ["OPENAI_MODEL"] = model
         elif provider == "openai":
             os.environ["OPENAI_API_KEY"] = api_key
-            os.environ["OPENAI_MODEL"] = model
+            if model:
+                os.environ["OPENAI_MODEL"] = model
         elif provider == "gemini":
             os.environ["GOOGLE_API_KEY"] = api_key
-            os.environ["GOOGLE_MODEL"] = model
+            if model:
+                os.environ["GOOGLE_MODEL"] = model
 
     # claude-code doesn't require API key (uses local Claude Code installation)
     # No environment setup needed
@@ -201,6 +241,7 @@ def _agent_process_entry_point(
         name=agent_name,
         config=config,
         skip_permissions=skip_permissions,
+        enable_task_manager=enable_task_manager,
         rpyc_port=True,  # ⚠️ MUST be True! Never use fixed port numbers!
     )
 
@@ -211,10 +252,11 @@ def _agent_process_entry_point(
 def _start_agent_process(
     agent_name: str,
     working_dir: Path,
-    model: str = "deepseek-chat",
+    model: Optional[str] = None,
     provider: str = "deepseek",
     skip_permissions: bool = True,  # ⚠️ CRITICAL: Must be True by default! See docstring.
     api_key: Optional[str] = None,
+    enable_task_manager: bool = False,
 ) -> AgentFixtureInfo:
     """Start a new agent process using multiprocessing.
 
@@ -289,7 +331,7 @@ def _start_agent_process(
     ctx = multiprocessing.get_context('spawn')
     process = ctx.Process(
         target=_agent_process_entry_point,
-        args=(agent_name, working_dir, model, provider, skip_permissions, api_key),
+        args=(agent_name, working_dir, model, provider, skip_permissions, api_key, enable_task_manager),
         name=f"agent-{agent_name}",
         daemon=True,
     )
@@ -364,10 +406,12 @@ def _start_agent_process(
 def agent_fixture(
     agent_name: str,
     working_dir: Optional[Path] = None,
-    model: str = "deepseek-chat",
+    model: Optional[str] = None,
     provider: str = "deepseek",
     skip_permissions: bool = True,
     api_key: Optional[str] = None,
+    enable_task_manager: bool = False,
+    pytest_item: Any = None,
 ) -> Generator[AgentFixtureInfo, None, None]:
     """Context manager for test agent lifecycle management.
 
@@ -383,7 +427,7 @@ def agent_fixture(
     Args:
         agent_name: Name of agent (must start with 'test_')
         working_dir: Working directory (defaults to /tmp)
-        model: AI model to use (default: deepseek-chat)
+        model: AI model to use (default: None → system default per provider)
         provider: AI provider (default: deepseek)
         skip_permissions: Skip permission prompts (default: True for tests)
                          ⚠️  CRITICAL: This MUST be True for all tests that invoke tools!
@@ -442,7 +486,27 @@ def agent_fixture(
                 provider=provider,
                 skip_permissions=skip_permissions,
                 api_key=api_key,
+                enable_task_manager=enable_task_manager,
             )
+
+        # Hand the freshly-spawned (or reused) agent off to the
+        # session-finish sweeper so that — even if pytest itself is
+        # killed before our ``finally`` runs — leaked passed-test
+        # agents still get cleaned up. The sweeper checks
+        # ``created_by_fixture`` and the test outcome before doing
+        # anything, so it is safe to register pre-existing agents
+        # too.
+        if pytest_item is not None:
+            try:
+                from .conftest import register_test_agent  # noqa: PLC0415
+                register_test_agent(
+                    agent_name,
+                    pytest_item,
+                    created_by_fixture=agent_info.created_by_fixture,
+                )
+            except Exception as exc:  # noqa: BLE001
+                # Don't let bookkeeping break the test.
+                logger.debug(f"register_test_agent failed: {exc}")
 
         # Yield to test
         yield agent_info

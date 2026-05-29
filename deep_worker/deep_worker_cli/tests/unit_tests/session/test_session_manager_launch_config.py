@@ -36,7 +36,7 @@ def sample_launch_config():
         "clean": True,
         "started_at": "2026-04-11T16:59:41.692129",
         "pid": 3726921,
-        "cli_args": "myagent -sp -tm --dir /path/to/project --provider claude-code --model opus --clean",
+        "cli_args": "lc4_test -sp -tm --dir /path/to/project --provider claude-code --model opus --clean",
     }
 
 
@@ -160,6 +160,58 @@ class TestLaunchConfigPreservedAcrossStatusUpdates:
         assert data["message_count"] == 1
 
 
+class TestLaunchConfigModelUpdate:
+    @pytest.mark.asyncio
+    async def test_update_launch_config_model_persists_model(self, temp_data_dir):
+        manager = SessionManager(
+            data_dir=temp_data_dir,
+            launch_config={"provider": "codex", "model": None},
+        )
+
+        await manager.update_launch_config_model("gpt-dynamic-default")
+
+        data = json.loads((temp_data_dir / "session_metadata.json").read_text())
+        assert data["launch_config"]["model"] == "gpt-dynamic-default"
+        assert manager.launch_config["model"] == "gpt-dynamic-default"
+
+    @pytest.mark.asyncio
+    async def test_update_launch_config_model_rejects_unknown(self, temp_data_dir):
+        manager = SessionManager(
+            data_dir=temp_data_dir,
+            launch_config={"provider": "codex", "model": None},
+        )
+
+        await manager.update_launch_config_model("unknown")
+
+        data = json.loads((temp_data_dir / "session_metadata.json").read_text())
+        assert data["launch_config"]["model"] is None
+
+    @pytest.mark.asyncio
+    async def test_update_launch_config_model_notifies(self, temp_data_dir):
+        events = []
+
+        async def notify(payload):
+            events.append(payload)
+
+        manager = SessionManager(
+            data_dir=temp_data_dir,
+            launch_config={"provider": "codex", "model": None},
+            notifier=notify,
+        )
+
+        await manager.update_launch_config_model("gpt-dynamic-default")
+
+        assert events == [
+            {
+                "type": "status_change",
+                "status": "idle",
+                "error_message": None,
+                "provider": "codex",
+                "model": "gpt-dynamic-default",
+            }
+        ]
+
+
 class TestLaunchConfigSurvivesReload:
     """launch_config must persist when a new SessionManager loads from disk."""
 
@@ -194,7 +246,7 @@ class TestLaunchConfigSurvivesReload:
         new_config = {
             "provider": "deepseek",
             "model": "deepseek-chat",
-            "working_dir": "/path/to/other-project",
+            "working_dir": "/path/to/project",
             "skip_permissions": False,
             "task_manager": False,
             "memory_only": True,
@@ -202,7 +254,7 @@ class TestLaunchConfigSurvivesReload:
             "clean": False,
             "started_at": "2026-04-12T10:00:00.000000",
             "pid": 9999,
-            "cli_args": "otheragent --provider deepseek --memory-only",
+            "cli_args": "vc_test --provider deepseek --memory-only",
         }
         manager2 = SessionManager(
             data_dir=temp_data_dir, launch_config=new_config

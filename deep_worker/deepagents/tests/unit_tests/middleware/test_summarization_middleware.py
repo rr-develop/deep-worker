@@ -1,6 +1,9 @@
 """Unit tests for `SummarizationMiddleware` with backend offloading."""
 
+import json
 from collections.abc import Generator
+from datetime import UTC, datetime
+from decimal import Decimal
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import MagicMock, patch
@@ -10,6 +13,10 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMe
 
 from deepagents.backends.protocol import BackendProtocol, EditResult, FileDownloadResponse, WriteResult
 from deepagents.middleware.summarization import SummarizationMiddleware
+from deepagents.middleware.summarization_history import (
+    deserialize_summarized_messages_jsonl,
+    serialize_summarized_messages_jsonl,
+)
 
 if TYPE_CHECKING:
     from langchain.agents.middleware.types import AgentState
@@ -231,6 +238,72 @@ def make_mock_model(summary_response: str = "This is a test summary.") -> MagicM
 # -----------------------------------------------------------------------------
 
 
+class TestSummarizationHistoryJsonl:
+    def test_jsonl_has_one_object_per_message_and_restores_losslessly(self) -> None:
+        messages = [
+            HumanMessage(
+                content="hello",
+                id="h1",
+                additional_kwargs={"created_at": "2026-05-29T10:00:00.000001+00:00"},
+            ),
+            AIMessage(
+                content="using a tool",
+                id="a1",
+                tool_calls=[{"id": "call-1", "name": "lookup", "args": {"query": "x"}}],
+                additional_kwargs={
+                    "created_at": "2026-05-29T10:00:00.000002+00:00",
+                    "tool_call_created_at": {"call-1": "2026-05-29T10:00:00.000002+00:00"},
+                },
+                response_metadata={"provider": "test"},
+            ),
+            ToolMessage(
+                content="tool result",
+                tool_call_id="call-1",
+                id="t1",
+                additional_kwargs={"created_at": "2026-05-29T10:00:00.000003+00:00"},
+            ),
+        ]
+
+        content = serialize_summarized_messages_jsonl(messages, summarized_at="2026-05-29T10:01:00.000000+00:00")
+        lines = content.splitlines()
+
+        assert len(lines) == len(messages)
+        entries = [json.loads(line) for line in lines]
+        assert [entry["message_index"] for entry in entries] == [0, 1, 2]
+        assert all(entry["schema_version"] == 4 for entry in entries)
+        # message is plain JSON, not msgpack/base64
+        assert all(isinstance(entry["message"], dict) for entry in entries)
+        assert all("type" in entry["message"] and "data" in entry["message"] for entry in entries)
+        assert all(isinstance(entry["message"]["data"]["content"], str) for entry in entries)
+
+        restored = deserialize_summarized_messages_jsonl(content)
+        assert [message.type for message in restored] == ["human", "ai", "tool"]
+        assert restored[0].id == "h1"
+        assert restored[1].id == "a1"
+        assert restored[1].tool_calls == messages[1].tool_calls
+        assert restored[1].additional_kwargs["tool_call_created_at"] == {"call-1": "2026-05-29T10:00:00.000002+00:00"}
+        assert restored[2].tool_call_id == "call-1"
+
+    def test_jsonplus_payload_preserves_non_json_metadata(self) -> None:
+        created = datetime(2026, 5, 29, 10, 0, 0, tzinfo=UTC)
+        message = AIMessage(
+            content="metadata",
+            id="a-non-json",
+            additional_kwargs={"created_at": "2026-05-29T10:00:00.000001+00:00", "dt": created},
+            response_metadata={"cost": Decimal("1.25")},
+        )
+
+        content = serialize_summarized_messages_jsonl([message])
+        restored = deserialize_summarized_messages_jsonl(content)
+
+        # Plain JSON serialization converts datetime to ISO string and Decimal to string
+        # Note: str(datetime) uses space, not T separator: "2026-05-29 10:00:00+00:00"
+        assert restored[0].additional_kwargs["dt"] == "2026-05-29 10:00:00+00:00"
+        assert restored[0].response_metadata["cost"] == "1.25"
+        # created_at was already a string, preserved as-is
+        assert restored[0].additional_kwargs["created_at"] == "2026-05-29T10:00:00.000001+00:00"
+
+
 class TestSummarizationMiddlewareInit:
     """Tests for middleware initialization."""
 
@@ -289,14 +362,19 @@ class TestOffloadingBasic:
         assert len(backend.write_calls) == 1
 
         path, content = backend.write_calls[0]
-        assert path == "/conversation_history/test-thread-123.md"
+        assert path == "/conversation_history/test-thread-123.jsonl"
 
-        assert "## Summarized at" in content
-        assert "Human:" in content or "AI:" in content
+        lines = content.splitlines()
+        assert len(lines) == 6
+        restored = deserialize_summarized_messages_jsonl(content)
+        assert [message.id for message in restored] == ["human-0", "ai-1", "tool-2", "human-3", "ai-4", "tool-5"]
 
     def test_offload_appends_to_existing_content(self) -> None:
-        """Test that second summarization appends to existing file."""
-        existing = "## Summarized at 2024-01-01T00:00:00Z\n\nHuman: Previous message\n\n"
+        """Test that second summarization appends JSONL lines to existing file."""
+        existing = serialize_summarized_messages_jsonl(
+            [HumanMessage(content="Previous message", id="prev-human")],
+            summarized_at="2024-01-01T00:00:00.000000+00:00",
+        )
         backend = MockBackend(existing_content=existing)
         mock_model = make_mock_model()
 
@@ -319,10 +397,11 @@ class TestOffloadingBasic:
         # old_string should be the existing content
         assert old_string == existing
 
-        # new_string (combined content) should contain both old and new sections
-        assert "## Summarized at 2024-01-01T00:00:00Z" in new_string
-        expected_section_count = 2  # One existing + one new summarization section
-        assert new_string.count("## Summarized at") == expected_section_count
+        restored = deserialize_summarized_messages_jsonl(new_string)
+        assert restored[0].id == "prev-human"
+        assert len(restored) == 7
+        assert [message.id for message in restored[1:]] == ["human-0", "ai-1", "tool-2", "human-3", "ai-4", "tool-5"]
+        assert len(new_string.splitlines()) == 7
 
     def test_typical_tool_heavy_conversation(self) -> None:
         """Test with a realistic tool-heavy conversation pattern.
@@ -374,9 +453,9 @@ class TestOffloadingBasic:
 
         _, content = backend.write_calls[0]
 
-        # Should have markdown content with summarized messages
-        assert "## Summarized at" in content
-        assert "Search for Python tutorials" in content
+        restored = deserialize_summarized_messages_jsonl(content)
+        assert restored[0].content == "Search for Python tutorials"
+        assert restored[1].tool_calls[0]["id"] == "tc1"
 
     def test_second_summarization_after_first(self) -> None:
         """Test a second summarization event after an initial one.
@@ -422,9 +501,10 @@ class TestOffloadingBasic:
         # The previous summary message (marked with lc_source: "summarization") should NOT
         # be offloaded—it's a synthetic message, and the original messages it summarized
         # are already stored in the backend file from the first summarization
-        assert "First summary" not in content, "Previous summary should be filtered from offload"
+        restored = deserialize_summarized_messages_jsonl(content)
+        assert all(message.id != "prev-summary" for message in restored), "Previous summary should be filtered from offload"
         # But the new conversation messages should be offloaded
-        assert "New question 1" in content
+        assert any(message.content == "New question 1" for message in restored)
 
     def test_filters_previous_summary_messages(self) -> None:
         """Test that previous summary `HumanMessage` objects are NOT included in offload.
@@ -488,7 +568,7 @@ class TestSummaryMessageFormat:
 
         # Should include the file path reference
         assert "full conversation history has been saved to" in summary_msg.content
-        assert "/conversation_history/test-thread.md" in summary_msg.content
+        assert "/conversation_history/test-thread.jsonl" in summary_msg.content
 
         # Should include the summary in XML tags
         assert "<summary>" in summary_msg.content
@@ -586,7 +666,7 @@ class TestSummaryMessageFormat:
 
         # Should include the file path reference
         assert "full conversation history has been saved to" in summary_msg.content
-        assert "/conversation_history/multi-summarize-thread.md" in summary_msg.content
+        assert "/conversation_history/multi-summarize-thread.jsonl" in summary_msg.content
 
         # Should include the summary in XML tags
         assert "<summary>" in summary_msg.content
@@ -700,7 +780,7 @@ class TestThreadIdExtraction:
             middleware.before_model(state, runtime)
 
         path, _ = backend.write_calls[0]
-        assert path == "/conversation_history/custom-thread-456.md"
+        assert path == "/conversation_history/custom-thread-456.jsonl"
 
     def test_fallback_thread_id_when_missing(self) -> None:
         """Test that a fallback ID is generated when `thread_id` is not in config."""
@@ -725,7 +805,7 @@ class TestThreadIdExtraction:
 
         # Should have a generated session ID in the path
         assert "session_" in path
-        assert path.endswith(".md")
+        assert path.endswith(".jsonl")
 
 
 class TestAsyncBehavior:
@@ -836,14 +916,14 @@ class TestCustomHistoryPathPrefix:
             middleware.before_model(state, runtime)
 
         path, _ = backend.write_calls[0]
-        assert path == "/custom/path/test-thread.md"
+        assert path == "/custom/path/test-thread.jsonl"
 
 
-class TestMarkdownFormatting:
-    """Tests for markdown message formatting using `get_buffer_string`."""
+class TestJsonlFormatting:
+    """Tests for JSONL message formatting."""
 
-    def test_markdown_format_includes_message_content(self) -> None:
-        """Test that markdown format includes message content."""
+    def test_jsonl_format_restores_message_content_and_timestamps(self) -> None:
+        """Test that JSONL format restores message content and timestamps."""
         backend = MockBackend()
         mock_model = make_mock_model()
 
@@ -861,13 +941,12 @@ class TestMarkdownFormatting:
         result = middleware.before_model(state, runtime)
         assert result is not None
 
-        # Verify the offloaded content is markdown formatted
         _, content = backend.write_calls[0]
 
-        # Should contain human-readable message prefixes
-        assert "Human:" in content or "AI:" in content
-        # Should contain the actual message content
-        assert "User message" in content
+        restored = deserialize_summarized_messages_jsonl(content)
+        assert restored[0].content == "User message 0"
+        assert restored[0].additional_kwargs["created_at"].endswith("+00:00")
+        assert len(content.splitlines()) == len(restored)
 
 
 class TestDownloadFilesException:
@@ -988,7 +1067,7 @@ class TestWriteEditException:
 
         Covers lines 314-322: Exception handler for edit in _offload_to_backend.
         """
-        existing = "## Summarized at 2024-01-01T00:00:00Z\n\nHuman: Previous message\n\n"
+        existing = serialize_summarized_messages_jsonl([HumanMessage(content="Previous message", id="prev-human")])
         backend = MockBackend(existing_content=existing, write_raises=True)
         mock_model = make_mock_model()
 
@@ -1016,7 +1095,7 @@ class TestWriteEditException:
 
         Covers lines 387-395: Exception handler for aedit in _aoffload_to_backend.
         """
-        existing = "## Summarized at 2024-01-01T00:00:00Z\n\nHuman: Previous message\n\n"
+        existing = serialize_summarized_messages_jsonl([HumanMessage(content="Previous message", id="prev-human")])
         backend = MockBackend(existing_content=existing, write_raises=True)
         mock_model = make_mock_model()
         mock_model.ainvoke = MagicMock(return_value=MagicMock(text="Async summary"))

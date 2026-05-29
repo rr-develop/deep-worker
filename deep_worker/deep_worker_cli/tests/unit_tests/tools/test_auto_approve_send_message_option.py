@@ -44,6 +44,7 @@ class TestAddInterruptOn:
 
         cfg = _add_interrupt_on()
         assert "send_message_to_agent" in cfg
+        assert "restart_agent" in cfg
 
     def test_flag_false_still_includes_send_message_to_agent(self) -> None:
         """Explicit False is equivalent to default."""
@@ -51,6 +52,7 @@ class TestAddInterruptOn:
 
         cfg = _add_interrupt_on(auto_approve_send_message=False)
         assert "send_message_to_agent" in cfg
+        assert "restart_agent" in cfg
 
     def test_flag_true_omits_send_message_to_agent(self) -> None:
         """When the flag is True, the tool is NOT in interrupt_on,
@@ -60,6 +62,7 @@ class TestAddInterruptOn:
 
         cfg = _add_interrupt_on(auto_approve_send_message=True)
         assert "send_message_to_agent" not in cfg
+        assert "restart_agent" in cfg
 
     def test_flag_true_does_not_affect_other_tools(self) -> None:
         """Other side-effect tools remain gated — only send_message_to_agent
@@ -75,6 +78,7 @@ class TestAddInterruptOn:
             "web_search",
             "fetch_url",
             "task",
+            "restart_agent",
         ):
             assert expected in cfg, (
                 f"Tool '{expected}' must still be gated when only "
@@ -368,6 +372,7 @@ class TestEndToEndSemantics:
         )
         assert isinstance(interrupt_on, dict)
         assert "send_message_to_agent" in interrupt_on
+        assert "restart_agent" in interrupt_on
         assert "execute" in interrupt_on
 
     def test_asm_only_ungates_only_send_message(
@@ -380,6 +385,7 @@ class TestEndToEndSemantics:
         )
         assert isinstance(interrupt_on, dict)
         assert "send_message_to_agent" not in interrupt_on
+        assert "restart_agent" in interrupt_on
         # Others stay gated
         assert "execute" in interrupt_on
         assert "edit_file" in interrupt_on

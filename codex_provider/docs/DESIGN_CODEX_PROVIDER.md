@@ -1,7 +1,7 @@
 # Design: Codex provider for deep-worker
 
 **Status:** ✅ IMPLEMENTED — first cut landed on branch `dev` on
-2026-05-15. 59/59 unit tests pass; 4/4 live integration tests pass
+2026-05-15. 88/88 unit tests pass; 4/4 live integration tests pass
 (hello-world, multi-turn memory, tool-call round-trip, thread
 isolation between main agent and TaskManager). See `tests/`.
 
@@ -27,9 +27,10 @@ exercised it live against `codex-cli 0.130.0`:
    ToolNode runs first. The earliest signal Codex gives us is
    `item.started` with `status="in_progress"`. There's a small race
    window (stdout `item.started` and HTTP `tools/call` arrive on
-   independent channels) so the loop waits up to 30 s for the
-   handler's Future to be parked. The wait is event-driven (5 ms
-   sleeps, NOT a busy loop) and bounded.
+   independent channels), so `ainvoke` parks on
+   `ProxyMCPServer.wait_for_pending_calls(...)`. The HTTP handler
+   resolves that waiter at the exact moment it registers the pending
+   call. No sleep loop, no polling.
 3. **The proxy MCP server is a process-global singleton.** Different
    `CodexChatModel` instances (LangGraph may rebuild the model during
    pickling; agent + TaskManager + subagents may share a process)
@@ -38,6 +39,139 @@ exercised it live against `codex-cli 0.130.0`:
    in `~/.codex/config.toml`. To avoid Codex caching an empty
    `tools/list`, we defer registration until tools are actually
    bound — never register an empty server.
+4. **Native Codex tools that overlap deep-worker tools are stripped
+   when possible, recorded into LangGraph otherwise.** (Mechanism
+   rewritten twice on 2026-05-18; see Implementation notes 6 and 7
+   for the working channels.) The original `--config
+   disabled_tools=[...]` override turned out to be silently ignored
+   by Codex 0.130; we migrated to per-feature `--disable <feature>`
+   flags + a top-level `web_search="disabled"` override
+   (Implementation note 6). The seven native tools that survive
+   every flag (`apply_patch`, `update_plan`, `view_image`,
+   `request_user_input`, `list_mcp_resources*`) are now recorded
+   into LangGraph as honest tool_call + ToolMessage pairs via the
+   event pump + native_tools machinery (Implementation note 7). The
+   legacy `_raise_if_blocked_native_item` defense-in-depth check
+   that used to abort the turn on every native event was removed —
+   it was harmful UX (turn became `status="error"` instead of
+   answering the user).
+5. **System prompt is delivered via `AGENTS.override.md`, not via
+   `--config base_instructions=...`** (changed 2026-05-18). Codex CLI
+   0.130.0 silently ignores the `base_instructions` config key —
+   verified by comparing `session_meta.payload.base_instructions.text`
+   in `~/.codex/sessions/.../*.jsonl` against the value we tried to
+   set: Codex always keeps its built-in default GPT-5 prompt. Three
+   delivery paths were tried and rejected: `-c base_instructions="..."`,
+   `[profiles.<name>] base_instructions = "..."`, and
+   `[profiles.<name>] instructions = "..."` — none of them overrode
+   the built-in. The path that *does* work is the `AGENTS.override.md`
+   file (recognised by `core/src/agents_md.rs` in the Codex binary);
+   Codex prepends its contents as the first `user` message of every
+   turn. `CodexExecRunner.spawn` now drops a marked override file into
+   the working directory before each `codex exec` and
+   `ExecHandle.aclose` removes it. The file is never overwritten if it
+   already exists without our `<!-- deepworker:codex_override v1 -->`
+   marker — a user-authored override is sacred.
+
+   *Sub-fix:* the `SystemMessage.content` extraction in `ainvoke` was
+   using `str(msg.content)`, which produced a Python `repr` of the
+   `content_blocks` list (`"[{'type': 'text', 'text': '...'}]"`)
+   whenever middleware wrapped the prompt — and deep-worker's
+   middleware stack (memory, skills, project_memory, local_context,
+   subagents) always wraps it. The provider now flattens content
+   blocks to plain text via `_flatten_message_content_to_text`,
+   skipping non-text blocks. See the test class
+   `TestAinvokeToolCalls::test_system_prompt_*` for the contract.
+
+6. **Native-tool deny-list channel: per-feature `--disable` flags, NOT
+   `disabled_tools=[...]`.** (Changed 2026-05-18.) Codex CLI 0.130
+   silently ignores the older `--config disabled_tools=[...]` channel —
+   we verified live via `RUST_LOG=codex_api=trace` that the
+   `response.create` websocket payload's `tools=[...]` list is
+   identical with or without it. The working contract is one
+   `--disable <feature>` per Codex feature flag whose tools we want
+   stripped from the API request, plus top-level config overrides for
+   the handful of keys that Codex moved out of the feature namespace
+   in 0.130 (currently just `web_search`, which now lives at the
+   top level as `"live" | "cached" | "disabled"`).
+
+   Feature → native tool mapping (verified against `codex features
+   list` on cli 0.130.0):
+
+   | Feature flag         | Native tools it adds to the API request    |
+   |----------------------|--------------------------------------------|
+   | `shell_tool`         | `exec_command` (single-call variant)       |
+   | `unified_exec`       | `exec_command` (with `write_stdin`)        |
+   | `multi_agent`        | `spawn_agent`, `send_input`, `resume_agent`, `wait_agent`, `close_agent` |
+   | `image_generation`   | `image_generation`                         |
+   | `tool_search`        | `tool_search`                              |
+   | `apps`               | `mcp__codex_apps__*` (e.g. GitHub)         |
+   | `plugins`            | Plugin-contributed tools                   |
+
+   Native tools that 0.130 has NO way to remove via config:
+   `apply_patch` (always-injected `custom` tool), `update_plan`,
+   `view_image`, `request_user_input`, `list_mcp_resources`,
+   `list_mcp_resource_templates`, `read_mcp_resource`. These survive
+   for every Codex 0.130 turn; their handling is described in
+   Implementation note 7.
+
+   See `codex_provider/chat_model.py:DEFAULT_DISABLED_FEATURES` and
+   `DEFAULT_CONFIG_OVERRIDES` for the canonical defaults, and
+   `codex_provider/tests/test_disallowed_tools.py` for the regression
+   contract.
+
+7. **Surviving native tools are recorded into LangGraph as honest
+   tool_call + ToolMessage pairs.** (Added 2026-05-18, replaces the
+   `_raise_if_blocked_native_item` defense-in-depth that aborted the
+   turn.) When Codex emits `item.started` for a native tool
+   (`command_execution`, `apply_patch`, `file_change`, `web_search`,
+   `tool_search`, `custom_tool_call`, `function_call`,
+   `function_call_output`), the codex_provider:
+
+   - returns an `AIMessage(tool_calls=[{id, name, args, type}])`
+     from `ainvoke` where `name` is exactly Codex's `item.type`
+     (no synthetic prefix) and `id` is Codex's `item.id` verbatim,
+   - LangGraph's ToolNode routes into one of the async BaseTool
+     bodies registered by `codex_provider.native_tools`. The bound
+     tool set is extended with `NATIVE_TOOLS` whenever a
+     CodexChatModel-backed agent is created, i.e. in both
+     `deep_worker_cli/process/agent_process.py` (main agent) and
+     `deep_worker_cli/task_manager/task_manager.py`
+     (`-tm` manager agent — symmetric injection so a native tool call
+     during a manager turn does not crash it).
+   - the tool body parks on an `asyncio.Future` that the background
+     event-pump task created at the same `item.started` event,
+   - when Codex emits `item.completed` the pump resolves the
+     Future with the rendered result string and the tool body
+     returns it. ToolNode wraps it in a `ToolMessage(name=…,
+     tool_call_id=…, additional_kwargs={"codex_native": True})`.
+
+   The outbound `ToolMessage` for a native call is *not* pushed
+   back into Codex — Codex never blocked on it, it has already
+   moved on inside the same `codex exec`. The discriminator is
+   `additional_kwargs["codex_native"]`; the existing mid-turn
+   reuse branch in `ainvoke` keeps reading the same handle's
+   `ainvoke_queue` for the next event.
+
+   The single reader of the JSONL stream is the background
+   `EventPumpTask` (`codex_provider.event_pump`) created at
+   `CodexExecRunner.spawn` time and torn down by
+   `ExecHandle.aclose`. Two destinations only:
+
+   - `ExecHandle.ainvoke_queue` (`asyncio.Queue(maxsize=64)`) — what
+     `ainvoke` reads (thread.started, turn.started/completed/failed,
+     item.started for both proxy MCP and native, item.completed for
+     `AgentMessageItem`).
+   - `ExecHandle.native_futures` (`dict[item_id → Future]`) —
+     awaited by the matching tool body.
+
+   All routing is pure event-driven: `async for`, `Queue.put`,
+   `Future.set_result`. No `asyncio.sleep`, no polling, no
+   while-True. See `codex_provider/docs/DESIGN_NATIVE_TOOL_PASSTHROUGH.md`
+   for the full design (including 16 sections of rationale, concurrency
+   invariants, and TDD plan), and
+   `codex_provider/tests/test_event_pump.py` +
+   `tests/test_native_tools.py` for the contract.
 
 ## Final decisions on open questions (user, 2026-05-15)
 
@@ -47,7 +181,7 @@ exercised it live against `codex-cli 0.130.0`:
 | Q2 | **Do not pin a model version.** Default = "let Codex CLI choose its own default" (do NOT pass `--model` to `codex exec` unless user explicitly set `CODEX_MODEL` env or `--model` flag). This way we automatically pick up Codex's evolving default. Concretely: `_PROVIDER_DEFAULT_MODELS["codex"] = ("CODEX_MODEL", None)` and `chat_model.py` omits `--model` when `model_name is None`. |
 | Q3 | **`-sp` / `skip_permissions` is the default operating mode for deep-worker agents** and MUST work for Codex too. Mirror claude-code's pattern: claude-code unconditionally sets `permission_mode="bypassPermissions"` (`client_manager.py:259-275`) — i.e. the provider always tells the upstream CLI "do not prompt for approvals, ever; deep-worker's HITL via `interrupt_on` decides what to allow at the LangGraph layer". For Codex this translates to: provider **always** passes `--config approval_policy="never"` and `--sandbox workspace-write`. Approval / HITL stays at the LangGraph level (via `interrupt_on` middleware), exactly where it lives today. |
 | Q4 | **HTTP** transport for the proxy MCP server (loopback, in-agent-process). |
-| Q5 | Codex built-in deny-list MUST contain at minimum the Codex counterparts of every default deep-worker tool, so Codex cannot bypass our tools. Implementation: pass `disallowed_tools` (or equivalent via `-c`) listing `shell`, `apply_patch`, `read`, `write`, `edit`, `glob`, `grep`, `web_search`, `memory`, `todo_list`, `task` and any other Codex internal that overlaps with deep-worker tools (`tools.py`). Validated empirically during implementation against `codex exec --experimental-json` output. |
+| Q5 | Codex built-in deny-list MUST strip every native tool that overlaps a default deep-worker tool, so the model never picks a native bypass over the proxy MCP. Implementation (post-2026-05-18, see Implementation note 6): pass one `--disable <feature>` per relevant Codex feature flag (`shell_tool`, `unified_exec`, `multi_agent`, `image_generation`, `tool_search`, `apps`, `plugins`) plus a top-level `-c 'web_search="disabled"'` override. The older `--config disabled_tools=[...]` channel was empirically verified to be silently ignored by Codex 0.130 and is no longer used. In addition, reject native tool-like Codex item types at runtime if the CLI still emits them — `apply_patch` in particular cannot be stripped via config on 0.130. |
 
 **Scope (in):** architecture, terminology discipline, state model,
 lifecycle, leak surface, concurrency invariants, integration
@@ -112,7 +246,7 @@ all, and what's the right shape". The implementation is a follow-up.
 
 ## 2. Background — how providers plug in today
 
-The CLI package's `config.py:1404-1670`
+`deep_worker/deep_worker_cli/deep_worker_cli/config.py:1404-1670`
 holds the single provider registry — `create_model(provider,
 model_name)`. The `claude-code` branch lives at `config.py:1647-1666`
 and sets the precedent for a "local sibling package" provider.
@@ -193,7 +327,7 @@ Event types relevant to us:
 | `turn.started` | – | informational |
 | `item.completed` (`item.type=agent_message`) | `.text` | the assistant's text reply |
 | `item.completed` (`item.type=mcp_tool_call`) | `server`, `tool`, `arguments`, `status`, `result?`, `error?` | a tool call routed to our proxy MCP server |
-| `item.completed` (other types) | – | reasoning/file_change/web_search/etc.; surfaced as text only |
+| `item.completed` (other types) | – | reasoning is ignored; native tool-like items such as `command_execution`, `file_change`, `web_search`, `tool_search`, `custom_tool_call`, `function_call`, and `function_call_output` are rejected because they bypass LangGraph tool history |
 | `turn.completed` | `usage` | end-of-turn; subprocess exits next |
 | `turn.failed` | `error.message` | raise |
 
@@ -214,10 +348,50 @@ $ codex mcp add <name> -- <command...>                 # stdio MCP
 $ codex mcp list
 ```
 
-Configuration persists to `~/.codex/config.toml`. Every `codex exec`
+`codex mcp add` persists to `~/.codex/config.toml`. Every `codex exec`
 re-reads this file and connects afresh to every declared MCP server.
-This is the channel through which Codex calls our tools (and the
-only such channel).
+This is the channel through which Codex calls our tools.
+
+**⚠️ We do NOT use `codex mcp add` — see §4.3.1.**
+
+### 4.3.1 MCP server isolation — per-agent, NEVER global
+
+**`~/.codex/config.toml` is GLOBAL to every codex process on the host.**
+A deep-worker host runs many codex agents over time, each with its own
+proxy MCP server (`deepworker_<pid>`). If each agent registered itself
+into that shared file via `codex mcp add`, the `[mcp_servers.*]` table
+would grow without bound — `codex mcp add` writes, nothing ever cleans
+the dead entries. Every subsequent `codex exec` (from any agent) then
+loads the WHOLE list and tries to connect to every declared server at
+startup. Dead ports (agent long gone) hang for the full
+`ProxyMCPServer` timeout — **120 s per stale server** — before failover.
+
+**Production incident (observed 2026-05-20):** the config had
+accumulated 21 dead `deepworker_<pid>` entries. A turn that needed a
+tool spent ~10 minutes timing out against dead servers one-by-one
+before stumbling onto a live one and "suddenly working". Simple
+prompts (`2+2`) that need no tool answered instantly — masking the
+problem. The user had never sanctioned any global shared list; agents
+are required to be fully independent.
+
+**The contract (DO NOT REGRESS):**
+
+1. The provider **never** runs `codex mcp add` / writes the global
+   config. (`_register_proxy_with_codex` was deleted 2026-05-20.)
+2. Every `codex exec` passes **`--ignore-user-config`** so it does NOT
+   load `~/.codex/config.toml` at all — neutralising any junk other
+   agents (or older builds) may have left. Auth still resolves via
+   `CODEX_HOME` and `resume <uuid>` still works (sessions live in
+   `CODEX_HOME/sessions`, not in config.toml).
+3. The agent injects **only its own** proxy server, per-invocation:
+   `--config mcp_servers.<name>.url="http://127.0.0.1:<port>/mcp"`,
+   sourced from `ExecArgs.mcp_server_name` / `mcp_server_port`
+   (set in `CodexChatModel.ainvoke`, rendered in
+   `CodexExecRunner._build_argv`).
+
+Result: a codex agent sees exactly one MCP server — its own — and
+touches no global state. Regression guards:
+`tests/test_exec_runner.py::TestMcpServerIsolation`.
 
 ### 4.4 Auth — `~/.codex/auth.json`
 
@@ -228,7 +402,8 @@ test above used no env key.
 
 ### 4.5 The Python wrapper in the Agents SDK (reference, not necessarily a runtime dep)
 
-The Agents SDK module `agents/extensions/experimental/codex/exec.py:61-228`
+`agents/extensions/experimental/codex/exec.py:61-228` (in the upstream
+OpenAI Agents SDK)
 spawns `codex exec --experimental-json [resume <uuid>] -` via
 `asyncio.create_subprocess_exec` and yields each stdout line.
 Per-turn subprocess; the `Codex` class holds no long-lived process.
@@ -336,12 +511,25 @@ uses, with the only differences that the "session id" being rotated
 is a UUID instead of a string, and the "client" is a short-lived
 `codex exec` instead of a long-lived `ClaudeSDKClient`.
 
+**Persistence across restarts.** The two scalars
+(`sent_count` + `codex_session_uuid`) are ALSO persisted to disk so a
+restarted agent does not "forget" — without it, a fresh process starts at
+`sent_count=0` / `codex_session_uuid=None`, replays the whole history into an
+empty Codex session, and drops every AIMessage / tool result. The on-disk
+layer (`codex_provider/session_state.py` — the per-agent state file
+(`codex_session_state.json`) under the agent's data directory), the
+lazy-seed in
+`CodexClientState.get_or_create`, the `persist()` call sites, and the
+single resume fallback (stale/missing session → one fresh-session retry with
+full-history replay) are specified in
+[`DESIGN_HISTORY_RESTORE_ON_RESTART.md`](./DESIGN_HISTORY_RESTORE_ON_RESTART.md).
+
 ### Why this satisfies every hard constraint (§0 cross-check)
 
 | Constraint | How Option C honours it |
 |---|---|
 | Don't change deep-worker contracts | `agent_thread_id` is read-only input; nothing we do mutates it. The deep-worker checkpointer thread is untouched. |
-| All messages in LangGraph history | We never bypass ToolNode; ToolMessages arrive through LangGraph and we treat them as Future resolutions (§7.5). Every tool call + result is in `result["messages"]`. |
+| All messages in LangGraph history | We never bypass ToolNode; ToolMessages arrive through LangGraph and we treat them as Future resolutions (§7.5). Native Codex tools that overlap deep-worker tools are disabled with `disabled_tools=[...]` and rejected if observed. Every accepted tool call + result is in `result["messages"]`. |
 | Lightweight, no external processes | Per-turn `codex exec` is the ONLY subprocess; it exists because Codex itself is an external CLI binary, not because we add an extra process. The proxy MCP server is an in-agent-process asyncio task (§7.2). |
 | Incremental history, no full rebuild | `sent_count` cursor; per-turn payload is `messages[sent_count:]` only. |
 | No polling, no blocking | Subprocess stdout via `await stdout.readline()`; MCP handler awaits a Future; nothing in the steady state polls. (§10.1) |
@@ -357,8 +545,10 @@ Codex CLI is a separate OS process. **It cannot call functions inside
 our address space directly** (this is unlike Claude SDK, which is a
 Python library in the same process and lets us register handlers
 in-process via `create_sdk_mcp_server`). The ONLY mechanism Codex
-provides for calling host-defined tools is its external MCP server
-registry (`codex mcp add` / `~/.codex/config.toml`).
+provides for calling host-defined tools is an external MCP server it
+connects to over HTTP. We declare ours **per-invocation** via
+`--config mcp_servers.<name>.url=...` (NOT via the global
+`codex mcp add` / `~/.codex/config.toml` registry — see §4.3.1).
 
 Therefore, exposing deep-worker tools to Codex **requires** us to
 host an MCP server Codex CLI can connect to. There is no "in-process
@@ -372,7 +562,7 @@ The MCP server is hosted **inside the deep-worker agent process** as
 an asyncio task running a small HTTP listener bound to
 `127.0.0.1:<random-free-port>`. Concretely: an
 `mcp.server.streamable_http` instance (the Python MCP SDK already
-ships this — `mcp/server/streamable_http.py` in the installed package),
+ships this — the Python MCP SDK's `mcp/server/streamable_http.py`),
 mounted on a small ASGI app and `asyncio.create_task`-ed during
 `bind_tools()` or first `ainvoke()`. **No `subprocess.Popen`, no
 `multiprocessing.Process`, no `os.fork`.** The handler functions are
@@ -585,10 +775,10 @@ class CodexChatModel(BaseChatModel):
         # 1. Extract tool metadata, identical to claude_code_provider.
         # 2. Ensure the in-process proxy MCP server is initialised in
         #    the singleton with this tool set.
-        # 3. Ensure Codex CLI is registered with our MCP URL:
-        #       codex mcp add deepworker_<pid> --url http://127.0.0.1:<port>
-        #    (idempotent; per-pid suffix so concurrent agent processes
-        #    don't clobber each other.)
+        # 3. Start the proxy server (bind a port). We do NOT register it
+        #    globally via ``codex mcp add`` — see §4.3.1. The server is
+        #    injected per-invocation into each ``codex exec`` via
+        #    ExecArgs.mcp_server_name/mcp_server_port + --ignore-user-config.
         ...
 
     async def ainvoke(self, input, config=None, **kwargs) -> AIMessage:
@@ -634,9 +824,11 @@ async def ainvoke(self, input, config=None, **kwargs) -> AIMessage:
         state.codex_session_uuid = None
         state.sent_count = 0
 
-    # 5. System prompt (first SystemMessage in messages); forwarded
-    #    via `--config base-instructions=...` on the codex exec.
-    system_prompt = _extract_system_prompt(messages)
+    # 5. System prompt (first SystemMessage in messages); delivered
+    #    via AGENTS.override.md (see Implementation note 5). Must be
+    #    flattened from content_blocks to plain text — middleware
+    #    routinely produces list-form `SystemMessage.content`.
+    system_prompt = _flatten_message_content_to_text(_extract_system(messages))
 
     # 6. Tail delta — INCREMENTAL, NEVER full rebuild.
     new_messages = messages[state.sent_count:]
@@ -683,14 +875,21 @@ async def ainvoke(self, input, config=None, **kwargs) -> AIMessage:
     async for event in events:
         if event.type == "thread.started" and state.codex_session_uuid is None:
             state.codex_session_uuid = event.thread_id    # cache
+        elif event.type == "item.started":
+            it = event.item
+            if it.type == "mcp_tool_call" and it.server == self._proxy_mcp.server_name:
+                pending_tool_calls = await self._proxy_mcp.wait_for_pending_calls(
+                    tool_name=it.tool,
+                    arguments=it.arguments,
+                    timeout=30.0,
+                )
+                break    # exec stays alive in state.current_exec
         elif event.type == "item.completed":
             it = event.item
             if it.type == "agent_message":
                 final_text = it.text
-            elif it.type == "mcp_tool_call" and it.server.startswith("deepworker"):
-                if self._proxy_mcp.has_pending_calls():
-                    pending_tool_calls = self._proxy_mcp.get_pending_calls()
-                    break    # exec stays alive in state.current_exec
+            elif it.type in BLOCKED_NATIVE_ITEM_TYPES:
+                raise RuntimeError("native Codex tool bypassed deep-worker proxy")
         elif event.type == "turn.completed":
             await self._exec_runner.aclose(state.current_exec)
             state.current_exec = None
@@ -741,7 +940,9 @@ design respects that.
    O(1)–O(N_subagents). Acceptable.
 2. **`ProxyMCPServer` HTTP listener** — one per agent process. Bound
    on first `bind_tools`; torn down on agent shutdown. Pending Futures
-   auto-expire via 120 s timeout. No leak from runaway tool calls.
+   auto-expire via 120 s timeout. `ainvoke` waiters for newly-created
+   pending calls are one-shot Futures removed in `finally`. No leak
+   from runaway tool calls.
 
 ### Short-lived objects (per turn)
 
@@ -757,16 +958,14 @@ design respects that.
   the agent process dies between two ainvokes, the subprocess is
   reaped by the OS (parent death) — no zombie.
 
-### Cross-reference to past memory-leak classes
+### Cross-reference to past incidents in this project
 
-Checked against related internal incident analyses (not included here):
-
-| Class of leak | Applicability here |
-|---|---|
-| rpyc dispatch task pin | No rpyc here. N/A. |
-| exception tracebacks stored on long-lived objects | Risk: an exception from a failed Codex turn could be cached on `state.current_exec` if cleared improperly. Mitigation: `state.current_exec = None` in `finally`; traceback is not retained on `_ThreadState`. |
-| cleanup task GC | No periodic cleanup loop here. N/A. |
-| rpyc AsyncResult held past `await` | No rpyc-style awaitables here. The asyncio.Future in the MCP handler is local and dropped after either resolution or timeout. |
+| Incident doc | Class of leak | Applicability here |
+|---|---|---|
+| a related internal incident analysis (not included here) | rpyc dispatch task pin | No rpyc here. N/A. |
+| a related internal incident analysis (not included here) | exception tracebacks stored on long-lived objects | Risk: an exception from a failed Codex turn could be cached on `state.current_exec` if cleared improperly. Mitigation: `state.current_exec = None` in `finally`; traceback is not retained on `_ThreadState`. |
+| a related internal incident analysis (not included here) | cleanup task GC | No periodic cleanup loop here. N/A. |
+| a related internal incident analysis (not included here) | rpyc AsyncResult held past `await` | No rpyc-style awaitables here. The asyncio.Future in the MCP handler is local and dropped after either resolution or timeout. |
 
 ---
 
@@ -828,7 +1027,8 @@ they appear.)
 
 - **D1 — "Depend on the upstream Agents SDK Codex extension."**
   Import `Codex`, `Thread`, `CodexExec` from
-  `agents/extensions/experimental/codex/`. We
+  `agents/extensions/experimental/codex/` (in the upstream OpenAI Agents
+  SDK). We
   write only a `BaseChatModel` wrapper on top of their primitives.
   ~50–100 LOC of our code. Cost: runtime dep on the `agents` package
   and on an upstream-experimental submodule that OpenAI may change
@@ -925,8 +1125,9 @@ A reviewer can validate this document without running anything:
    matches.
 2. `ls -l ~/.codex/auth.json` — cached login present → no API key
    needed.
-3. `codex mcp list` — no MCP server registered yet, so the
-   `codex mcp add deepworker_<pid> --url ...` path is clear.
+3. `codex mcp list` — should be EMPTY. We never register globally;
+   the proxy server is injected per-invocation (§4.3.1). A non-empty
+   list means an old build polluted the global config — clean it.
 4. Read `agent_process.py:915, 1016, 1143` and confirm
    `config["configurable"]["thread_id"] == self.name`. Design treats
    this as immutable input.
@@ -941,7 +1142,7 @@ A reviewer can validate this document without running anything:
    `effective_session_id` / `rotate_session` precedent — Codex design
    renames these to `codex_session_uuid` and "drop on summarization",
    same effect, clearer names.
-8. Read `mcp/server/streamable_http.py` in the installed Python MCP SDK
+8. Read the Python MCP SDK's `mcp/server/streamable_http.py`
    — Python MCP SDK ships an in-process HTTP server we mount on
    asyncio. No external process is needed for the proxy.
 

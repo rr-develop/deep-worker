@@ -52,7 +52,7 @@ class TestAgentServiceMetadata:
 
         metadata = result["metadata"]
         assert metadata["directory"] == "/test/working/dir"
-        # pid will be the current process PID, so just check that it is present
+        # pid is the current process PID, so we just check that it is present
         assert "pid" in metadata
         assert isinstance(metadata["pid"], int)
         assert metadata["started"] == "2024-01-15T10:30:00"
@@ -155,6 +155,8 @@ class TestAgentServiceMetadataProvider:
         mock_config.working_dir = "/test/dir"
         # resolved_model property should return "deepseek-chat"
         mock_config.resolved_model = "deepseek-chat"
+        mock_config.dynamic_display_model = None  # prevent Mock auto-stub
+        mock_config.dynamic_display_model = None  # prevent Mock auto-stub
         mock_agent.config = mock_config
 
         service._agent_process = mock_agent

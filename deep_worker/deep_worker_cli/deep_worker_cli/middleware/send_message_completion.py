@@ -53,6 +53,8 @@ from langchain.agents.middleware.types import (
 )
 from langchain_core.messages import AIMessage, ToolMessage
 
+from deepagents.middleware.message_timestamps import ensure_message_created_at_after
+
 if TYPE_CHECKING:
     from langgraph.runtime import Runtime
 
@@ -169,4 +171,5 @@ class SendMessageCompletionMiddleware(AgentMiddleware):
             delivered[:120],
         )
         echo = AIMessage(content=delivered)
+        ensure_message_created_at_after(messages, echo)
         return {"messages": [echo], "jump_to": "end"}

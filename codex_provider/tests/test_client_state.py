@@ -33,6 +33,23 @@ from codex_provider.client_state import (  # noqa: E402
 from codex_provider.custom_types import ThreadState  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _isolate_home(  # pyright: ignore[reportUnusedFunction]
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Isolate ``Path.home()`` per test.
+
+    Since the restart-persistence fix, ``CodexClientState.get_or_create``
+    lazily seeds ``sent_count`` + ``codex_session_uuid`` from
+    ``~/.deep_worker/<agent>/codex_session_state.json``. Without pointing
+    ``Path.home()`` at a fresh tmp dir, a leaked file from another test (or a
+    prior run) would seed stale values and break the fresh-state assertions
+    below. The dedicated persistence behaviour is covered by
+    ``test_session_state_persistence.py``.
+    """
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))  # pyright: ignore[reportUnknownLambdaType]
+
+
 class TestSingleton:
     def test_get_global_returns_same_instance(self) -> None:
         a = get_global_client_state()
@@ -46,8 +63,9 @@ class TestSingleton:
         a.get_or_create("survives_del").sent_count = 7
         del a
         b = get_global_client_state()
-        assert b.get("survives_del") is not None
-        assert b.get("survives_del").sent_count == 7
+        st = b.get("survives_del")
+        assert st is not None
+        assert st.sent_count == 7
         b.forget("survives_del")  # cleanup
 
 

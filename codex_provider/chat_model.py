@@ -11,8 +11,12 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import os
-from typing import Any, Callable, Sequence
+import sys
+from pathlib import Path
+from types import TracebackType
+from typing import Any, Awaitable, Callable, Sequence
 
 from langchain_core.language_models.base import LanguageModelInput
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -28,14 +32,12 @@ from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool
 from pydantic import ConfigDict, PrivateAttr
 
-from codex_provider.client_state import (
-    CodexClientState,
-    get_global_client_state,
-)
-from codex_provider.custom_types import MCPResult, ToolMetadata
+from codex_provider.client_state import get_global_client_state
+from codex_provider.custom_types import ToolMetadata
 from codex_provider.exec_runner import (
     AgentMessageItem,
     CodexExecRunner,
+    CodexProtocolError,
     ExecArgs,
     ExecHandle,
     GenericItem,
@@ -46,40 +48,150 @@ from codex_provider.exec_runner import (
     TurnCompletedEvent,
     TurnFailedEvent,
 )
-from codex_provider.proxy_mcp_server import (
-    ProxyMCPServer,
-    get_global_proxy_mcp_server,
-)
+from codex_provider.proxy_mcp_server import get_global_proxy_mcp_server
 
 
-# Codex built-in deny-list (Q5). At minimum the Codex counterparts of
-# every default deep-worker tool, so Codex never bypasses our tools.
-# Format: name → ``--config tools.<name>=false``.
+# Codex built-in deny-list (Q5). Codex CLI 0.130 disables native tools via
+# per-feature flags (``--disable <feature>``), NOT via the older
+# ``--config disabled_tools=[...]`` channel — that channel is silently
+# ignored (verified live via ``RUST_LOG=codex_api=trace``: the
+# ``response.create`` websocket payload's ``tools=[...]`` list was
+# identical with or without it).
 #
-# This list is intentionally conservative — we'd rather over-disable
-# than under-disable. A future Codex addition will not break us because
-# unknown config keys are silently ignored by the CLI.
-DEFAULT_DISALLOWED_TOOLS: tuple[str, ...] = (
-    # Filesystem
-    "read",
-    "write",
-    "edit",
-    "apply_patch",
-    "glob",
-    "grep",
-    # Shell
-    "shell",
-    "exec",
-    "bash",
-    # Web
-    "web_search",
-    "web_fetch",
-    "fetch",
-    # Agent infra
-    "memory",
-    "todo_list",
-    "task",
+# Mapping verified live against ``codex features list`` on cli 0.130.0:
+#
+#   shell_tool, unified_exec → exec_command, write_stdin
+#   multi_agent              → spawn_agent, send_input, resume_agent,
+#                              wait_agent, close_agent
+#   image_generation         → image_generation
+#   tool_search              → tool_search
+#   apps                     → mcp__codex_apps__*
+#   plugins                  → plugin-contributed tools (we don't use any)
+#
+# Native tools that CANNOT be removed via any config/feature key on
+# 0.130 and therefore remain in every API request:
+#
+#   apply_patch     — always-injected ``custom`` tool (no flag).
+#                     Recorded into LangGraph via the native-passthrough
+#                     path (see codex_provider.event_pump and
+#                     codex_provider.native_tools).
+#   update_plan     — Codex's TodoWrite analog. Harmless side-effect-free
+#                     planning surface; we accept the noise.
+#   view_image      — non-mutating; we ship our own ``read_image`` tool
+#                     for the same purpose. Harmless.
+#   request_user_input
+#                   — elicitation surface; Codex would prompt the user via
+#                     its own UI, which is not reachable in our headless
+#                     ``codex exec`` topology. Harmless.
+#   list_mcp_resources,
+#   list_mcp_resource_templates,
+#   read_mcp_resource
+#                   — read-only MCP introspection. Harmless.
+DEFAULT_DISABLED_FEATURES: tuple[str, ...] = (
+    # Shell / exec — must be off; otherwise the model picks ``exec_command``
+    # in preference to our ``execute`` MCP proxy.
+    "shell_tool",
+    "unified_exec",
+    # Native multi-agent family — Codex's own subagent spawn would not
+    # become a LangGraph ``Task`` middleware call.
+    "multi_agent",
+    # Native code-mode / image / search / plugins / apps — none of these
+    # have analogs in deep-worker history, and the model should not have
+    # the option to use them. ``apps`` covers ``mcp__codex_apps__github``
+    # (the connector apps surface), ``plugins`` covers plugin-contributed
+    # tools, ``image_generation`` and ``tool_search`` cover their own tools.
+    "image_generation",
+    "tool_search",
+    "apps",
+    "plugins",
 )
+
+# Top-level Codex config keys (non-feature) that we override to disable
+# additional native tools. Each pair is ``(key, value_as_TOML)``. We quote
+# string values here so the resulting ``-c key=value`` argv parses as TOML
+# on the Codex side.
+#
+# ``web_search="disabled"`` is the canonical case — Codex 0.130 moved
+# ``web_search`` out of ``[features]`` into a top-level string config
+# (``"live"`` | ``"cached"`` | ``"disabled"``). Passing ``--disable web_search``
+# on 0.130 triggers a deprecation error AND leaves the tool active; the
+# top-level override is the only working channel.
+DEFAULT_CONFIG_OVERRIDES: tuple[tuple[str, str], ...] = (
+    ("web_search", '"disabled"'),
+)
+
+
+# NOTE: The legacy ``BLOCKED_NATIVE_ITEM_TYPES`` / ``_raise_if_blocked_
+# native_item`` defense-in-depth scheme was removed on 2026-05-18. It
+# fired a ``RuntimeError`` whenever Codex emitted a native tool event,
+# which aborted the turn and surfaced as ``status="error"`` — bad UX
+# for the user and architecturally wrong (we never want to drop a real
+# Codex action on the floor). The replacement is the native-passthrough
+# scheme: native tool calls are recorded as honest LangGraph
+# ``AIMessage.tool_calls`` + ``ToolMessage`` pairs via the
+# ``codex_provider.event_pump`` + ``codex_provider.native_tools``
+# machinery. See ``docs/DESIGN_NATIVE_TOOL_PASSTHROUGH.md``.
+
+
+def _get_codex_home() -> Path:
+    raw = os.environ.get("CODEX_HOME")
+    return Path(raw).expanduser() if raw else Path.home() / ".codex"
+
+
+def resolve_model_from_session_log(
+    thread_id: str,
+    *,
+    codex_home: Path | None = None,
+) -> str | None:
+    if not thread_id:
+        return None
+    sessions_dir = (codex_home or _get_codex_home()) / "sessions"
+    if not sessions_dir.exists():
+        return None
+    try:
+        candidates = sorted(
+            sessions_dir.rglob(f"*{thread_id}.jsonl"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:
+        return None
+    for candidate in candidates:
+        try:
+            with candidate.open(encoding="utf-8") as handle:
+                for line in handle:
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if event.get("type") != "turn_context":
+                        continue
+                    payload = event.get("payload")
+                    if not isinstance(payload, dict):
+                        continue
+                    model = payload.get("model")
+                    if isinstance(model, str) and model.strip():
+                        return model.strip()
+        except OSError:
+            continue
+    return None
+
+
+TOOL_CONTRACT = """\
+Deep-worker tool contract:
+- Use only the deep-worker MCP proxy tools (prefix `mcp__deepworker_*__`)
+  for file, shell, web, task, memory, and agent operations.
+- For shell commands use the deep-worker `execute` tool — NEVER the
+  native `exec_command`/`shell` tools. Deep-worker has disabled them for
+  this session.
+- For file edits use deep-worker's `read_file`/`write_file`/`edit_file`
+  — prefer them over the native `apply_patch` tool. (`apply_patch` may
+  appear in your tools list because Codex CLI hard-codes it; deep-worker
+  records every native call into history but cannot gate it with HITL.)
+- For web search / fetch use deep-worker's `web_search_delegation_tool`
+  / `fetch_url` — NEVER Codex's native `web_search`. Deep-worker has
+  disabled it for this session.
+"""
 
 
 class CodexChatModel(BaseChatModel):
@@ -102,7 +214,13 @@ class CodexChatModel(BaseChatModel):
     _tools_metadata: list[ToolMetadata] = PrivateAttr(default_factory=list)
     _working_dir: str | None = PrivateAttr(default=None)
     _model_name: str | None = PrivateAttr(default=None)
-    _disallowed_tools: tuple[str, ...] = PrivateAttr(default=DEFAULT_DISALLOWED_TOOLS)
+    _resolved_model_name: str | None = PrivateAttr(default=None)
+    _resolved_model_callback: Callable[[str], Awaitable[None] | None] | None = PrivateAttr(default=None)
+    _last_reported_model_name: str | None = PrivateAttr(default=None)
+    _disabled_features: tuple[str, ...] = PrivateAttr(default=DEFAULT_DISABLED_FEATURES)
+    _config_overrides: tuple[tuple[str, str], ...] = PrivateAttr(
+        default=DEFAULT_CONFIG_OVERRIDES,
+    )
     _sandbox_mode: str = PrivateAttr(default="workspace-write")
     _approval_policy: str = PrivateAttr(default="never")
     _proxy_started: bool = PrivateAttr(default=False)
@@ -115,10 +233,14 @@ class CodexChatModel(BaseChatModel):
     @classmethod
     def __get_pydantic_json_schema__(cls, core_schema: Any, handler: Any) -> dict[str, Any]:
         try:
-            parent = handler(core_schema)
+            parent_raw: Any = handler(core_schema)
+            parent: dict[str, Any] = parent_raw if isinstance(parent_raw, dict) else {
+                "type": "object", "properties": {}
+            }
         except Exception:
             parent = {"type": "object", "properties": {}}
-        props: dict[str, Any] = parent.get("properties", {}) or {}
+        props_raw: Any = parent.get("properties", {}) or {}
+        props: dict[str, Any] = props_raw if isinstance(props_raw, dict) else {}
         parent["properties"] = {
             k: v for k, v in props.items()
             if k not in {"custom_get_token_ids", "callbacks", "rate_limiter"}
@@ -145,7 +267,8 @@ class CodexChatModel(BaseChatModel):
         max_tokens: int | None = None,
         sandbox_mode: str = "workspace-write",
         approval_policy: str = "never",
-        disallowed_tools: Sequence[str] | None = None,
+        disabled_features: Sequence[str] | None = None,
+        config_overrides: Sequence[tuple[str, str]] | None = None,
         **kwargs: Any,
     ) -> None:
         # BaseChatModel has a Callable field that breaks JSON-schema
@@ -157,14 +280,38 @@ class CodexChatModel(BaseChatModel):
         self._exec_runner = CodexExecRunner()
         self._tools_metadata = []
         self._model_name = model
+        self._resolved_model_name = model
         self._sandbox_mode = sandbox_mode
         self._approval_policy = approval_policy
-        if disallowed_tools is not None:
-            self._disallowed_tools = tuple(disallowed_tools)
+        if disabled_features is not None:
+            self._disabled_features = tuple(disabled_features)
+        if config_overrides is not None:
+            self._config_overrides = tuple(config_overrides)
 
     @property
     def _llm_type(self) -> str:
         return "codex"
+
+    @property
+    def resolved_model_name(self) -> str | None:
+        return self._resolved_model_name
+
+    def set_resolved_model_callback(
+        self,
+        callback: Callable[[str], Awaitable[None] | None],
+    ) -> None:
+        self._resolved_model_callback = callback
+
+    async def _record_resolved_model(self, model: str | None) -> None:
+        if not model or model == self._last_reported_model_name:
+            return
+        self._resolved_model_name = model
+        self._last_reported_model_name = model
+        if self._resolved_model_callback is None:
+            return
+        result = self._resolved_model_callback(model)
+        if inspect.isawaitable(result):
+            await result
 
     # ------------------------------------------------------------------
     # Tools
@@ -233,11 +380,17 @@ class CodexChatModel(BaseChatModel):
                             "type": ptype,
                             "title": pname.replace("_", " ").title(),
                         }
-                        if hasattr(ann, "__metadata__"):
-                            for meta in ann.__metadata__:
-                                if isinstance(meta, str):
-                                    prop["description"] = meta
-                                    break
+                        # ``Annotated[...]`` carries metadata at ``ann.__metadata__``.
+                        # pyright sees ``ann`` as ``type[int]`` / ``type[bool]`` etc.
+                        # in the early branches above, where ``__metadata__`` is
+                        # not a member. Read it through a runtime ``getattr`` so
+                        # the type checker doesn't infer a member access on
+                        # plain types.
+                        meta_tuple: Any = getattr(ann, "__metadata__", ())
+                        for meta in meta_tuple:
+                            if isinstance(meta, str):
+                                prop["description"] = meta
+                                break
                         if param.default != inspect.Parameter.empty:
                             prop["default"] = param.default
                         else:
@@ -307,26 +460,51 @@ class CodexChatModel(BaseChatModel):
             state = self._client_state.get_or_create(agent_thread_id)
 
         # 5. System prompt (first SystemMessage in messages)
+        #
+        # ⚠️ Must extract *plain text*, not ``str(msg.content)``. LangGraph
+        # middleware (deepagents memory/skills/etc.) routinely wraps the
+        # system prompt in ``SystemMessage(content=[{'type':'text',
+        # 'text': ...}, ...])`` via ``request.override``. ``str([...])``
+        # would emit a Python repr like
+        # ``[{'type': 'text', 'text': '...'}, ...]`` into our
+        # AGENTS.override.md, which Codex tokenises as literal noise
+        # instead of instructions.
         system_prompt: str | None = None
         for msg in messages:
             if isinstance(msg, SystemMessage):
-                system_prompt = str(msg.content)
+                system_prompt = _flatten_message_content_to_text(msg.content)
                 break
 
         # 6. Ensure proxy MCP server is started (lazy, idempotent)
         await self._ensure_proxy_started()
 
-        # 7. Tail delta only — incremental mirror, never full rebuild
+        # 7. Tail delta only — incremental mirror, never full rebuild.
+        #
+        # ToolMessages from LangGraph carry the codex_native marker
+        # when they came from the native-tool passthrough path. Those
+        # must NOT be pushed back to Codex via the proxy MCP — Codex
+        # ran the tool itself and is not blocked on us. Proxy MCP
+        # ToolMessages, by contrast, must unblock the parked HTTP
+        # handler so Codex can continue.
         new_messages = messages[state.sent_count:]
         user_text_parts: list[str] = []
         tool_resolved = False
+        saw_native_resume = False
         for msg in new_messages:
             if isinstance(msg, ToolMessage):
-                self._proxy_mcp.resolve_call(
-                    msg.tool_call_id,
-                    {"content": _build_mcp_content(msg.content)},
+                is_native = bool(
+                    (getattr(msg, "additional_kwargs", None) or {}).get(
+                        "codex_native", False
+                    )
                 )
-                tool_resolved = True
+                if is_native:
+                    saw_native_resume = True
+                else:
+                    self._proxy_mcp.resolve_call(
+                        msg.tool_call_id,
+                        {"content": _build_mcp_content(msg.content)},
+                    )
+                    tool_resolved = True
             elif isinstance(msg, HumanMessage):
                 content = msg.content if isinstance(msg.content, str) else str(msg.content)
                 user_text_parts.append(content)
@@ -338,102 +516,244 @@ class CodexChatModel(BaseChatModel):
                 pass
 
         # 8. Update sent_count BEFORE awaiting response (mirror claude-code)
+        # and PERSIST it so a restart resumes from the right cursor instead
+        # of replaying the whole history into an empty session.
+        # See docs/DESIGN_HISTORY_RESTORE_ON_RESTART.md §3.3.
         state.sent_count = len(messages)
+        self._client_state.persist(agent_thread_id)
 
-        # 9. Mid-turn (we're resolving a previously-emitted tool_call)
-        #    vs new turn (spawn fresh codex exec).
-        if tool_resolved and state.current_exec is not None and not user_text_parts:
-            events_iter = state.current_exec.events
-            handle: ExecHandle | Any = state.current_exec
-        else:
-            # If there's an old current_exec from a previous interrupted
-            # turn (e.g. main user message arrived before tool resolution),
-            # close it cleanly to avoid an orphaned subprocess.
-            if state.current_exec is not None:
-                with _suppress_errors():
-                    await state.current_exec.aclose()
-                state.current_exec = None
+        # 9. Mid-turn (resuming an in-flight Codex turn) vs new turn
+        #    (spawn fresh codex exec). Either a proxy MCP ToolMessage
+        #    (tool_resolved) or a native ToolMessage (saw_native_resume)
+        #    means Codex is still running inside the same exec — keep
+        #    reading the same handle's queue.
+        is_mid_turn = (
+            (tool_resolved or saw_native_resume)
+            and state.current_exec is not None
+            and not user_text_parts
+        )
+        if is_mid_turn:
+            # Resuming an in-flight exec. No new spawn / no session_uuid
+            # decision here, so the resume fallback does NOT apply — keep
+            # the existing error semantics.
+            handle = state.current_exec
+            return await self._consume_turn(state, agent_thread_id, handle)
 
-            prompt = "\n\n".join(user_text_parts) if user_text_parts else ""
-            args = ExecArgs(
-                prompt=prompt,
-                session_uuid=state.codex_session_uuid,
-                working_directory=self._working_dir,
-                sandbox_mode=self._sandbox_mode,
-                approval_policy=self._approval_policy,
-                model=self._model_name,
-                base_instructions=system_prompt,
-                disallowed_tools=self._disallowed_tools,
+        # New turn → spawn a fresh ``codex exec``. If there's an old
+        # current_exec from a previous interrupted turn (e.g. a main user
+        # message arrived before tool resolution), close it cleanly to avoid
+        # an orphaned subprocess.
+        if state.current_exec is not None:
+            with _suppress_errors():
+                await state.current_exec.aclose()
+            state.current_exec = None
+
+        prompt = "\n\n".join(user_text_parts) if user_text_parts else ""
+
+        # Resume fallback (DESIGN §6.1): we are about to spawn with whatever
+        # ``codex_session_uuid`` is cached. If that uuid points at a stale /
+        # missing Codex session (e.g. CODEX_HOME wiped, session pruned),
+        # ``codex exec resume <uuid>`` fails — but, unlike claude-code's
+        # synchronous ``connect()``, the failure surfaces ASYNCHRONOUSLY in
+        # ``_consume_turn`` as a TurnFailedEvent / END_OF_STREAM pump_error.
+        # When we attempted a resume and it failed, fall back ONCE to a fresh
+        # session (session_uuid=None) and replay the FULL history so the agent
+        # comes back working instead of going to ERROR status.
+        spawned_with_resume = state.codex_session_uuid is not None
+        handle = await self._spawn_turn(state, prompt, system_prompt)
+        try:
+            return await self._consume_turn(state, agent_thread_id, handle)
+        except (RuntimeError, CodexProtocolError) as exc:
+            if not spawned_with_resume:
+                # A genuine fresh-session failure — nothing to retry.
+                raise
+            # The resume of a stale/missing Codex session failed. Reset to a
+            # fresh session and replay the full history once.
+            sys.stderr.write(
+                f"[codex_provider] resume of {state.codex_session_uuid!r} "
+                f"failed ({exc!r}); starting a fresh session and replaying "
+                f"history for thread {agent_thread_id!r}.\n"
             )
-            handle = await self._exec_runner.spawn(args)
-            state.current_exec = handle
-            events_iter = handle.events
+            sys.stderr.flush()
+            with _suppress_errors():
+                if state.current_exec is not None:
+                    await state.current_exec.aclose()
+            state.current_exec = None
+            state.codex_session_uuid = None
+            # Force a full-history replay: every HumanMessage is re-sent.
+            state.sent_count = 0
+            self._client_state.persist(agent_thread_id)
 
-        # 10. Consume events — event-driven, no polling.
+            fresh_prompt = "\n\n".join(
+                m.content if isinstance(m.content, str) else str(m.content)
+                for m in messages
+                if isinstance(m, HumanMessage)
+            )
+            # Mirror the normal post-spawn cursor update + persist.
+            state.sent_count = len(messages)
+            self._client_state.persist(agent_thread_id)
+            handle = await self._spawn_turn(state, fresh_prompt, system_prompt)
+            return await self._consume_turn(state, agent_thread_id, handle)
+
+    async def _spawn_turn(
+        self,
+        state: Any,
+        prompt: str,
+        system_prompt: str | None,
+    ) -> "ExecHandle":
+        """Build ``ExecArgs`` from the current state + prompt and spawn one
+        ``codex exec``. Records the handle on ``state.current_exec``.
+
+        ``ExecArgs.session_uuid`` comes from ``state.codex_session_uuid`` —
+        when set, Codex resumes the existing session
+        (``codex exec resume <uuid>``); when ``None``, a fresh session starts.
+        """
+        # Per-agent MCP isolation (observed 2026-05-20): pass THIS
+        # agent's own proxy server into the ExecArgs so it is injected
+        # per-invocation via ``--config mcp_servers.<name>.url``, and
+        # ``_build_argv`` also adds ``--ignore-user-config`` so the shared
+        # ~/.codex/config.toml (with other agents' stale servers) is NOT
+        # loaded. We deliberately do NOT register globally via
+        # ``codex mcp add`` — see ``_ensure_proxy_started``.
+        args = ExecArgs(
+            prompt=prompt,
+            session_uuid=state.codex_session_uuid,
+            working_directory=self._working_dir,
+            sandbox_mode=self._sandbox_mode,
+            approval_policy=self._approval_policy,
+            model=self._model_name,
+            base_instructions=_augment_base_instructions(system_prompt),
+            disabled_features=self._disabled_features,
+            config_overrides=self._config_overrides,
+            mcp_server_name=(
+                self._proxy_mcp.server_name
+                if self._proxy_mcp is not None else None
+            ),
+            mcp_server_port=(
+                self._proxy_mcp.port
+                if self._proxy_mcp is not None else None
+            ),
+        )
+        handle = await self._exec_runner.spawn(
+            args,
+            proxy_mcp_server_name=(
+                self._proxy_mcp.server_name
+                if self._proxy_mcp is not None else None
+            ),
+        )
+        state.current_exec = handle
+        return handle
+
+    async def _consume_turn(
+        self,
+        state: Any,
+        agent_thread_id: str,
+        handle: "ExecHandle",
+    ) -> AIMessage:
+        """Consume events from the pump's queue — event-driven, no polling.
+
+        The pump runs in the background, draining ``handle.events`` once and
+        routing each event to either ``ainvoke_queue`` (us) or
+        ``native_futures`` (the matching tool body). Native item.completed
+        events never reach this loop — the tool body awaits the matching
+        Future.
+
+        Raises on a failed turn (TurnFailedEvent / END_OF_STREAM pump_error);
+        the fresh-turn caller may catch that to drive the resume fallback.
+        """
+        # Local import — keep module-load cost low and avoid a circular
+        # dependency between chat_model and event_pump.
+        from codex_provider.event_pump import (
+            END_OF_STREAM,
+            NATIVE_TOOL_ITEM_TYPES,
+            native_args,
+        )
+
         final_text = ""
         pending_tool_calls: list[dict[str, Any]] = []
         turn_done = False
         try:
-            async for event in events_iter:
+            while True:
+                event = await handle.ainvoke_queue.get()
+                # End-of-stream sentinel — pump task is done (process
+                # exited or was cancelled). Stop consuming.
+                if event is END_OF_STREAM:
+                    # If the pump finished because the Codex stream
+                    # raised (e.g. an API 400 for an unsupported model),
+                    # it recorded the cause on ``handle.pump_error``.
+                    # Re-raise it here so the caller sees a real error
+                    # instead of an empty assistant message — the latter
+                    # silently stalls the agent (observed 2026-05-20).
+                    pump_error = getattr(handle, "pump_error", None)
+                    if pump_error is not None:
+                        raise pump_error
+                    turn_done = True
+                    break
                 if isinstance(event, ThreadStartedEvent):
                     if state.codex_session_uuid is None:
                         state.codex_session_uuid = event.thread_id
+                        # Persist the freshly-learned uuid as soon as Codex
+                        # assigns it, so even a crash mid-turn leaves a
+                        # resumable uuid on disk (DESIGN §3.3).
+                        self._client_state.persist(agent_thread_id)
+                    if self._model_name is None:
+                        await self._record_resolved_model(
+                            resolve_model_from_session_log(event.thread_id)
+                        )
                 elif isinstance(event, ItemStartedEvent):
-                    # ``item.started`` with ``status="in_progress"`` for an
-                    # ``mcp_tool_call`` on OUR proxy is the earliest signal
-                    # that Codex is calling our tool. We wait (event-driven)
-                    # for the in-process HTTP handler to actually receive
-                    # the ``tools/call`` request and park its Future —
-                    # those are two independent channels (stdout vs HTTP)
-                    # and either can land first.
-                    #
-                    # We do NOT touch other servers' tool calls — Codex
-                    # handles them internally.
                     it = event.item
                     if (
                         isinstance(it, McpToolCallItem)
+                        and self._proxy_mcp is not None
                         and it.server == self._proxy_mcp.server_name
                         and it.status == "in_progress"
                     ):
-                        # Wait up to 30 s for the matching tools/call to
-                        # land at our HTTP handler. Each tick is ``await
-                        # asyncio.sleep(0)`` which is the standard
-                        # "yield control" idiom in asyncio — NOT polling
-                        # in the CPU-busy sense; the loop wakes us only
-                        # when something else runs. We bound the wait so
-                        # a never-arriving call doesn't deadlock the turn.
-                        deadline = asyncio.get_event_loop().time() + 30.0
-                        while not self._proxy_mcp.has_pending_calls():
-                            if asyncio.get_event_loop().time() > deadline:
-                                break
-                            # Sleep briefly so other tasks (the HTTP
-                            # handler) get scheduled. 5 ms is a balance:
-                            # short enough to be responsive, long enough
-                            # to avoid burning CPU.
-                            await asyncio.sleep(0.005)
-                        if self._proxy_mcp.has_pending_calls():
-                            pending_tool_calls = [
-                                {"id": pc["id"], "name": pc["name"], "args": pc["args"]}
-                                for pc in self._proxy_mcp.get_pending_calls()
-                            ]
+                        # Proxy MCP tool starting — event-driven wait
+                        # for the HTTP handler's parked Future.
+                        try:
+                            pending_tool_calls = await self._proxy_mcp.wait_for_pending_calls(
+                                tool_name=it.tool,
+                                arguments=it.arguments,
+                                timeout=30.0,
+                            )
+                        except asyncio.TimeoutError as exc:
+                            turn_done = True
+                            raise RuntimeError(
+                                "Codex MCP tool started, but the proxy MCP "
+                                "handler did not register a matching pending "
+                                f"call within 30s: {it.tool}"
+                            ) from exc
+                        if pending_tool_calls:
                             break
+                    elif (
+                        isinstance(it, GenericItem)
+                        and it.type in NATIVE_TOOL_ITEM_TYPES
+                    ):
+                        # Native tool starting. The pump has already
+                        # created native_futures[it.id]; emit the
+                        # AIMessage.tool_call so LangGraph routes into
+                        # ToolNode, which invokes the matching async
+                        # tool body in ``codex_provider.native_tools``.
+                        # That body parks on the future and wakes up
+                        # event-driven when the pump processes the
+                        # matching item.completed.
+                        pending_tool_calls.append({
+                            "id": it.id,
+                            "name": it.type,
+                            "args": native_args(it),
+                            "type": "tool_call",
+                        })
+                        break
+                    # else: harmless GenericItem (reasoning, plan,
+                    # etc.) — ignore.
                 elif isinstance(event, ItemCompletedEvent):
                     it = event.item
                     if isinstance(it, AgentMessageItem):
                         final_text = it.text
-                    elif isinstance(it, McpToolCallItem):
-                        # Tool call already completed (resolved by us or
-                        # cancelled/failed by Codex). Nothing more for us
-                        # to do here — pending_calls was cleared when the
-                        # handler returned. If the call FAILED, Codex
-                        # likely emits a turn.failed or its agent_message
-                        # explaining the failure next; we surface that
-                        # to the user.
-                        pass
-                    elif isinstance(it, GenericItem):
-                        # reasoning / file_change / web_search / etc.
-                        # No deep-worker action; ignore.
-                        pass
+                    # McpToolCallItem completion was filtered by the
+                    # pump; native item.completed was consumed into
+                    # native_futures by the pump and never reaches
+                    # here.
                 elif isinstance(event, TurnCompletedEvent):
                     turn_done = True
                     break
@@ -476,9 +796,16 @@ class CodexChatModel(BaseChatModel):
                     pass
         if not self._proxy_started:
             await self._proxy_mcp.start()
-            await _register_proxy_with_codex(
-                self._proxy_mcp.server_name, self._proxy_mcp.port
-            )
+            # NOTE: we deliberately do NOT register the server into the
+            # global ``~/.codex/config.toml`` (no ``codex mcp add``).
+            # That global list is shared by every codex process on the
+            # host, never gets cleaned, and made each ``codex exec``
+            # connect to dozens of dead ``deepworker_<pid>`` ports —
+            # 120 s hang per stale server (observed 2026-05-20). Instead the server is injected per-invocation
+            # via ``ExecArgs.mcp_server_name``/``mcp_server_port`` (see
+            # the ExecArgs construction in ``ainvoke`` and
+            # ``CodexExecRunner._build_argv``). Agents stay fully
+            # independent — there is no sanctioned global MCP list.
             self._proxy_started = True
 
 
@@ -501,6 +828,57 @@ def _build_mcp_content(content: Any) -> list[dict[str, Any]]:
     return blocks
 
 
+def _flatten_message_content_to_text(content: Any) -> str:
+    """Collapse a LangChain message ``content`` field to a plain string.
+
+    LangChain's ``BaseMessage.content`` is ``str | list[str | dict]``.
+    Middleware that uses ``request.override(system_message=
+    SystemMessage(content=[...]))`` produces the list form. ``str(list)``
+    yields a Python repr that is useless to an LLM; we must instead pull
+    out the text payload of every text block (and discard non-text blocks
+    such as images / tool_use / anything else, since the consumer in this
+    module is Codex's ``AGENTS.override.md`` file which is plain markdown).
+
+    The flattener is intentionally permissive:
+
+    - ``str`` content is returned unchanged.
+    - ``list`` items that are themselves plain strings are kept verbatim
+      (LangChain tolerates that shape).
+    - ``dict`` items with ``type == "text"`` contribute their ``text`` value.
+    - All other items are silently skipped (no exception, no garbage in
+      the output).
+
+    Text segments are joined with a single ``"\\n\\n"`` so a multi-block
+    prompt looks like consecutive markdown paragraphs.
+    """
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        # Unknown shape — degrade gracefully to ``str()`` so the prompt
+        # still carries *something* readable.
+        return str(content)
+    parts: list[str] = []
+    for item in content:  # type: ignore[reportUnknownVariableType]
+        if isinstance(item, str):
+            parts.append(item)
+        elif isinstance(item, dict) and item.get("type") == "text":
+            text_val = item.get("text", "")
+            if isinstance(text_val, str):
+                parts.append(text_val)
+            else:
+                parts.append(str(text_val))
+        # else: image / tool_use / unknown — skip (cannot render to text).
+    return "\n\n".join(parts)
+
+
+def _augment_base_instructions(system_prompt: str | None) -> str:
+    if not system_prompt:
+        return TOOL_CONTRACT
+    if TOOL_CONTRACT in system_prompt:
+        return system_prompt
+    return f"{system_prompt.rstrip()}\n\n{TOOL_CONTRACT}"
+
+
 class _suppress_errors:
     """Context manager that swallows any exception during cleanup paths.
 
@@ -512,47 +890,33 @@ class _suppress_errors:
     def __enter__(self) -> "_suppress_errors":
         return self
 
-    def __exit__(self, exc_type, exc, tb) -> bool:  # noqa: ANN001
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> bool:
         return True  # suppress
 
     async def __aenter__(self) -> "_suppress_errors":
         return self
 
-    async def __aexit__(self, exc_type, exc, tb) -> bool:  # noqa: ANN001
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> bool:
         return True
 
 
-async def _register_proxy_with_codex(server_name: str, port: int) -> None:
-    """Run ``codex mcp add <name> --url http://127.0.0.1:<port>``.
-
-    Idempotent in spirit: we first try ``codex mcp remove <name>`` (silent
-    on failure) to clear any stale entry from a previous crashed agent,
-    then add fresh.
-    """
-    # Defensive: refuse to register garbage. Codex demands server_name
-    # match [A-Za-z0-9_-]; an integer port. If a test mistakenly passed
-    # a MagicMock, fail here instead of polluting ~/.codex/config.toml.
-    import re
-    if not isinstance(server_name, str) or not re.match(r"^[A-Za-z0-9_-]+$", server_name):
-        raise ValueError(f"invalid MCP server_name: {server_name!r}")
-    if not isinstance(port, int) or port <= 0:
-        raise ValueError(f"invalid MCP port: {port!r}")
-    url = f"http://127.0.0.1:{port}/mcp"
-    # Remove first (silent)
-    rm = await asyncio.create_subprocess_exec(
-        "codex", "mcp", "remove", server_name,
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.DEVNULL,
-    )
-    await rm.wait()
-    add = await asyncio.create_subprocess_exec(
-        "codex", "mcp", "add", server_name, "--url", url,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    out, err = await add.communicate()
-    if add.returncode != 0:
-        raise RuntimeError(
-            f"`codex mcp add {server_name} --url {url}` failed "
-            f"(exit {add.returncode}): {err.decode(errors='replace')}"
-        )
+# NOTE: ``_register_proxy_with_codex`` (which ran ``codex mcp add`` to
+# write the proxy server into the GLOBAL ``~/.codex/config.toml``) was
+# REMOVED on 2026-05-20. That global, never-cleaned list accumulated one
+# ``[mcp_servers.deepworker_<pid>]`` entry per agent ever launched, and
+# every ``codex exec`` then tried to connect to all of them — each dead
+# port hanging for the 120 s proxy timeout (observed: "hangs 10 min then
+# works"). The proxy server is now injected per-invocation via
+# ``ExecArgs.mcp_server_name`` / ``mcp_server_port`` +
+# ``--ignore-user-config`` (see ``CodexExecRunner._build_argv``). DO NOT
+# re-introduce a global ``codex mcp add`` — agents must stay independent.

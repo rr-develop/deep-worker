@@ -14,7 +14,7 @@ Tests verify that:
 
 import asyncio
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage
@@ -23,7 +23,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 import sys
 from pathlib import Path
 
-_claude_sdk_path = Path(__file__).parent.parent.parent.parent / "claude_sdk" / "src"
+_claude_sdk_path = Path(__file__).parent.parent.parent.parent / "claude_agent_sdk"
 if _claude_sdk_path.exists() and str(_claude_sdk_path) not in sys.path:
     sys.path.insert(0, str(_claude_sdk_path))
 
@@ -518,6 +518,291 @@ class TestRaceConditionPrevention:
         # Tool call should be detected via pending_calls
         assert len(result.tool_calls) == 1
         assert result.tool_calls[0]["name"] == "read_file"
+
+
+class TestMcpPrefixedToolDetection:
+    """Regression tests for the ``mcp__deepworker__`` prefix bug.
+
+    Claude Agent SDK exposes MCP tools to the LLM with the canonical
+    ``mcp__<server_name>__<tool_name>`` naming convention. Our proxy
+    server is created as ``create_sdk_mcp_server(name="deepworker", ...)``
+    in :mod:`claude_code_provider.proxy_mcp_server`, so every proxy tool
+    that Claude calls arrives as a ``ToolUseBlock`` whose ``name`` is
+    ``mcp__deepworker__<tool_name>`` — NOT the bare tool name registered
+    in ``ToolMetadata``.
+
+    Before this fix, ``ainvoke`` compared ``block.name`` directly against
+    the set of bare ``ToolMetadata`` names. The membership check always
+    failed for real Claude payloads, every proxy tool was misclassified
+    as a built-in Claude tool, and ``receive_response()`` kept iterating
+    instead of returning ``tool_calls`` to LangGraph. The result was a
+    hung agent: ProxyMCPServer handler tasks blocked on Futures that
+    LangGraph never resolved, RPyC inbound quarantine eventually fired,
+    and the agent stopped responding entirely.
+
+    These tests recreate the production payload shape (prefixed names,
+    multiple ToolUseBlocks in one AssistantMessage) and assert that
+    every proxy tool call is surfaced to LangGraph.
+    """
+
+    @pytest.mark.asyncio
+    async def test_single_prefixed_mcp_tool_is_detected(
+        self, mock_client_and_proxy: Any, sample_tools_metadata: Any
+    ) -> None:
+        """A ToolUseBlock with ``mcp__deepworker__<name>`` MUST be treated
+        as a proxy MCP tool and returned to LangGraph as a tool_call."""
+        mock_client, mock_proxy = mock_client_and_proxy
+
+        async def mock_receive_response():
+            yield ClaudeAssistantMessage(
+                content=[
+                    TextBlock(text="Reading the file."),
+                    ToolUseBlock(
+                        id="call_prefixed_1",
+                        name="mcp__deepworker__read_file",
+                        input={"path": "/tmp/test.txt"},
+                    ),
+                ],
+                model="claude-sonnet-4-5-20250929",
+            )
+            yield ResultMessage(
+                subtype="result",
+                duration_ms=10,
+                duration_api_ms=5,
+                is_error=False,
+                num_turns=1,
+                session_id="test-thread",
+                total_cost_usd=0.0,
+                usage={"input_tokens": 1, "output_tokens": 1},
+            )
+
+        mock_client.receive_response = mock_receive_response
+
+        # The proxy MCP handler task registers the pending_call when the
+        # SDK invokes it via control_request. Simulate that registration
+        # via wait_for_any_pending_call — production uses an asyncio
+        # Future woken by ProxyMCPServer._wake_matching_pending_waiters.
+        _state = {"registered": False}
+
+        async def _wait_for_any_pending_call(*, timeout: float) -> None:
+            _state["registered"] = True
+
+        mock_proxy.wait_for_any_pending_call = AsyncMock(
+            side_effect=_wait_for_any_pending_call
+        )
+        mock_proxy.has_pending_calls = Mock(
+            side_effect=lambda: _state["registered"]
+        )
+        mock_proxy.get_pending_calls = Mock(
+            side_effect=lambda: (
+                [
+                    {
+                        "id": "call_prefixed_1",
+                        "name": "read_file",
+                        "args": {"path": "/tmp/test.txt"},
+                    }
+                ]
+                if _state["registered"]
+                else []
+            )
+        )
+
+        with patch(
+            "claude_code_provider.chat_model.get_global_client_manager"
+        ) as mock_get_manager:
+            mock_manager = MagicMock()
+            mock_manager.get_or_create_client = AsyncMock(
+                return_value=(mock_client, mock_proxy)
+            )
+            mock_manager.get_sent_count.return_value = 0
+            mock_manager.update_sent_count = MagicMock()
+            mock_get_manager.return_value = mock_manager
+
+            model = ClaudeCodeChatModel(model="sonnet")
+            # Inject metadata directly — mirrors what bind_tools() does.
+            setattr(model, "_tools_metadata", sample_tools_metadata)
+            mock_client.query = AsyncMock()
+
+            result = await model.ainvoke(
+                [HumanMessage(content="Read /tmp/test.txt")],
+                config={"configurable": {"thread_id": "test-thread"}},
+            )
+
+        assert isinstance(result, AIMessage)
+        assert len(result.tool_calls) == 1, (
+            "Prefixed mcp__deepworker__read_file must be detected as proxy "
+            "tool and returned to LangGraph as a tool_call"
+        )
+        assert result.tool_calls[0]["name"] == "read_file"
+        # wait_for_any_pending_call must have been used (event-based, no
+        # polling), proving the membership check succeeded.
+        mock_proxy.wait_for_any_pending_call.assert_awaited_once_with(timeout=30.0)
+
+    @pytest.mark.asyncio
+    async def test_multiple_prefixed_mcp_tools_in_one_message_returns_first(
+        self, mock_client_and_proxy: Any, sample_tools_metadata: Any
+    ) -> None:
+        """When Claude emits multiple prefixed ToolUseBlocks in one
+        AssistantMessage, ainvoke MUST return only the currently
+        registered pending call(s) and exit — not wait for the rest.
+
+        Claude CLI dispatches MCP control_requests SEQUENTIALLY: the next
+        tool's control_request is only sent after the previous tool_result
+        arrives. So only ONE handler runs at a time and only ONE entry
+        exists in pending_calls. Waiting for all of them would deadlock
+        (Claude waits for tool_result for #1; we wait for #2 to register;
+        nothing progresses). This was the hang observed in live testing.
+
+        The remaining ToolUseBlocks naturally surface in the NEXT ainvoke
+        iteration, after LangGraph runs the tool and resolve_call is
+        called — Claude then sends the next control_request and the next
+        handler registers.
+        """
+        mock_client, mock_proxy = mock_client_and_proxy
+
+        async def mock_receive_response():
+            # Production payload shape: 3 prefixed blocks visible in one
+            # AssistantMessage. (live log showed: execute, ls, ls.)
+            yield ClaudeAssistantMessage(
+                content=[
+                    ToolUseBlock(
+                        id="call_a",
+                        name="mcp__deepworker__bash",
+                        input={"command": "echo hi"},
+                    ),
+                    ToolUseBlock(
+                        id="call_b",
+                        name="mcp__deepworker__read_file",
+                        input={"path": "/a"},
+                    ),
+                    ToolUseBlock(
+                        id="call_c",
+                        name="mcp__deepworker__read_file",
+                        input={"path": "/b"},
+                    ),
+                ],
+                model="claude-sonnet-4-5-20250929",
+            )
+
+        mock_client.receive_response = mock_receive_response
+
+        # Only the FIRST handler registers — mirrors Claude CLI's
+        # sequential control_request dispatch.
+        first_pending = [
+            {"id": "call_a", "name": "bash", "args": {"command": "echo hi"}},
+        ]
+        _state = {"registered": False}
+
+        async def _wait_for_any_pending_call(*, timeout: float) -> None:
+            _state["registered"] = True
+
+        mock_proxy.wait_for_any_pending_call = AsyncMock(
+            side_effect=_wait_for_any_pending_call
+        )
+        mock_proxy.has_pending_calls = Mock(
+            side_effect=lambda: _state["registered"]
+        )
+        mock_proxy.get_pending_calls = Mock(
+            side_effect=lambda: first_pending if _state["registered"] else []
+        )
+
+        with patch(
+            "claude_code_provider.chat_model.get_global_client_manager"
+        ) as mock_get_manager:
+            mock_manager = MagicMock()
+            mock_manager.get_or_create_client = AsyncMock(
+                return_value=(mock_client, mock_proxy)
+            )
+            mock_manager.get_sent_count.return_value = 0
+            mock_manager.update_sent_count = MagicMock()
+            mock_get_manager.return_value = mock_manager
+
+            model = ClaudeCodeChatModel(model="sonnet")
+            setattr(model, "_tools_metadata", sample_tools_metadata)
+            mock_client.query = AsyncMock()
+
+            # Must complete quickly — no deadlock waiting for the other
+            # two handlers to register. If this hangs, the regression is
+            # back.
+            result = await asyncio.wait_for(
+                model.ainvoke(
+                    [HumanMessage(content="Do three things")],
+                    config={"configurable": {"thread_id": "test-thread"}},
+                ),
+                timeout=2.0,
+            )
+
+        assert isinstance(result, AIMessage)
+        # Critical: must return the ONE pending call (whatever is
+        # registered) and exit — NOT block for the other two.
+        assert [tc["name"] for tc in result.tool_calls] == ["bash"]
+        mock_proxy.wait_for_any_pending_call.assert_awaited_once_with(timeout=30.0)
+
+    @pytest.mark.asyncio
+    async def test_prefixed_unknown_tool_is_built_in(
+        self, mock_client_and_proxy: Any, sample_tools_metadata: Any
+    ) -> None:
+        """A ToolUseBlock for a tool that is NOT in the proxy metadata
+        must still be treated as a built-in Claude tool (we must not
+        accidentally treat every ``mcp__*`` block as ours)."""
+        mock_client, mock_proxy = mock_client_and_proxy
+
+        async def mock_receive_response():
+            yield ClaudeAssistantMessage(
+                content=[
+                    ToolUseBlock(
+                        id="builtin_1",
+                        name="WebSearch",
+                        input={"query": "weather"},
+                    ),
+                ],
+                model="claude-sonnet-4-5-20250929",
+            )
+            yield ClaudeAssistantMessage(
+                content=[TextBlock(text="The weather is sunny.")],
+                model="claude-sonnet-4-5-20250929",
+            )
+            yield ResultMessage(
+                subtype="result",
+                duration_ms=10,
+                duration_api_ms=5,
+                is_error=False,
+                num_turns=1,
+                session_id="test-thread",
+                total_cost_usd=0.0,
+                usage={"input_tokens": 1, "output_tokens": 1},
+            )
+
+        mock_client.receive_response = mock_receive_response
+        mock_proxy.has_pending_calls.return_value = False
+        mock_proxy.get_pending_calls.return_value = []
+        mock_proxy.wait_for_any_pending_call = AsyncMock()
+
+        with patch(
+            "claude_code_provider.chat_model.get_global_client_manager"
+        ) as mock_get_manager:
+            mock_manager = MagicMock()
+            mock_manager.get_or_create_client = AsyncMock(
+                return_value=(mock_client, mock_proxy)
+            )
+            mock_manager.get_sent_count.return_value = 0
+            mock_manager.update_sent_count = MagicMock()
+            mock_get_manager.return_value = mock_manager
+
+            model = ClaudeCodeChatModel(model="sonnet")
+            setattr(model, "_tools_metadata", sample_tools_metadata)
+            mock_client.query = AsyncMock()
+
+            result = await model.ainvoke(
+                [HumanMessage(content="What's the weather?")],
+                config={"configurable": {"thread_id": "test-thread"}},
+            )
+
+        assert isinstance(result, AIMessage)
+        # Built-in tool — Claude handles it; no tool_calls returned.
+        assert len(result.tool_calls) == 0
+        assert "sunny" in result.content
+        mock_proxy.wait_for_any_pending_call.assert_not_awaited()
 
 
 if __name__ == "__main__":

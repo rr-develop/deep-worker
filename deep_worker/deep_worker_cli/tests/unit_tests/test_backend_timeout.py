@@ -8,7 +8,7 @@ rewrite mocks the asyncio subprocess path instead.
 
 from __future__ import annotations
 
-import asyncio
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -92,49 +92,40 @@ class TestPerCommandTimeout:
             await backend.execute("echo hello", timeout=-5)
 
 
-class TestTimeoutErrorMessage:
-    """Tests for timeout error message with retry guidance."""
+class TestTimeoutBackgroundJob:
+    """Tests for the NEW timeout behavior (2026-05-21): on timeout the command
+    is NOT killed — it becomes a background job and the agent gets a job_id
+    plus wait/kill options. (Was: kill + exit_code 124. See
+    test_background_jobs.py for the full real-subprocess coverage.)"""
 
     @pytest.mark.asyncio
-    async def test_timeout_error_includes_retry_guidance(self) -> None:
-        """Timeout error must include guidance to use `timeout` parameter."""
-        backend = CLIShellBackend(timeout=1, inherit_env=True)
+    async def test_timeout_does_not_kill_and_offers_actions(self) -> None:
+        """On timeout the command must NOT be killed; the result must offer
+        wait_for_job and kill_job by job_id. Real subprocess (mocking the
+        shield/timeout interplay is brittle)."""
+        backend = CLIShellBackend(root_dir=Path("/tmp"), inherit_env=True)
+        result = await backend.execute("sleep 10", timeout=1)
 
-        # Force `asyncio.wait_for(proc.communicate(), ...)` to time out.
-        proc = MagicMock()
-        proc.communicate = AsyncMock(side_effect=asyncio.TimeoutError())
-        proc.terminate = MagicMock()
-        proc.kill = MagicMock()
-        proc.wait = AsyncMock()
+        assert result.exit_code is None  # still running
+        assert "job_" in result.output
+        assert "wait_for_job" in result.output
+        assert "kill_job" in result.output
+        assert len(backend._jobs) == 1
 
-        with patch(
-            "asyncio.create_subprocess_shell",
-            new_callable=AsyncMock,
-            return_value=proc,
-        ):
-            result = await backend.execute("sleep 10")
-
-        assert "timed out" in result.output.lower()
-        assert "timeout parameter" in result.output.lower()
-        assert result.exit_code == 124
+        job_id = next(iter(backend._jobs))
+        # Process must still be alive (was NOT killed on timeout).
+        assert backend._jobs[job_id].proc.returncode is None
+        await backend.kill_job(job_id)  # cleanup
 
     @pytest.mark.asyncio
-    async def test_timeout_error_shows_effective_timeout(self) -> None:
-        """Timeout error should reflect the effective per-command timeout."""
-        backend = CLIShellBackend(timeout=60, inherit_env=True)
+    async def test_timeout_message_shows_effective_timeout(self) -> None:
+        """The still-running message should reflect the effective per-command
+        timeout."""
+        backend = CLIShellBackend(root_dir=Path("/tmp"), inherit_env=True)
+        result = await backend.execute("sleep 10", timeout=2)
 
-        proc = MagicMock()
-        proc.communicate = AsyncMock(side_effect=asyncio.TimeoutError())
-        proc.terminate = MagicMock()
-        proc.kill = MagicMock()
-        proc.wait = AsyncMock()
+        assert "2s" in result.output
+        assert "job_" in result.output
 
-        with patch(
-            "asyncio.create_subprocess_shell",
-            new_callable=AsyncMock,
-            return_value=proc,
-        ):
-            result = await backend.execute("sleep 10", timeout=5)
-
-        assert "5" in result.output
-        assert "timeout parameter" in result.output.lower()
+        for jid in list(backend._jobs):
+            await backend.kill_job(jid)  # cleanup

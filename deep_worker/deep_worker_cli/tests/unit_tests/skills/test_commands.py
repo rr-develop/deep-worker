@@ -12,6 +12,7 @@ from rich.console import Console
 
 from deep_worker_cli.main import parse_args
 from deep_worker_cli.skills.commands import (
+    _create,
     _format_info_fields,
     _generate_template,
     _info,
@@ -282,6 +283,23 @@ class TestIntegrationSecurity:
             else:
                 # Name validation caught it - this is good
                 assert name_error != "", f"No error message for {attack_type}"
+
+
+class TestCreateSkillPermissions:
+    def test_user_skill_storage_is_private(self, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        _create("private-skill", agent="test_v3", project=False)
+
+        skill_dir = tmp_path / Path("~/.deep_worker").name / "test_v3" / "data" / "skills" / "private-skill"
+        skill_md = skill_dir / "SKILL.md"
+        assert skill_dir.is_dir()
+        assert skill_md.is_file()
+        assert oct((tmp_path / Path("~/.deep_worker").name / "test_v3").stat().st_mode & 0o777) == "0o700"
+        assert oct((tmp_path / Path("~/.deep_worker").name / "test_v3" / "data").stat().st_mode & 0o777) == "0o700"
+        assert oct((tmp_path / Path("~/.deep_worker").name / "test_v3" / "data" / "skills").stat().st_mode & 0o777) == "0o700"
+        assert oct(skill_dir.stat().st_mode & 0o777) == "0o700"
+        assert oct(skill_md.stat().st_mode & 0o777) == "0o600"
 
 
 class TestGenerateTemplate:

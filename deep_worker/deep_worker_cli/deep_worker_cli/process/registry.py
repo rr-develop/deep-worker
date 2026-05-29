@@ -1,13 +1,15 @@
 """Process registry for tracking running deep_worker agents."""
 
+import asyncio
 import fcntl
 import json
 import logging
 import os
+import struct
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from deep_worker_cli.exceptions import AgentAlreadyExistsError, RegistryLockError
 from deep_worker_cli.types import AgentProcessInfo
@@ -263,7 +265,7 @@ class ProcessRegistry:
             temp_file.write_text(json.dumps(registry, indent=2))
 
             # Set permissions to 0o666 (rw-rw-rw-) so all users can read/write
-            # This is necessary for multi-user environments (e.g., multiple deep-worker instances)
+            # This is necessary for multi-user environments (e.g., the web client + deep-worker)
             os.chmod(temp_file, 0o666)
 
             # Atomic replace
@@ -378,3 +380,82 @@ class ProcessRegistry:
                 "error": f"Failed to check registry file permissions: {e}",
                 "fixed": False,
             }
+
+
+    async def wait_for_registration(
+        self, agent_name: str, timeout: float = 30.0
+    ) -> Optional[AgentProcessInfo]:
+        """Wait for an agent to register, using Linux inotify.
+
+        Uses inotify to avoid polling.
+        """
+        info = self.lookup(agent_name)
+        if info is not None:
+            return info
+
+        event = asyncio.Event()
+        inotify_fd: int | None = None
+
+        try:
+            import ctypes
+            import ctypes.util
+            libc_name = ctypes.util.find_library("c")
+            if libc_name is None:
+                return None
+            libc = ctypes.CDLL(libc_name, use_errno=True)
+            O_NONBLOCK = 0o4000
+            inotify_fd = libc.inotify_init1(O_NONBLOCK)
+            if inotify_fd < 0:
+                return None
+            IN_CLOSE_WRITE = 0x00000008
+            IN_MOVED_TO = 0x00000080
+            IN_CREATE = 0x00000100
+            mask = IN_CLOSE_WRITE | IN_MOVED_TO | IN_CREATE
+            wd = libc.inotify_add_watch(
+                inotify_fd,
+                str(self.registry_file.parent).encode(),
+                mask,
+            )
+            if wd < 0:
+                return None
+        except (ImportError, OSError, AttributeError, TypeError):
+            return None
+
+        loop = asyncio.get_running_loop()
+        target_name = self.registry_file.name.encode()
+
+        def _on_inotify_event(fd):
+            try:
+                raw = os.read(fd, 4096)
+                offset = 0
+                while offset < len(raw):
+                    header_size = 16
+                    if offset + header_size > len(raw):
+                        break
+                    wd_val, mask_val, _cookie, name_len = struct.unpack(
+                        b"iIII", raw[offset: offset + header_size]
+                    )
+                    name_bytes = raw[offset + header_size: offset + header_size + name_len]
+                    name_bytes = name_bytes.rstrip(b"\x00")
+                    if name_bytes == target_name:
+                        info = self.lookup(agent_name)
+                        if info is not None:
+                            event.set()
+                            break
+                    offset += header_size + name_len
+            except (BlockingIOError, OSError):
+                pass
+
+        try:
+            loop.add_reader(inotify_fd, lambda: _on_inotify_event(inotify_fd))
+            await asyncio.wait_for(event.wait(), timeout=timeout)
+            return self.lookup(agent_name)
+        except asyncio.TimeoutError:
+            return None
+        finally:
+            if inotify_fd is not None:
+                try:
+                    loop.remove_reader(inotify_fd)
+                    os.close(inotify_fd)
+                except (OSError, ValueError):
+                    pass

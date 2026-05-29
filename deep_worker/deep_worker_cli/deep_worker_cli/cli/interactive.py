@@ -17,6 +17,16 @@ from textual.css.query import NoMatches
 from textual.message import Message
 from textual.widgets import Static
 
+# ============================================================================
+# CRITICAL: RPYC MUST BE IMPORTED FROM SOURCE CODE, NOT FROM PIP!
+# ============================================================================
+# ALWAYS import rpyc from the rpyc_async source directory (not from pip).
+# This ensures we use rpyc_async with AsyncioServer support.
+# ============================================================================
+_rpyc_async_path = Path("/path/to/rpyc_async")
+if _rpyc_async_path.exists() and str(_rpyc_async_path) not in sys.path:
+    sys.path.insert(0, str(_rpyc_async_path))
+
 import rpyc
 from rpyc.core.async_connect import async_connect
 from deep_worker_cli.process.registry import ProcessRegistry
@@ -36,6 +46,7 @@ from deep_worker_cli.widgets.welcome import WelcomeBanner
 if TYPE_CHECKING:
     from textual.app import ComposeResult
     from textual.events import Resize
+
 
 class ChatScroll(VerticalScroll):
     """Scrollable chat container that posts ScrolledUp on upward user scroll.
@@ -95,6 +106,7 @@ class ChatScroll(VerticalScroll):
         if new_value < old_value:
             # Scrolled toward the top → post message that bubbles to App
             self.post_message(self.ScrolledUp())
+
 
 class InteractiveApp(App):
     """Textual TUI app for interacting with a running deep-worker agent.
@@ -874,18 +886,47 @@ class InteractiveApp(App):
 
         Args:
             widget: Message widget to mount
+
+        Scroll policy (sticky-scroll-to-bottom):
+        - If the user is already near the bottom (was watching live messages),
+          we keep the input area + newest message visible by scrolling down.
+        - If the user has scrolled up to read older messages, we DO NOT yank
+          them back to the bottom; their reading position is preserved and
+          the input area is allowed to remain off-screen below until the user
+          chooses to scroll back down.
+
+        This matches the user-stated requirement: the input must remain
+        visible at the bottom IF it was visible to begin with (user not
+        scrolled up), even as new messages stream in.
         """
         messages_container = self.query_one("#messages", Container)
         await messages_container.mount(widget)
 
-        self._scroll_chat_to_bottom()
-
-        # Make sure input is always visible (like deepagents does)
+        # Decide stickiness BEFORE scrolling, using the pre-mount distance from
+        # bottom that _scroll_chat_to_bottom() also uses. We replicate the
+        # threshold here so we can guard `scroll_visible()` on the same
+        # condition — otherwise an unconditional scroll_visible() on the input
+        # container would drag the user back down even when they intentionally
+        # scrolled up to read older history.
+        was_near_bottom = True
         try:
-            input_container = self.query_one("#bottom-app-container", Container)
-            input_container.scroll_visible()
+            chat = self.query_one("#chat", VerticalScroll)
+            if chat.max_scroll_y > 0:
+                distance_from_bottom = chat.max_scroll_y - chat.scroll_y
+                was_near_bottom = distance_from_bottom < 100
         except Exception:
             pass
+
+        self._scroll_chat_to_bottom()
+
+        # Only keep the input area in view if the user was already near the
+        # bottom. If they scrolled up to read, leave them where they are.
+        if was_near_bottom:
+            try:
+                input_container = self.query_one("#bottom-app-container", Container)
+                input_container.scroll_visible()
+            except Exception:
+                pass
 
     def _scroll_chat_to_bottom(self) -> None:
         """Scroll chat to bottom using sticky scroll pattern (like deepagents).

@@ -74,20 +74,14 @@ _AGENT_NAME = "test_headless_broadcast"
 
 
 @pytest.fixture
-def broadcast_agent():
+def broadcast_agent(request: pytest.FixtureRequest):
     """Start a fresh agent WITHOUT TaskManager (standard configuration).
 
-    This fixture:
-    1. Kills any existing agent with the test name
-    2. Cleans up data directories
-    3. Starts agent with --skip-permissions (NO TaskManager)
-    4. Waits for agent to register
-    5. Yields agent name
-    6. Kills agent on teardown
-
-    Working directory is /tmp to prevent junk files.
+    Cleanup policy: passed → terminate, failed → preserve for debug.
+    See ``conftest.pytest_sessionfinish`` for the safety net.
     """
     from deep_worker_cli.process.registry import ProcessRegistry
+    from .conftest import register_test_agent
 
     agent_name = _AGENT_NAME
     agent_process = None
@@ -152,10 +146,20 @@ def broadcast_agent():
             "Check that 'deep-worker' is installed and working."
         )
 
+    register_test_agent(agent_name, request.node, created_by_fixture=True)
+
     yield agent_name
 
-    # Teardown
-    logger.info(f"Tearing down agent '{agent_name}'")
+    # Teardown: passed → terminate, failed → preserve.
+    rep_call = getattr(request.node, "rep_call", None)
+    if rep_call is not None and not rep_call.passed:
+        logger.warning(
+            f"Test FAILED → preserving agent '{agent_name}' for debugging. "
+            f"Connect with: dwcli {agent_name}"
+        )
+        return
+
+    logger.info(f"Test passed → terminating agent '{agent_name}'")
     if agent_process and agent_process.poll() is None:
         try:
             agent_process.terminate()

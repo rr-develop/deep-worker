@@ -137,6 +137,27 @@ BUILT_IN_TOOLS = [
     "SendMessage",
     "TeamCreate",
     "TeamDelete",
+    # ─────────────────────────────────────────────────────────────────────
+    # 2026-05-15 audit additions — harness-level tools.
+    # ─────────────────────────────────────────────────────────────────────
+    # ``CLAUDE_CODE_BUILTIN_TOOLS_AUDIT.md:139`` previously claimed these
+    # are claude.ai-runtime-only and never reach the SDK subprocess.
+    # That turned out to be WRONG empirically: ``ScheduleWakeup`` IS
+    # exposed inside ``claude_agent_sdk``'s default tool list and is
+    # reachable from a deep-worker agent. Calling it parks the agent's
+    # turn waiting for a future re-invocation that LangGraph never
+    # delivers — same failure shape as ``CronCreate``/``Monitor``.
+    #
+    # Defence in depth: also block the rest of the harness-level family
+    # that has the same "wait for external trigger" model. Even if some
+    # of these are unreachable in a given Claude Code release, blocking
+    # them is free.
+    "ScheduleWakeup",          # parks turn for delayed re-invocation
+    "EnterPlanMode",           # plan-mode is a harness feature, not an agent capability
+    "ExitPlanMode",
+    "EnterWorktree",           # worktree is a harness/UI feature
+    "ExitWorktree",
+    "ShareOnboardingGuide",    # claude.ai harness UI feature
 ]
 
 
@@ -206,6 +227,7 @@ class ClientManager:
         tools_metadata: list[ToolMetadata],
         working_dir: str | None = None,
         system_prompt: str | None = None,
+        resume_session_id: str | None = None,
     ) -> tuple[ClaudeSDKClient, ProxyMCPServer]:
         """Get or create ClaudeSDKClient for a thread_id.
 
@@ -222,6 +244,15 @@ class ClientManager:
             system_prompt: System prompt from LangGraph middleware (e.g.
                 ProjectMemoryMiddleware cognitive hints). Passed to Claude SDK
                 session via ClaudeAgentOptions.system_prompt.
+            resume_session_id: When set, the new CLI session resumes this
+                session uuid (``ClaudeAgentOptions.resume`` + ``fork_session``)
+                so the agent's prior conversation is restored on restart
+                WITHOUT re-executing tools. Either an existing CLI session
+                (validated by tail-match) or a transcript synthesized from the
+                LangGraph history (cross-provider). See
+                docs/DESIGN_HISTORY_RESTORE_ON_RESTART.md. Only honored on the
+                FIRST creation for this thread_id (cached clients are returned
+                as-is).
 
         Returns:
             Tuple of (ClaudeSDKClient, ProxyMCPServer)
@@ -266,6 +297,16 @@ class ClientManager:
                     # This carries cognitive hints (e.g. project_memory instructions).
                     # DO NOT remove — agents lose tool awareness without it.
                     system_prompt=system_prompt,
+                    # ⚠️ CRITICAL: Pin the CLI subprocess cwd to the agent's
+                    # working_dir. Claude CLI stores each session transcript
+                    # under ~/.claude/projects/<sanitize(cwd)>/<uuid>.jsonl. If
+                    # cwd is left None the CLI inherits the daemon cwd (``/``)
+                    # and writes under the shared ``-`` slug, while the restore
+                    # path reads from slug(working_dir) — that mismatch makes
+                    # history-restore-on-restart silently fail (the agent
+                    # "forgets"). DO NOT remove. See
+                    # docs/DESIGN_FIX_CWD_SLUG_MISMATCH_ON_RESTART.md.
+                    cwd=working_dir,
                 )
             else:
                 # Create default options
@@ -274,36 +315,127 @@ class ClientManager:
                     disallowed_tools=BUILT_IN_TOOLS,
                     permission_mode="bypassPermissions",  # Delegate all approval to deep-worker
                     system_prompt=system_prompt,
+                    # See the replace() branch above — pinning cwd to
+                    # working_dir keeps the session-write slug aligned with the
+                    # restore-read slug so restart restores history.
+                    cwd=working_dir,
                 )
 
-            # Create and connect client
+            # Restore prior conversation on a fresh session (restart / cross-
+            # provider continuation). resume loads the transcript as history;
+            # fork_session=True forks to a NEW session id so we get our own
+            # writable transcript and never corrupt the source. The CLI does
+            # NOT re-execute tools on resume (verified — experiment E1). See
+            # docs/DESIGN_HISTORY_RESTORE_ON_RESTART.md.
+            #
+            # ⚠️ INVARIANT: ``resume_session_id`` MUST point at a transcript
+            # deep_worker itself wrote (a real prior run of THIS agent, or one
+            # synthesized by ``session_synthesis``). NEVER resume a session
+            # authored by an external ``claude`` run: the CLI restores that
+            # session's tool/permission config, which has no
+            # ``mcp__deepworker__*`` tools — combined with our
+            # ``disallowed_tools`` that strips the agent down to ~1 usable tool
+            # (observed 2026-05-24). The ``--import-claude`` importer therefore
+            # deliberately does NOT seed a hint for the imported file.
+            if resume_session_id:
+                options = replace(
+                    options, resume=resume_session_id, fork_session=True
+                )
+                print(
+                    f"[claude_code_provider] resuming session "
+                    f"{resume_session_id} for thread {thread_id}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+            # Create and connect client. If resume fails (stale/invalid
+            # transcript, CLI schema drift), retry once WITHOUT resume so the
+            # agent still starts — restore is best-effort, never fatal.
             client = ClaudeSDKClient(options=options)
-            await client.connect()
+            try:
+                await client.connect()
+            except Exception as exc:  # noqa: BLE001
+                if not resume_session_id:
+                    raise
+                print(
+                    f"[claude_code_provider] resume of {resume_session_id} "
+                    f"failed ({exc!r}); starting a fresh session instead.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                options = replace(options, resume=None, fork_session=False)
+                client = ClaudeSDKClient(options=options)
+                await client.connect()
 
             # Cache
             self.clients[thread_id] = (client, proxy_mcp)
 
             return client, proxy_mcp
 
+    def has_client(self, thread_id: str) -> bool:
+        """True iff a live Claude CLI client already exists for ``thread_id``
+        in THIS process. False right after a restart (the trigger for history
+        restore on the first turn)."""
+        return thread_id in self.clients
+
     def get_sent_count(self, thread_id: str) -> int:
         """Get number of messages sent for a thread.
 
-        Args:
-            thread_id: Thread ID to check
-
-        Returns:
-            Number of messages sent to Claude for this thread
+        Lazily seeds from the persisted state on first access in a fresh
+        process, so a restart does NOT silently reset to 0 (which would run
+        the broken empty-session replay). See
+        docs/DESIGN_HISTORY_RESTORE_ON_RESTART.md §3.4.
         """
+        if thread_id not in self._sent_count:
+            try:
+                from claude_code_provider.session_state import (  # noqa: PLC0415
+                    load_session_state,
+                )
+
+                state = load_session_state(thread_id)
+                if state is not None:
+                    self._sent_count[thread_id] = int(state["sent_count"])
+            except Exception:  # noqa: BLE001 — best-effort; default to 0
+                pass
         return self._sent_count.get(thread_id, 0)
 
     def update_sent_count(self, thread_id: str, count: int) -> None:
-        """Update sent message count for a thread.
-
-        Args:
-            thread_id: Thread ID to update
-            count: New sent count value
-        """
+        """Update sent message count for a thread, and PERSIST it so restart is
+        deterministic. Persistence is best-effort (never raises)."""
         self._sent_count[thread_id] = count
+        try:
+            from claude_code_provider.session_state import (  # noqa: PLC0415
+                load_session_state,
+                save_session_state,
+            )
+
+            prev = load_session_state(thread_id)
+            save_session_state(
+                thread_id,
+                sent_count=count,
+                session_uuid=(prev or {}).get("session_uuid"),
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    def record_session_uuid(self, thread_id: str, session_uuid: str) -> None:
+        """Persist the latest Claude session uuid as a restore HINT (the
+        tail-match is authoritative, so a stale hint is harmless). Called when
+        the SDK reports a session id (e.g. ResultMessage.session_id)."""
+        try:
+            from claude_code_provider.session_state import (  # noqa: PLC0415
+                load_session_state,
+                save_session_state,
+            )
+
+            prev = load_session_state(thread_id)
+            save_session_state(
+                thread_id,
+                sent_count=(prev or {}).get("sent_count", self.get_sent_count(thread_id)),
+                session_uuid=session_uuid,
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
     def get_session_epoch(self, thread_id: str) -> int:
         """Get current session epoch for a thread.

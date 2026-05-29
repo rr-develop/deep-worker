@@ -14,39 +14,45 @@ def _has_excluded_component(path: Path) -> bool:
     return any(part in EXCLUDED_DIRS for part in path.parts)
 
 
-def scan_files(repo_path: Path) -> Iterator[Path]:
-    """Yield all indexable files under *repo_path*.
+def _scan_files_via_filesystem(repo_path: Path) -> Iterator[Path]:
+    """Yield indexable files under *repo_path* using a pure filesystem walk.
 
-    Uses git to determine which files to index, automatically respecting .gitignore.
-    Includes both tracked files and untracked files that are not gitignored.
+    Walks *repo_path* recursively via :meth:`Path.rglob`, skipping any path
+    whose components include a directory name listed in
+    :data:`semantic_search.config.EXCLUDED_DIRS` (``.git``, ``node_modules``,
+    ``__pycache__``, ``.venv``, ``dist``, ``build``, ``.vector_index``, etc.),
+    and keeping only files whose suffix is in
+    :data:`semantic_search.config.INDEXED_EXTENSIONS`.
 
-    This ensures that:
-    - Downloaded dependencies (e.g., google-cloud-sdk/) are excluded
-    - Build artifacts, virtual environments, and other ignored files are excluded
-    - Only source files that are (or could be) committed to git are indexed
+    This walker has **no** notion of ``.gitignore`` — callers that want that
+    semantics must use the git-aware branch (see :func:`_scan_files_via_git`).
+    """
+    for path in repo_path.rglob("*"):
+        if not path.is_file():
+            continue
+        if _has_excluded_component(path):
+            continue
+        if path.suffix in INDEXED_EXTENSIONS:
+            yield path.resolve()
 
-    Args:
-        repo_path: Root directory of the repository to scan (must be a git repo).
 
-    Yields:
-        Absolute ``Path`` objects for each indexable file.
+def _scan_files_via_git(repo_path: Path) -> Iterator[Path]:
+    """Yield indexable files under *repo_path* using ``git ls-files``.
+
+    Honours ``.gitignore`` automatically by deferring to git for the file
+    list. Combines tracked files with untracked-but-not-ignored files so
+    that newly-added (uncommitted) source files are indexed too.
 
     Raises:
-        FileNotFoundError: If *repo_path* does not exist or is not a directory.
         RuntimeError: If *repo_path* is not a git repository.
     """
     import subprocess  # noqa: PLC0415
 
-    if not repo_path.exists():
-        raise FileNotFoundError(f"Repository path does not exist: {repo_path}")
-    if not repo_path.is_dir():
-        raise FileNotFoundError(f"Repository path is not a directory: {repo_path}")
-
-    # Check if it's a git repository
     if not (repo_path / ".git").exists():
         msg = (
             f"Not a git repository: {repo_path}. "
-            "Semantic search requires a git repository to respect .gitignore patterns."
+            "Pass ``use_git=False`` for a filesystem-only scan, or run "
+            "``git init`` first."
         )
         raise RuntimeError(msg)
 
@@ -84,6 +90,53 @@ def scan_files(repo_path: Path) -> Iterator[Path]:
             continue
         if path.suffix in INDEXED_EXTENSIONS:
             yield path
+
+
+def scan_files(
+    repo_path: Path,
+    *,
+    use_git: bool | None = None,
+) -> Iterator[Path]:
+    """Yield all indexable files under *repo_path*.
+
+    Two scanning strategies are supported; the right one is picked from
+    *use_git*:
+
+      - ``use_git=True``  — shell out to ``git ls-files`` so ``.gitignore``
+        is honoured for free. Raises :class:`RuntimeError` if *repo_path* is
+        not a git repository.
+      - ``use_git=False`` — pure-Python filesystem walk that ignores
+        ``.gitignore`` entirely. Always works on any directory.
+      - ``use_git=None`` (default) — **auto-detect**. Use the git-aware
+        scanner when ``repo_path/.git`` exists, otherwise the filesystem
+        scanner. This is what callers like ``index_repository`` rely on so
+        the feature works for both committed-repo and ad-hoc directories.
+
+    Args:
+        repo_path: Root directory of the repository to scan.
+        use_git: Override auto-detection. See above.
+
+    Yields:
+        Absolute ``Path`` objects for each indexable file.
+
+    Raises:
+        FileNotFoundError: If *repo_path* does not exist or is not a directory.
+        RuntimeError: If *use_git* is ``True`` and *repo_path* is not a
+            git repository.
+    """
+    if not repo_path.exists():
+        raise FileNotFoundError(f"Repository path does not exist: {repo_path}")
+    if not repo_path.is_dir():
+        raise FileNotFoundError(f"Repository path is not a directory: {repo_path}")
+
+    # Decide on the strategy.
+    if use_git is None:
+        use_git = (repo_path / ".git").exists()
+
+    if use_git:
+        yield from _scan_files_via_git(repo_path)
+    else:
+        yield from _scan_files_via_filesystem(repo_path)
 
 
 def get_language(path: Path) -> str | None:

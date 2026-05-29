@@ -133,6 +133,72 @@ async def test_status_change_without_tm_preserves_unknown() -> None:
 
 
 @pytest.mark.asyncio
+async def test_status_change_with_model_updates_metadata_and_broadcasts() -> None:
+    svc = _make_service_with_agent("alpha")
+
+    events = await _deliver(
+        svc,
+        "alpha",
+        {
+            "type": "status_change",
+            "status": "idle",
+            "provider": "codex",
+            "model": "gpt-dynamic-default",
+        },
+    )
+
+    info = svc._agents["alpha"]
+    assert info.provider == "codex"
+    assert info.model == "gpt-dynamic-default"
+    assert any(
+        e.get("type") == "agent_metadata"
+        and e.get("agent_name") == "alpha"
+        and e.get("provider") == "codex"
+        and e.get("model") == "gpt-dynamic-default"
+        for e in events
+    ), f"expected agent_metadata broadcast; got {events}"
+
+
+@pytest.mark.asyncio
+async def test_status_change_forwards_and_caches_status_metadata() -> None:
+    svc = _make_service_with_agent("alpha")
+
+    events = await _deliver(
+        svc,
+        "alpha",
+        {
+            "type": "status_change",
+            "status": "idle",
+            "status_metadata": {
+                "substatus": "waiting_agent",
+                "source_tool": "send_message_to_agent",
+            },
+        },
+    )
+
+    assert svc._agents["alpha"].status_metadata == {
+        "substatus": "waiting_agent",
+        "source_tool": "send_message_to_agent",
+    }
+    status_events = [e for e in events if e.get("type") == "agent_status"]
+    assert status_events
+    assert status_events[0]["status_metadata"] == svc._agents["alpha"].status_metadata
+
+
+@pytest.mark.asyncio
+async def test_plain_idle_status_change_clears_stale_status_metadata() -> None:
+    svc = _make_service_with_agent("alpha")
+    svc._agents["alpha"].status_metadata = {"substatus": "waiting_agent"}
+
+    events = await _deliver(svc, "alpha", {"type": "status_change", "status": "idle"})
+
+    assert svc._agents["alpha"].status_metadata is None
+    status_events = [e for e in events if e.get("type") == "agent_status"]
+    assert status_events
+    assert "status_metadata" not in status_events[0]
+
+
+@pytest.mark.asyncio
 async def test_unknown_event_type_is_passed_through_as_agent_message() -> None:
     """Existing behaviour: random message types still wrap to
     ``agent_message``. We only specialise ``status_change``."""
@@ -143,3 +209,48 @@ async def test_unknown_event_type_is_passed_through_as_agent_message() -> None:
     )
     # Must be wrapped, not dropped.
     assert any(e.get("type") == "agent_message" for e in events)
+
+
+@pytest.mark.asyncio
+async def test_error_status_forwards_error_message() -> None:
+    """When the agent transitions to ``error``, the human-readable
+    ``error_message`` MUST ride along in the ``agent_status`` broadcast
+    so the UI can show it persistently (incident observed 2026-05-20: the error
+    was only a transient toast and vanished). This is the data-path
+    contract the frontend error panel depends on."""
+    svc = _make_service_with_agent("alpha")
+
+    err = (
+        "Agent invocation failed: Codex stream error: "
+        '{"status":400,"error":{"message":"The \'unknown\' model is '
+        'not supported when using Codex with a ChatGPT account."}}'
+    )
+    events = await _deliver(
+        svc,
+        "alpha",
+        {"type": "status_change", "status": "error", "error_message": err},
+    )
+
+    status_events = [e for e in events if e.get("type") == "agent_status"]
+    assert status_events, f"expected agent_status broadcast; got {events}"
+    e = status_events[0]
+    assert e.get("status") == "error"
+    assert e.get("error_message") == err, (
+        "error_message must be forwarded verbatim so the UI can render "
+        "the full, copyable cause"
+    )
+
+
+@pytest.mark.asyncio
+async def test_non_error_status_omits_error_message() -> None:
+    """A clean status_change (no error_message in the payload) must NOT
+    fabricate an error_message — otherwise the UI would show a stale
+    error panel after recovery."""
+    svc = _make_service_with_agent("alpha")
+
+    events = await _deliver(
+        svc, "alpha", {"type": "status_change", "status": "idle"}
+    )
+    status_events = [e for e in events if e.get("type") == "agent_status"]
+    assert status_events
+    assert "error_message" not in status_events[0]

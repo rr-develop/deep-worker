@@ -1,4 +1,4 @@
-# Deep-Worker-Web: Architecture Design Document
+# Web App: Architecture Design Document
 
 **Version**: 1.0  
 **Date**: 2024-04-02  
@@ -27,16 +27,16 @@
 
 ### Purpose
 
-Deep-Worker-Web is a specialized web UI for managing and interacting with deep-worker agents running on localhost. It provides real-time monitoring, message exchange, and control capabilities for deep-worker agent processes.
+The web app is a specialized web UI for managing and interacting with deep-worker agents running on localhost. It provides real-time monitoring, message exchange, and control capabilities for deep-worker agent processes.
 
-### Key Differentiators from the reference web application
+### Key Differentiators from the Legacy Web App
 
-| Aspect | Reference web application | Deep-Worker-Web |
+| Aspect | Legacy web app | This web app |
 |--------|--------|-----------------|
 | **Session Model** | Manages multiple session types (CCO, CSDK, Persistent, LangChain, DwSession) | No session abstraction - works directly with agent processes |
 | **Communication** | Through session abstractions (DwSession wraps agent) | Direct RPyC connection to agent processes |
 | **Scope** | General-purpose session manager | Specialized for deep-worker agents only |
-| **Task Management** | External TaskManager | Internal TaskManager inside each agent |
+| **Task Management** | External TaskManager in the legacy web app | Internal TaskManager inside each agent |
 | **Discovery** | CCO daemon for session discovery | ProcessRegistry for agent discovery |
 
 ### Design Goals
@@ -47,7 +47,7 @@ Deep-Worker-Web is a specialized web UI for managing and interacting with deep-w
 4. **Security First**: Hardcoded localhost:7887 binding with startup validation
 5. **Async Native**: Single event loop, no threads, pure asyncio with AsyncioServer
 6. **TDD Approach**: Test-driven development with comprehensive coverage
-7. **Zero Dependencies on External Packages**: Work with local source checkouts directly
+7. **Zero Dependencies on External Packages**: Work directly with local source code
 
 ---
 
@@ -67,7 +67,7 @@ Deep-Worker-Web is a specialized web UI for managing and interacting with deep-w
           │ HTTP REST        │ WebSocket        │ HTTP REST
           ▼                  ▼                  ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│  deep-worker-web (FastAPI @ 127.0.0.1:7887)                     │
+│  web app (FastAPI @ 127.0.0.1:7887)                             │
 │  ┌──────────────────────────────────────────────────────────┐   │
 │  │  Main Event Loop (asyncio)                               │   │
 │  │  ┌────────────┐  ┌────────────┐  ┌────────────┐         │   │
@@ -123,14 +123,14 @@ Deep-Worker-Web is a specialized web UI for managing and interacting with deep-w
 
 ### P1: Direct Agent Communication
 
-**NO session abstraction layer**. Unlike the reference web application which uses DwSession to wrap agents, deep-worker-web connects directly to agent processes via RPyC.
+**NO session abstraction layer**. Unlike the legacy web app which uses DwSession to wrap agents, the web app connects directly to agent processes via RPyC.
 
 ```python
-# ❌ WRONG (reference web application pattern - uses DwSession wrapper)
+# ❌ WRONG (legacy web app pattern - uses DwSession wrapper)
 session = DwSession(agent_name="project-a")
 await session.invoke("Hello")
 
-# ✅ CORRECT (deep-worker-web pattern - direct RPyC)
+# ✅ CORRECT (web app pattern - direct RPyC)
 client = AgentClient("project-a")  # Direct RPyC connection
 await client.connect()
 await client.invoke_agent("Hello")
@@ -157,7 +157,7 @@ async def main():
 
 ### P3: Agent as Single Source of Truth
 
-Following deep-worker architecture principles (see the CLI's `ARCHITECTURE.md`):
+Following deep-worker architecture principles (see `deep_worker/deep_worker_cli/ARCHITECTURE.md`):
 
 **ALL messages flow through agent and are broadcast to ALL subscribers**.
 
@@ -218,12 +218,12 @@ def process_data(data):  # Fails pyright strict
 
 ### P6: No Virtual Environments
 
-**Work directly with local source checkouts**. No pip install for local projects.
+**Work directly with local source code**. No pip install for local projects.
 
 ```python
 # ✅ CORRECT: Import from source
 import sys
-sys.path.insert(0, RPYC_ASYNC_SOURCE_DIR)
+sys.path.insert(0, "/path/to/rpyc_async")
 from rpyc.utils.async_server import AsyncioServer
 
 sys.path.insert(0, DEEP_WORKER_CLI_DIR)
@@ -233,7 +233,7 @@ from deep_worker_cli.process.registry import ProcessRegistry
 # pip install rpyc  # Uses pip version, not rpyc_async!
 ```
 
-**Rationale**: Ensures consistency with the other local checkouts, uses latest source code, avoids version conflicts.
+**Rationale**: Ensures consistency with other local projects, uses latest source code, avoids version conflicts.
 
 ### P7: Test-Driven Development
 
@@ -510,7 +510,7 @@ class AgentConnection:
         """Establish RPyC connection using AsyncioServer."""
         # Import from source (not pip!)
         import sys
-        sys.path.insert(0, RPYC_ASYNC_SOURCE_DIR)
+        sys.path.insert(0, "/path/to/rpyc_async")
         sys.path.insert(0, DEEP_WORKER_CLI_DIR)
         
         from deep_worker_cli.client.agent_client import AgentClient
@@ -720,7 +720,7 @@ import sys
 from pathlib import Path
 
 # Add rpyc_async to path FIRST
-rpyc_async_path = Path(RPYC_ASYNC_SOURCE_DIR)
+rpyc_async_path = Path("/path/to/rpyc_async")
 if str(rpyc_async_path) not in sys.path:
     sys.path.insert(0, str(rpyc_async_path))
 
@@ -951,7 +951,7 @@ class AgentConnection:
 
 ```
 ┌────────────────────────────────────────────────────────────────┐
-│ Deep-Worker-Web                                    [127.0.0.1] │
+│ Web App                                            [127.0.0.1] │
 ├────────────────────────────────────────────────────────────────┤
 │                                                                │
 │ ┌─────────────────┐  ┌────────────────────────────────────┐   │
@@ -1510,7 +1510,7 @@ async def test_agent():
     agent = await start_test_agent(
         name=agent_name,
         provider="deepseek",
-        model="deepseek-chat"
+        model="deepseek-v4-flash"
     )
     
     # Wait for agent to be ready
@@ -1660,7 +1660,7 @@ def mock_registry():
 - B: Query agent via RPyC (expose provider in status)
 - C: Store in ProcessRegistry
 
-**DECISION**: Option B (query via RPyC) - User choice: "not sure - pick one yourself"
+**DECISION**: Option B (query via RPyC) - User choice: "not sure - you decide"
 
 Agent knows its own provider and should expose it in status response. This provides accurate, real-time information.
 
@@ -1714,14 +1714,14 @@ Background task in AgentService monitors ProcessRegistry and automatically recon
 
 **DECISION**: Option A - Load all messages upfront, but only on button click (User choice)
 
-Full dialog view loads complete message history when user clicks "Full Dialog" button. Main view shows only user requests and final responses (similar to the reference web application's approach).
+Full dialog view loads complete message history when user clicks "Full Dialog" button. Main view shows only user requests and final responses (similar to the legacy web app approach).
 
 ---
 
 ## Appendix A: File Structure
 
 ```
-deep_worker_web/
+web-app/
 ├── app/
 │   ├── __init__.py
 │   ├── main.py                    # FastAPI app with lifespan

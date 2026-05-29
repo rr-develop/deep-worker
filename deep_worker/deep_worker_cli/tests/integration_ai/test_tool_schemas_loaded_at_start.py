@@ -7,11 +7,11 @@ What this test does
 1. Spawns a real ``deep-worker`` agent in DEV mode:
 
         deep-worker <name> --dev --provider claude-code \\
-            -sp --dir <dev-tree>
+            -sp --dir /path/to/dev-tree
 
    The launcher re-execs into the dev-tree launcher (the --dev path
-   under test) and the agent process loads code from
-   <dev-tree> — the exact tree this change set lives in.
+   under test) and the agent process loads code from the dev tree —
+   the exact tree this change set lives in.
 
 2. Connects to the agent via RPyC and sends three questions in turn 1
    of a *fresh* conversation:
@@ -47,8 +47,8 @@ Dependencies
 ============
 
 * ``deep-worker`` launcher must be in $PATH (this is the
-  production-tree launcher; --dev re-execs it).
-* The developer tree must exist (so --dev dispatch succeeds).
+  launcher from this repository tree; --dev re-execs it).
+* the dev tree must exist (so --dev dispatch succeeds).
 * ``claude`` CLI must be installed and authenticated locally
   (provider claude-code). The test skips otherwise.
 """
@@ -88,7 +88,7 @@ _DEEP_WORKER = _DEEP_WORKER_CLI.parent
 _TREE_ROOT = _DEEP_WORKER.parent
 
 LAUNCHER = _DEEP_WORKER_CLI / "deep-worker"
-DEV_TREE = Path("<dev-tree>")
+DEV_TREE = Path("/path/to/dev-tree")
 DEV_TREE_AGENT_DIR = DEV_TREE  # working dir = the dev tree itself
 
 
@@ -112,15 +112,20 @@ def _skip_if_prereqs_missing() -> None:
 
 
 @pytest.fixture
-def dev_agent_with_claude_code():
+def dev_agent_with_claude_code(request: pytest.FixtureRequest):
     """Yields a tuple ``(agent_name, agent_info)`` for a freshly-spawned
-    dev-tree agent. Kills the agent and cleans state on teardown.
+    dev-tree agent.
+
+    Cleanup policy: passed → terminate + clean, failed → preserve for
+    debug. The session-finish sweeper is the safety net.
     """
+    from .conftest import register_test_agent
+
     _skip_if_prereqs_missing()
 
     # Use a unique name per-run so parallel CI doesn't collide and so
     # there's no stale checkpoint history hiding the issue.
-    name = f"itest_devschemas_{os.getpid()}_{uuid.uuid4().hex[:6]}"
+    name = f"test_itest_devschemas_{os.getpid()}_{uuid.uuid4().hex[:6]}"
 
     # Make sure no stale state of the same name exists. The fixture
     # owns the name end-to-end.
@@ -183,10 +188,21 @@ def dev_agent_with_claude_code():
         f"the dev tree {DEV_TREE_AGENT_DIR!r}; --dev dispatch broke"
     )
 
-    try:
-        yield name, info
-    finally:
-        _kill_and_clean(name)
+    register_test_agent(name, request.node, created_by_fixture=True)
+
+    yield name, info
+
+    # Teardown: passed → terminate, failed → preserve.
+    rep_call = getattr(request.node, "rep_call", None)
+    if rep_call is not None and not rep_call.passed:
+        logger.warning(
+            "Test FAILED → preserving agent '%s' for debugging. "
+            "Connect with: dwcli %s", name, name,
+        )
+        return
+
+    logger.info("Test passed → terminating agent '%s'", name)
+    _kill_and_clean(name)
 
 
 def _kill_and_clean(name: str) -> None:

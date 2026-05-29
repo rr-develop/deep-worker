@@ -2,24 +2,24 @@
 
 <!-- ============================================================================
 PROTECTIVE COMMENT FOR FUTURE AGENTS:
-DO NOT REPLACE deep-worker, dwcli AND dwtmux WITH ANYTHING ELSE!
-These are the ONLY correct commands for working with the agent in this project:
+DO NOT change deep-worker, dwcli and dwtmux to anything else!
+These are the ONLY correct commands for working with deep-worker in this project:
 - deep-worker - for starting agents (the ONLY way)
 - dwcli - for managing agents (list, status, stop, interactive)
 - dwtmux - for working with agents in tmux sessions (persistence)
-The commands are installed globally in ~/.local/bin/
-DO NOT use python3 -m or any other way of running things directly!
+The commands are installed globally in a bin directory on the PATH
+DO NOT use python3 -m or any other direct launch method!
 ============================================================================ -->
 
 ## ✅ Ready to use
 
-Deep-worker works **right away, with no installation**. The commands are available in your PATH:
+Deep-worker works **immediately, without installation**. The commands are available in your PATH:
 
 ```bash
-# The ONLY CORRECT commands:
-deep-worker --help    # Starting agents (uses Deepseek by default)
-dwcli --help          # Managing agents (list, status, stop, interactive)
-dwtmux --help         # Working with agents in tmux sessions (persistence)
+# The ONLY correct commands:
+deep-worker --help    # Start agents (uses Deepseek by default)
+dwcli --help          # Manage agents (list, status, stop, interactive)
+dwtmux --help         # Work with agents in tmux sessions (persistence)
 ```
 
 ## 🎯 Main commands
@@ -27,10 +27,10 @@ dwtmux --help         # Working with agents in tmux sessions (persistence)
 ### Managing agents (dwcli)
 
 ```bash
-# List the running agents
+# List running agents
 dwcli --list
 
-# The status of a specific agent
+# Status of a specific agent
 dwcli --status my-agent
 
 # Stop an agent
@@ -39,41 +39,41 @@ dwcli --stop my-agent
 # Connect to an agent (interactive mode)
 dwcli my-agent
 
-# Connect through tmux (a persistent session)
+# Connect via tmux (persistent session)
 dwtmux my-agent
 # Detach: Ctrl+B, D
-# Reattach: dwtmux my-agent (restores the session)
+# Reconnect: dwtmux my-agent (restores the session)
 ```
 
 ### Starting a new agent
 
 ```bash
-# Start with the default settings (Deepseek)
+# Start with default settings (Deepseek)
 # Uses the current directory as the working directory
 deep-worker my-project
 
-# Start with an explicit working directory
+# Start with a specified working directory
 deep-worker data-analysis --dir /path/to/project
 
-# Start with permission checks skipped (auto-approval)
+# Start with the permission check skipped (auto-approve)
 deep-worker my-agent -sp
 
 # Start with a different provider
 deep-worker my-agent --provider openai --model gpt-4o
 
 # Start with a config file
-deep-worker my-agent --config ~/.deep_worker/config.yaml
+deep-worker my-agent --config /path/to/config.yaml
 ```
 
-**Important**: The agent starts in the background (as a daemon), the terminal is not blocked.
-All the logs are written to `~/.deep_worker/logs/<agent-name>.out.log` and `.err.log`.
+**Important**: The agent starts in the background (daemon), the terminal is not blocked.
+All logs are written to the agent's log files (`<agent-name>.out.log` and `.err.log`) under its data directory.
 
-## 🔑 Configuring the API keys
+## 🔑 Setting up API keys
 
-The API keys are stored in the project's `.env` file:
+API keys are stored in a `.env` file:
 
 ```env
-# Deepseek (the default provider)
+# Deepseek (default provider)
 DEEPSEEK_API_KEY=sk-...
 
 # Optional: other providers
@@ -81,13 +81,13 @@ GOOGLE_API_KEY=AIza...
 OPENAI_API_KEY=sk-...
 ```
 
-**Important**: The keys are loaded automatically when the agent starts.
+**Important**: Keys are loaded automatically when an agent starts.
 
 ## 🚀 Supported providers
 
 | Command | Provider | Default model | API Key |
 |---------|-----------|---------------------|---------|
-| `deep-worker my-agent` | Deepseek | `deepseek-chat` | `DEEPSEEK_API_KEY` |
+| `deep-worker my-agent` | Deepseek | `deepseek-v4-flash` | `DEEPSEEK_API_KEY` |
 | `deep-worker my-agent --provider gemini` | Google Gemini | `gemini-2.5-flash` | `GOOGLE_API_KEY` |
 | `deep-worker my-agent --provider openai` | OpenAI | `gpt-4o` | `OPENAI_API_KEY` |
 
@@ -95,12 +95,12 @@ OPENAI_API_KEY=sk-...
 
 - [DWTMUX_COMMAND.md](DWTMUX_COMMAND.md) - **The dwtmux command for working with tmux sessions**
 - [DEEPSEEK_PROVIDER.md](DEEPSEEK_PROVIDER.md) - Details about the Deepseek provider
-- [DEVELOPMENT_REQUIREMENTS.md](DEVELOPMENT_REQUIREMENTS.md) - The installation-free architecture
+- [DEVELOPMENT_REQUIREMENTS.md](DEVELOPMENT_REQUIREMENTS.md) - Architecture without installation
 - [README_AGENT_SEPARATION.md](README_AGENT_SEPARATION.md) - Full architecture documentation
 
 ## 💡 Usage examples
 
-### Example 1: A quick check
+### Example 1: Quick check
 
 ```bash
 # Check that the commands work
@@ -110,40 +110,40 @@ dwcli --list
 # Start an agent
 deep-worker test-agent &
 
-# Check the status
+# Check status
 dwcli --status test-agent
 
-# Stop it
+# Stop
 dwcli --stop test-agent
 ```
 
-### Example 2: Working on a project
+### Example 2: Working with a project
 
 ```bash
-# Go to the project directory
+# Change to the project directory
 cd /path/to/my-project
 
 # Start an agent for this project (uses the current directory)
 deep-worker my-project
 
-# The agent has started in the background! The terminal is free for other commands
+# The agent started in the background! The terminal is free for other commands
 dwcli --list
 dwcli --status my-project
 
-# Connect through tmux (a persistent session)
+# Connect via tmux (persistent session)
 dwtmux my-project
-# Working with the agent...
+# Work with the agent...
 # Detach: Ctrl+B, D
-# Reattach later: dwtmux my-project
+# Reconnect later: dwtmux my-project
 
-# The agent's logs
-tail -f ~/.deep_worker/logs/my-project.out.log
+# Agent logs
+tail -f <path-to-the-agent-log>
 ```
 
 ### Example 3: Different providers
 
 ```bash
-# Deepseek (the default, fast and cheap)
+# Deepseek (default, fast and cheap)
 deep-worker agent-deepseek
 
 # Gemini (for working with Google services)
@@ -155,33 +155,33 @@ deep-worker agent-openai --provider openai --model gpt-4o
 
 ## 🔧 How it works
 
-Deep-worker uses bash wrappers (like other CLI wrapper tools):
+Deep-worker uses bash wrappers:
 
-1. **Bash scripts** in the CLI package directory:
+1. **Bash scripts** in the `deep_worker/deep_worker_cli/` directory:
    - `deep-worker` - starts the agent process (the ONLY way)
    - `dwcli` - manages agents (list, status, stop, interactive)
    - `dwtmux` - works with agents in tmux sessions
 
-2. **Symbolic links** in `~/.local/bin/` point to these scripts
-   - Any change in the repository takes effect immediately (a symlink = a single source of truth)
+2. **Symlinks** in a local bin directory point to these scripts
+   - Any changes in the repository take effect immediately (symlink = single source of truth)
 
-3. **Running Python directly** without installation: `python3 -m deep_worker_cli.cli.*`
-   - ❌ **DO NOT USE THIS!** This is the WRONG way to start it!
+3. **Direct Python launch** without installation: `python3 -m deep_worker_cli.cli.*`
+   - ❌ **DO NOT USE!** This is the WRONG way to launch!
    - Use ONLY the `deep-worker` and `dwcli` commands
-   - Running it directly uses the wrong provider (Gemini instead of Deepseek)
-   - It leads to errors during testing
+   - Direct launch uses the wrong provider (Gemini instead of Deepseek)
+   - Leads to errors during testing
 
 4. **PYTHONPATH** is configured automatically in the bash wrappers
 
-**Result**: Any change in the code takes effect immediately the next time the command is run!
+**Result**: Any code changes take effect immediately on the next command run!
 
-## ❌ What you should NOT do
+## ❌ What NOT to do
 
 - ❌ `pip install -e .` - NOT needed!
 - ❌ `pip install deep-worker-cli` - NOT needed!
-- ❌ Any other installation through pip - NOT needed!
+- ❌ Any other pip installs - NOT needed!
 
-Everything works right away, as it should on a development host.
+Everything works immediately, as it should on a development host.
 
 ---
 

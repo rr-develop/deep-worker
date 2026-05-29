@@ -1,14 +1,28 @@
 """Agent process implementation for deep_worker."""
 
 import asyncio
+import json
+import logging
 import os
 import signal
 import socket
 import sys
 import traceback
+import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
+
+# ============================================================================
+# CRITICAL: RPYC_ASYNC MUST BE IMPORTED FROM SOURCE, NOT FROM PIP!
+# ============================================================================
+# Add rpyc_async to sys.path to use AsyncioServer from the rpyc_async source directory
+# This enables true bidirectional async communication (156x faster!)
+# DO NOT use 'pip install rpyc' - it will use classic RPyC 5.0 without AsyncioServer
+# ============================================================================
+_rpyc_async_path = Path("/path/to/rpyc_async")
+if _rpyc_async_path.exists() and str(_rpyc_async_path) not in sys.path:
+    sys.path.insert(0, str(_rpyc_async_path))
 
 from rpyc.core.protocol import DEFAULT_CONFIG
 from rpyc.utils.async_server import AsyncioServer  # AsyncioServer from rpyc_async!
@@ -17,6 +31,60 @@ from deep_worker_cli.agent_config_pkg.agent_config import AgentConfig
 from deep_worker_cli.process.registry import ProcessRegistry
 from deep_worker_cli.session.session_manager import SessionManager
 from deep_worker_cli.types import AgentProcessInfo, AgentStatus
+
+
+def _resolve_persisted_codex_display_model(agent_name: str) -> str | None:
+    try:
+        state_path = Path.home() / Path("~/.deep_worker").name / agent_name / "codex_session_state.json"
+        state_data = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(state_data, dict):
+        return None
+    session_state = state_data.get(agent_name)
+    if not isinstance(session_state, dict):
+        return None
+    session_uuid = session_state.get("session_uuid")
+    if not isinstance(session_uuid, str) or not session_uuid.strip():
+        return None
+
+    raw_codex_home = os.environ.get("CODEX_HOME")
+    codex_home = Path(raw_codex_home).expanduser() if raw_codex_home else Path.home() / ".codex"
+    sessions_dir = codex_home / "sessions"
+    if not sessions_dir.exists():
+        return None
+    try:
+        candidates = sorted(
+            sessions_dir.rglob(f"*{session_uuid}.jsonl"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:
+        return None
+    for candidate in candidates:
+        try:
+            with candidate.open(encoding="utf-8") as handle:
+                for line in handle:
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(event, dict) or event.get("type") != "turn_context":
+                        continue
+                    payload = event.get("payload")
+                    if not isinstance(payload, dict):
+                        continue
+                    model = payload.get("model")
+                    if not isinstance(model, str) or not model.strip():
+                        continue
+                    model_name = model.strip()
+                    if model_name.lower() == "unknown":
+                        return None
+                    return model_name
+        except OSError:
+            continue
+    return None
+
 
 def _find_free_port(start_port: int = 0, max_attempts: int = 100) -> int:
     """Find a free port dynamically.
@@ -72,6 +140,37 @@ def _find_free_port(start_port: int = 0, max_attempts: int = 100) -> int:
         f"No free ports available in range {start_port}-{start_port + max_attempts - 1}"
     )
 
+
+def _utc_log_timestamp() -> str:
+    return datetime.now(UTC).isoformat(timespec="microseconds")
+
+
+def _message_attr(message: Any, key: str) -> Any:
+    if isinstance(message, dict):
+        return message.get(key)
+    return getattr(message, key, None)
+
+
+def _log_error_context(
+    *,
+    error: str,
+    input_message_id: str | None,
+    messages: list[Any] | None = None,
+) -> None:
+    fields = [f"error={error}"]
+    if input_message_id:
+        fields.append(f"input_message_id={input_message_id}")
+    if messages:
+        last_message = messages[-1]
+        last_message_id = _message_attr(last_message, "id")
+        last_message_type = _message_attr(last_message, "type") or _message_attr(last_message, "role")
+        if last_message_id:
+            fields.append(f"last_message_id={last_message_id}")
+        if last_message_type:
+            fields.append(f"last_message_type={last_message_type}")
+    print(f"[{_utc_log_timestamp()}] [INVOKE_ERROR] {' '.join(fields)}", file=sys.stderr)
+
+
 class AgentProcess:
     """
     Main class for a deep-worker agent process.
@@ -121,6 +220,15 @@ class AgentProcess:
         # " :> " separator before the message body.
         tail = response[len(sender_prefix):]
         return " :> " in tail
+
+    def _idle_metadata_for_response(self, response: Any) -> dict[str, str] | None:
+        if not self._is_outgoing_inter_agent_echo(self.name, response):
+            return None
+        return {
+            "substatus": "waiting_agent",
+            "source_tool": "send_message_to_agent",
+            "reason": "tool_call",
+        }
 
     def __init__(
         self,
@@ -189,9 +297,13 @@ class AgentProcess:
         # Paths
         self.pid_file = pid_file or Path(f"/tmp/deep_worker_{name}.pid")
         self.data_dir = data_dir or (Path("~/.deep_worker").expanduser() / name)
+        from deep_worker_cli.storage_paths import (
+            detect_storage_version,
+            ensure_private_dir,
+        )
+        self.storage_version = detect_storage_version(name)
 
-        # Ensure data directory exists
-        self.data_dir.mkdir(parents=True, exist_ok=True)
+        ensure_private_dir(self.data_dir)
 
         # Components
         self.registry = registry or ProcessRegistry()
@@ -237,6 +349,12 @@ class AgentProcess:
         self.is_running: bool = False  # True when agent is executing
         self.current_worker_task: Any = None  # Current asyncio task for cancellation
 
+        # Invoke tasks whose RPyC dispatch task was cancelled (channel drain /
+        # inbound-quarantine) while the invoke kept running. Strong refs here
+        # keep them alive until they finish; they self-remove via a done
+        # callback. See AgentService.exposed_invoke_agent (decoupling).
+        self._detached_invoke_tasks: set[Any] = set()
+
         # Approval decisions cache (for backward compatibility)
         # Used by AgentService to store approval decisions when not using HITL framework
         # Maps approval_id -> decision dict (with "type" field: "approve", "reject", etc.)
@@ -280,6 +398,13 @@ class AgentProcess:
             "status": status_value,
             "error_message": error_message,
         }
+        status_metadata = (
+            getattr(self.session_manager, "status_metadata", None)
+            if self.session_manager is not None
+            else None
+        )
+        if status_metadata is not None:
+            payload["status_metadata"] = status_metadata
         if self.task_manager is not None:
             payload["task_manager_active"] = (
                 self.task_manager.state != "inactive"
@@ -290,48 +415,230 @@ class AgentProcess:
     async def _dispatch_status_event(self, _payload: dict[str, Any]) -> None:
         """Notifier wired into ``SessionManager``.
 
-        ``session_manager`` hands us its own minimal payload; we
-        ignore it and rebuild the full envelope via
+        ``session_manager`` hands us its own minimal payload; we ignore
+        it and rebuild the full envelope via
         ``_current_status_snapshot()`` so TaskManager fields — which
         live outside SessionManager — are always fresh.
 
-        Each subscriber is pushed to via a fresh ``asyncio.create_task``
-        so the caller (usually ``SessionManager.set_status``) returns
-        immediately and — more importantly — we never make a
-        synchronous re-entrant RPyC call from an asyncio handler that
-        is already processing a message on the same connection. The
-        ``sync_request() from asyncio loop`` guard in rpyc would
-        otherwise trip. The deferred dispatch is still event-driven
-        (no polling, no sleeps), just scheduled on the next loop tick.
+        Each subscriber is pushed to via ``fire_and_forget_async`` with
+        a bounded timeout. Three reasons this matters, all from
+        production incidents:
 
-        ``await on_message(payload_str)`` on a rpyc_async async-flagged
-        netref routes through ``HANDLE_ASYNC_CALL`` by itself, which
-        the peer's ``_dispatch_request_async`` awaits correctly. Do
-        NOT wrap with ``rpyc.async_`` — that forces ``HANDLE_CALL``
-        (sync) on the peer, which calls ``async def exposed_on_message``
-        without awaiting, leaving a stranded coroutine ("Boxing
-        coroutine object ... Did you forget to await?") and silently
-        dropping every status_change on the way to the UI.
+        1. *Caller never blocks.* ``SessionManager.set_status`` is on
+           the hot path; we must not let one dead WS peer freeze every
+           future status change.
+        2. *Pinned in ``_INFLIGHT``.* ``fire_and_forget_async`` adds
+           the dispatched Task to ``rpyc.utils.helpers._INFLIGHT`` with
+           an auto-discard ``add_done_callback``, so a GC pass cannot
+           silently drop a half-finished outbound RPC and pin its
+           ``AsyncResult`` chain in ``Connection._request_callbacks``
+           (incidents 2026-05-08, 2026-05-11).
+        3. *Timeout breaks the hang.* A subscriber whose ``on_message``
+           never resolves used to accumulate one parked Task per
+           ``set_status`` for the rest of the process's life
+           (incident observed 2026-05-19). With the timeout, each dispatched
+           Task settles within ``DWCLI_STATUS_PUSH_TIMEOUT_SEC``
+           (default 10 s) and releases its slot.
+
+        Do NOT wrap with ``rpyc.async_`` — that forces ``HANDLE_CALL``
+        on the peer, which calls ``async def exposed_on_message``
+        without awaiting, drops the payload and emits the telltale
+        "Boxing coroutine object … Did you forget to await?" warning.
+        The async-flagged netref already picks ``HANDLE_ASYNC_CALL``.
         """
         import json as _json
+        import os as _os
 
         if not self._message_subscribers:
             return
         payload_str = _json.dumps(self._current_status_snapshot(), default=str)
 
-        async def _push(target: Any) -> None:
-            try:
-                await target.on_message(payload_str)
-            except Exception as exc:  # noqa: BLE001
-                # Use id() to avoid netref attribute access that would
-                # round-trip over a possibly dying connection.
-                print(
-                    f"[AGENT] status push to subscriber id={id(target)} failed: {exc}",
-                    file=sys.stderr,
-                )
+        try:
+            push_timeout = float(_os.environ.get("DWCLI_STATUS_PUSH_TIMEOUT_SEC", "10"))
+        except ValueError:
+            push_timeout = 10.0
+
+        from rpyc.utils.helpers import fire_and_forget_async  # noqa: PLC0415
 
         for subscriber in list(self._message_subscribers):
-            asyncio.create_task(_push(subscriber))
+            subscriber_id = id(subscriber)
+
+            async def _on_error(
+                exc: BaseException,
+                _sid: int = subscriber_id,
+                _sub: Any = subscriber,
+            ) -> None:
+                # Use the captured id() instead of touching the netref;
+                # attribute access on a dying peer would re-enter the
+                # same broken connection.
+                print(
+                    f"[AGENT] status push to subscriber id={_sid} failed: {exc!r}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                # EVICT the dead subscriber. on_disconnect deliberately
+                # does NOT clean up — it relies on a graceful
+                # exposed_unsubscribe_messages that never arrives when the
+                # web client dies/restarts ungracefully. Without eviction
+                # the dead MessageCallbackService netref lingers forever
+                # and EVERY status push goes only to the corpse (10 s
+                # timeout each), so the live UI never updates — the
+                # "stuck at idle while actually working" bug
+                # (incident observed 2026-05-20). A live web re-subscribes on its next
+                # connect_to_agent, so eviction is safe.
+                #
+                # Evict by IDENTITY: ``set.discard(netref)`` would call
+                # ``netref.__hash__`` → a sync RPyC round-trip over the
+                # already-dead channel → EOFError, which on the invoke path
+                # escaped and forced the agent to ERROR (incident observed 2026-05-22).
+                # ``evict_subscriber_by_identity`` never crosses the wire.
+                from deep_worker_cli.rpyc_service.agent_service import (  # noqa: PLC0415
+                    evict_subscriber_by_identity,
+                )
+                evict_subscriber_by_identity(self._message_subscribers, _sub)
+
+            try:
+                awaitable = subscriber.on_message(payload_str)
+            except Exception as exc:  # noqa: BLE001
+                # Construction-time failure (rare): the netref is so
+                # dead it can't even produce an AsyncResult. Log and
+                # move on; do not let one broken subscriber abort the
+                # whole snapshot fan-out.
+                print(
+                    f"[AGENT] status push to subscriber id={subscriber_id} "
+                    f"could not be dispatched: {exc!r}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                # Same identity-based eviction as the _on_error path (a
+                # ``discard`` here would re-raise EOFError via __hash__).
+                from deep_worker_cli.rpyc_service.agent_service import (  # noqa: PLC0415
+                    evict_subscriber_by_identity,
+                )
+                evict_subscriber_by_identity(self._message_subscribers, subscriber)
+                continue
+
+            fire_and_forget_async(
+                awaitable,
+                timeout=push_timeout,
+                error_callback=_on_error,
+                name=f"status-push-{subscriber_id}",
+            )
+
+    def _on_inbound_quarantine(self, info: dict[str, Any]) -> None:
+        """rpyc_async ``on_inbound_quarantine`` hook (sync, runs on the loop).
+
+        A client's RPyC channel was put into inbound quarantine because it
+        flooded the agent past ``max_inbound_inflight``. This is purely a
+        WARNING: the agent keeps working and its status MUST NOT change. We
+        only log it and broadcast a non-status warning event to the live
+        subscribers (the quarantined channel itself won't receive it — it's
+        the spammer — but other live channels, e.g. the web client, will).
+
+        Quarantine (vs. closing the channel) is intentional: it stops the
+        spammer from immediately opening a fresh connection. See
+        rpyc_async/docs/DESIGN_INBOUND_BACKPRESSURE.md.
+        """
+        connid = info.get("connid")
+        peer = info.get("peer")
+        print(
+            f"[RPyC][WARNING] inbound channel quarantined: connid={connid} "
+            f"peer={peer} inbound_inflight={info.get('inbound_inflight')} "
+            f"threshold={info.get('threshold')}. A client flooded this "
+            f"channel; it is now ignored. The agent keeps working — status "
+            f"unchanged.",
+            file=sys.stderr,
+            flush=True,
+        )
+        # Schedule the async fan-out without blocking the dispatch path.
+        try:
+            loop = asyncio.get_event_loop()
+            loop.create_task(self._broadcast_channel_quarantine_warning(info))
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"[RPyC][WARNING] could not schedule quarantine broadcast: {exc!r}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    async def _broadcast_channel_quarantine_warning(self, info: dict[str, Any]) -> None:
+        """Fan a ``channel_quarantined`` warning out to all live subscribers.
+
+        CRITICAL: this does NOT touch ``session_manager`` / agent status. It
+        is a warning only; the agent continues its task. Reuses the same
+        fire-and-forget + dead-subscriber-eviction pattern as
+        ``_dispatch_status_event`` so one dead peer can't block the rest.
+        """
+        import json as _json
+        import os as _os
+
+        if not self._message_subscribers:
+            return
+
+        payload_str = _json.dumps({
+            "type": "channel_quarantined",
+            "role": "system",
+            "level": "warning",
+            "connid": info.get("connid"),
+            "peer": str(info.get("peer")),
+            "inbound_inflight": info.get("inbound_inflight"),
+            "threshold": info.get("threshold"),
+            "content": (
+                "A client RPyC channel was flooded and put into quarantine. "
+                "The agent keeps working; this is a warning, not an error."
+            ),
+        }, default=str)
+
+        try:
+            push_timeout = float(_os.environ.get("DWCLI_STATUS_PUSH_TIMEOUT_SEC", "10"))
+        except ValueError:
+            push_timeout = 10.0
+
+        from rpyc.utils.helpers import fire_and_forget_async  # noqa: PLC0415
+
+        for subscriber in list(self._message_subscribers):
+            subscriber_id = id(subscriber)
+
+            async def _on_error(
+                exc: BaseException,
+                _sid: int = subscriber_id,
+                _sub: Any = subscriber,
+            ) -> None:
+                print(
+                    f"[AGENT] quarantine-warning push to subscriber id={_sid} "
+                    f"failed: {exc!r}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                # Evict by identity — never ``discard`` a netref (its
+                # __hash__ crosses the dead wire → EOFError, incident
+                # observed 2026-05-22).
+                from deep_worker_cli.rpyc_service.agent_service import (  # noqa: PLC0415
+                    evict_subscriber_by_identity,
+                )
+                evict_subscriber_by_identity(self._message_subscribers, _sub)
+
+            try:
+                awaitable = subscriber.on_message(payload_str)
+            except Exception as exc:  # noqa: BLE001
+                print(
+                    f"[AGENT] quarantine-warning push to subscriber "
+                    f"id={subscriber_id} could not be dispatched: {exc!r}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                from deep_worker_cli.rpyc_service.agent_service import (  # noqa: PLC0415
+                    evict_subscriber_by_identity,
+                )
+                evict_subscriber_by_identity(self._message_subscribers, subscriber)
+                continue
+
+            fire_and_forget_async(
+                awaitable,
+                timeout=push_timeout,
+                error_callback=_on_error,
+                name=f"quarantine-warning-{subscriber_id}",
+            )
 
     async def start(self) -> None:
         """Start the agent process.
@@ -342,6 +649,11 @@ class AgentProcess:
             # 0. Reset shutdown event and set started_at timestamp
             self.shutdown_event.clear()
             self.started_at = datetime.now()
+            # Capture the running loop up front so signal handling (and the
+            # fallback path) can safely schedule shutdown onto it. Also set
+            # later in the RPyC start path for callbacks; setting it here is
+            # harmless and earlier.
+            self._agent_event_loop = asyncio.get_running_loop()
 
             # 1. Create PID file
             await self._create_pid_file()
@@ -349,11 +661,27 @@ class AgentProcess:
             # 2. Setup signal handlers
             self._setup_signal_handlers()
 
+            # 2.5 Auto-migrate storage to latest version if needed
+            # Must happen before session manager init so metadata reflects v4.
+            from deep_worker_cli.storage_paths import CURRENT_STORAGE_VERSION, migrate_agent_storage_to_v4
+
+            if self.storage_version < CURRENT_STORAGE_VERSION:
+                migrate_result = migrate_agent_storage_to_v4(self.name)
+                self.storage_version = CURRENT_STORAGE_VERSION
+                msg = (
+                    f"[STORAGE] Auto-migrated agent '{self.name}' "
+                    f"from v{migrate_result['migrated_from']} to v{CURRENT_STORAGE_VERSION}\n"
+                )
+                sys.stdout.write(msg)
+                sys.stdout.flush()
+
             # 3. Initialize session manager (with launch_config for post-mortem inspection)
             # ``notifier=self._dispatch_status_event`` wires every
             # ``set_status`` / ``set_error`` transition into the
             # subscribe-messages broadcast, so UI clients learn of
             # state changes without any polling.
+            if isinstance(self.launch_config, dict):
+                self.launch_config.setdefault("storage_version", self.storage_version)
             self.session_manager = SessionManager(
                 data_dir=self.data_dir,
                 launch_config=self.launch_config,
@@ -370,7 +698,15 @@ class AgentProcess:
                 sys.stdout.flush()
                 print(msg, file=sys.stderr)
 
-                # Load environment variables from the .env file in the user's agents directory BEFORE importing config
+                # Set up logging to stderr so log_token_usage() output is visible
+                _log = logging.getLogger("deep_worker_cli")
+                if not _log.handlers:
+                    _handler = logging.StreamHandler(sys.stderr)
+                    _handler.setFormatter(logging.Formatter("%(message)s"))
+                    _log.addHandler(_handler)
+                    _log.setLevel(logging.INFO)
+
+                # Load environment variables from the agent's data directory (.env) BEFORE importing config
                 # This is critical because config.py initializes Settings at module level
                 # and needs OPENAI_MODEL, OPENAI_BASE_URL, etc. to be set before import
                 deepagents_env = PathLib.home() / ".deepagents" / ".env"
@@ -390,10 +726,11 @@ class AgentProcess:
                 #
                 # The path is derived from __file__ so the SAME line works
                 # for BOTH the production tree and the developer tree.
-                # Hard-coding the prod path here used to defeat the --dev
-                # launcher dispatch: even after the bash launcher correctly
-                # re-execs into the dev tree, this insertion would prepend
-                # the prod ``deepagents`` and shadow the dev one. See
+                # Hard-coding
+                # the prod path here used to defeat the --dev launcher
+                # dispatch: even after the bash launcher correctly re-execs
+                # into the dev tree, this insertion would prepend the prod
+                # ``deepagents`` and shadow the dev one. See
                 # docs/DESIGN_DEV_FLAG.md.
                 #
                 # __file__ here =
@@ -411,6 +748,7 @@ class AgentProcess:
                 # Now import AFTER environment is loaded and deepagents is in path
                 from deep_worker_cli.agent import create_cli_agent
                 from deep_worker_cli.config import create_model
+                from deep_worker_cli import tools as cli_tools
                 from deep_worker_cli.tools import (
                     http_request,
                     fetch_url,
@@ -420,10 +758,14 @@ class AgentProcess:
                 )
 
                 # Create model using configuration from AgentConfig
-                # Pass provider and model explicitly from config
+                # Pass provider and model explicitly from config.
+                # Pass user=self.name for KV-cache isolation so the main
+                # agent and its TaskManager (:tm) use separate user_ids
+                # and do not evict each other's DeepSeek prefix-cache.
                 model = create_model(
                     provider=self.config.provider,
-                    model_name=self.config.model
+                    model_name=self.config.model,
+                    user=self.name,
                 )
 
                 # Set working_dir on model for MCP direct tool execution
@@ -433,19 +775,62 @@ class AgentProcess:
                 if hasattr(model, '_working_dir'):
                     setattr(model, '_working_dir', str(self.config.working_dir))
 
+                set_resolved_model_callback = getattr(
+                    model, "set_resolved_model_callback", None
+                )
+                if callable(set_resolved_model_callback):
+                    async def _on_resolved_model(model_name: str) -> None:
+                        set_display_model = getattr(
+                            self.config, "set_dynamic_display_model", None
+                        )
+                        if callable(set_display_model):
+                            set_display_model(model_name)
+                        if self.session_manager is not None:
+                            update_model = getattr(
+                                self.session_manager,
+                                "update_launch_config_model",
+                                None,
+                            )
+                            if callable(update_model):
+                                await update_model(model_name)
+
+                    set_resolved_model_callback(_on_resolved_model)
+                    if self.config.provider == "codex" and self.config.model is None:
+                        persisted_model = _resolve_persisted_codex_display_model(self.name)
+                        if persisted_model:
+                            await _on_resolved_model(persisted_model)
+
+                restart_tool_factory = getattr(cli_tools, "make_restart_agent_tool")
+
                 # Prepare web tools
                 # - http_request and fetch_url work without API keys
                 # - web_search_delegation_tool uses Claude Code SDK for universal web search
                 # - send_message_to_agent: inter-agent messaging; sender name
                 #   is baked into the factory from self.name so the LLM
                 #   cannot forge it. See docs/DESIGN_SEND_MESSAGE_TO_AGENT_TOOL.md
-                web_tools = [
+                web_tools: list[Any] = [
                     http_request,
                     fetch_url,
                     web_search_delegation_tool,
                     read_image,
+                    restart_tool_factory(self.name),
                     make_send_message_to_agent_tool(self.name),
                 ]
+
+                # Codex-specific: register the native-tool passthroughs.
+                # Codex CLI hard-codes a few native tools (apply_patch,
+                # update_plan, view_image, request_user_input, mcp
+                # resource introspection) that no --disable flag can
+                # remove from its API tools list. When the model calls
+                # one of them, ``codex_provider.event_pump`` records the
+                # call as an honest LangGraph tool_call referencing the
+                # matching BaseTool from ``codex_provider.native_tools``.
+                # The body parks on an asyncio.Future and the pump
+                # resolves it at item.completed — event-driven, no
+                # polling. See docs/DESIGN_NATIVE_TOOL_PASSTHROUGH.md.
+                if self.config.provider == "codex":
+                    from codex_provider.native_tools import NATIVE_TOOLS
+                    web_tools.extend(NATIVE_TOOLS)
 
                 # Determine checkpointer based on flags and environment
                 # Priority order:
@@ -672,14 +1057,53 @@ class AgentProcess:
             self.pid_file.unlink()
 
     def _setup_signal_handlers(self) -> None:
-        """Setup signal handlers for graceful shutdown."""
-        signal.signal(signal.SIGTERM, self._signal_handler)
-        signal.signal(signal.SIGINT, self._signal_handler)
+        """Setup signal handlers for graceful shutdown.
+
+        Uses ``loop.add_signal_handler`` so the callback runs INSIDE the event
+        loop and can safely set ``shutdown_event``. A plain ``signal.signal``
+        handler runs between bytecodes on the main thread and must not touch
+        asyncio primitives — and historically it only flipped ``self.running``,
+        which the main loop (blocked on ``await self.shutdown_event.wait()``)
+        never observed, so SIGTERM printed "shutting down" but the process hung
+        forever still serving RPyC (stop_agent then timed out / kill -9 needed;
+        2026-05-25). Setting the event is what actually unblocks shutdown.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                loop.add_signal_handler(sig, self._handle_shutdown_signal, sig)
+        except (NotImplementedError, RuntimeError):
+            # No running loop or platform without add_signal_handler: fall back
+            # to signal.signal. _signal_handler then schedules the event set
+            # onto the stored loop (it cannot set it directly from here).
+            signal.signal(signal.SIGTERM, self._signal_handler)
+            signal.signal(signal.SIGINT, self._signal_handler)
+
+    def _handle_shutdown_signal(self, signum: int) -> None:
+        """Loop-native shutdown callback: unblock the main loop's wait().
+
+        Only sets the event — it does NOT flip ``self.running``. ``shutdown()``
+        guards on ``if not self.running: return`` for idempotency, so clearing
+        ``running`` here would make the awaited ``shutdown()`` skip all cleanup
+        (RPyC close, unregister) and the process would still not exit. Let
+        ``shutdown()`` own the ``running`` transition.
+        """
+        print(f"\nReceived signal {signum}, shutting down...")
+        self.shutdown_event.set()
 
     def _signal_handler(self, signum: int, frame: Any) -> None:
-        """Handle shutdown signals."""
+        """Fallback signal handler (no running loop at setup time).
+
+        Runs on the main thread between bytecodes, so it must NOT call
+        ``shutdown_event.set()`` directly; instead it hops onto the agent's
+        event loop, which sets the event in a loop-safe way. As with
+        ``_handle_shutdown_signal``, it does not flip ``self.running`` — see
+        that method's note.
+        """
         print(f"\nReceived signal {signum}, shutting down...")
-        self.running = False
+        loop = self._agent_event_loop
+        if loop is not None:
+            loop.call_soon_threadsafe(self.shutdown_event.set)
 
     async def _start_rpyc_server(self) -> None:
         """Start RPyC AsyncioServer (native asyncio, no threads!).
@@ -811,6 +1235,10 @@ class AgentProcess:
                 "allow_pickle": True,
                 "safe_attrs": extended_safe_attrs,
                 # NO TIMEOUT - connection can live for days/weeks
+                # Surface inbound-quarantine as a non-blocking WARNING (log +
+                # broadcast to live subscribers). Does NOT change agent status
+                # — the agent keeps working. Observed 2026-05-22.
+                "on_inbound_quarantine": self._on_inbound_quarantine,
             }
         )
 
@@ -881,7 +1309,19 @@ class AgentProcess:
         limit: int | None = int_limit if int_limit > 0 else None
         offset = command.get("offset", 0)
 
-        logger.info(f"[GET_HISTORY] Starting get_history (limit={limit}, offset={offset})")
+        # ⚠️ LOG-STORM GUARD — DO NOT repr the state / agent / config here.
+        # get_history is POLLED at high frequency by web/CLI clients. The old
+        # code logged the FULL StateSnapshot (every message body, tool output,
+        # file dump) and the Pregel ``agent`` repr at INFO on EVERY call:
+        #   logger.info(f"... Successfully got state: {state}")
+        #   logger.info(f"... Agent is initialized: {self.agent}")
+        # That grew the agent log to 5.2 GB at ~46 KB/s and spiked RssAnon per
+        # call (observed 2026-05-23; first seen 2026-05-08, see
+        # a related internal incident analysis (not included here)). Keep ONLY
+        # bounded breadcrumbs (sizes/counts, never content), and at DEBUG so a
+        # polled hot path is silent by default. NEVER interpolate ``state``,
+        # ``self.agent``, ``config``, or any message into a log record.
+        logger.debug("[GET_HISTORY] start (limit=%s, offset=%s)", limit, offset)
 
         if not self.agent:
             logger.error("[GET_HISTORY] Agent not initialized")
@@ -889,8 +1329,6 @@ class AgentProcess:
                 "success": False,
                 "error": "Agent not initialized",
             }
-
-        logger.info(f"[GET_HISTORY] Agent is initialized: {self.agent}")
 
         try:
             from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
@@ -905,12 +1343,11 @@ class AgentProcess:
                     "updated_at": datetime.now(UTC).isoformat(),
                 },
             }
-            logger.info(f"[GET_HISTORY] Config created: {config}")
 
-            # Get state from agent checkpoint
-            logger.info(f"[GET_HISTORY] About to call agent.aget_state()...")
+            # Get state from agent checkpoint. Do NOT log ``state`` — see the
+            # log-storm guard above; only a bounded message COUNT is logged
+            # after we extract it.
             state = await self.agent.aget_state(config)
-            logger.info(f"[GET_HISTORY] Successfully got state: {state}")
             if not state or not state.values:
                 return {
                     "success": True,
@@ -921,6 +1358,9 @@ class AgentProcess:
 
             messages = state.values.get("messages", [])
             total_count = len(messages)
+            # Bounded breadcrumb: COUNT only, never content. (DEBUG so the
+            # polled hot path is silent by default.) See log-storm guard above.
+            logger.debug("[GET_HISTORY] got %d message(s)", total_count)
 
             # Apply offset and limit for pagination.
             # ``limit is None`` ⇒ return everything (no cap).
@@ -1086,6 +1526,8 @@ class AgentProcess:
         """
         message = command.get("message")
         stream = command.get("stream", True)  # Default to streaming to match deepagents
+        input_message_id: str | None = None
+        last_error_messages: list[Any] = []
 
         if not message:
             return {
@@ -1118,8 +1560,14 @@ class AgentProcess:
 
         try:
             if self.agent:
+                from langchain_core.messages import HumanMessage
                 from langchain_core.runnables import RunnableConfig
                 from deep_worker_cli.process.status_callback import StatusTrackingCallback
+
+                def _next_user_message(content: str) -> HumanMessage:
+                    nonlocal input_message_id
+                    input_message_id = f"user-{uuid.uuid4().hex}"
+                    return HumanMessage(content=content, id=input_message_id)
 
                 # Create status tracking callback
                 status_callback = StatusTrackingCallback(session_manager=self.session_manager)
@@ -1214,7 +1662,7 @@ class AgentProcess:
                         # data is safely persisted. With DeltaSqliteCheckpointer,
                         # each checkpoint is a small delta, not a full state copy.
                         async for chunk in self.agent.astream(
-                            {"messages": [{"role": "user", "content": current_message}]},
+                            {"messages": [_next_user_message(current_message)]},
                             stream_mode=["messages", "updates"],
                             subgraphs=True,
                             config=config,
@@ -1356,7 +1804,23 @@ class AgentProcess:
 
                     # Set status back to IDLE after successful completion
                     if self.session_manager:
-                        await self.session_manager.set_status(AgentStatus.IDLE)
+                        await self.session_manager.set_status(
+                            AgentStatus.IDLE,
+                            metadata=self._idle_metadata_for_response(full_response),
+                        )
+
+                    # Log token usage with cache info from agent state
+                    try:
+                        from deep_worker_cli.utils import log_token_usage
+                        state = await self.agent.aget_state(config)
+                        if state and state.values:
+                            msgs = state.values.get("messages", [])
+                            if msgs:
+                                last = msgs[-1]
+                                rm = getattr(last, 'response_metadata', None) or {}
+                                log_token_usage(logging.getLogger(__name__), self.name, rm, "stream")
+                    except Exception:
+                        pass
 
                     # Send final response
                     return {
@@ -1388,12 +1852,13 @@ class AgentProcess:
 
                             # Invoke agent
                             result = await self.agent.ainvoke(
-                                {"messages": [{"role": "user", "content": current_message}]},
+                                {"messages": [_next_user_message(current_message)]},
                                 config
                             )
 
                             # Extract response
                             messages = result.get("messages", [])
+                            last_error_messages = list(messages) if isinstance(messages, list) else []
                             if not messages:
                                 break
 
@@ -1455,6 +1920,7 @@ class AgentProcess:
 
                         # Return final response
                         messages = result.get("messages", [])
+                        last_error_messages = list(messages) if isinstance(messages, list) else []
                         if messages:
                             last_msg = messages[-1]
                             content = last_msg.content if hasattr(last_msg, "content") else last_msg.get("content", "")
@@ -1468,8 +1934,22 @@ class AgentProcess:
                                     "content": content,
                                 })
 
+                            # Log token usage with cache info
+                            try:
+                                from deep_worker_cli.utils import log_token_usage
+                                if messages:
+                                    last = messages[-1]
+                                    rm = getattr(last, 'response_metadata', None) or {}
+                                    print(f"[INVOKE_DEBUG] log_token_usage: rm={rm}", file=sys.stderr)
+                                    log_token_usage(logging.getLogger(__name__), self.name, rm, "invoke")
+                            except Exception:
+                                pass
+
                             if self.session_manager:
-                                await self.session_manager.set_status(AgentStatus.IDLE)
+                                await self.session_manager.set_status(
+                                    AgentStatus.IDLE,
+                                    metadata=self._idle_metadata_for_response(content),
+                                )
 
                             return {
                                 "success": True,
@@ -1479,6 +1959,18 @@ class AgentProcess:
                                 },
                             }
                         else:
+                            # Terminal failure: settle status so the agent
+                            # is not left dangling at RUNNING forever (the
+                            # incident observed 2026-05-20, "forever working" bug).
+                            if self.session_manager:
+                                _log_error_context(
+                                    error="No messages returned from agent",
+                                    input_message_id=input_message_id,
+                                    messages=last_error_messages,
+                                )
+                                await self.session_manager.set_error(
+                                    "No messages returned from agent"
+                                )
                             return {
                                 "success": False,
                                 "error": "No messages returned from agent",
@@ -1496,7 +1988,7 @@ class AgentProcess:
 
                         # Initial ainvoke with user message
                         result = await self.agent.ainvoke(
-                            {"messages": [{"role": "user", "content": message}]},
+                            {"messages": [_next_user_message(message)]},
                             config
                         )
                         print(f"[INVOKE] Initial ainvoke: Got result with {len(result.get('messages', []))} messages", file=sys.stderr)
@@ -1505,6 +1997,7 @@ class AgentProcess:
                             iteration += 1
 
                             messages = result.get("messages", [])
+                            last_error_messages = list(messages) if isinstance(messages, list) else []
                             if not messages:
                                 print(f"[INVOKE] No messages in result", file=sys.stderr)
                                 break
@@ -1660,6 +2153,18 @@ class AgentProcess:
 
                         if iteration >= max_iterations:
                             print(f"[INVOKE] Max iterations reached without final response", file=sys.stderr)
+                            # Settle status — do not leave the agent
+                            # dangling at RUNNING (incident observed 2026-05-20).
+                            if self.session_manager:
+                                _log_error_context(
+                                    error="Agent exceeded maximum iterations without producing final response",
+                                    input_message_id=input_message_id,
+                                    messages=last_error_messages,
+                                )
+                                await self.session_manager.set_error(
+                                    "Agent exceeded maximum iterations "
+                                    "without producing final response"
+                                )
                             return {
                                 "success": False,
                                 "error": "Agent exceeded maximum iterations without producing final response"
@@ -1667,6 +2172,20 @@ class AgentProcess:
 
                         if not final_content:
                             print(f"[INVOKE] No final content found after {iteration} iterations", file=sys.stderr)
+                            # Settle status — do not leave the agent
+                            # dangling at RUNNING (incident observed 2026-05-20).
+                            # This is the exact path the codex API-400
+                            # failure took: ainvoke returned an empty
+                            # assistant message and we fell through here.
+                            if self.session_manager:
+                                _log_error_context(
+                                    error="Agent did not produce a response",
+                                    input_message_id=input_message_id,
+                                    messages=last_error_messages,
+                                )
+                                await self.session_manager.set_error(
+                                    "Agent did not produce a response"
+                                )
                             return {
                                 "success": False,
                                 "error": "Agent did not produce a response"
@@ -1689,7 +2208,21 @@ class AgentProcess:
 
                         # Set status back to IDLE after successful completion
                         if self.session_manager:
-                            await self.session_manager.set_status(AgentStatus.IDLE)
+                            await self.session_manager.set_status(
+                                AgentStatus.IDLE,
+                                metadata=self._idle_metadata_for_response(final_content),
+                            )
+
+                        # Log token usage with cache info from last invocation
+                        try:
+                            from deep_worker_cli.utils import log_token_usage
+                            msgs = result.get("messages", [])
+                            if msgs:
+                                last = msgs[-1]
+                                rm = getattr(last, 'response_metadata', None) or {}
+                                log_token_usage(logging.getLogger(__name__), self.name, rm, "invoke")
+                        except Exception:
+                            pass
 
                         return {
                             "success": True,
@@ -1709,6 +2242,11 @@ class AgentProcess:
                 print(f"[INVOKE] {error_msg}", file=sys.stderr)
 
                 if self.session_manager:
+                    _log_error_context(
+                        error="Agent not initialized",
+                        input_message_id=input_message_id,
+                        messages=last_error_messages,
+                    )
                     await self.session_manager.set_error("Agent not initialized")
 
                 raise RuntimeError(error_msg)
@@ -1717,11 +2255,21 @@ class AgentProcess:
             # Task was cancelled (interrupted) — this is a NORMAL state
             # transition initiated by the user, not an error. The agent
             # process is fully alive and ready to accept the next user
-            # message, so we land in WAITING_INPUT (not ERROR).
+            # message, so we land in INTERRUPTED (not ERROR, not
+            # WAITING_INPUT).
             #
-            # Putting the agent in ERROR here was a bug: clients refuse
-            # to send new messages to an agent in error state, requiring
-            # a manual restart after every interrupt.
+            # History of this branch:
+            # - Originally called set_error("Agent interrupted"); the UI
+            #   then refused to talk to the agent until manual restart.
+            # - Then switched to WAITING_INPUT — but that name is
+            #   overloaded: ``StatusTrackingCallback.on_tool_start`` also
+            #   uses WAITING_INPUT for the in-turn tool-running state.
+            #   Same status, two meanings — confusing in the UI.
+            # - Now INTERRUPTED is a first-class state. UI renders it
+            #   in amber (same colour as the Interrupt button) so the
+            #   user can see at a glance that the agent is paused
+            #   mid-turn waiting for their next message — typically a
+            #   correction.
             print("[INVOKE] Agent task cancelled (interrupted)", file=sys.stderr)
 
             # Notify cancellation via callback (if provided)
@@ -1732,9 +2280,10 @@ class AgentProcess:
                     "content": "Interrupted",
                 })
 
-            # Transition to WAITING_INPUT — interrupted, awaiting user input
+            # Transition to INTERRUPTED — agent is alive, awaiting the
+            # user's next message (typically a correction). NOT an error.
             if self.session_manager:
-                await self.session_manager.set_status(AgentStatus.WAITING_INPUT)
+                await self.session_manager.set_status(AgentStatus.INTERRUPTED)
 
             # Re-raise to properly handle cancellation
             raise
@@ -1743,6 +2292,36 @@ class AgentProcess:
             import traceback
             print(f"[INVOKE] Exception occurred: {e}", file=sys.stderr)
             print(f"[INVOKE] Traceback:\n{traceback.format_exc()}", file=sys.stderr)
+
+            # Usage/session-limit gets a clean, user-facing message instead
+            # of the raw "Agent invocation failed: ..." wrapper. The provider
+            # raises ClaudeUsageLimitError whose str() is the CLI marker (incl.
+            # the reset time). Detected by class name to keep this module
+            # provider-agnostic (codex agents never import the claude module).
+            # Observed 2026-05-21: the limit used to fail silently to idle.
+            if type(e).__name__ == "ClaudeUsageLimitError":
+                limit_msg = f"Claude usage limit reached — {str(e)}"
+                print(f"[INVOKE] {limit_msg}", file=sys.stderr)
+                if notify_callback is not None:
+                    try:
+                        await notify_callback({
+                            "type": "error",
+                            "role": "system",
+                            "content": limit_msg,
+                        })
+                    except Exception as notify_err:
+                        print(f"[INVOKE] Warning: Failed to notify limit to TUI: {notify_err}", file=sys.stderr)
+                if self.session_manager:
+                    _log_error_context(
+                        error=limit_msg,
+                        input_message_id=input_message_id,
+                        messages=last_error_messages,
+                    )
+                    await self.session_manager.set_error(limit_msg)
+                return {
+                    "success": False,
+                    "error": limit_msg,
+                }
 
             # CRITICAL: Notify error to TUI so users see what went wrong
             # This matches deepagents architecture where errors are displayed via ErrorMessage
@@ -1759,7 +2338,13 @@ class AgentProcess:
 
             # Set error status on exception
             if self.session_manager:
-                await self.session_manager.set_error(f"Agent invocation failed: {str(e)}")
+                invocation_error = f"Agent invocation failed: {str(e)}"
+                _log_error_context(
+                    error=invocation_error,
+                    input_message_id=input_message_id,
+                    messages=last_error_messages,
+                )
+                await self.session_manager.set_error(invocation_error)
 
             return {
                 "success": False,

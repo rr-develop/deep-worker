@@ -172,6 +172,68 @@ _AUDIT_NEW_TOOLS = (
 )
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# 2026-05-15 audit additions — harness-level tools.
+# ─────────────────────────────────────────────────────────────────────────
+# These are "park the session" / "wait for external trigger" tools at the
+# harness layer rather than the CLI's traditional tools layer. The 2026-05-14
+# audit doc (CLAUDE_CODE_BUILTIN_TOOLS_AUDIT.md:139) originally claimed they
+# never reach the SDK subprocess — that turned out to be wrong empirically:
+# a deep-worker agent driven by claude-code SDK CAN invoke ``ScheduleWakeup``,
+# which parks its turn waiting for a future re-invocation that LangGraph
+# never delivers (same failure shape as ``CronCreate``/``Monitor``).
+#
+# Defence in depth: block the rest of the harness-level family too. Most are
+# only available in specific Claude Code runtimes (claude.ai web, plan-mode
+# enabled sessions, …), but blocking them is free and keeps the contract
+# robust to future Claude Code releases re-routing them through the SDK.
+_HARNESS_LEVEL_TOOLS = (
+    # Wakeup / dynamic-loop tool. Parks the turn waiting for a delayed
+    # re-invocation. Equivalent to ``CronCreate`` in our taxonomy but
+    # with millisecond granularity. Empirically reachable via SDK.
+    "ScheduleWakeup",
+    # Plan-mode tools. Plan mode is a Claude Code feature where the
+    # assistant proposes a plan and the harness gates execution on
+    # user approval. There's no analog in the deep-worker LangGraph
+    # loop — entering plan mode would just hang the turn.
+    "EnterPlanMode",
+    "ExitPlanMode",
+    # Worktree tools. Tied to the Claude Code harness's git-worktree
+    # feature — irrelevant in deep-worker and would create dangling
+    # directories the agent has no mechanism to clean up.
+    "EnterWorktree",
+    "ExitWorktree",
+    # claude.ai onboarding-guide upload tool. Pure UI feature, no place
+    # in an autonomous agent.
+    "ShareOnboardingGuide",
+)
+
+
+@pytest.mark.parametrize("tool_name", _HARNESS_LEVEL_TOOLS)
+def test_harness_level_tool_disallowed(tool_name: str) -> None:
+    """Each harness-level Claude Code tool must be present in
+    BUILT_IN_TOOLS. These are tools that schedule work or pause the
+    turn waiting for external input — deep-worker has no such wait
+    state.
+
+    Regression guard for the 2026-05-15 audit: ``ScheduleWakeup`` was
+    initially documented as runtime-only-unreachable but is in fact
+    invocable from a deep-worker agent. See
+    ``CLAUDE_CODE_BUILTIN_TOOLS_AUDIT.md:139`` for the historical claim
+    that we are now correcting.
+    """
+    from claude_code_provider.client_manager import BUILT_IN_TOOLS
+
+    assert tool_name in BUILT_IN_TOOLS, (
+        f"{tool_name!r} is missing from BUILT_IN_TOOLS. It is a "
+        f"harness-level Claude Code tool that either parks the turn "
+        f"waiting for external input or controls Claude Code UI "
+        f"features that have no deep-worker analog. If the model "
+        f"calls it, deep-worker will incorrectly mark the turn done "
+        f"while a side effect is still pending."
+    )
+
+
 @pytest.mark.parametrize("tool_name", _AUDIT_NEW_TOOLS)
 def test_audit_new_tool_disallowed(tool_name: str) -> None:
     """Each Claude Code built-in identified by the 2026-05-14 audit

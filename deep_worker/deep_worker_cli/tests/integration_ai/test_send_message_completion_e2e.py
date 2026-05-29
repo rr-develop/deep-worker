@@ -19,8 +19,7 @@ What this test does
    is the echo injected by ``SendMessageCompletionMiddleware``.
 4. Verifies the destination agent's history received the prefixed
    message as a ``HumanMessage``.
-5. Replays the exact pair-parser logic from
-   ``deep_worker_web/app/services/agent_service.py::get_agent_dialog_formatted``
+5. Replays the exact pair-parser logic from the web app
    and asserts the outgoing message appears as an assistant response
    in the parsed dialog pairs. This is the end state the user cares
    about.
@@ -47,15 +46,14 @@ from . import agent_fixture
 
 
 # ---------------------------------------------------------------------------
-# Helpers copied verbatim from deep_worker_web for fidelity
+# Helpers copied verbatim from the web app for fidelity
 # ---------------------------------------------------------------------------
 
 
 def _dialog_pairs_from_history(history: list[dict[str, Any]]) -> list[tuple[str, str]]:
-    """Re-implement deep_worker_web's pair parser exactly.
+    """Re-implement the web app's pair parser exactly.
 
-    Keep this logic identical to
-    ``deep_worker_web/app/services/agent_service.py::get_agent_dialog_formatted``
+    Keep this logic identical to the web app's dialog pair parser
     — the whole point of the middleware is to produce messages the
     same parser renders correctly.
     """
@@ -96,14 +94,12 @@ def two_agents():
     with agent_fixture(
         agent_name=_SRC_NAME,
         working_dir=Path("/tmp"),
-        model="deepseek-chat",
         provider="deepseek",
         skip_permissions=True,
         api_key=api_key,
     ) as src, agent_fixture(
         agent_name=_DST_NAME,
         working_dir=Path("/tmp"),
-        model="deepseek-chat",
         provider="deepseek",
         skip_permissions=True,
         api_key=api_key,
@@ -129,10 +125,10 @@ async def test_send_message_to_agent_echoes_and_ends_turn(two_agents):
 
     # --- Step 1: ask source agent to call send_message_to_agent ---
     prompt = (
-        f"Use the send_message_to_agent() tool exactly once "
+        f"Use the send_message_to_agent() tool exactly once, "
         f"to send the agent '{_DST_NAME}' exactly this text (without "
         f"quotes): {_MESSAGE_TEXT}\n\n"
-        f"Do not comment on or write anything else. Just call the tool."
+        f"Do not comment or write anything else. Just call the tool."
     )
 
     import asyncio as _asyncio
@@ -238,7 +234,7 @@ async def test_send_message_to_agent_echoes_and_ends_turn(two_agents):
         f"{latest_tool_content[:300]!r}"
     )
 
-    # --- Step 4: dialog pair parser (deep_worker_web) renders it ---
+    # --- Step 4: dialog pair parser (web app) renders it ---
     pairs = _dialog_pairs_from_history(history)
     assert pairs, (
         "pair-parser must find at least one (user, assistant) pair; "
@@ -247,7 +243,7 @@ async def test_send_message_to_agent_echoes_and_ends_turn(two_agents):
     # The last pair's assistant side must be our echo.
     last_user, last_assistant = pairs[-1]
     assert last_assistant == expected_echo, (
-        f"deep_worker_web's pair parser must render the outgoing message "
+        f"the web app's pair parser must render the outgoing message "
         f"as the assistant reply.\n"
         f"  expected assistant: {expected_echo!r}\n"
         f"  got assistant:      {last_assistant!r}\n"

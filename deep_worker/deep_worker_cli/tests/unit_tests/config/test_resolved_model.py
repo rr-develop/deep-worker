@@ -23,7 +23,7 @@ class TestResolvedModel:
         with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "test-key"}):
             os.environ.pop("DEEPSEEK_MODEL", None)
             config = AgentConfig(working_dir=Path("/tmp"), model=None, provider="deepseek")
-        assert config.resolved_model == "deepseek-chat"
+        assert config.resolved_model == "deepseek-v4-flash"
 
     def test_respects_env_override(self):
         """When model is None, resolved_model checks env var first."""

@@ -30,6 +30,12 @@ def multiply_numbers(a: float, b: float) -> float:
     return a * b
 
 
+@langchain_tool("read_file")
+def read_file_tool(path: str, limit: int) -> str:
+    """Read a file (test stub)."""
+    return f"read {path} limit={limit}"
+
+
 class TestIntegrationSimpleConversation:
     """Integration tests for simple conversation flow without tools."""
 
@@ -147,7 +153,11 @@ class TestIntegrationToolCalls:
                 assert result1.tool_calls[0]["name"] == "add_numbers"
                 assert result1.tool_calls[0]["args"] == {"a": 15, "b": 27}
 
-                # Step 2: Execute tool (in LangGraph, this would be done by ToolNode)
+                # Step 2: Execute tool (in LangGraph, this would be done by ToolNode).
+                # The real ClientManager caches the client after Step 1; keep
+                # this mock integration faithful so the ToolMessage round-trip
+                # is not mistaken for a restart restore.
+                model.client_manager.clients["test-2"] = (mock_client, mock_proxy)
                 tool_result = add_numbers.invoke(result1.tool_calls[0]["args"])
                 assert tool_result == 42.0
 
@@ -388,3 +398,97 @@ class TestIntegrationMessageConversions:
         # Should succeed
         assert isinstance(result, AIMessage)
         assert result.content == "Response"
+
+
+class TestIntegrationDivergentVisibleVsControlArgs:
+    """End-to-end against a REAL ProxyMCPServer (no mocked proxy).
+
+    Reproduces the production failure observed on a live agent (2026-05-26): the visible
+    message-stream ToolUseBlock and the actual MCP control-channel call are
+    the same logical call, but Claude streams slightly different argument
+    JSON in the assistant message than the finalized args delivered to the
+    MCP handler. With strict (tool_name, args) matching this dead-locked for
+    30s and surfaced as agent `error`. The fix waits for ANY handler
+    registration and then surfaces the authoritative control-channel call.
+    """
+
+    @pytest.mark.asyncio
+    async def test_divergent_args_surfaces_control_channel_call(self) -> None:
+        from claude_agent_sdk import ToolUseBlock
+
+        from claude_code_provider.custom_types import ToolMetadata
+        from claude_code_provider.proxy_mcp_server import ProxyMCPServer
+
+        tools_metadata: list[ToolMetadata] = [
+            {
+                "name": "read_file",
+                "description": "Read a file",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "limit": {"type": "integer"},
+                    },
+                },
+            }
+        ]
+        # REAL proxy — its handler registers the authoritative pending call.
+        proxy = ProxyMCPServer(tools_metadata)
+        real_handler = proxy.tool_handlers[0].handler
+
+        model = ClaudeCodeChatModel(base_options=None)
+        model = model.bind_tools([read_file_tool])
+
+        mock_client = Mock()
+        mock_client.query = AsyncMock()
+
+        handler_task: dict[str, Any] = {}
+
+        async def mock_receive() -> Any:
+            # The SDK control channel runs the MCP handler in a SEPARATE task,
+            # concurrently with stream consumption. It invokes the handler with
+            # the FINALIZED args: limit=40 (different from the visible block).
+            handler_task["task"] = asyncio.create_task(
+                real_handler({"path": "/tmp/x.py", "limit": 40})
+            )
+            # Visible block carries the streamed (earlier) args: limit=30.
+            yield ClaudeAssistantMessage(
+                content=[
+                    ToolUseBlock(
+                        id="toolu_read",
+                        name="mcp__deepworker__read_file",
+                        input={"path": "/tmp/x.py", "limit": 30},
+                    )
+                ],
+                model="claude-sonnet-4-5-20250929",
+            )
+
+        mock_client.receive_response = mock_receive
+
+        with patch.object(
+            model.client_manager,
+            "get_or_create_client",
+            return_value=(mock_client, proxy),
+        ):
+            result = await asyncio.wait_for(
+                model.ainvoke(
+                    [HumanMessage(content="read the file")],
+                    config={"configurable": {"thread_id": "test-divergent-e2e"}},
+                ),
+                timeout=5.0,  # MUST NOT hit the 30s control-channel timeout.
+            )
+
+        # ainvoke must surface the AUTHORITATIVE control-channel call (limit=40),
+        # NOT the visible block's args (limit=30), and must NOT deadlock/error.
+        assert isinstance(result, AIMessage)
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["name"] == "read_file"
+        assert result.tool_calls[0]["args"] == {"path": "/tmp/x.py", "limit": 40}
+
+        # Resolve the real handler so its task completes cleanly.
+        for call in proxy.get_pending_calls():
+            proxy.resolve_call(
+                call["id"], {"content": [{"type": "text", "text": "ok"}]}
+            )
+        await handler_task["task"]
+

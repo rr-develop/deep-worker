@@ -24,10 +24,10 @@ agent = create_deep_agent(middleware=[middleware])
 
 ## Storage
 
-Offloaded messages are stored as markdown at `/conversation_history/{thread_id}.md`.
+Offloaded messages are stored as JSONL at `/conversation_history/{thread_id}.jsonl`.
 
-Each summarization event appends a new section to this file, creating a running log
-of all evicted messages.
+Each summarization event appends one JSON object per evicted message to this file,
+creating a lossless structured log of summarized history.
 """
 
 from __future__ import annotations
@@ -48,13 +48,15 @@ from langchain.agents.middleware.summarization import (
     TokenCounter,
 )
 from langchain.tools import ToolRuntime
-from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, RemoveMessage, get_buffer_string
+from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, RemoveMessage
 from langchain_core.messages.utils import count_tokens_approximately, trim_messages
 from langgraph.config import get_config
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from typing_extensions import TypedDict, override
 
 from deepagents.backends.protocol import BackendProtocol
+from deepagents.middleware.message_timestamps import MonotonicUtcClock, ensure_message_created_at, ensure_messages_created_at
+from deepagents.middleware.summarization_history import serialize_summarized_messages_jsonl
 
 if TYPE_CHECKING:
     from langchain.agents.middleware.types import AgentState
@@ -367,10 +369,10 @@ class SummarizationMiddleware(BaseSummarizationMiddleware):
         Returns a single file per thread that gets appended to over time.
 
         Returns:
-            Path string like `'/conversation_history/{thread_id}.md'`
+            Path string like `'/conversation_history/{thread_id}.jsonl'`
         """
         thread_id = self._get_thread_id()
-        return f"{self._history_path_prefix}/{thread_id}.md"
+        return f"{self._history_path_prefix}/{thread_id}.jsonl"
 
     def _is_summary_message(self, msg: AnyMessage) -> bool:
         """Check if a message is a previous summarization message.
@@ -430,12 +432,12 @@ A condensed summary follows:
         else:
             content = f"Here is a summary of the conversation to date:\n\n{summary}"
 
-        return [
-            HumanMessage(
-                content=content,
-                additional_kwargs={"lc_source": "summarization"},
-            )
-        ]
+        summary_message = HumanMessage(
+            content=content,
+            additional_kwargs={"lc_source": "summarization"},
+        )
+        ensure_message_created_at(summary_message, MonotonicUtcClock())
+        return [summary_message]
 
     def _should_truncate_args(self, messages: list[AnyMessage], total_tokens: int) -> bool:
         """Check if argument truncation should be triggered.
@@ -601,8 +603,8 @@ A condensed summary follows:
     ) -> str | None:
         """Persist messages to backend before summarization.
 
-        Appends evicted messages to a single markdown file per thread. Each
-        summarization event adds a new section with a timestamp header.
+        Appends evicted messages to a single JSONL file per thread. Each
+        line stores one losslessly serialized original message.
 
         Previous summary messages are filtered out to avoid redundant storage during
         chained summarization events.
@@ -619,8 +621,12 @@ A condensed summary follows:
         # Filter out previous summary messages to avoid redundant storage
         filtered_messages = self._filter_summary_messages(messages)
 
-        timestamp = datetime.now(UTC).isoformat()
-        new_section = f"## Summarized at {timestamp}\n\n{get_buffer_string(filtered_messages)}\n\n"
+        timestamp = datetime.now(UTC).isoformat(timespec="microseconds")
+        ensure_messages_created_at(filtered_messages, MonotonicUtcClock())
+        new_section = serialize_summarized_messages_jsonl(
+            filtered_messages,
+            summarized_at=timestamp,
+        )
 
         # Read existing content (if any) and append
         # Note: We use download_files() instead of read() because read() returns
@@ -672,8 +678,8 @@ A condensed summary follows:
     ) -> str | None:
         """Persist messages to backend before summarization (async).
 
-        Appends evicted messages to a single markdown file per thread. Each
-        summarization event adds a new section with a timestamp header.
+        Appends evicted messages to a single JSONL file per thread. Each
+        line stores one losslessly serialized original message.
 
         Previous summary messages are filtered out to avoid redundant storage during
         chained summarization events.
@@ -690,8 +696,12 @@ A condensed summary follows:
         # Filter out previous summary messages to avoid redundant storage
         filtered_messages = self._filter_summary_messages(messages)
 
-        timestamp = datetime.now(UTC).isoformat()
-        new_section = f"## Summarized at {timestamp}\n\n{get_buffer_string(filtered_messages)}\n\n"
+        timestamp = datetime.now(UTC).isoformat(timespec="microseconds")
+        ensure_messages_created_at(filtered_messages, MonotonicUtcClock())
+        new_section = serialize_summarized_messages_jsonl(
+            filtered_messages,
+            summarized_at=timestamp,
+        )
 
         # Read existing content (if any) and append
         # Note: We use adownload_files() instead of aread() because read() returns

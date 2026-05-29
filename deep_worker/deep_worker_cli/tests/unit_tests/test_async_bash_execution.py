@@ -101,19 +101,26 @@ class TestAsyncBashExecution:
             assert exit_code == 0, f"{label} failed with exit code {exit_code}"
 
     @pytest.mark.asyncio
-    async def test_timeout_still_works(self):
-        """Test that timeout mechanism still works with async execution."""
+    async def test_timeout_returns_promptly_as_background_job(self):
+        """Timeout must return promptly. NEW behavior (2026-05-21): the
+        command is NOT killed — it becomes a background job and the result
+        offers wait_for_job / kill_job by id. (Was: kill + exit_code 124.)"""
         backend = CLIShellBackend(root_dir=Path("/tmp"), inherit_env=True)
 
-        # Command that sleeps longer than timeout
         start = time.time()
         result = await backend.execute("sleep 10", timeout=1)
         duration = time.time() - start
 
-        # Should timeout after ~1-2 seconds (timeout + graceful termination)
-        assert duration < 3.0, f"Timeout took {duration}s, expected <3s"
-        assert result.exit_code == 124, f"Expected timeout exit code 124, got {result.exit_code}"
-        assert "timed out" in result.output.lower()
+        # Returns right at the timeout, without blocking on the full sleep.
+        assert duration < 3.0, f"Timeout return took {duration}s, expected <3s"
+        assert result.exit_code is None  # still running, not killed
+        assert "job_" in result.output
+        assert "wait_for_job" in result.output
+        assert "kill_job" in result.output
+
+        # Cleanup the still-running background process.
+        job_id = next(iter(backend._jobs))
+        await backend.kill_job(job_id)
 
     @pytest.mark.asyncio
     async def test_command_output_captured(self):

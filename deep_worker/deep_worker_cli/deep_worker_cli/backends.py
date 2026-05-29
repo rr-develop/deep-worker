@@ -40,9 +40,11 @@ When the SDK adds this natively, these subclasses can be removed.
 from __future__ import annotations
 
 import asyncio
+import itertools
 import logging
 import subprocess  # noqa: S404
-from typing import Annotated, cast
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Annotated, cast
 
 from deepagents.backends.composite import CompositeBackend
 from deepagents.backends.local_shell import LocalShellBackend
@@ -63,17 +65,64 @@ from deep_worker_cli.constants import DEFAULT_EXECUTE_TIMEOUT
 
 logger = logging.getLogger(__name__)
 
+if TYPE_CHECKING:
+    from asyncio.subprocess import Process
+
 _TIMEOUT_DESC = (
-    "Optional timeout in seconds. Overrides the default. Use for long-running commands."
+    "Optional timeout in seconds (default 120). On timeout the command is "
+    "NOT killed — it keeps running in the background and you get a job_id. "
+    "Use wait_for_job(job_id) to wait longer or kill_job(job_id) to stop it."
 )
+
+
+@dataclass
+class _BackgroundJob:
+    """A shell command that outlived its execute() timeout and is still
+    running in the background.
+
+    The reader task drains the process pipes to completion and stores the
+    final ``(stdout, stderr)`` in ``result``. Because the task is shielded
+    from the timeout cancellation, the command keeps running after execute()
+    returns — the agent decides whether to ``wait_for_job`` or ``kill_job``.
+    """
+
+    job_id: str
+    command: str
+    proc: "Process"
+    reader: "asyncio.Task[tuple[bytes, bytes]]"
+    started_at: float
+    result: tuple[bytes, bytes] | None = field(default=None)
+
+    @property
+    def finished(self) -> bool:
+        return self.reader.done()
 
 
 class CLIShellBackend(LocalShellBackend):
     """Local shell backend with per-command timeout override support.
 
     Extends `LocalShellBackend` to accept an optional `timeout` keyword on
-    each `execute()` call.
+    each `execute()` call. On timeout the command is NOT killed: it is moved
+    to a per-backend background-job registry and the agent can later
+    ``wait_for_job`` or ``kill_job`` it. The registry lives on the backend
+    instance, which is created once per agent and persists across tool calls.
     """
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)  # type: ignore[arg-type]
+        self._jobs: dict[str, _BackgroundJob] = {}
+        self._job_counter = itertools.count(1)
+
+    def _format_partial(self, stdout: bytes, stderr: bytes) -> str:
+        """Format already-captured output for an in-flight/finished job."""
+        stdout_s = stdout.decode("utf-8", errors="replace") if stdout else ""
+        stderr_s = stderr.decode("utf-8", errors="replace") if stderr else ""
+        parts: list[str] = []
+        if stdout_s:
+            parts.append(stdout_s)
+        if stderr_s:
+            parts.extend(f"[stderr] {ln}" for ln in stderr_s.strip().split("\n"))
+        return "\n".join(parts) if parts else "<no output yet>"
 
     async def execute(  # ty: ignore[invalid-method-override]
         self,
@@ -130,40 +179,60 @@ class CLIShellBackend(LocalShellBackend):
 
         try:
             # Create async subprocess - DOES NOT block event loop!
+            # start_new_session=True puts the command in its OWN process
+            # group so that, if it is later killed as a background job, we can
+            # signal the WHOLE group (shell + its children, e.g. the `sleep`
+            # in `sleep 30 && echo`). Signalling only the shell pid leaks the
+            # child (observed live 2026-05-22).
             proc = await asyncio.create_subprocess_shell(
                 command,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=self._env,
                 cwd=str(self.cwd),
+                start_new_session=True,
             )
 
-            # Wait for process with timeout - event loop remains responsive!
+            # Drain the pipes in a dedicated task so that, if the initial
+            # wait times out, the command can keep running in the background
+            # WITHOUT us cancelling the read (which would lose its output and
+            # require killing the process). ``shield`` lets the timeout fire
+            # while the reader task survives.
+            reader: asyncio.Task[tuple[bytes, bytes]] = asyncio.ensure_future(
+                proc.communicate()
+            )
+
             try:
                 stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                    proc.communicate(),
-                    timeout=effective_timeout
+                    asyncio.shield(reader),
+                    timeout=effective_timeout,
                 )
             except asyncio.TimeoutError:
-                # Kill the process if it times out
-                # Use terminate() first (SIGTERM), then kill() if needed (SIGKILL)
-                try:
-                    proc.terminate()  # Send SIGTERM
-                    try:
-                        await asyncio.wait_for(proc.wait(), timeout=1.0)
-                    except asyncio.TimeoutError:
-                        # Process didn't terminate gracefully, force kill
-                        proc.kill()  # Send SIGKILL
-                        await proc.wait()
-                except ProcessLookupError:
-                    pass  # Process already died
+                # NEW BEHAVIOR (2026-05-21): do NOT kill on timeout. Register
+                # the still-running command as a background job and tell the
+                # agent its job_id + the actions it can take. The agent then
+                # decides: wait_for_job(job_id) to wait longer, or
+                # kill_job(job_id) to stop it.
+                import time as _time
 
+                job_id = f"job_{next(self._job_counter)}"
+                self._jobs[job_id] = _BackgroundJob(
+                    job_id=job_id,
+                    command=command,
+                    proc=proc,
+                    reader=reader,
+                    started_at=_time.monotonic(),
+                )
                 return ExecuteResponse(
                     output=(
-                        f"Error: Command timed out after {effective_timeout} seconds."
-                        " For long-running commands, re-run using the timeout parameter."
+                        f"Command still running after {effective_timeout}s timeout — "
+                        f"it was NOT killed. Background job id: {job_id}\n"
+                        f"  • wait_for_job(job_id=\"{job_id}\", timeout=<seconds>) "
+                        f"to wait for it to finish\n"
+                        f"  • kill_job(job_id=\"{job_id}\") to stop it\n"
+                        f"Command: {command}"
                     ),
-                    exit_code=124,  # Standard timeout exit code
+                    exit_code=None,  # Still running — no exit code yet.
                     truncated=False,
                 )
 
@@ -204,6 +273,120 @@ class CLIShellBackend(LocalShellBackend):
                 truncated=False,
             )
 
+    def _finalize_job(self, job: _BackgroundJob) -> ExecuteResponse:
+        """Build the final ExecuteResponse for a finished background job and
+        drop it from the registry."""
+        stdout_bytes, stderr_bytes = job.reader.result()
+        self._jobs.pop(job.job_id, None)
+        output = self._format_partial(stdout_bytes, stderr_bytes)
+        if output == "<no output yet>":
+            output = "<no output>"
+        truncated = False
+        if len(output) > self._max_output_bytes:
+            output = output[: self._max_output_bytes]
+            output += f"\n\n... Output truncated at {self._max_output_bytes} bytes."
+            truncated = True
+        return ExecuteResponse(
+            output=output,
+            exit_code=job.proc.returncode if job.proc.returncode is not None else 0,
+            truncated=truncated,
+        )
+
+    async def wait_for_job(
+        self, job_id: str, *, timeout: int | None = None
+    ) -> ExecuteResponse:
+        """Wait up to ``timeout`` seconds for a background job to finish.
+
+        Returns the job's full output + exit code when it finishes. If it is
+        still running after ``timeout``, returns a message restating the same
+        wait/kill options — the job is left running.
+        """
+        job = self._jobs.get(job_id)
+        if job is None:
+            return ExecuteResponse(
+                output=f"Error: no background job with id '{job_id}'.",
+                exit_code=1,
+                truncated=False,
+            )
+
+        effective_timeout = timeout if timeout is not None else self._timeout
+        if effective_timeout <= 0:
+            msg = f"timeout must be positive, got {effective_timeout}"
+            raise ValueError(msg)
+
+        try:
+            await asyncio.wait_for(asyncio.shield(job.reader), timeout=effective_timeout)
+        except asyncio.TimeoutError:
+            return ExecuteResponse(
+                output=(
+                    f"Job '{job_id}' is STILL running after waiting "
+                    f"{effective_timeout}s — not killed.\n"
+                    f"  • wait_for_job(job_id=\"{job_id}\", timeout=<seconds>) "
+                    f"to keep waiting\n"
+                    f"  • kill_job(job_id=\"{job_id}\") to stop it\n"
+                    f"Command: {job.command}"
+                ),
+                exit_code=None,
+                truncated=False,
+            )
+
+        return self._finalize_job(job)
+
+    async def kill_job(self, job_id: str) -> ExecuteResponse:
+        """Terminate a background job (SIGTERM, then SIGKILL) and return any
+        output captured before it died."""
+        job = self._jobs.get(job_id)
+        if job is None:
+            return ExecuteResponse(
+                output=f"Error: no background job with id '{job_id}'.",
+                exit_code=1,
+                truncated=False,
+            )
+
+        # Signal the whole process group (the command runs under
+        # start_new_session=True, so its pgid == its pid). This reaches the
+        # shell AND its children (e.g. the `sleep` in `sleep 30 && echo`),
+        # which a bare proc.terminate() would leak. Fall back to the plain
+        # proc signals if the group lookup fails.
+        import os
+        import signal
+
+        def _signal_group(sig: int) -> None:
+            try:
+                os.killpg(os.getpgid(job.proc.pid), sig)
+            except (ProcessLookupError, PermissionError):
+                try:
+                    job.proc.send_signal(sig)
+                except ProcessLookupError:
+                    pass
+
+        try:
+            _signal_group(signal.SIGTERM)
+            try:
+                await asyncio.wait_for(job.proc.wait(), timeout=1.0)
+            except asyncio.TimeoutError:
+                _signal_group(signal.SIGKILL)
+                await job.proc.wait()
+        except ProcessLookupError:
+            pass  # Already dead.
+
+        # The reader task resolves once the pipes close after the kill.
+        try:
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(job.reader, timeout=5.0)
+        except (asyncio.TimeoutError, Exception):  # noqa: BLE001
+            stdout_bytes, stderr_bytes = b"", b""
+        self._jobs.pop(job_id, None)
+
+        captured = self._format_partial(stdout_bytes, stderr_bytes)
+        return ExecuteResponse(
+            output=(
+                f"Job '{job_id}' killed.\n"
+                f"Output captured before kill:\n{captured}"
+            ),
+            exit_code=job.proc.returncode,
+            truncated=False,
+        )
+
 
 def _format_execute_result(result: ExecuteResponse) -> str:
     """Format an `ExecuteResponse` for LLM consumption.
@@ -223,14 +406,73 @@ def _format_execute_result(result: ExecuteResponse) -> str:
     return "".join(parts)
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# 🛑 PROTECTED INVARIANT — DO NOT BREAK (a related internal incident
+# analysis, not included here)
+# ═══════════════════════════════════════════════════════════════════════════
+# The agent's final backend may be wrapped in transparent proxies
+# (PrivateSummariesBackend → CompositeBackend → CLIShellBackend). Resolving the
+# sandbox here is what decides whether the `execute` shell tool works AND
+# whether it is even exposed to the model (see _supports_execution in
+# deepagents/middleware/filesystem.py — the SAME invariant lives there).
+#
+# RULES for anyone (human or agent) editing backend wrapping or this resolver:
+#   1. If you add a NEW backend wrapper, it MUST be unwrappable here — either
+#      expose its inner backend via a `_backend` attribute (the convention
+#      _unwrap_proxy_backend follows) OR update _unwrap_proxy_backend.
+#   2. NEVER replace these `_unwrap_proxy_backend(...)` calls with a bare
+#      `isinstance(backend, CompositeBackend)` — that is exactly the regression
+#      (commit 9b8b570) that silently stripped the `execute` tool from an agent.
+#   3. Mirror ANY change here in deepagents `_supports_execution`.
+# Breakage symptom: agent reports "I have no execute tool" / "backend does not
+# support command execution". Covered by tests/unit_tests/test_sandbox_backend_unwrap.py.
+# ═══════════════════════════════════════════════════════════════════════════
+def _unwrap_proxy_backend(backend: BackendProtocol) -> BackendProtocol:
+    """Peel off transparent proxy wrappers to reach the wrapped backend.
+
+    Some backends are proxies that delegate to an inner backend held in
+    ``_backend`` (e.g. ``PrivateSummariesBackend``, summaries.py). Such a
+    proxy subclasses ``BackendProtocol`` — NOT ``CompositeBackend`` — so the
+    composite/sandbox ``isinstance`` checks below do not see through it. We
+    follow the ``_backend`` chain so a proxy(composite(sandbox)) still resolves
+    to the sandbox. See a related internal incident analysis (not included here).
+
+    Iterative + visited-set so a self-referential or cyclic wrapper can never
+    spin. We stop at the first non-proxy (composite/sandbox/plain) backend.
+    """
+    seen: set[int] = set()
+    current = backend
+    # A "proxy" here = has a private ``_backend`` AND is not itself a structural
+    # backend type we know how to introspect (composite/sandbox). This avoids
+    # accidentally unwrapping a real backend that merely happens to expose a
+    # ``_backend`` attribute.
+    while (
+        not isinstance(current, (CompositeBackend, SandboxBackendProtocol))
+        and hasattr(current, "_backend")
+        and id(current) not in seen
+    ):
+        seen.add(id(current))
+        inner = getattr(current, "_backend", None)
+        if inner is None or inner is current:
+            break
+        current = inner
+    return current
+
+
 def _get_sandbox_backend(
     backend: BackendProtocol,
 ) -> SandboxBackendProtocol | None:
-    """Unwrap a `CompositeBackend` to find the sandbox backend.
+    """Unwrap proxy + `CompositeBackend` layers to find the sandbox backend.
 
     `CompositeBackend.execute()` delegates to `self.default.execute()` but
     doesn't forward extra kwargs like `timeout`. This helper reaches through
     to the actual sandbox backend so we can call `execute(timeout=...)` on it.
+
+    It first peels transparent proxy wrappers (``_backend`` chain, e.g.
+    ``PrivateSummariesBackend``) — without this, an agent whose final backend
+    is ``PrivateSummariesBackend(CompositeBackend(CLIShellBackend))`` resolves
+    to ``None`` and ``execute`` wrongly reports "backend does not support
+    command execution" (see a related internal incident analysis).
 
     The returned backend must support a `timeout` kwarg on `execute()`
     (e.g., `CLIShellBackend`). The base `SandboxBackendProtocol` does not
@@ -238,13 +480,15 @@ def _get_sandbox_backend(
     subclass.
 
     Args:
-        backend: The resolved backend, possibly a `CompositeBackend`.
+        backend: The resolved backend, possibly proxy- and/or composite-wrapped.
 
     Returns:
         The sandbox backend if found, `None` otherwise.
     """
+    backend = _unwrap_proxy_backend(backend)
     if isinstance(backend, CompositeBackend):
-        default = backend.default
+        # The composite's default may itself be proxy-wrapped.
+        default = _unwrap_proxy_backend(backend.default)
         if isinstance(default, SandboxBackendProtocol):
             return default
         logger.warning(
@@ -259,11 +503,33 @@ def _get_sandbox_backend(
 
 
 class CLIFilesystemMiddleware(FilesystemMiddleware):
-    """Filesystem middleware with per-command timeout on the execute tool.
+    """Filesystem middleware with per-command timeout on the execute tool
+    plus background-job control.
 
-    Overrides `_create_execute_tool` to expose a `timeout` parameter in the
-    tool schema so the LLM can pass it for long-running commands.
+    - Overrides `_create_execute_tool` to expose a `timeout` parameter so the
+      LLM can pass it for long-running commands.
+    - Adds `wait_for_job` and `kill_job` tools so that when `execute` times
+      out (and the command keeps running in the background — see
+      `CLIShellBackend`), the agent can wait for it or stop it by job_id.
     """
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)  # type: ignore[arg-type]
+        # Expose the background-job tools alongside the filesystem tools.
+        # ``self.tools`` is built by the base ``__init__`` (it already
+        # includes our overridden ``execute``); appending here means the
+        # new tools flow through the same registration path that surfaces
+        # ``execute`` to the model (incl. the claude-code proxy MCP).
+        self.tools = [*self.tools, self._create_wait_for_job_tool(), self._create_kill_job_tool()]
+
+    def _resolve_sandbox(
+        self, runtime: ToolRuntime[None, FilesystemState]
+    ) -> "CLIShellBackend | None":
+        """Resolve the CLIShellBackend for job tools, or None if unavailable."""
+        proto = _get_sandbox_backend(self._get_backend(runtime))
+        if proto is None or not isinstance(proto, CLIShellBackend):
+            return None
+        return proto
 
     def _create_execute_tool(self) -> BaseTool:
         """Create the execute tool with an additional `timeout` parameter.
@@ -383,6 +649,115 @@ class CLIFilesystemMiddleware(FilesystemMiddleware):
             description=tool_description,
             func=sync_execute,
             coroutine=async_execute,
+        )
+
+    def _create_wait_for_job_tool(self) -> BaseTool:
+        """Tool to wait for a background job (created when execute timed out)."""
+
+        _NOT_AVAILABLE = (
+            "Error: background jobs are not available — this agent's backend "
+            "does not support command execution."
+        )
+
+        def _run_sync(job_id: str, timeout: int | None, runtime: ToolRuntime[None, FilesystemState]) -> str:
+            sandbox = self._resolve_sandbox(runtime)
+            if sandbox is None:
+                return _NOT_AVAILABLE
+            try:
+                loop = asyncio.get_running_loop()
+                future = asyncio.run_coroutine_threadsafe(
+                    sandbox.wait_for_job(job_id, timeout=timeout), loop
+                )
+                result = future.result()
+            except RuntimeError:
+                result = asyncio.run(sandbox.wait_for_job(job_id, timeout=timeout))
+            except ValueError as e:
+                return f"Error: Invalid parameter. {e}"
+            return _format_execute_result(result)
+
+        def sync_wait(
+            job_id: Annotated[str, "Background job id returned by execute on timeout."],
+            runtime: ToolRuntime[None, FilesystemState],
+            timeout: Annotated[
+                int | None,
+                "Seconds to wait (default 120). If still running after this, "
+                "you get the job_id back and can wait again or kill it.",
+            ] = None,
+        ) -> str:
+            return _run_sync(job_id, timeout, runtime)
+
+        async def async_wait(
+            job_id: Annotated[str, "Background job id returned by execute on timeout."],
+            runtime: ToolRuntime[None, FilesystemState],
+            timeout: Annotated[  # noqa: ASYNC109
+                int | None,
+                "Seconds to wait (default 120). If still running after this, "
+                "you get the job_id back and can wait again or kill it.",
+            ] = None,
+        ) -> str:
+            sandbox = self._resolve_sandbox(runtime)
+            if sandbox is None:
+                return _NOT_AVAILABLE
+            try:
+                result = await sandbox.wait_for_job(job_id, timeout=timeout)
+            except ValueError as e:
+                return f"Error: Invalid parameter. {e}"
+            return _format_execute_result(result)
+
+        return StructuredTool.from_function(
+            name="wait_for_job",
+            description=(
+                "Wait for a background shell job (created when `execute` timed "
+                "out) to finish, up to `timeout` seconds. Returns its output "
+                "and exit code if it finishes, or the job_id again (still "
+                "running) so you can wait more or kill it."
+            ),
+            func=sync_wait,
+            coroutine=async_wait,
+        )
+
+    def _create_kill_job_tool(self) -> BaseTool:
+        """Tool to kill a background job (created when execute timed out)."""
+
+        _NOT_AVAILABLE = (
+            "Error: background jobs are not available — this agent's backend "
+            "does not support command execution."
+        )
+
+        def sync_kill(
+            job_id: Annotated[str, "Background job id returned by execute on timeout."],
+            runtime: ToolRuntime[None, FilesystemState],
+        ) -> str:
+            sandbox = self._resolve_sandbox(runtime)
+            if sandbox is None:
+                return _NOT_AVAILABLE
+            try:
+                loop = asyncio.get_running_loop()
+                future = asyncio.run_coroutine_threadsafe(sandbox.kill_job(job_id), loop)
+                result = future.result()
+            except RuntimeError:
+                result = asyncio.run(sandbox.kill_job(job_id))
+            return _format_execute_result(result)
+
+        async def async_kill(
+            job_id: Annotated[str, "Background job id returned by execute on timeout."],
+            runtime: ToolRuntime[None, FilesystemState],
+        ) -> str:
+            sandbox = self._resolve_sandbox(runtime)
+            if sandbox is None:
+                return _NOT_AVAILABLE
+            result = await sandbox.kill_job(job_id)
+            return _format_execute_result(result)
+
+        return StructuredTool.from_function(
+            name="kill_job",
+            description=(
+                "Terminate a background shell job (created when `execute` timed "
+                "out) by its job_id. Returns any output captured before it was "
+                "stopped."
+            ),
+            func=sync_kill,
+            coroutine=async_kill,
         )
 
 

@@ -24,8 +24,9 @@ def _read_agent_status(data_dir: Path) -> str:
     """Read agent status from session_metadata.json.
 
     Returns:
-        Status string ("idle", "running", "waiting_input", "error", "shutdown").
-        Defaults to "idle" if file missing or unreadable.
+        Status string — one of the ``AgentStatus`` enum values:
+        "idle", "running", "waiting_input", "interrupted", "error",
+        "shutdown". Defaults to "idle" if file missing or unreadable.
     """
     metadata_file = data_dir / "session_metadata.json"
     try:
@@ -48,7 +49,8 @@ async def stop_agent(
         name: Agent name.
         registry: ProcessRegistry to look up agent.
         data_dir: Agent data directory (for reading status).
-                  Defaults to the per-agent data directory.
+                  Defaults to the agent's data directory under the
+                  user's home.
         timeout: Seconds to wait for process to exit after SIGTERM.
 
     Returns:

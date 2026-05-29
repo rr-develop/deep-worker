@@ -5,9 +5,9 @@ This test file verifies the CLI commands work end-to-end:
 - deep-worker --history <thread-id>
 - deep-worker --remove-before <date>
 
-Tests run against an isolated ~/.deepagents (HOME-override) so they
+Tests run against an isolated agent data directory (HOME-override) so they
 exercise the per-agent DB layout that is now the primary storage.  They
-do not touch the developer's real ~/.deepagents.
+do not touch the developer's real agent data directory.
 """
 from __future__ import annotations
 
@@ -25,27 +25,35 @@ import pytest
 
 CHECKPOINT_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS checkpoints (
-    thread_id TEXT,
-    checkpoint_id TEXT,
+    thread_id TEXT NOT NULL,
+    checkpoint_ns TEXT NOT NULL DEFAULT '',
+    checkpoint_id TEXT NOT NULL,
     parent_checkpoint_id TEXT,
-    checkpoint_ns TEXT,
     type TEXT,
     checkpoint BLOB,
-    metadata TEXT
+    metadata TEXT,
+    PRIMARY KEY (thread_id, checkpoint_ns, checkpoint_id)
 )
 """
 
 WRITES_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS writes (
-    thread_id TEXT,
-    task_id TEXT
+    thread_id TEXT NOT NULL,
+    checkpoint_ns TEXT NOT NULL DEFAULT '',
+    checkpoint_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    idx INTEGER NOT NULL DEFAULT 0,
+    channel TEXT NOT NULL,
+    type TEXT,
+    value BLOB,
+    PRIMARY KEY (thread_id, checkpoint_ns, checkpoint_id, task_id, idx)
 )
 """
 
 
 @pytest.fixture
 def isolated_home(tmp_path):
-    """Give the subprocess a private ~/.deepagents."""
+    """Give the subprocess a private agent data directory."""
     home = tmp_path / "home"
     (home / ".deepagents").mkdir(parents=True)
     yield home
@@ -85,8 +93,10 @@ async def _seed_checkpoint(
                 messages.append({"type": "human", "content": content})
             if ai_content is not None:
                 messages.append({"type": "ai", "content": ai_content})
+            checkpoint_id = f"cp-{thread_id}"
             checkpoint_data = json.dumps(
                 {
+                    "id": checkpoint_id,
                     "ts": updated_at or datetime.now(UTC).isoformat(),
                     "channel_values": {"messages": messages},
                 }
@@ -99,15 +109,16 @@ async def _seed_checkpoint(
             metadata["updated_at"] = updated_at
         metadata_str = json.dumps(metadata) if metadata else "{}"
 
+        checkpoint_id = f"cp-{thread_id}"
         await conn.execute(
             """
             INSERT INTO checkpoints
-            (thread_id, checkpoint_id, type, checkpoint, metadata, parent_checkpoint_id)
-            VALUES (?, ?, ?, ?, ?, ?)
+            (thread_id, checkpoint_ns, checkpoint_id, type, checkpoint, metadata, parent_checkpoint_id)
+            VALUES (?, '', ?, ?, ?, ?, ?)
             """,
             (
                 thread_id,
-                f"cp-{thread_id}",
+                checkpoint_id,
                 "json" if checkpoint_data else None,
                 checkpoint_data,
                 metadata_str,

@@ -31,10 +31,15 @@ class TestCreateModelWithParameters:
 
         `create_model` reads the API key from the module-level
         `settings` singleton (`settings.deepseek_api_key`), which is
-        populated on first import from `~/.deepagents/.env`. A plain
+        populated on first import from `<agent-data-dir>/.env`. A plain
         `monkeypatch.setenv(...)` does NOT retroactively update a
         singleton that's already been built, so tests must patch
         `deep_worker_cli.config.settings` directly.
+
+        NOTE: deepseek now uses ``langchain_deepseek.ChatDeepSeek`` (not bare
+        ChatOpenAI) so reasoning_content round-trips for the v4-flash thinking
+        model (incident observed 2026-05-22). ChatDeepSeek uses ``api_base`` (not
+        ``base_url``).
         """
         from deep_worker_cli.config import create_model
 
@@ -48,17 +53,17 @@ class TestCreateModelWithParameters:
             mock_settings.model_name = None
             mock_settings.model_provider = None
 
-            with patch("langchain_openai.ChatOpenAI") as mock_openai:
+            with patch("deep_worker_cli.deepseek_model.ReasoningChatDeepSeek") as mock_ds:
                 mock_model = MagicMock()
-                mock_openai.return_value = mock_model
+                mock_ds.return_value = mock_model
 
                 result = create_model(provider="deepseek", model_name="deepseek-chat")
 
-                # Should create ChatOpenAI with deepseek config
-                mock_openai.assert_called_once()
-                call_kwargs = mock_openai.call_args[1]
+                # Should create ChatDeepSeek with deepseek config
+                mock_ds.assert_called_once()
+                call_kwargs = mock_ds.call_args[1]
                 assert call_kwargs["model"] == "deepseek-chat"
-                assert call_kwargs["base_url"] == "https://api.deepseek.com"
+                assert call_kwargs["api_base"] == "https://api.deepseek.com"
                 assert call_kwargs["api_key"] == "sk-test-deepseek"
                 assert result == mock_model
 
@@ -113,16 +118,16 @@ class TestCreateModelWithParameters:
 
         from deep_worker_cli.config import create_model
 
-        with patch("langchain_openai.ChatOpenAI") as mock_openai:
+        with patch("deep_worker_cli.deepseek_model.ReasoningChatDeepSeek") as mock_ds:
             mock_model = MagicMock()
-            mock_openai.return_value = mock_model
+            mock_ds.return_value = mock_model
 
             # Call without parameters - should auto-detect deepseek
             result = create_model()
 
-            # Should auto-detect and use deepseek
-            mock_openai.assert_called_once()
-            call_kwargs = mock_openai.call_args[1]
+            # Should auto-detect and use deepseek (via ChatDeepSeek)
+            mock_ds.assert_called_once()
+            call_kwargs = mock_ds.call_args[1]
             assert "deepseek" in call_kwargs["model"]
             assert result == mock_model
 
@@ -157,16 +162,16 @@ class TestCreateModelWithParameters:
 
         from deep_worker_cli.config import create_model
 
-        with patch("langchain_openai.ChatOpenAI") as mock_openai:
+        with patch("deep_worker_cli.deepseek_model.ReasoningChatDeepSeek") as mock_ds:
             mock_model = MagicMock()
-            mock_openai.return_value = mock_model
+            mock_ds.return_value = mock_model
 
             # Use old parameter name
             result = create_model(model_name_override="deepseek-chat")
 
             # Should still work
-            mock_openai.assert_called_once()
-            call_kwargs = mock_openai.call_args[1]
+            mock_ds.assert_called_once()
+            call_kwargs = mock_ds.call_args[1]
             assert call_kwargs["model"] == "deepseek-chat"
             assert result == mock_model
 
@@ -191,9 +196,9 @@ class TestCreateModelWithParameters:
 
         from deep_worker_cli.config import create_model
 
-        with patch("langchain_openai.ChatOpenAI") as mock_openai:
+        with patch("deep_worker_cli.deepseek_model.ReasoningChatDeepSeek") as mock_ds:
             mock_model = MagicMock()
-            mock_openai.return_value = mock_model
+            mock_ds.return_value = mock_model
 
             # Both parameters provided - model_name should win
             result = create_model(
@@ -202,10 +207,123 @@ class TestCreateModelWithParameters:
                 model_name_override="ignored-model"
             )
 
-            mock_openai.assert_called_once()
-            call_kwargs = mock_openai.call_args[1]
+            mock_ds.assert_called_once()
+            call_kwargs = mock_ds.call_args[1]
             assert call_kwargs["model"] == "deepseek-chat"  # Not "ignored-model"
             assert result == mock_model
+
+    # ── user parameter tests ──────────────────────────────────────────
+
+    def test_create_model_deepseek_with_user(self, monkeypatch):
+        """Should pass user via model_kwargs when user param is provided."""
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-deepseek")
+
+        from deep_worker_cli.config import create_model
+
+        with patch("deep_worker_cli.deepseek_model.ReasoningChatDeepSeek") as mock_ds:
+            mock_model = MagicMock()
+            mock_ds.return_value = mock_model
+
+            create_model(
+                provider="deepseek",
+                model_name="deepseek-v4-flash",
+                user="my_agent",
+            )
+
+            mock_ds.assert_called_once()
+            call_kwargs = mock_ds.call_args[1]
+            assert call_kwargs["model"] == "deepseek-v4-flash"
+            assert call_kwargs["model_kwargs"] == {"user": "my_agent"}
+
+    def test_create_model_deepseek_with_user_tm(self, monkeypatch):
+        """Should pass user=agent_name:tm for TaskManager."""
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-deepseek")
+
+        from deep_worker_cli.config import create_model
+
+        with patch("deep_worker_cli.deepseek_model.ReasoningChatDeepSeek") as mock_ds:
+            mock_model = MagicMock()
+            mock_ds.return_value = mock_model
+
+            create_model(
+                provider="deepseek",
+                model_name="deepseek-v4-flash",
+                user="my_agent:tm",
+            )
+
+            mock_ds.assert_called_once()
+            call_kwargs = mock_ds.call_args[1]
+            assert call_kwargs["model_kwargs"] == {"user": "my_agent:tm"}
+
+    def test_create_model_deepseek_without_user(self, monkeypatch):
+        """Should NOT set model_kwargs when user param is None."""
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-deepseek")
+
+        from deep_worker_cli.config import create_model
+
+        with patch("deep_worker_cli.deepseek_model.ReasoningChatDeepSeek") as mock_ds:
+            mock_model = MagicMock()
+            mock_ds.return_value = mock_model
+
+            create_model(
+                provider="deepseek",
+                model_name="deepseek-v4-flash",
+                user=None,
+            )
+
+            mock_ds.assert_called_once()
+            call_kwargs = mock_ds.call_args[1]
+            # No user → model_kwargs is omitted entirely (ChatDeepSeek rejects
+            # model_kwargs=None, so we only pass it when there is a user).
+            assert call_kwargs.get("model_kwargs") is None
+
+    def test_create_model_openai_ignores_user(self, monkeypatch):
+        """Should NOT pass user for openai provider even when specified."""
+        from deep_worker_cli.config import create_model
+
+        with patch("deep_worker_cli.config.settings") as mock_settings:
+            mock_settings.has_openai = True
+            mock_settings.openai_api_key = "sk-test-openai"
+            mock_settings.model_name = None
+            mock_settings.model_provider = None
+
+            with patch("langchain_openai.ChatOpenAI") as mock_openai:
+                mock_model = MagicMock()
+                mock_openai.return_value = mock_model
+
+                create_model(
+                    provider="openai",
+                    model_name="gpt-4o",
+                    user="my_agent",  # Should be ignored
+                )
+
+                mock_openai.assert_called_once()
+                call_kwargs = mock_openai.call_args[1]
+                # model_kwargs should NOT contain user
+                mkw = call_kwargs.get("model_kwargs", {})
+                assert "user" not in mkw
+
+    def test_create_model_deepseek_default_model_with_user(self, monkeypatch):
+        """Should work with default deepseek model name and user param."""
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-deepseek")
+
+        from deep_worker_cli.config import create_model
+
+        with patch("deep_worker_cli.deepseek_model.ReasoningChatDeepSeek") as mock_ds:
+            mock_model = MagicMock()
+            mock_ds.return_value = mock_model
+
+            # Simulate what agent_process.py does: no model_name, with user
+            create_model(
+                provider="deepseek",
+                model_name=None,  # Will resolve to deepseek-v4-flash
+                user="test_agent",
+            )
+
+            mock_ds.assert_called_once()
+            call_kwargs = mock_ds.call_args[1]
+            assert call_kwargs["model"] == "deepseek-v4-flash"
+            assert call_kwargs["model_kwargs"] == {"user": "test_agent"}
 
 
 class TestCreateModelProviderValidation:
@@ -217,14 +335,14 @@ class TestCreateModelProviderValidation:
 
         from deep_worker_cli.config import create_model
 
-        with patch("langchain_openai.ChatOpenAI") as mock_openai:
-            mock_openai.return_value = MagicMock()
+        with patch("deep_worker_cli.deepseek_model.ReasoningChatDeepSeek") as mock_ds:
+            mock_ds.return_value = MagicMock()
 
             # provider=None should trigger auto-detection
             create_model(provider=None, model_name="deepseek-chat")
 
-            # Should auto-detect deepseek
-            assert mock_openai.called
+            # Should auto-detect deepseek (via ChatDeepSeek)
+            assert mock_ds.called
 
     def test_create_model_with_none_model_name_uses_env_default(self, monkeypatch):
         """Should use environment default when model_name=None."""
@@ -233,11 +351,11 @@ class TestCreateModelProviderValidation:
 
         from deep_worker_cli.config import create_model
 
-        with patch("langchain_openai.ChatOpenAI") as mock_openai:
-            mock_openai.return_value = MagicMock()
+        with patch("deep_worker_cli.deepseek_model.ReasoningChatDeepSeek") as mock_ds:
+            mock_ds.return_value = MagicMock()
 
             # model_name=None should use DEEPSEEK_MODEL env var
             create_model(provider="deepseek", model_name=None)
 
-            call_kwargs = mock_openai.call_args[1]
+            call_kwargs = mock_ds.call_args[1]
             assert call_kwargs["model"] == "deepseek-reasoner"

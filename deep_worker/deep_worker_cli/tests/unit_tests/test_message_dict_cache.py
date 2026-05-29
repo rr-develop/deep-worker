@@ -59,6 +59,34 @@ class TestSerializerPure:
         assert out["name"] == "grep"
         assert out["content"] == "ok"
 
+    def test_message_created_at_is_serialized(self) -> None:
+        msg = HumanMessage(
+            content="hello",
+            id="h1",
+            additional_kwargs={"created_at": "2026-05-28T12:00:00.000000+00:00"},
+        )
+
+        out = serialize_message(msg)
+
+        assert out["created_at"] == "2026-05-28T12:00:00.000000+00:00"
+
+    def test_tool_call_created_at_is_serialized(self) -> None:
+        tc = {"id": "call_1", "name": "grep", "args": {"q": "x"}}
+        msg = AIMessage(
+            content="running grep",
+            id="a2",
+            tool_calls=[tc],
+            additional_kwargs={
+                "tool_call_created_at": {
+                    "call_1": "2026-05-28T12:00:00.000000+00:00"
+                }
+            },
+        )
+
+        out = serialize_message(msg)
+
+        assert out["tool_calls"][0]["created_at"] == "2026-05-28T12:00:00.000000+00:00"
+
 
 class TestMessageDictCache:
     def test_first_call_populates_cache(self) -> None:

@@ -36,6 +36,12 @@ class TestFullModelNames:
     def test_deepseek_chat(self):
         assert get_model_context_limit("deepseek-chat", None) == 128_000
 
+    def test_deepseek_v4_flash(self):
+        assert get_model_context_limit("deepseek-v4-flash", None) == 1_000_000
+
+    def test_deepseek_v4_pro(self):
+        assert get_model_context_limit("deepseek-v4-pro", None) == 1_000_000
+
     def test_unknown_model_returns_default(self):
         assert get_model_context_limit("some-unknown-model", None) == 100_000
 

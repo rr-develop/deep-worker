@@ -67,20 +67,28 @@ _TM_AGENT_NAME = "test_taskmanager_tui"
 
 
 @pytest.fixture
-def tm_agent():
+def tm_agent(request: pytest.FixtureRequest):
     """Auto-start a fresh deep-worker agent with TaskManager (-tm) enabled.
+
+    Cleanup policy (per user mandate):
+      * test passed → terminate the agent
+      * test failed → preserve the agent (debug via ``dwcli``)
+      * pytest killed before teardown → safety-net sweep in
+        ``conftest.pytest_sessionfinish`` still terminates passed agents.
 
     This fixture:
     1. Kills any existing agent with the test name
     2. Cleans up data directories for a fresh start
     3. Starts the agent with --skip-permissions and -tm flags
     4. Waits for the agent to register in ProcessRegistry
-    5. Yields the agent name
-    6. Kills the agent on teardown
+    5. Registers the agent with the session-finish sweeper
+    6. Yields the agent name
+    7. Applies the cleanup policy on teardown
 
-    Working directory is /tmp to prevent junk files in the source tree.
+    Working directory is /tmp to prevent junk files in the repository tree.
     """
     from deep_worker_cli.process.registry import ProcessRegistry
+    from .conftest import register_test_agent
 
     agent_name = _TM_AGENT_NAME
     agent_process = None
@@ -151,10 +159,24 @@ def tm_agent():
             "Check that 'deep-worker' is installed and working."
         )
 
+    # Tell the session-finish sweeper about this agent so a SIGKILL'd
+    # pytest can still clean up if the test passed.
+    register_test_agent(agent_name, request.node, created_by_fixture=True)
+
     yield agent_name
 
-    # Teardown: kill agent
-    logger.info(f"Tearing down agent '{agent_name}'")
+    # Teardown: passed → kill, failed → preserve. The sessionfinish
+    # sweeper is the safety net for the case where yield-teardown
+    # never runs at all.
+    rep_call = getattr(request.node, "rep_call", None)
+    if rep_call is not None and not rep_call.passed:
+        logger.warning(
+            f"Test FAILED → preserving agent '{agent_name}' for debugging. "
+            f"Connect with: dwcli {agent_name}"
+        )
+        return
+
+    logger.info(f"Test passed → terminating agent '{agent_name}'")
     if agent_process and agent_process.poll() is None:
         try:
             agent_process.terminate()
@@ -168,20 +190,19 @@ def tm_agent():
 # Prompt for TaskManager tests
 # ============================================================================
 
-# This prompt is designed to be specific enough that the TaskManager will
-# verify compliance with multiple requirements. DeepSeek is less capable than
-# Claude Sonnet 4.5 and is unlikely to satisfy ALL requirements on the first try,
-# triggering TaskManager to send corrective prompts.
+# Standard TaskManager test prompt: deterministically forces multiple TM
+# iterations regardless of how capable the underlying model is. The agent
+# is instructed to report partial progress (30% → 50% → 70% → done) across
+# several turns, which guarantees that the TaskManager evaluation loop
+# produces at least three "TaskManager:> ..." corrective prompts that the
+# TUI must broadcast in real time.
 # NOTE: Must be single-line for TUI terminal emulator (newlines trigger Enter)
 _TM_TEST_PROMPT = (
-    "Write a Python function called `add_numbers` that adds two numbers. "
-    "Your response MUST include ALL of the following: "
-    "1. A complete docstring with Args section, Returns section, and Raises section "
-    "2. Type hints for all parameters and return value "
-    "3. Input validation that raises TypeError for non-numeric inputs "
-    "4. At least two concrete usage examples in the docstring "
-    "5. A brief comment explaining why this function is useful "
-    "Make sure every single requirement above is present in your response."
+    "Test. If you are asked to complete a task fully or partially, "
+    "you must first reply that you completed the task at 30% (and wait "
+    "for the next request), then 50% (and wait for the next request), "
+    "then 70% (and wait for the next request) then that you completed "
+    "the task fully. Complete this test task."
 )
 
 
@@ -213,16 +234,6 @@ def test_taskmanager_messages_visible_in_tui(tm_agent):
       from TaskManager is broadcast and appears in the TUI.
     """
     agent_name = tm_agent
-
-    # CRITICAL: Delete /tmp/add_numbers.py to ensure TaskManager generates corrective prompts
-    # If the file already exists with correct content, TaskManager will evaluate as "done"
-    # on first iteration without sending any corrective prompts
-    import os
-    try:
-        os.remove("/tmp/add_numbers.py")
-        logger.info("Deleted /tmp/add_numbers.py to ensure fresh start")
-    except FileNotFoundError:
-        pass
 
     # Open a TUI session connected to the TM-enabled agent
     session = DwcliTerminalSession(
@@ -437,10 +448,10 @@ def test_taskmanager_no_duplicate_messages():
 
     # Test prompt that triggers multiple TaskManager iterations with specific progress markers
     test_prompt = (
-        "A test. If you are asked to finish the task completely or partially, then you "
-        "must first answer that you have completed the task by 30% (and wait for the next "
-        "request), then by 50% (and wait for the next request), then by 70% (and "
-        "wait for the next request) and then that you have completed the task completely. Finish "
+        "Test. If you are asked to complete a task fully or partially, you "
+        "must first reply that you completed the task at 30% (and wait for the next "
+        "request), then 50% (and wait for the next request), then 70% (and "
+        "wait for the next request) then that you completed the task fully. Complete "
         "this test task"
     )
 
@@ -493,7 +504,7 @@ def test_taskmanager_no_duplicate_messages():
             if not found:
                 pytest.fail("No TaskManager messages appeared in TUI")
 
-            # Wait for task completion (when "100%" or "completely" appears)
+            # Wait for task completion (when "100%" or "fully" appears)
             logger.info("Waiting for task completion...")
             time.sleep(30.0)  # Give time for multiple iterations
 

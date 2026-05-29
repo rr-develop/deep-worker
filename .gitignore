@@ -20,7 +20,7 @@ secrets/
 # ============================================================
 # SENSITIVE DATA
 # ============================================================
-# Google API keys (must never be in git)
+# Google API keys (should not be in git)
 *service-account*.json
 *-key.json
 *.service-account*
@@ -78,6 +78,9 @@ Thumbs.db
 # Vector index (generated, NEVER commit!)
 .vector_index/
 
+# AI coding agent generated prompt override
+AGENTS.override.md
+
 # Test outputs
 test_output/
 *.test
@@ -88,3 +91,4 @@ tests/screenshots/
 # Backup files
 *.backup
 *.backup.*
+

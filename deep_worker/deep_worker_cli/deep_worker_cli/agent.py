@@ -51,6 +51,9 @@ from deep_worker_cli.config import (
 )
 from deep_worker_cli.integrations.sandbox_factory import get_default_working_dir
 from deep_worker_cli.local_context import LocalContextMiddleware
+from deep_worker_cli.middleware.dangling_tool_calls import (
+    DanglingToolCallMiddleware,
+)
 from deep_worker_cli.subagents import list_subagents
 
 DEFAULT_AGENT_NAME = "agent"
@@ -407,6 +410,20 @@ def _format_execute_description(
     return f"Execute Command: {command}"
 
 
+def _format_restart_agent_description(
+    tool_call: ToolCall, _state: AgentState[Any], _runtime: Runtime[Any]
+) -> str:
+    args = tool_call["args"]
+    target = args.get("agent_name", "unknown")
+    glyphs = get_glyphs()
+    return (
+        f"Target Agent: {target}\n\n"
+        f"{glyphs.warning}  This may stop and restart an idle/waiting deep-worker agent "
+        f"using deep-worker --restart. Approve only when the user or procedure "
+        f"explicitly requires this agent to be running."
+    )
+
+
 def _format_send_message_to_agent_description(
     tool_call: ToolCall, _state: AgentState[Any], _runtime: Runtime[Any]
 ) -> str:
@@ -497,6 +514,11 @@ def _add_interrupt_on(
         "description": _format_send_message_to_agent_description,
     }
 
+    restart_agent_interrupt_config: InterruptOnConfig = {
+        "allowed_decisions": ["approve", "reject"],
+        "description": _format_restart_agent_description,
+    }
+
     result: dict[str, InterruptOnConfig] = {
         "execute": execute_interrupt_config,
         "write_file": write_file_interrupt_config,
@@ -504,6 +526,7 @@ def _add_interrupt_on(
         "web_search": web_search_interrupt_config,
         "fetch_url": fetch_url_interrupt_config,
         "task": task_interrupt_config,
+        "restart_agent": restart_agent_interrupt_config,
     }
 
     # Only gate send_message_to_agent when we are NOT explicitly told to
@@ -513,6 +536,62 @@ def _add_interrupt_on(
         result["send_message_to_agent"] = send_message_to_agent_interrupt_config
 
     return result
+
+
+def _maybe_add_delivery_resolve_middleware(
+    agent_middleware: list[Any], model: "str | BaseChatModel",
+) -> None:
+    """Append the claude-code delivery-resolve middleware iff ``model`` is a
+    ``ClaudeCodeChatModel``.
+
+    The proxy-MCP early-resolve knowledge lives in the claude_code_provider
+    layer (``InterAgentDeliveryResolveMiddleware``); other providers (codex,
+    deepseek) and plain string models get nothing. Best-effort: if the
+    provider package can't be imported, leave the stack unchanged rather than
+    breaking agent construction.
+    """
+    try:
+        from claude_code_provider import ClaudeCodeChatModel
+        from claude_code_provider.delivery_resolve_middleware import (
+            InterAgentDeliveryResolveMiddleware,
+        )
+    except Exception:  # noqa: BLE001 — provider optional / import path issue
+        return
+    if isinstance(model, ClaudeCodeChatModel):
+        agent_middleware.append(InterAgentDeliveryResolveMiddleware(model))
+
+
+def _dedupe_tools_by_name_priority(
+    tools: Sequence[Any],
+) -> list[Any]:
+    """Keep the FIRST tool for each name; drop later duplicates.
+
+    Fix A (DESIGN_FIX_TOOL_NAME_PRIORITY_AND_DANGLING_TOOLCALLS.md): the bound
+    tool set of a Codex agent (and a Codex subordinate's TaskManager) contains
+    both base/proxy deep-worker tools and the Codex native passthrough tools,
+    and ``web_search`` exists in both. LangGraph's ``ToolNode`` resolves a name
+    by "last registration wins", and native tools are appended last, so the
+    native passthrough silently overrides the proxy tool.
+
+    Resolution is made deterministic by a single, order-preserving "keep first
+    by name" rule applied here, at the one funnel both the main agent and the
+    TaskManager pass through. Base/proxy tools are assembled before
+    ``NATIVE_TOOLS`` is appended, so "keep first" == base/proxy wins, native is
+    a fallback only for names not already provided (user decision: on a
+    collision the BASE tool wins). Tools without a ``.name`` are passed through
+    untouched.
+    """
+    seen: set[str] = set()
+    out: list[Any] = []
+    for t in tools:
+        name = getattr(t, "name", None)
+        if isinstance(name, str):
+            if name in seen:
+                # A higher-priority tool already owns this name — drop the dup.
+                continue
+            seen.add(name)
+        out.append(t)
+    return out
 
 
 def create_cli_agent(
@@ -660,6 +739,14 @@ def create_cli_agent(
     # Build middleware stack based on enabled features
     agent_middleware = []
 
+    # FIRST before_model middleware (graph entry_node): close any tool-call
+    # left dangling by a previous, interrupted session BEFORE the model or
+    # ToolNode runs, so a stale tool is never silently re-executed on restart.
+    # Must precede every other before_model hook so they all see a normalised,
+    # tool-call-consistent state. See
+    # docs/DESIGN_FIX_TOOL_NAME_PRIORITY_AND_DANGLING_TOOLCALLS.md (Fix B).
+    agent_middleware.append(DanglingToolCallMiddleware())
+
     # Treat a successful send_message_to_agent tool call as the agent's
     # final response for this turn — injects an echo AIMessage (so Full
     # Dialog and other history clients can see it) and jumps to the end
@@ -670,6 +757,13 @@ def create_cli_agent(
         SendMessageCompletionMiddleware,
     )
     agent_middleware.append(SendMessageCompletionMiddleware())
+
+    # claude-code only: resolve the inter-agent send Future at DELIVERY time
+    # (not on the next round-trip), so the Claude CLI gets its tool_result
+    # immediately and the proxy-MCP timeout bounds delivery — not the
+    # recipient's work. Provider-agnostic stack stays untouched.
+    # See deep_worker_web/docs/DESIGN_SUBSCRIPTION_AND_DELIVERY_FIX.md (Bug 2).
+    _maybe_add_delivery_resolve_middleware(agent_middleware, model)
 
     # Add memory middleware
     if enable_memory:
@@ -779,11 +873,10 @@ def create_cli_agent(
         )
         # NOTE: the previous "/conversation_history/" route to an
         # ephemeral tempdir was removed in favour of a persistent,
-        # human-inspectable on-disk location — the per-agent summaries
-        # directory under the tool's data directory.
-        # SummarizationMiddleware now writes directly to that absolute
-        # path via the default backend. See
-        # DESIGN_SUMMARIZATION_PERSISTENT_STORAGE.md.
+        # human-inspectable on-disk location under
+        # ~/.deep_worker/<agent>/summaries/ — SummarizationMiddleware
+        # now writes directly to that absolute path via the default
+        # backend. See DESIGN_SUMMARIZATION_PERSISTENT_STORAGE.md.
         composite_backend = CompositeBackend(
             default=backend,
             routes={
@@ -810,8 +903,20 @@ def create_cli_agent(
     # summarization HumanMessage will be this absolute filesystem path
     # (see DESIGN_SUMMARIZATION_PERSISTENT_STORAGE.md). Created eagerly
     # so the backend write never races a missing-dir error.
-    summaries_dir = Path("~/.deep_worker").expanduser() / assistant_id / "summaries"
-    summaries_dir.mkdir(parents=True, exist_ok=True)
+    from importlib import import_module
+
+    summaries_mod = cast(Any, import_module("deep_worker_cli.summaries"))
+    summaries_dir = summaries_mod.ensure_summaries_dir(assistant_id)
+    composite_backend = summaries_mod.PrivateSummariesBackend(
+        composite_backend,
+        summaries_dir,
+    )
+
+    # Fix A: deterministic tool-name resolution. Drop later duplicates so a
+    # base/proxy tool always wins over a same-named Codex native passthrough
+    # (e.g. ``web_search``). See
+    # docs/DESIGN_FIX_TOOL_NAME_PRIORITY_AND_DANGLING_TOOLCALLS.md (Fix A).
+    tools = _dedupe_tools_by_name_priority(tools)
 
     agent = create_deep_agent(
         model=model,

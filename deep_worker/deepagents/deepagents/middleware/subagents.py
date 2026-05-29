@@ -14,8 +14,8 @@ from typing import Annotated, Any, NotRequired, TypedDict, Unpack, cast
 # default ``DEFAULT_RECURSION_LIMIT`` is 25 (see
 # ``langchain_core/runnables/config.py:143``); a content-audit subagent
 # inspecting more than 25 files trivially exceeds it and crashes the
-# WHOLE main agent with ``GraphRecursionError`` (production incident on
-# demo_agent, 2026-04-25 12:13:23).
+# WHOLE main agent with ``GraphRecursionError`` (production incident
+# observed 2026-04-25 12:13:23).
 #
 # This is the same project-wide rule that ``deep_worker_cli/config.py``
 # §"NO RECURSION LIMIT ON AGENTS" enforces for the main agent — extended
@@ -43,6 +43,7 @@ from langchain_core.messages import HumanMessage, ToolMessage
 from langchain_core.runnables import Runnable
 from langchain_core.runnables.config import RunnableConfig
 from langchain_core.tools import StructuredTool
+from langgraph.pregel import Pregel
 from langgraph.types import Command
 
 from deepagents.backends.protocol import BackendFactory, BackendProtocol
@@ -65,7 +66,7 @@ def _build_subagent_config(thread_id: str) -> RunnableConfig:
       input), the assertion fires on the very first subagent call
       and halts it with a clear, non-silent failure mode — instead
       of the silent "all subagents now cap at 25" regression that
-      crashed demo_agent on 2026-04-25.
+      crashed an agent on 2026-04-25.
     * If a future change drops the ``recursion_limit`` key entirely,
       the assertion also fires (``KeyError`` from the dict access).
       The langchain_core default of 25 must not slip through.
@@ -84,7 +85,7 @@ def _build_subagent_config(thread_id: str) -> RunnableConfig:
     # int (e.g. 25), the equality check would still pass.
     # One million is:
     #   * astronomically larger than any realistic step count for
-    #     a real subagent task (demo_agent died at the langchain_core
+    #     a real subagent task (an agent died at the langchain_core
     #     default of 25);
     #   * safely below ``sys.maxsize`` so the unlimited sentinel
     #     always passes;
@@ -101,11 +102,35 @@ def _build_subagent_config(thread_id: str) -> RunnableConfig:
             f"canonical sentinel is sys.maxsize = {sys.maxsize}). "
             "This is FORBIDDEN — see the module-level NO RECURSION "
             "LIMIT comment in deepagents/middleware/subagents.py and "
-            "the production incident analysis (demo_agent, 2026-04-25 "
+            "the production incident analysis (observed 2026-04-25 "
             "— content-audit subagent crashed at the langchain_core "
             "default of 25)."
         )
     return config
+
+
+def _build_subagent_invoke_kwargs(
+    subagent: Runnable,
+    thread_id: str,
+    context: Any,
+) -> dict[str, Any]:
+    """Build the kwargs passed to ``subagent.invoke`` / ``subagent.ainvoke``.
+
+    Always includes ``config`` (via ``_build_subagent_config``). The parent
+    agent's static ``context`` is forwarded so context-aware subagent tools
+    (``ToolRuntime.context``) see the same context as the orchestrator.
+
+    ``context`` is ONLY a valid keyword for LangGraph ``Pregel`` graphs
+    (compiled agents). A ``CompiledSubAgent`` may instead wrap a plain
+    ``RunnableLambda``/``Runnable`` whose ``invoke`` signature is
+    ``(input, config)`` and rejects an unexpected ``context`` kwarg with a
+    ``TypeError``. Only attach ``context`` when the runnable is a ``Pregel``
+    graph, so both subagent shapes keep working.
+    """
+    kwargs: dict[str, Any] = {"config": _build_subagent_config(thread_id)}
+    if isinstance(subagent, Pregel):
+        kwargs["context"] = context
+    return kwargs
 
 
 class SubAgent(TypedDict):
@@ -539,14 +564,14 @@ def _build_task_tool(
 
         # NO RECURSION LIMIT — see module-level comment above the
         # _SUBAGENT_RECURSION_LIMIT_UNLIMITED constant. The langchain_core
-        # default of 25 is what crashed demo_agent mid-audit; a subagent
+        # default of 25 is what crashed an agent mid-audit; a subagent
         # tasked with content-auditing a directory trivially needs more
         # than 25 tool calls. Config is built by ``_build_subagent_config``
         # which runtime-asserts the unlimited sentinel — any future
         # regression that downgrades the limit fails loudly here.
         result = subagent.invoke(
             subagent_state,
-            config=_build_subagent_config(sub_thread_id),
+            **_build_subagent_invoke_kwargs(subagent, sub_thread_id, runtime.context),
         )
         if not runtime.tool_call_id:
             value_error_msg = "Tool call ID is required for subagent invocation"
@@ -577,7 +602,7 @@ def _build_task_tool(
         # of truth and runtime-asserts the unlimited sentinel.
         result = await subagent.ainvoke(
             subagent_state,
-            config=_build_subagent_config(sub_thread_id),
+            **_build_subagent_invoke_kwargs(subagent, sub_thread_id, runtime.context),
         )
         if not runtime.tool_call_id:
             value_error_msg = "Tool call ID is required for subagent invocation"

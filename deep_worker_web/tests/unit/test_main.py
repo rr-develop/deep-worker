@@ -3,6 +3,7 @@
 import pytest
 from fastapi.testclient import TestClient
 
+from app.config import settings
 from app.main import app
 
 
@@ -22,7 +23,12 @@ class TestMainApplication:
             data = response.json()
             assert data["status"] == "healthy"
             assert data["host"] == "127.0.0.1"
-            assert data["port"] == 7887
+            # The bound port is tree-dependent by design (7887 for the prod
+            # checkout, 7888 for the dev checkout — see app/config.py
+            # _APPROVED_BINDINGS).
+            # Assert against the configured value rather than a hard-coded
+            # number so the test passes in whichever tree it runs from.
+            assert data["port"] == settings.port
 
     def test_root_redirect(self) -> None:
         """Test that root redirects to index.html."""

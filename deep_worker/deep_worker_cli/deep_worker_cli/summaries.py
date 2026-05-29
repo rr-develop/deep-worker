@@ -4,7 +4,7 @@ Design: ``deep_worker/docs/DESIGN_SUMMARIZATION_PERSISTENT_STORAGE.md``.
 
 Layout this module operates on:
 
-    <data-root>/<agent_name>/summaries/<thread_id>.md
+    $HOME/.deep_worker/<agent_name>/summaries/<thread_id>.md
 
 Each file is the append-only log written by
 ``deepagents.middleware.summarization.SummarizationMiddleware``.
@@ -21,6 +21,7 @@ a tiny append-only markdown-section format.
 Public API:
 
 - :func:`get_summaries_dir`  — per-agent directory path (does not create).
+- :func:`ensure_summaries_dir` — create/fix per-agent summaries directory permissions.
 - :func:`iter_summary_files` — inventory, with parsed per-file metadata.
 - :func:`parse_summary_headers` — list the ``## Summarized at <ts>`` lines.
 - :func:`prune_summaries_before` — delete/rewrite sections older than a
@@ -33,7 +34,9 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Iterator
+from typing import Any, Iterator
+
+from deepagents.backends.protocol import BackendProtocol
 
 # Matches exactly the header the middleware writes:
 #   "## Summarized at 2026-04-22T15:40:18.122420+00:00"
@@ -44,11 +47,105 @@ def get_summaries_dir(agent_name: str) -> Path:
     """Return the per-agent summaries directory path.
 
     This is a pure function: it does NOT create the directory. Callers that
-    need the directory to exist must call ``.mkdir(parents=True, exist_ok=True)``
-    themselves (the middleware wiring in ``deep_worker_cli/agent.py`` does so
-    once at agent startup).
+    need the directory to exist must use :func:`ensure_summaries_dir` so
+    private directory permissions are enforced.
     """
     return Path("~/.deep_worker").expanduser() / agent_name / "summaries"
+
+
+def ensure_summaries_dir(agent_name: str) -> Path:
+    """Create the per-agent summaries directory with private permissions."""
+    from deep_worker_cli.storage_paths import agent_root, ensure_private_dir
+
+    root = agent_root(agent_name)
+    return ensure_private_dir(root / "summaries")
+
+
+class PrivateSummariesBackend(BackendProtocol):
+    """Backend proxy that keeps summary files owner-only.
+
+    The generic filesystem backend intentionally uses normal tool-file
+    permissions. Deep-worker summaries are internal per-agent storage, so
+    writes under this prefix must be tightened to 0600 after create/edit.
+    """
+
+    def __init__(self, backend: Any, summaries_dir: Path):
+        self._backend = backend
+        self._summaries_dir = summaries_dir
+
+    def __getattribute__(self, name: str) -> Any:
+        own = {
+            "_backend",
+            "_summaries_dir",
+            "_ensure_private_summary_file",
+            "write",
+            "awrite",
+            "edit",
+            "aedit",
+            "__class__",
+            "__dict__",
+            "__getattribute__",
+            "__init__",
+        }
+        if name in own or name.startswith("__"):
+            return object.__getattribute__(self, name)
+        return getattr(object.__getattribute__(self, "_backend"), name)
+
+    def _ensure_private_summary_file(self, file_path: str, result: Any) -> None:
+        if getattr(result, "error", None):
+            return
+        try:
+            path = Path(file_path)
+            if not path.is_absolute():
+                return
+            path.relative_to(self._summaries_dir)
+            from deep_worker_cli.storage_paths import ensure_private_file
+
+            ensure_private_file(path)
+        except (OSError, ValueError):
+            return
+
+    def write(self, file_path: str, content: str) -> Any:
+        result = self._backend.write(file_path, content)
+        self._ensure_private_summary_file(file_path, result)
+        return result
+
+    async def awrite(self, file_path: str, content: str) -> Any:
+        result = await self._backend.awrite(file_path, content)
+        self._ensure_private_summary_file(file_path, result)
+        return result
+
+    def edit(
+        self,
+        file_path: str,
+        old_string: str,
+        new_string: str,
+        replace_all: bool = False,
+    ) -> Any:
+        result = self._backend.edit(
+            file_path,
+            old_string,
+            new_string,
+            replace_all=replace_all,
+        )
+        self._ensure_private_summary_file(file_path, result)
+        return result
+
+    async def aedit(
+        self,
+        file_path: str,
+        old_string: str,
+        new_string: str,
+        replace_all: bool = False,
+    ) -> Any:
+        result = await self._backend.aedit(
+            file_path,
+            old_string,
+            new_string,
+            replace_all=replace_all,
+        )
+        self._ensure_private_summary_file(file_path, result)
+        return result
 
 
 def parse_summary_headers(text: str) -> list[str]:
@@ -64,7 +161,7 @@ class SummaryFileInfo:
     """Metadata for one offloaded summary file.
 
     Attributes:
-        agent: Agent name (directory name under the per-user data directory).
+        agent: Agent name (directory name under the agent data directory).
         thread: Thread id (filename stem — ``<agent>`` for main thread,
             ``<agent>:tm`` for the TaskManager thread, or a UUID for
             subagent threads).
@@ -83,12 +180,12 @@ class SummaryFileInfo:
 
 
 def _deep_worker_root() -> Path:
-    """Parent directory of all per-agent data directories."""
+    """``$HOME/.deep_worker`` — parent of all per-agent dirs."""
     return Path("~/.deep_worker").expanduser()
 
 
 def iter_summary_files(agent_name: str | None = None) -> Iterator[SummaryFileInfo]:
-    """Walk the per-agent summaries directories and yield :class:`SummaryFileInfo`.
+    """Walk the per-agent ``summaries/*.md`` files and yield :class:`SummaryFileInfo`.
 
     Args:
         agent_name: If given, yield only summaries for this agent. If
@@ -251,8 +348,12 @@ def prune_summaries_before(
             if not dry_run:
                 new_text = "".join(kept)
                 tmp = info.path.with_suffix(info.path.suffix + ".tmp")
+                from deep_worker_cli.storage_paths import ensure_private_file
+
                 tmp.write_text(new_text, encoding="utf-8")
+                ensure_private_file(tmp)
                 os.replace(tmp, info.path)
+                ensure_private_file(info.path)
             counters["files_rewritten"] += 1
             counters["sections_deleted"] += dropped
 

@@ -8,7 +8,7 @@ that caused the reported failure:
     Error: no such table: checkpoints
 
 The tests use a temporary ``HOME`` so they do not touch the developer's
-real ``~/.deepagents``.
+real agent data directory.
 """
 from __future__ import annotations
 
@@ -23,22 +23,37 @@ import pytest
 
 
 def _schema_sql() -> tuple[str, str]:
+    # Schema must match DeltaSqliteCheckpointer (deep_worker_cli/delta_checkpointer.py):
+    # ``checkpoint_ns TEXT NOT NULL DEFAULT ''`` is critical — the production
+    # SELECT used by ``deep-worker --history`` filters on
+    # ``WHERE thread_id = ? AND checkpoint_ns = ?`` with an empty string.
+    # If we leave the column nullable and don't write to it, rows get NULL
+    # and ``NULL = ''`` is NULL (falsy), so the SELECT returns no rows and
+    # --history prints "Thread '<id>' not found in database".
     return (
         """
         CREATE TABLE IF NOT EXISTS checkpoints (
-            thread_id TEXT,
-            checkpoint_id TEXT,
+            thread_id TEXT NOT NULL,
+            checkpoint_ns TEXT NOT NULL DEFAULT '',
+            checkpoint_id TEXT NOT NULL,
             parent_checkpoint_id TEXT,
-            checkpoint_ns TEXT,
             type TEXT,
             checkpoint BLOB,
-            metadata TEXT
+            metadata TEXT,
+            PRIMARY KEY (thread_id, checkpoint_ns, checkpoint_id)
         )
         """,
         """
         CREATE TABLE IF NOT EXISTS writes (
-            thread_id TEXT,
-            task_id TEXT
+            thread_id TEXT NOT NULL,
+            checkpoint_ns TEXT NOT NULL DEFAULT '',
+            checkpoint_id TEXT NOT NULL,
+            task_id TEXT NOT NULL,
+            idx INTEGER NOT NULL DEFAULT 0,
+            channel TEXT NOT NULL,
+            type TEXT,
+            value BLOB,
+            PRIMARY KEY (thread_id, checkpoint_ns, checkpoint_id, task_id, idx)
         )
         """,
     )
@@ -57,8 +72,14 @@ async def _seed_per_agent_db(
         await conn.execute(writes_sql)
 
         ts = updated_at or datetime.now(UTC).isoformat()
+        cp_id = f"cp-{thread_id}"
+        # The checkpoint JSON must include an ``id`` field — LangGraph's
+        # Checkpoint TypedDict has it and DeltaSqliteCheckpointer's
+        # _cache_put reads ``checkpoint["id"]`` unconditionally. Missing
+        # it surfaces as ``KeyError: 'id'`` during --history.
         checkpoint = json.dumps(
             {
+                "id": cp_id,
                 "ts": ts,
                 "channel_values": {
                     "messages": [{"type": "human", "content": content}]
@@ -69,20 +90,25 @@ async def _seed_per_agent_db(
         if agent_name_meta is not None:
             meta["agent_name"] = agent_name_meta
 
+        # Must write ``checkpoint_ns=''`` explicitly. The production query
+        # in DeltaSqliteCheckpointer.aget_tuple filters on
+        # ``WHERE thread_id = ? AND checkpoint_ns = ?`` with the empty
+        # string, so leaving the column unspecified (NULL) silently
+        # produces zero hits and --history reports "not found".
         await conn.execute(
             """
             INSERT INTO checkpoints
-            (thread_id, checkpoint_id, type, checkpoint, metadata)
-            VALUES (?, ?, ?, ?, ?)
+            (thread_id, checkpoint_ns, checkpoint_id, type, checkpoint, metadata)
+            VALUES (?, '', ?, ?, ?, ?)
             """,
-            (thread_id, f"cp-{thread_id}", "json", checkpoint, json.dumps(meta)),
+            (thread_id, cp_id, "json", checkpoint, json.dumps(meta)),
         )
         await conn.commit()
 
 
 @pytest.fixture
 def isolated_home(tmp_path):
-    """Run deep-worker with a temp HOME so tests don't touch ~/.deepagents."""
+    """Run deep-worker with a temp HOME so tests don't touch the agent data directory."""
     home = tmp_path / "home"
     (home / ".deepagents").mkdir(parents=True)
 

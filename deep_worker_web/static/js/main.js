@@ -1,4 +1,4 @@
-// Deep-Worker-Web - Main JavaScript
+// Web App - Main JavaScript
 
 // State
 let ws = null;
@@ -34,7 +34,7 @@ function generateUUID() {
 
 // Initialize on page load
 document.addEventListener('DOMContentLoaded', () => {
-    console.log('Deep-Worker-Web starting...');
+    console.log('Web App starting...');
     loadAgents();
     connectWebSocket();
     setupEventListeners();
@@ -81,6 +81,7 @@ function renderAgentList() {
         
         const statusClass = getStatusDotClass(agent.status);
         const textClass = getStatusTextClass(agent.status);
+        const statusLabel = getStatusDisplayLabel(agent);
         const checked = selectedAgents.has(name) ? 'checked' : '';
         item.innerHTML = `
             <div class="agent-item-row">
@@ -90,7 +91,7 @@ function renderAgentList() {
                     <div class="agent-item-name">
                         <span class="status-indicator ${statusClass}"></span>
                         <strong>${name}</strong>
-                        <span class="${textClass}">[${agent.status}]</span>
+                        <span class="${textClass}">[${statusLabel}]</span>
                     </div>
                     <div class="agent-item-status">${agent.provider} / ${agent.model}</div>
                 </div>
@@ -102,22 +103,60 @@ function renderAgentList() {
     updateBatchToolbar();
 }
 
-// Get CSS class for status indicator dot (matches the web UI)
+function getStatusDisplayLabel(agent) {
+    if (!agent || !agent.status) return 'unknown';
+    const status = agent.status;
+    const metadata = agent.status_metadata;
+    const substatus = metadata && typeof metadata.substatus === 'string'
+        ? metadata.substatus.trim()
+        : '';
+    if (status === 'idle' && substatus) {
+        return `idle(${substatus})`;
+    }
+    return status;
+}
+
+// Get CSS class for status indicator dot (matches the legacy web app)
+//
+// IMPORTANT: the 'interrupted' check MUST come before any
+// status.includes('waiting') check. Otherwise — depending on string
+// content — interrupted could leak into the waiting branch. As a guard,
+// keep 'interrupted' as an exact-match early-return.
 function getStatusDotClass(status) {
     if (status === 'ready' || status === 'idle') return 'status-ready';
     if (status === 'working' || status === 'running') return 'status-working';
     if (status === 'error') return 'status-error';
+    if (status === 'interrupted') return 'status-interrupted';
     if (status.includes('waiting')) return 'status-waiting';
     return '';
 }
 
-// Get CSS class for status text (matches the web UI)
+// Get CSS class for status text (matches the legacy web app)
 function getStatusTextClass(status) {
     if (status === 'ready' || status === 'idle') return 'status-text-ready';
     if (status === 'working' || status === 'running') return 'status-text-working';
     if (status === 'error') return 'status-text-error';
+    if (status === 'interrupted') return 'status-text-interrupted';
     if (status.includes('waiting')) return 'status-text-waiting_input';
     return 'status-text-unknown';
+}
+
+// Decide whether a stop/restart *failure* event means the agent is GONE
+// (dead / not in the registry) rather than a transient failure against a live
+// agent. When true, the failed-op handler should remove the card — otherwise
+// a phantom card for an already-dead agent lingers and "Stop" appears to do
+// nothing (observed 2026-05-24). Backend signals this via a LookupError raised
+// from request_stop ("Agent '<name>' not found"). We match on error_type AND
+// the message text so a backend wording/type tweak can't silently regress.
+// Pure function (no DOM/globals) so it is unit-testable in node.
+function stopFailureMeansAgentGone(data) {
+    if (!data || typeof data !== 'object') return false;
+    const errorType = String(data.error_type || '');
+    const error = String(data.error || '');
+    if (errorType === 'LookupError') return true;
+    if (/\bnot found\b/i.test(error)) return true;
+    if (/\bnot running\b/i.test(error)) return true;
+    return false;
 }
 
 // Select an agent
@@ -147,6 +186,15 @@ function selectAgent(name) {
     // the next status event.
     updateStopTaskManagerButton(agent);
     updateTmControls(agent);
+
+    // Reflect the agent's stored error state in the persistent panel:
+    // show it if this agent is in error, clear it otherwise. This makes
+    // the error survive an agent re-select / page reload.
+    if (agent.status === 'error' && agent.error_message) {
+        showLastError(agent.error_message);
+    } else {
+        dismissLastError();
+    }
 
     // Load last assistant response
     loadLastResponse(name);
@@ -255,7 +303,7 @@ async function sendMessage() {
     }
 }
 
-// Copy last response to clipboard (matches the web UI's copyLastResponse)
+// Copy last response to clipboard (matches the legacy web app copyLastResponse)
 async function copyLastResponse(event) {
     const content = document.getElementById('last-response-content');
     const text = content.textContent;
@@ -281,8 +329,52 @@ async function copyLastResponse(event) {
     }
 }
 
+// ---- Last Error panel ---------------------------------------------------
+// The error panel is SEPARATE from the Last Response panel. It is
+// persistent (never auto-dismissed), copyable, and shows the full
+// agent error text. It never overwrites the model's last response.
+// Incident observed 2026-05-20: errors used to be a transient toast that
+// vanished and could not be copied.
+
+// Show (or update) the persistent error panel with the given text.
+function showLastError(errorText) {
+    const panel = document.getElementById('last-error-panel');
+    const content = document.getElementById('last-error-content');
+    if (!panel || !content) return;
+    content.textContent = errorText || '';
+    panel.style.display = '';
+}
+
+// Hide the error panel (manual dismiss only).
+function dismissLastError() {
+    const panel = document.getElementById('last-error-panel');
+    const content = document.getElementById('last-error-content');
+    if (panel) panel.style.display = 'none';
+    if (content) content.textContent = '';
+}
+
+// Copy the current error text to the clipboard.
+async function copyLastError(event) {
+    const content = document.getElementById('last-error-content');
+    const text = content ? content.textContent : '';
+    if (!text) return;
+    try {
+        await navigator.clipboard.writeText(text);
+        const btn = event.target;
+        const originalText = btn.textContent;
+        btn.textContent = '✅ Copied!';
+        btn.style.background = '#2a5a2a';
+        setTimeout(() => {
+            btn.textContent = originalText;
+            btn.style.background = '';
+        }, 2000);
+    } catch (err) {
+        console.error('Copy error:', err);
+    }
+}
+
 // localStorage key for the persisted verbosity choice (per design §3.6 UI).
-const FULL_DIALOG_VERBOSITY_KEY = 'deep_worker_web.dialog_verbosity';
+const FULL_DIALOG_VERBOSITY_KEY = 'web_app.dialog_verbosity';
 
 // Read verbosity from the dropdown; fall back to 'final'.
 function getFullDialogVerbosity() {
@@ -593,6 +685,21 @@ async function stopTaskManager() {
 // Toggle TaskManager enabled/disabled
 async function toggleTaskManager(enabled) {
     if (!selectedAgent) return;
+    // Update the local cache IMMEDIATELY so the choice sticks when the
+    // user switches to another agent and back. ``selectAgent`` /
+    // ``updateTmControls`` read ``agents[name].task_manager_disabled``;
+    // if we only POST and rely on a later status broadcast, a switch-
+    // away-and-back in between re-checks the box from the stale cache.
+    // (The backend also broadcasts agent_status with the new value, and
+    // the agent is the source of truth — but the local write makes the
+    // UX correct instantly and independent of broadcast timing.)
+    // User report 2026-05-20: disabling TM did not stick across
+    // re-select. Disabling must be permanent until the user re-enables.
+    const agent = agents[selectedAgent];
+    if (agent) {
+        agent.task_manager_disabled = !enabled;
+        agent.has_task_manager = true;
+    }
     try {
         await fetch(`/api/agents/${selectedAgent}/task-manager/toggle`, {
             method: 'POST',
@@ -764,6 +871,13 @@ function handleWebSocketMessage(data) {
         case 'agent_interrupt_result':
             handleAgentInterruptResult(data);
             break;
+        case 'channel_quarantined':
+            // A client RPyC channel to the agent was flooded and quarantined.
+            // This is a WARNING ONLY — the agent keeps working and its status
+            // is unchanged. Show a non-blocking warning; do NOT touch the
+            // agent's status badge or the error panel. Incident observed 2026-05-22.
+            handleChannelQuarantined(data);
+            break;
 
         // ---- Fire-and-forget lifecycle events ----
         case 'agent_stop_started':
@@ -813,6 +927,21 @@ function handleWebSocketMessage(data) {
         case 'agent_spawn_failed':
         case 'batch_failed':
             finalizeRequest(data.request_id);
+            // If a stop/restart failed because the agent is GONE (not found /
+            // not running), the card is a phantom — remove it so the UI is
+            // consistent and "Stop" visibly resolves it (observed 2026-05-24).
+            if (
+                (data.type === 'agent_stop_failed' || data.type === 'agent_restart_failed') &&
+                data.agent_name &&
+                stopFailureMeansAgentGone(data)
+            ) {
+                handleAgentTerminated({ agent_name: data.agent_name });
+                showNotification(
+                    `${data.agent_name} was already gone — removed from the list.`,
+                    'info',
+                );
+                break;
+            }
             showNotification(
                 `${labelForOp(data.type.replace(/_failed$/, ''))} failed: ${data.agent_name || ''} — ${data.error || 'unknown error'} (${data.error_type || ''})`,
                 'error',
@@ -924,19 +1053,23 @@ function handleAgentError(data) {
     const { agent_name, error, error_type } = data;
     console.error(`Agent ${agent_name} error:`, error);
 
-    // Show error notification to user
-    let errorMessage = `Agent error: ${error}`;
+    // Short, friendly summary for the transient toast.
+    let summary = `Agent error: ${error}`;
     if (error_type === 'TimeoutError') {
-        errorMessage = `Agent not responding (timeout)`;
+        summary = `Agent not responding (timeout)`;
     } else if (error_type === 'ConnectionError' || error_type === 'EOFError') {
-        errorMessage = `Connection to agent lost`;
+        summary = `Connection to agent lost`;
     }
+    showNotification(summary, 'error');
 
-    showNotification(errorMessage, 'error');
-
-    // If it's the selected agent, reload last response
+    // For the selected agent, surface the FULL error text persistently
+    // in the dedicated error panel — copyable, does not auto-dismiss,
+    // and does NOT overwrite the model's last response.
     if (agent_name === selectedAgent) {
-        setTimeout(() => loadLastResponse(agent_name), 1000);
+        const fullText = error_type ? `${error_type}: ${error}` : String(error);
+        showLastError(fullText);
+        // Intentionally NOT reloading last-response here: the error must
+        // not replace the previous successful model response.
     }
 }
 
@@ -1021,10 +1154,15 @@ function handleDetailedStatusError(data) {
 // Handle agent status change
 // Handle agent metadata update (provider/model fetched after connect)
 function handleAgentMetadata(data) {
-    const { agent_name, provider, model } = data;
+    const { agent_name, provider, model, status_metadata } = data;
     if (agents[agent_name]) {
         if (provider) agents[agent_name].provider = provider;
         if (model) agents[agent_name].model = model;
+        if (status_metadata && typeof status_metadata === 'object') {
+            agents[agent_name].status_metadata = status_metadata;
+        } else if ('status_metadata' in data) {
+            agents[agent_name].status_metadata = null;
+        }
 
         if (agent_name === selectedAgent) {
             document.getElementById('agent-provider').textContent = agents[agent_name].provider;
@@ -1034,10 +1172,23 @@ function handleAgentMetadata(data) {
 }
 
 function handleAgentStatus(data) {
-    const { agent_name, status, task_manager_active, task_manager_disabled } = data;
+    const { agent_name, status, task_manager_active, task_manager_disabled, error_message, status_metadata } = data;
 
     if (agents[agent_name]) {
         agents[agent_name].status = status;
+        if (status_metadata && typeof status_metadata === 'object') {
+            agents[agent_name].status_metadata = status_metadata;
+        } else {
+            agents[agent_name].status_metadata = null;
+        }
+        // Keep the last known error text on the agent record so a page
+        // reload / agent re-select can re-show it.
+        if (status === 'error' && error_message) {
+            agents[agent_name].error_message = error_message;
+        } else if (status !== 'error') {
+            // Recovered → drop the stored error.
+            agents[agent_name].error_message = null;
+        }
         if (task_manager_active !== undefined) {
             agents[agent_name].task_manager_active = task_manager_active;
             agents[agent_name].has_task_manager = true;
@@ -1050,6 +1201,12 @@ function handleAgentStatus(data) {
         if (agent_name === selectedAgent) {
             updateStopTaskManagerButton(agents[agent_name]);
             updateTmControls(agents[agent_name]);
+            // Persistent error panel mirrors the agent's error state.
+            if (status === 'error' && error_message) {
+                showLastError(error_message);
+            } else if (status !== 'error') {
+                dismissLastError();
+            }
         }
 
         renderAgentList();
@@ -1120,11 +1277,16 @@ function handleAgentInterrupted(data) {
     const agentName = data.agent_name || (data.message && data.message.agent_name);
     console.log('[Interrupt] agent_interrupted received:', data);
 
-    // Optimistically reflect the new state in the local agent map so the UI
-    // shows the agent as waiting for user input until the next status poll.
+    // Optimistically reflect the new state in the local agent map so the
+    // UI shows the agent as interrupted (amber) until the next status
+    // poll confirms it. INTERRUPTED is distinct from WAITING_INPUT:
+    // - INTERRUPTED = user paused this turn; awaiting next user message
+    //   (often a correction). Rendered in amber.
+    // - WAITING_INPUT = inside an in-progress turn, waiting for a tool to
+    //   return. Rendered in blue.
     const target = agentName || selectedAgent;
     if (target && agents[target]) {
-        agents[target].status = 'waiting_input';
+        agents[target].status = 'interrupted';
         agents[target].interrupted = true;
         renderAgentList();
     }
@@ -1151,6 +1313,28 @@ function handleAgentInterruptResult(data) {
                 'error',
             );
         }
+    }
+}
+
+// Channel-quarantine warning. A client's RPyC channel to the agent was
+// flooded and quarantined. The agent KEEPS WORKING and its status is
+// unchanged — so we show a non-blocking warning toast only, and deliberately
+// do NOT touch the agent's status badge or the "Last Error" panel.
+// Incident observed 2026-05-22.
+function handleChannelQuarantined(data) {
+    const { agent_name, peer, connid } = data;
+    console.warn(
+        `[channel_quarantined] agent=${agent_name} connid=${connid} peer=${peer} — ` +
+        `a client flooded an RPyC channel; it was quarantined. Agent keeps working.`,
+    );
+    // Only surface a toast for the agent the user is looking at, to avoid
+    // noise from background agents.
+    if (agent_name === selectedAgent) {
+        showNotification(
+            `Warning: a client connection to ${agent_name} was flooded and ` +
+            `quarantined. The agent keeps working — status unchanged.`,
+            'warning',
+        );
     }
 }
 
@@ -1202,6 +1386,9 @@ function showNotification(message, type = 'info') {
     } else if (type === 'error') {
         notification.style.backgroundColor = '#f44336';
         notification.style.color = 'white';
+    } else if (type === 'warning') {
+        notification.style.backgroundColor = '#ff9800';
+        notification.style.color = 'white';
     } else {
         notification.style.backgroundColor = '#2196F3';
         notification.style.color = 'white';
@@ -1219,7 +1406,7 @@ function showNotification(message, type = 'info') {
 // ==============================================================================
 
 async function restartServer() {
-    if (!confirm('Are you sure you want to restart deep-worker-web server?\n\nAll agent connections will be re-established after restart.')) {
+    if (!confirm('Are you sure you want to restart the web app server?\n\nAll agent connections will be re-established after restart.')) {
         return;
     }
 
@@ -1394,4 +1581,14 @@ async function restartCurrentAgent() {
     } catch (error) {
         showNotification('Error restarting agent: ' + error.message, 'error');
     }
+}
+
+// ---------------------------------------------------------------------------
+// Test hook (no-op in the browser). Lets node-based unit tests import pure
+// decision functions from this file without a DOM or a module bundler. The
+// guard checks for CommonJS ``module`` which exists in node but not in the
+// browser, so this line is inert when the page loads main.js as a <script>.
+// ---------------------------------------------------------------------------
+if (typeof module !== 'undefined' && module.exports) {
+    module.exports = { stopFailureMeansAgentGone };
 }

@@ -97,6 +97,7 @@ def agent_fixture(
     api_key: Optional[str] = None,
     cleanup_on_success: bool = True,
     timeout: float = 60.0,
+    pytest_item: Any = None,
 ) -> Iterator[AgentFixtureInfo]:
     """Create a real deep-worker agent for integration testing.
 
@@ -187,33 +188,76 @@ def agent_fixture(
         process=process,
     )
 
+    # Hand off to the per-session sweeper (see tests/integration/conftest.py)
+    # so a SIGKILL'd pytest still gets its passed-test agents cleaned up.
+    if pytest_item is not None:
+        try:
+            from .conftest import register_test_agent  # noqa: PLC0415
+            register_test_agent(
+                agent_name,
+                pytest_item,
+                created_by_fixture=True,
+            )
+        except Exception:  # noqa: BLE001
+            # Bookkeeping must never break a real test.
+            pass
+
     test_failed = False
 
     try:
         yield fixture_info
     except Exception:
-        # Test failed - preserve agent for debugging
+        # Test failed → preserve the running agent so the developer can
+        # ``dwcli`` into it for debugging. Per user mandate.
         test_failed = True
         raise
     finally:
-        # Cleanup
-        should_cleanup = cleanup_on_success and not test_failed
-
-        # Stop the agent process
-        if process.is_alive():
-            process.terminate()
-            process.join(timeout=5)
-
-            if process.is_alive():
-                process.kill()
-                process.join(timeout=2)
-
-        # Clean up temp directory if requested
-        if should_cleanup:
-            import shutil
-            shutil.rmtree(temp_dir, ignore_errors=True)
+        # NOTE: never use ``return`` from inside this ``finally`` —
+        # that would swallow the exception that drove ``test_failed``
+        # to True and the test would erroneously show as PASS.
+        if test_failed:
+            # Preserve: the agent process is kept alive, the temp dir
+            # is left on disk, the registry entry remains. The user
+            # debugs with ``dwcli {agent_name}``.
+            print(
+                f"\nTest failed → preserving test agent '{agent_name}' "
+                f"(PID {agent_pid}, port {agent_port}, data {temp_dir}). "
+                f"Connect with: dwcli {agent_name}",
+                flush=True,
+            )
         else:
-            print(f"\nPreserving failed test agent data: {temp_dir}")
+            # Passed (or no exception propagated) — terminate the agent
+            # process, clear the registry entry, and drop on-disk
+            # artefacts (the temp working dir AND
+            # ``<agent-data-dir>/<agent_name>/`` which the SessionManager
+            # created — see AgentProcess.__init__).
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+
+                if process.is_alive():
+                    process.kill()
+                    process.join(timeout=2)
+
+            # The registry stores a (name → AgentProcessInfo) entry
+            # per agent. If we don't clear it, every passed run leaks
+            # a stale entry that ``dwcli --list`` will keep surfacing.
+            try:
+                ProcessRegistry().unregister(agent_name)
+            except Exception:  # noqa: BLE001 — defensive: don't crash teardown
+                pass
+
+            if cleanup_on_success:
+                import shutil
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                # Also remove the agent's persistent data dir. This is
+                # what used to leak hundreds of stale <agent-data-dir>/
+                # test_agent_<pid>_<ts>/ directories. Safe: agent_name
+                # is the f-string ``test_agent_{pid}_{ts}`` (line 128)
+                # or the caller-supplied name, all under our control.
+                data_dir = Path("~/.deep_worker").expanduser() / agent_name
+                if data_dir.exists():
+                    shutil.rmtree(data_dir, ignore_errors=True)
 
 
 @contextmanager

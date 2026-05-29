@@ -120,7 +120,7 @@ class TestAgentServiceConnection:
     async def test_is_connected_returns_false_when_conn_closed(
         self, agent_service: AgentService
     ) -> None:
-        """Regression for the earlier AsyncResult-leak incident.
+        """Regression for a related internal incident analysis (not included here).
 
         ``is_connected`` previously checked only the local
         ``_connections`` dict. After the peer process died and rpyc
@@ -413,6 +413,50 @@ class TestAgentServiceSendMessageFireAndForget:
         assert error_msg["agent_name"] == "test-agent-1"
         assert error_msg["success"] is False
         assert "Agent error" in error_msg["error"]
+
+    async def test_send_message_interrupted_result_is_not_an_error_or_response(
+        self, agent_service: AgentService
+    ) -> None:
+        """A user-initiated interrupt comes back as a clean
+        ``{"success": False, "interrupted": True}`` result (NOT a remote
+        exception — see exposed_invoke_agent). The web must NOT broadcast
+        it as ``agent_error`` (no spurious popup / Last Error) and NOT as
+        ``agent_response`` (no false "processed successfully" toast). The
+        agent already broadcast ``agent_interrupted`` separately.
+        Regression for the 2026-05-20 interrupt-as-error bug.
+        """
+        import asyncio
+
+        await agent_service.initialize()
+
+        broadcast_messages = []
+        async def capture_broadcast(msg):
+            broadcast_messages.append(msg)
+        agent_service.register_message_callback(capture_broadcast)
+
+        mock_root = AsyncMock()
+        mock_root.invoke_agent = AsyncMock(
+            return_value={
+                "success": False,
+                "interrupted": True,
+                "message": "Agent invocation interrupted by user",
+            }
+        )
+        mock_conn = MagicMock()
+        agent_service._roots["test-agent-1"] = mock_root
+        agent_service._connections["test-agent-1"] = mock_conn
+
+        await agent_service.send_message("test-agent-1", "hello")
+        await asyncio.sleep(0.5)
+
+        # No agent_error broadcast (the user's complaint).
+        assert not any(
+            m.get("type") == "agent_error" for m in broadcast_messages
+        ), f"interrupt must not broadcast agent_error; got {broadcast_messages}"
+        # No agent_response broadcast (no false success).
+        assert not any(
+            m.get("type") == "agent_response" for m in broadcast_messages
+        ), f"interrupt must not broadcast agent_response; got {broadcast_messages}"
 
     async def test_send_message_has_no_timeout(
         self, agent_service: AgentService
