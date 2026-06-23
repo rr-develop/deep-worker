@@ -1,16 +1,20 @@
+# pyright: reportPrivateUsage=false, reportUnusedImport=false
 """Tests for sent_count tracking in ClaudeCodeChatModel.
 
 Session-state persistence isolation + singleton reset is handled by the
 autouse ``_isolate_claude_session_state`` fixture in conftest.py.
 """
 
+import asyncio
 import pytest
+from typing import Any
 from unittest.mock import AsyncMock, Mock, patch
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from claude_agent_sdk import AssistantMessage as ClaudeAssistantMessage, TextBlock, ResultMessage
 
 from claude_code_provider.chat_model import ClaudeCodeChatModel
+from claude_code_provider.custom_types import ToolMetadata
 
 
 class TestSentCountTracking:
@@ -203,6 +207,102 @@ class TestSentCountTracking:
         # Check sent_count removed
         assert "test" not in model.client_manager._sent_count
 
+
+class TestClientRecreationAfterRotation:
+    """Regression: after ``rotate_session()`` the old client is disconnected;
+    ``ainvoke`` must obtain a fresh client instead of using the stale reference.
+
+    See Issue #115 — ``CLIConnectionError: MCP transport used before connect()
+    completed`` was raised because the local ``client`` variable still pointed
+    at the disconnected instance after rotation.
+    """
+
+    @pytest.mark.asyncio
+    async def test_recreates_client_after_rotation(self) -> None:
+        """After sent_count > len(messages) triggers rotation, ainvoke must get
+        a fresh client (the old one was disconnected by rotate_session)."""
+        model = ClaudeCodeChatModel()
+        thread_id = "test_rotation_115"
+        model.client_manager._sent_count[thread_id] = 10  # > len(messages) below
+
+        # Two distinct mock clients to distinguish first- vs second-get_or_create.
+        old_client = Mock()
+        old_client.query = AsyncMock()
+
+        async def _old_receive():
+            # Should NEVER be awaited — old client is disconnected after rotation
+            yield ClaudeAssistantMessage(content=[TextBlock(text="old")], model="c")
+            yield ResultMessage(subtype="success", duration_ms=1, duration_api_ms=1, is_error=False, num_turns=1, session_id="old")
+
+        old_client.receive_response = _old_receive
+
+        new_client = Mock()
+        new_client.query = AsyncMock()
+
+        async def _new_receive():
+            yield ClaudeAssistantMessage(content=[TextBlock(text="2")], model="c")
+            yield ResultMessage(subtype="success", duration_ms=1, duration_api_ms=1, is_error=False, num_turns=1, session_id="new")
+
+        new_client.receive_response = _new_receive
+        new_client.disconnect = AsyncMock()
+
+        old_proxy = Mock()
+        old_proxy.has_pending_calls = Mock(return_value=False)
+        new_proxy = Mock()
+        new_proxy.has_pending_calls = Mock(return_value=False)
+
+        calls: list[dict[str, Any]] = []
+
+        async def _get_client_side_effect(
+            thread_id: str,
+            tools_metadata: list[ToolMetadata],
+            working_dir: str | None = None,
+            system_prompt: str | None = None,
+            resume_session_id: str | None = None,
+        ) -> tuple[Any, Any]:
+            calls.append({
+                "thread_id": thread_id,
+                "resume_session_id": resume_session_id,
+                "system_prompt": system_prompt,
+            })
+            # First call → old client, subsequent → new client
+            if len(calls) == 1:
+                return (old_client, old_proxy)
+            return (new_client, new_proxy)
+
+        with patch.object(
+            model.client_manager, "get_or_create_client",
+            side_effect=_get_client_side_effect,
+        ):
+            await model.ainvoke(
+                [HumanMessage("1+1")],
+                config={"configurable": {"thread_id": thread_id}},
+            )
+
+        # 1) get_or_create_client must have been called TWICE:
+        #    first at line 679 (restore), second after rotation (fresh).
+        assert len(calls) == 2, (
+            f"Expected 2 get_or_create_client calls (restore + after rotation), got {len(calls)}"
+        )
+
+        # 2) The SECOND call must have resume_session_id=None (fresh session).
+        assert calls[1]["resume_session_id"] is None, (
+            f"Second get_or_create_client after rotation must have resume_session_id=None, "
+            f"got {calls[1]['resume_session_id']!r}"
+        )
+
+        # 3) The second call must be for the same thread_id.
+        assert calls[1]["thread_id"] == thread_id
+
+        # 4) query() must have been called (we sent HumanMessage).
+        #    The OLD client's query should NOT have been used (it's disconnected).
+        assert old_client.query.call_count == 0, (
+            f"Old (disconnected) client's query was called {old_client.query.call_count}x"
+        )
+        assert new_client.query.call_count >= 1, (
+            "New client's query must have been called after rotation"
+        )
+
     @pytest.mark.asyncio
     async def test_handles_tool_messages_without_resending(self) -> None:
         """Should handle ToolMessage without resending old messages."""
@@ -222,6 +322,12 @@ class TestSentCountTracking:
         mock_proxy = Mock()
         mock_proxy.has_pending_calls = Mock(return_value=False)
         mock_proxy.resolve_call = Mock()
+        # The sequential-dispatch wait in chat_model is event-driven with
+        # no timeout (incident 2026-06-14). Since this test scenario has
+        # nothing further to dispatch, return immediately after letting
+        # ainvoke "park" once — has_pending_calls stays False so the
+        # branch falls through to "no pending calls".
+        mock_proxy.wait_for_any_pending_call = AsyncMock(return_value=None)
 
         with patch.object(
             model.client_manager, "get_or_create_client", return_value=(mock_client, mock_proxy)

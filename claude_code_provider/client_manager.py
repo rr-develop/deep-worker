@@ -6,6 +6,7 @@ each thread_id (session) gets its own isolated client and ProxyMCPServer.
 
 import asyncio
 import sys
+from contextlib import suppress
 from dataclasses import replace
 from pathlib import Path
 from typing import Any  # type: ignore[reportUnusedImport]
@@ -209,6 +210,20 @@ class ClientManager:
         """
         self.base_options = base_options
         self.clients: dict[str, tuple[ClaudeSDKClient, ProxyMCPServer]] = {}
+        # ════════════════════════════════════════════════════════════════
+        # PREWARM RESERVATION SLOT (incident 2026-06-15).
+        # ════════════════════════════════════════════════════════════════
+        # ``_proxy_only`` holds a fully-built ``ProxyMCPServer`` reserved
+        # by ``prepare_proxy_only`` BEFORE any Claude CLI subprocess has
+        # been spawned for ``thread_id``. This separation is what makes
+        # history-restore on the first turn after (re)start work:
+        # ``has_client(thread_id)`` stays False while the slot is here
+        # (no CLI client yet), so ``ClaudeCodeChatModel.ainvoke`` runs
+        # the restore block and computes ``resume_session_id``; the next
+        # ``get_or_create_client`` then ADOPTS this proxy and finally
+        # opens the CLI subprocess WITH the requested ``resume``.
+        # See INCIDENT 2026-06-15 (mj1_init forgot history after restart).
+        self._proxy_only: dict[str, ProxyMCPServer] = {}
         self._creation_locks: dict[str, asyncio.Lock] = {}
         # Track sent message count per thread for proper message mirroring
         # This is stored in ClientManager (not ClaudeCodeChatModel) because
@@ -220,6 +235,139 @@ class ClientManager:
         # session accumulates unbounded history and eventually hits
         # "Prompt is too long". DO NOT remove this mechanism.
         self._session_epoch: dict[str, int] = {}
+
+    async def _cache_entry_matches_tools(
+        self,
+        thread_id: str,
+        tools_metadata: list[ToolMetadata],
+    ) -> bool:
+        """Check whether the cached ProxyMCPServer advertises the same
+        tool surface as the incoming ``tools_metadata``.
+
+        Incident 2026-06-13 (#2) step C invariant: the cache key is
+        ``thread_id``, but the cache VALUE encodes a snapshot of the
+        tool inventory at construction time. If the inventory changes
+        (e.g. middleware now contributes additional tools that weren't
+        present on the first call) the cache slot is STALE and must
+        not be reused.
+
+        We compare by tool-name set, not full ToolMetadata equality:
+        equal names mean equal MCP advertisement, which is what the CLI
+        subprocess actually sees. Schema drift inside a tool is handled
+        by the LangGraph side (StructuredTool reconstruction) and does
+        not require a session rotation.
+
+        Returns ``True`` when the cache entry's tool names equal the
+        incoming names (order-insensitive). Returns ``True`` on any
+        error (defence in depth — a comparison failure must not by
+        itself cause a forced rotation; the surrounding code will catch
+        a true mismatch on the next call).
+        """
+        try:
+            entry = self.clients.get(thread_id)
+            if entry is None:
+                return False
+            _client, proxy = entry
+            cached = set(getattr(proxy, "tool_names", []) or [])
+            incoming = {t["name"] for t in tools_metadata}
+            return cached == incoming
+        except Exception:  # noqa: BLE001
+            return True
+
+    async def prepare_proxy_only(
+        self,
+        thread_id: str,
+        tools_metadata: list[ToolMetadata],
+        working_dir: str | None = None,
+    ) -> ProxyMCPServer:
+        """Reserve a cache slot with a ready ``ProxyMCPServer``, WITHOUT
+        spawning a Claude CLI subprocess.
+
+        ════════════════════════════════════════════════════════════════
+        ⚠ WHY THIS EXISTS — INCIDENT 2026-06-15 (mj1_init lost history).
+        ════════════════════════════════════════════════════════════════
+        Before this method existed, ``agent_process._prewarm_client_manager``
+        called ``get_or_create_client(...)``, which actually opened a
+        Claude CLI session with ``resume=None``. That broke the
+        history-restore design (``DESIGN_HISTORY_RESTORE_ON_RESTART.md``):
+
+          * ``ClaudeCodeChatModel.ainvoke`` runs the restore block only
+            when ``not has_client(thread_id)`` — i.e. on the very first
+            turn after a (re)start.
+          * After prewarm, ``has_client(thread_id)`` was already True,
+            so the restore block was NEVER reached, ``resume_session_id``
+            stayed ``None``, and the agent forgot every prior turn.
+
+        This method does the half of the work prewarm actually needs:
+        build the ``ProxyMCPServer`` from the FINAL tool inventory so the
+        rotate-on-mismatch defence at incident-2026-06-13 (#2) never
+        fires on the first real turn — but DOES NOT open the CLI session.
+        ``has_client(thread_id)`` stays False until the first
+        ``get_or_create_client(resume_session_id=X)`` adopts this proxy
+        and finally opens the CLI subprocess.
+
+        ⚠ DO NOT regress this by making prewarm call
+        ``get_or_create_client`` again. See INCIDENT 2026-06-15 and
+        ``test_client_manager_prewarm_no_connect.py``.
+
+        Args:
+            thread_id: Unique identifier for this thread/session.
+            tools_metadata: Final tool inventory the CLI subprocess must
+                see at connect time. Same shape as for
+                ``get_or_create_client``.
+            working_dir: Working directory pinned for both the
+                ProxyMCPServer's tool routing and the eventual CLI
+                subprocess (must match — same constraint as
+                ``get_or_create_client``).
+
+        Returns:
+            The reserved ``ProxyMCPServer``. Most callers do not use the
+            return value — they will get it back via
+            ``get_or_create_client`` on the first real turn.
+        """
+        # Idempotent re-prepare with the SAME tool set is a no-op (matches
+        # ``get_or_create_client``'s cache-hit semantics). A re-prepare with
+        # a DIFFERENT tool set replaces the reservation — the connect path
+        # would have rotated it anyway via ``_cache_entry_matches_tools``.
+        existing = self._proxy_only.get(thread_id)
+        incoming_names = {t["name"] for t in tools_metadata}
+        if existing is not None:
+            cached_names = set(getattr(existing, "tool_names", []) or [])
+            if cached_names == incoming_names:
+                return existing
+        proxy_mcp = ProxyMCPServer(
+            tools_metadata,
+            working_dir=working_dir,
+            agent_name=thread_id,
+        )
+        self._proxy_only[thread_id] = proxy_mcp
+        return proxy_mcp
+
+    async def _drop_stale_cache_entry(self, thread_id: str) -> None:
+        """Disconnect and evict a cache entry whose tool inventory no
+        longer matches the requested set.
+
+        Best-effort cleanup: the disconnect MUST NOT raise into the
+        caller (we are about to create a fresh client and that path is
+        what the caller actually cares about). Errors are logged at
+        info level and swallowed.
+
+        See ``_cache_entry_matches_tools`` for why this exists.
+        """
+        entry = self.clients.pop(thread_id, None)
+        if entry is None:
+            return
+        client, _proxy = entry
+        try:
+            await client.disconnect()
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"[ClientManager] disconnect-on-rotate failed for "
+                f"thread_id={thread_id!r}: {exc!r} (continuing — fresh "
+                f"client will be created next)",
+                file=sys.stderr,
+                flush=True,
+            )
 
     async def get_or_create_client(
         self,
@@ -257,27 +405,79 @@ class ClientManager:
         Returns:
             Tuple of (ClaudeSDKClient, ProxyMCPServer)
         """
-        # If already cached, return immediately
+        # ════════════════════════════════════════════════════════════════
+        # CACHE-HIT INVARIANT (incident 2026-06-13 #2 step C, defence in
+        # depth for the prewarm fix at agent_process.start()).
+        # ════════════════════════════════════════════════════════════════
+        # When the cached ProxyMCPServer advertises a tool inventory that
+        # DOES NOT MATCH the incoming ``tools_metadata``, we MUST rotate
+        # the session — disconnect the stale client, drop the slot, and
+        # fall through to create a fresh client+proxy with the new
+        # inventory. Returning the cached pair on a mismatch is exactly
+        # what made the incident-06-13 regression survive forever once
+        # planted: any later code path that arrived with the FULL 23-tool
+        # set silently inherited the stale 4-tool proxy because of the
+        # unconditional cache return.
+        #
+        # ⚠ DO NOT delete this check or replace it with "use cached
+        # anyway, it'll catch up eventually". It will not catch up:
+        # ProxyMCPServer's tool list is decided at construction and
+        # advertised once over MCP — there is no live re-publish path.
+        # The Claude CLI subprocess sees what we tell it at connect()
+        # time, and only what we tell it.
         if thread_id in self.clients:
-            return self.clients[thread_id]
+            if await self._cache_entry_matches_tools(thread_id, tools_metadata):
+                return self.clients[thread_id]
+            # Mismatch — rotate the stale slot before falling through to
+            # the create path. ``_drop_stale_cache_entry`` disconnects
+            # the old client and clears self.clients[thread_id].
+            await self._drop_stale_cache_entry(thread_id)
 
         # Get or create lock for this thread_id
         if thread_id not in self._creation_locks:
             self._creation_locks[thread_id] = asyncio.Lock()
 
         async with self._creation_locks[thread_id]:
-            # Double-check after acquiring lock (another coroutine might have created it)
+            # Double-check after acquiring lock (another coroutine might have created it).
+            # Same mismatch invariant applies — the race-winner could have created
+            # a cache entry with a different tool_set than ours.
             if thread_id in self.clients:
-                return self.clients[thread_id]
+                if await self._cache_entry_matches_tools(thread_id, tools_metadata):
+                    return self.clients[thread_id]
+                await self._drop_stale_cache_entry(thread_id)
 
-            # Create ProxyMCPServer for this thread.
-            # ⚠️ ProxyMCPServer uses Future-based proxy — NO direct execution.
-            # Tools are executed by LangGraph ToolNode, not by MCP handler.
-            proxy_mcp = ProxyMCPServer(
-                tools_metadata,
-                working_dir=working_dir,
-                agent_name=thread_id,
-            )
+            # ════════════════════════════════════════════════════════════
+            # ADOPT prewarm-reserved ProxyMCPServer when it matches.
+            # ════════════════════════════════════════════════════════════
+            # ``prepare_proxy_only`` may have reserved a ProxyMCPServer for
+            # this thread before the first real turn. If the reservation's
+            # tool set matches what we are about to connect with, re-use
+            # the SAME instance — no throw-away allocation, no duplicate
+            # MCP server seen by the SDK. On any mismatch, discard the
+            # reservation and build fresh (same outcome as the connected
+            # rotate-on-mismatch path above).
+            # INCIDENT 2026-06-15.
+            reserved = self._proxy_only.pop(thread_id, None)
+            if reserved is not None:
+                reserved_names = set(getattr(reserved, "tool_names", []) or [])
+                incoming_names = {t["name"] for t in tools_metadata}
+                if reserved_names == incoming_names:
+                    proxy_mcp = reserved
+                else:
+                    proxy_mcp = ProxyMCPServer(
+                        tools_metadata,
+                        working_dir=working_dir,
+                        agent_name=thread_id,
+                    )
+            else:
+                # Create ProxyMCPServer for this thread.
+                # ⚠️ ProxyMCPServer uses Future-based proxy — NO direct execution.
+                # Tools are executed by LangGraph ToolNode, not by MCP handler.
+                proxy_mcp = ProxyMCPServer(
+                    tools_metadata,
+                    working_dir=working_dir,
+                    agent_name=thread_id,
+                )
 
             # Build options for this client
             # ⚠️ CRITICAL: Permission delegation architecture
@@ -335,8 +535,9 @@ class ClientManager:
             # session's tool/permission config, which has no
             # ``mcp__deepworker__*`` tools — combined with our
             # ``disallowed_tools`` that strips the agent down to ~1 usable tool
-            # (observed 2026-05-24). The ``--import-claude`` importer therefore
-            # deliberately does NOT seed a hint for the imported file.
+            # (observed live). The ``--import-claude`` importer therefore
+            # deliberately does NOT seed a hint for the imported file; see
+            # the import-claude design notes (§6).
             if resume_session_id:
                 options = replace(
                     options, resume=resume_session_id, fork_session=True
@@ -366,6 +567,87 @@ class ClientManager:
                 options = replace(options, resume=None, fork_session=False)
                 client = ClaudeSDKClient(options=options)
                 await client.connect()
+
+            # [MCP_DIAG] Probe what the CLI subprocess sees right after
+            # connect(). On a fresh start the deepworker MCP server should
+            # be active and ``mcp__deepworker__*`` tools should be in the
+            # CLI inventory. On after-rotation we suspect this set is
+            # empty — the whole point of this diagnostic is to prove or
+            # falsify that. Best-effort, never throws.
+            # NEVER let a diagnostic probe surface as a tool error to the
+            # agent — wrap everything in suppress.
+            try:
+                info = await client.get_server_info()
+                epoch = self._session_epoch.get(thread_id, 0)
+                if info is None:
+                    print(
+                        f"[MCP_DIAG] connect_done thread={thread_id} "
+                        f"epoch={epoch} resume={resume_session_id!r} "
+                        f"server_info=None",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                else:
+                    # Best-effort key extraction — we don't know the
+                    # exact init schema across CLI versions. Log keys
+                    # and any tool-related entries we can spot.
+                    keys = sorted(info.keys()) if hasattr(info, "keys") else []
+                    tools_entry = (
+                        info.get("tools") if hasattr(info, "get") else None
+                    )
+                    commands_entry = (
+                        info.get("commands") if hasattr(info, "get") else None
+                    )
+                    mcp_servers_entry = (
+                        info.get("mcp_servers")
+                        if hasattr(info, "get")
+                        else None
+                    )
+                    tools_count = (
+                        len(tools_entry)
+                        if isinstance(tools_entry, list)
+                        else "n/a"
+                    )
+                    cmd_count = (
+                        len(commands_entry)
+                        if isinstance(commands_entry, list)
+                        else "n/a"
+                    )
+                    # Sample a few entries — truncate hard so this never
+                    # blows up the log.
+                    sample = ""
+                    if isinstance(tools_entry, list) and tools_entry:
+                        sample = str(tools_entry[:5])[:300]
+                    print(
+                        f"[MCP_DIAG] connect_done thread={thread_id} "
+                        f"epoch={epoch} resume={resume_session_id!r} "
+                        f"info_keys={keys} tools_count={tools_count} "
+                        f"commands_count={cmd_count} "
+                        f"mcp_servers={mcp_servers_entry!r} "
+                        f"tools_sample={sample}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                # Also log what WE put in proxy_mcp so we can correlate
+                # against what CLI reports back.
+                print(
+                    f"[MCP_DIAG] proxy_mcp thread={thread_id} "
+                    f"epoch={epoch} proxy_tool_count="
+                    f"{len(proxy_mcp.tool_names)} "
+                    f"proxy_tools_sample={proxy_mcp.tool_names[:5]}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            except Exception as exc:  # noqa: BLE001
+                # Diagnostic logging MUST NOT break the connect path.
+                # If anything goes wrong here — just record the failure
+                # and move on. The agent keeps working.
+                print(
+                    f"[MCP_DIAG] probe_failed thread={thread_id} "
+                    f"err={exc!r}",
+                    file=sys.stderr,
+                    flush=True,
+                )
 
             # Cache
             self.clients[thread_id] = (client, proxy_mcp)
@@ -465,15 +747,28 @@ class ClientManager:
             return thread_id
         return f"{thread_id}__epoch_{epoch}"
 
-    def rotate_session(self, thread_id: str) -> str:
+    async def rotate_session(self, thread_id: str) -> str:
         """Rotate to a new Claude CLI session for this thread.
 
         Called when LangGraph summarization resets the message history
         (detected by ``sent_count > len(messages)`` in ainvoke).
-        Increments epoch, resets sent_count, and returns the new session_id.
+        Disconnects the current ClaudeSDKClient (so its subprocess is
+        torn down cleanly), increments epoch, resets sent_count, and
+        returns the new session_id.
 
-        The old Claude CLI session is simply abandoned — Claude CLI
-        handles its own garbage collection.
+        ⚠️ The previous (sync) version of this method only bumped the
+        epoch and reset the counter — it did NOT disconnect the old
+        ``ClaudeSDKClient`` stored in ``self.clients[thread_id]``. The
+        next ``get_or_create_client(thread_id)`` then overwrote the slot
+        with a fresh client, leaving the old one (and its ``claude``
+        subprocess) unreachable — GC could not run the async
+        ``disconnect()``. The orphan subprocess kept open pipes and
+        eventually triggered the pipe-I/O deadlock described in
+        a related internal incident analysis (not included here).
+
+        Disconnect is best-effort: any exception is suppressed so a
+        transient SDK error does not block epoch rotation (and thereby
+        block summarisation recovery).
 
         Args:
             thread_id: Thread ID to rotate.
@@ -481,10 +776,25 @@ class ClientManager:
         Returns:
             New effective session_id.
         """
-        current = self._session_epoch.get(thread_id, 0)
-        self._session_epoch[thread_id] = current + 1
-        self._sent_count[thread_id] = 0
-        return self.get_effective_session_id(thread_id)
+        # Acquire the same per-thread creation lock used by
+        # get_or_create_client() so that pop+disconnect is serialised
+        # against concurrent client creation for this thread_id.
+        if thread_id not in self._creation_locks:
+            self._creation_locks[thread_id] = asyncio.Lock()
+        async with self._creation_locks[thread_id]:
+            # Disconnect the old client BEFORE bumping the epoch, so that:
+            # 1. the slot is empty when the next get_or_create_client() runs,
+            # 2. no other coroutine can pick up a half-rotated state.
+            old = self.clients.pop(thread_id, None)
+            if old is not None:
+                client, _proxy_mcp = old
+                with suppress(Exception):
+                    await client.disconnect()
+
+            current = self._session_epoch.get(thread_id, 0)
+            self._session_epoch[thread_id] = current + 1
+            self._sent_count[thread_id] = 0
+            return self.get_effective_session_id(thread_id)
 
     async def cleanup_client(self, thread_id: str) -> None:
         """Cleanup client for a thread_id.

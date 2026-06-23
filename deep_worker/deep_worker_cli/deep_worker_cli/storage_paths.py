@@ -11,7 +11,8 @@ STORAGE_VERSION_GLOBAL_DB = 1
 STORAGE_VERSION_DEEPAGENTS_PER_AGENT = 2
 STORAGE_VERSION_AGENT_ROOT = 3
 STORAGE_VERSION_AGENT_ROOT_WITH_JSONL = 4
-CURRENT_STORAGE_VERSION = STORAGE_VERSION_AGENT_ROOT_WITH_JSONL
+STORAGE_VERSION_WITH_PREFERRED_PROVIDER = 5
+CURRENT_STORAGE_VERSION = STORAGE_VERSION_WITH_PREFERRED_PROVIDER
 
 _AGENT_NAME_RE = re.compile(r"^[a-zA-Z0-9_\-:\s]+$")
 
@@ -28,7 +29,7 @@ def agent_name_from_thread_id(thread_id: str) -> str:
     return thread_id.split(":", 1)[0]
 
 
-def agent_data_home(home: Path | None = None) -> Path:
+def deep_worker_home(home: Path | None = None) -> Path:
     return (home or Path.home()) / Path("~/.deep_worker").name
 
 
@@ -63,7 +64,7 @@ def ensure_private_tree(path: Path) -> Path:
 
 def agent_root(agent_name: str, *, home: Path | None = None, create: bool = True) -> Path:
     validate_agent_name(agent_name)
-    root = agent_data_home(home) / agent_name
+    root = deep_worker_home(home) / agent_name
     if create:
         ensure_private_dir(root)
     return root
@@ -134,7 +135,11 @@ def threads_db_path(
         return legacy_global_db_path(home=home, create_parent=create_parent)
     if version == STORAGE_VERSION_DEEPAGENTS_PER_AGENT:
         return legacy_per_agent_db_path(agent_name, home=home, create_parent=create_parent)
-    if version == STORAGE_VERSION_AGENT_ROOT or version == STORAGE_VERSION_AGENT_ROOT_WITH_JSONL:
+    if (
+        version == STORAGE_VERSION_AGENT_ROOT
+        or version == STORAGE_VERSION_AGENT_ROOT_WITH_JSONL
+        or version == STORAGE_VERSION_WITH_PREFERRED_PROVIDER
+    ):
         root = agent_root(agent_name, home=home, create=create_parent)
         return root / "threads.db"
     raise ValueError(f"Unsupported storage_version: {version!r}")
@@ -148,7 +153,11 @@ def deepagents_data_dir(
     create: bool = True,
 ) -> Path:
     version = storage_version or detect_storage_version(agent_name, home=home)
-    if version == STORAGE_VERSION_AGENT_ROOT or version == STORAGE_VERSION_AGENT_ROOT_WITH_JSONL:
+    if (
+        version == STORAGE_VERSION_AGENT_ROOT
+        or version == STORAGE_VERSION_AGENT_ROOT_WITH_JSONL
+        or version == STORAGE_VERSION_WITH_PREFERRED_PROVIDER
+    ):
         data_dir = agent_root(agent_name, home=home, create=create) / "data"
         if create:
             ensure_private_dir(data_dir)
@@ -162,7 +171,7 @@ def deepagents_data_dir(
 
 def iter_thread_db_paths(*, home: Path | None = None) -> list[Path]:
     paths: list[Path] = []
-    worker_root = agent_data_home(home)
+    worker_root = deep_worker_home(home)
     if worker_root.exists():
         for candidate in sorted(worker_root.iterdir()):
             if candidate.is_dir():

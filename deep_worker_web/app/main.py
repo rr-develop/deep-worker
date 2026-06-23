@@ -3,8 +3,8 @@
 CRITICAL SECURITY:
 ==================
 This application MUST ONLY run on 127.0.0.1, on the port that matches
-the active checkout — 7887 for the production checkout, 7888 for the
-development checkout. Security validation happens at config import
+the active checkout — 7887 for /path/to/production, 7888 for
+/path/to/dev. Security validation happens at config import
 and startup (see app/config.py).
 
 ARCHITECTURE:
@@ -22,9 +22,31 @@ from pathlib import Path
 from typing import AsyncIterator
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from starlette.types import Scope
+
+
+class NoStaleStaticFiles(StaticFiles):
+    """``StaticFiles`` that forces the browser to revalidate every asset.
+
+    A bare ``StaticFiles`` mount serves ``index.html`` / ``main.js`` with an
+    ETag but no ``Cache-Control``, so browsers apply heuristic caching and can
+    keep running the PREVIOUS UI without revalidating. That is the root cause
+    of the Full Dialog introspection bug: a stale 3-option verbosity dropdown
+    cannot emit ``system_prompt``/``tools``, so clicking Full Dialog shows the
+    conversation instead. See ``docs/DESIGN_STATIC_NO_STALE_CACHE.md``.
+
+    ``no-cache`` means "cache, but revalidate before every reuse" — combined
+    with the existing ETag the browser gets cheap ``304``s while never serving
+    a stale asset. On localhost the revalidation cost is negligible.
+    """
+
+    async def get_response(self, path: str, scope: Scope) -> Response:
+        response = await super().get_response(path, scope)
+        response.headers["Cache-Control"] = "no-cache, must-revalidate"
+        return response
 
 from app.config import settings
 from app.routers import agents_router, websocket_router
@@ -114,6 +136,27 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     logger.critical(
         f"SECURITY CHECK: Server bound to {settings.host}:{settings.port} ONLY"
     )
+    # One-line startup diagnostic with git commit SHA + launch configuration.
+    import os as _os
+    from app.config import _CHECKOUT_ROOT, get_git_commit_info
+
+    _tree = str(_CHECKOUT_ROOT)
+    _commit, _describe = get_git_commit_info(_tree)
+    _env_web = {k: v for k, v in sorted(_os.environ.items())
+                if k.startswith("DEEP_WORKER_")}
+    _env_str = " ".join(f"{k}={v}" for k, v in _env_web.items())
+    logger.info(
+        "[STARTUP] component=deep_worker_web "
+        f"host={settings.host} port={settings.port} "
+        f"commit={_commit} describe={_describe} "
+        f"tree={_tree} "
+        f"dev_tree={'true' if _os.environ.get('DEEP_WORKER_DEV_TREE') == '1' else 'false'} "
+        f"pid={_os.getpid()} "
+        f"debug={str(settings.debug).lower()} "
+        f"reload={str(settings.reload).lower()} "
+        f"{_env_str}"
+    )
+
     logger.info("Starting deep-worker-web application")
 
     # Initialize uptime tracking
@@ -244,7 +287,7 @@ app.include_router(server_router)
 # Mount static files
 static_dir = Path(__file__).parent.parent / "static"
 if static_dir.exists():
-    app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+    app.mount("/static", NoStaleStaticFiles(directory=str(static_dir)), name="static")
     logger.info(f"Mounted static files from {static_dir}")
 else:
     logger.warning(f"Static directory not found: {static_dir}")

@@ -31,7 +31,7 @@ dependencies = [
   # host's system-installed packages. Open ranges produced silent API
   # drift between the type-check uv-venv (which was getting the latest
   # PyPI release) and pytest (running against the system install) —
-  # see ``.githooks/pre-commit`` 2026-04-25 incident note and the
+  # see the pre-commit hook note from 2026-04-25 and the
   # subagent recursion_limit bug fixed in
   # deepagents/middleware/subagents.py.
   "deepagents==0.3.12",
@@ -40,7 +40,7 @@ dependencies = [
   # DeepSeek thinking models (deepseek-v4-flash) require reasoning_content to
   # be round-tripped; we build them with ReasoningChatDeepSeek (subclass of
   # ChatDeepSeek). Pinned exact to match the host install. See
-  # deepseek_model.py and DEEPSEEK_PROVIDER.md (incident observed 2026-05-22).
+  # deepseek_model.py and DEEPSEEK_PROVIDER.md (observed live).
   "langchain-deepseek==1.0.1",
   "langgraph-checkpoint-sqlite==3.0.3",
 
@@ -63,13 +63,15 @@ dependencies = [
 
   # Tools
   "tavily-python>=0.7.21,<1.0.0",
+  # External MCP clients (stdio + streamable HTTP). Exact host-compatible pin.
+  "mcp==1.17.0",
 
   # Clipboard
   "pyperclip>=1.11.0,<2.0.0",
 
   # IPC/RPC - MIGRATED TO ASYNCIO SERVER
   # Using rpyc_async from source (with AsyncioServer support)
-  "rpyc @ file:///path/to/rpyc_async",
+  "rpyc @ file://../rpyc_async",
 
   # Utilities
   "python-dotenv>=1.0.0,<2.0.0",
@@ -131,7 +133,7 @@ deepagents = { path = "../deepagents", editable = true }
 # extra-paths is SAFETY-CRITICAL. DO NOT REMOVE ENTRIES without replacing
 # them with a working equivalent. In particular:
 #
-#   /path/to/rpyc_async
+#   ../../../rpyc_async
 #       ← MUST be present. This project talks to agents over
 #         rpyc_async's AsyncioServer and uses rpyc_async-specific
 #         entry points that do not exist in the pip/stub `rpyc`:
@@ -149,21 +151,21 @@ deepagents = { path = "../deepagents", editable = true }
 # If you are tempted to bypass type checks: don't. Fix the path here
 # or fix the real type error. There are no third options.
 # ═══════════════════════════════════════════════════════════════════════════
-# Paths are tree-relative (../../  = <repo>/, ../  = deep_worker/).
-# Using ../.. instead of hard-coded absolute repo paths means this file
-# works identically in the production tree and the developer tree.
-# Hard-coding the prod path caused
-# `ty check` to fail in the dev tree: it would add BOTH the prod
-# deep_worker_cli (via extra-paths) and the dev deep_worker_cli (via cwd)
-# to the module-resolution path, then refuse to resolve relative imports
-# like `from .task_manager import …` because two copies of the same
-# package were visible. See docs/DESIGN_DEV_FLAG.md.
+# Paths are tree-relative (../../  = <repo>/, ../  = <repo>/<main-package>/).
+# Using ../.. instead of hard-coded absolute paths means this file works
+# identically in the production and development trees. Hard-coding the
+# production path caused `ty check` to fail in the dev tree: it would add
+# BOTH the production deep_worker_cli (via extra-paths) and the dev
+# deep_worker_cli (via cwd) to the module-resolution path, then refuse to
+# resolve relative imports like `from .task_manager import …` because two
+# copies of the same package were visible. See docs/DESIGN_DEV_FLAG.md.
 extra-paths = [
+    ".",
     "../..",
     "../../claude_code_provider",
     "../../semantic_search",
     "../deepagents",
-    "/path/to/rpyc_async",
+    "../../../rpyc_async",
 ]
 
 [tool.ty.rules]

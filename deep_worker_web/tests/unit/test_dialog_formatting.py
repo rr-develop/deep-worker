@@ -3,12 +3,9 @@
 Covers all 50 cases from
 DESIGN_FULL_DIALOG_FINAL_RESPONSE_PAIRS.md sections 4.1-4.6 and 4.8.
 
-(The 5 no-limit RPyC-server tests live in
-deep_worker_cli/tests/unit_tests/process/test_get_history_no_limit.py
-because they target the agent-side ``_handle_get_history`` and need the
-``deep_worker_cli`` import path.)
-
-(The demo-agent regression test lives in test_dialog_regression_demo_site.py.)
+(The 5 no-limit RPyC-server tests live in the agent-side test suite
+(test_get_history_no_limit.py) because they target the agent-side
+``_handle_get_history`` and need the CLI import path.)
 """
 
 from __future__ import annotations
@@ -67,6 +64,18 @@ def tool(
 
 def tc(name: str = "execute", args: dict[str, Any] | None = None, tc_id: str = "tc1") -> dict[str, Any]:
     return {"id": tc_id, "name": name, "args": args or {}}
+
+
+def system(content: str, msg_id: str = "s") -> dict[str, Any]:
+    return {"type": "SystemMessage", "id": msg_id, "content": content}
+
+
+def system(content: str, msg_id: str = "s") -> dict[str, Any]:
+    return {"type": "SystemMessage", "id": msg_id, "content": content}
+
+
+def system(content: str, msg_id: str = "s") -> dict[str, Any]:
+    return {"type": "SystemMessage", "id": msg_id, "content": content}
 
 
 def fmt(history: list[dict[str, Any]], verbosity: str = "final") -> str:
@@ -460,9 +469,9 @@ class TestFullMode:
     def test_full_mode_handles_unicode_args(self) -> None:
         out = fmt([
             human("q"),
-            ai("", tool_calls=[tc("execute", {"command": "café"})]),
+            ai("", tool_calls=[tc("execute", {"command": "search"})]),
         ], verbosity="full")
-        assert "café" in out  # not escaped to \u…
+        assert "search" in out  # not escaped to \u…
 
     def test_full_mode_no_response_still_renders_placeholder(self) -> None:
         out = fmt([human("q")], verbosity="full")
@@ -537,3 +546,246 @@ class TestFormatToolCall:
         assert s.endswith("...)")
         # full string under reasonable cap
         assert len(s) <= 220
+
+
+# ============================================================================
+# System messages are first-class in history rendering.
+#
+# POLICY: Rendering full conversation history WITHOUT system prompts is
+# misleading and is forbidden. System messages (the base agent prompt AND
+# runtime middleware hints such as the inter-agent reply hint) MUST be
+# rendered at every verbosity at or above "text" ("All assistant text").
+# They are intentionally omitted only from the most compact "final" view.
+# See DESIGN_FULL_DIALOG_FINAL_RESPONSE_PAIRS.md §"System messages".
+# ============================================================================
+
+
+class TestSystemMessagesVisible:
+    def test_leading_system_prompt_rendered_in_text_mode(self) -> None:
+        out = fmt(
+            [system("You are a helpful assistant."), human("q"), ai("a")],
+            verbosity="text",
+        )
+        assert "--- System ---" in out
+        assert "You are a helpful assistant." in out
+
+    def test_leading_system_prompt_rendered_in_full_mode(self) -> None:
+        out = fmt(
+            [system("You are a helpful assistant."), human("q"), ai("a")],
+            verbosity="full",
+        )
+        assert "--- System ---" in out
+        assert "You are a helpful assistant." in out
+
+    def test_midturn_system_hint_rendered_in_text_mode(self) -> None:
+        # The inter-agent reply hint is injected AFTER a HumanMessage.
+        out = fmt(
+            [
+                human("alpha -> beta :> please review"),
+                system("You just received a message from agent 'alpha'."),
+                ai("Sure, reviewing now."),
+            ],
+            verbosity="text",
+        )
+        assert "--- System ---" in out
+        assert "You just received a message from agent 'alpha'." in out
+        # And the assistant text is still present, in order.
+        assert "Sure, reviewing now." in out
+
+    def test_midturn_system_hint_rendered_in_full_mode_in_order(self) -> None:
+        out = fmt(
+            [
+                human("alpha -> beta :> please review"),
+                system("HINT: reply via send_message_to_agent."),
+                ai("On it.", tool_calls=[tc("execute", {"command": "ls"})]),
+            ],
+            verbosity="full",
+        )
+        assert "--- System ---" in out
+        assert "HINT: reply via send_message_to_agent." in out
+        # System hint must appear before the assistant text that follows it.
+        assert out.index("HINT: reply") < out.index("On it.")
+
+    def test_system_prompt_omitted_in_final_mode(self) -> None:
+        # "final" is the most compact view: one assistant block per turn.
+        # System messages are intentionally not surfaced there.
+        out = fmt(
+            [system("You are a helpful assistant."), human("q"), ai("a")],
+            verbosity="final",
+        )
+        assert "--- System ---" not in out
+        assert "You are a helpful assistant." not in out
+
+    def test_system_only_history_renders_in_text_mode(self) -> None:
+        # A history that is only a system prompt (no human turn yet) must
+        # still surface the system prompt at text/full verbosity.
+        out = fmt([system("You are a helpful assistant.")], verbosity="text")
+        assert "--- System ---" in out
+        assert "You are a helpful assistant." in out
+
+    def test_system_only_history_renders_in_full_mode(self) -> None:
+        out = fmt([system("You are a helpful assistant.")], verbosity="full")
+        assert "--- System ---" in out
+        assert "You are a helpful assistant." in out
+
+
+# ============================================================================
+# System messages are first-class in history rendering.
+#
+# POLICY: Rendering full conversation history WITHOUT system prompts is
+# misleading and is forbidden. System messages (the base agent prompt AND
+# runtime middleware hints such as the inter-agent reply hint) MUST be
+# rendered at every verbosity at or above "text" ("All assistant text").
+# They are intentionally omitted only from the most compact "final" view.
+# See DESIGN_FULL_DIALOG_FINAL_RESPONSE_PAIRS.md §"System messages".
+# ============================================================================
+
+
+class TestSystemMessagesVisible:
+    def test_leading_system_prompt_rendered_in_text_mode(self) -> None:
+        out = fmt(
+            [system("You are a helpful assistant."), human("q"), ai("a")],
+            verbosity="text",
+        )
+        assert "--- System ---" in out
+        assert "You are a helpful assistant." in out
+
+    def test_leading_system_prompt_rendered_in_full_mode(self) -> None:
+        out = fmt(
+            [system("You are a helpful assistant."), human("q"), ai("a")],
+            verbosity="full",
+        )
+        assert "--- System ---" in out
+        assert "You are a helpful assistant." in out
+
+    def test_midturn_system_hint_rendered_in_text_mode(self) -> None:
+        # The inter-agent reply hint is injected AFTER a HumanMessage.
+        out = fmt(
+            [
+                human("alpha -> beta :> please review"),
+                system("You just received a message from agent 'alpha'."),
+                ai("Sure, reviewing now."),
+            ],
+            verbosity="text",
+        )
+        assert "--- System ---" in out
+        assert "You just received a message from agent 'alpha'." in out
+        # And the assistant text is still present, in order.
+        assert "Sure, reviewing now." in out
+
+    def test_midturn_system_hint_rendered_in_full_mode_in_order(self) -> None:
+        out = fmt(
+            [
+                human("alpha -> beta :> please review"),
+                system("HINT: reply via send_message_to_agent."),
+                ai("On it.", tool_calls=[tc("execute", {"command": "ls"})]),
+            ],
+            verbosity="full",
+        )
+        assert "--- System ---" in out
+        assert "HINT: reply via send_message_to_agent." in out
+        # System hint must appear before the assistant text that follows it.
+        assert out.index("HINT: reply") < out.index("On it.")
+
+    def test_system_prompt_omitted_in_final_mode(self) -> None:
+        # "final" is the most compact view: one assistant block per turn.
+        # System messages are intentionally not surfaced there.
+        out = fmt(
+            [system("You are a helpful assistant."), human("q"), ai("a")],
+            verbosity="final",
+        )
+        assert "--- System ---" not in out
+        assert "You are a helpful assistant." not in out
+
+    def test_system_only_history_renders_in_text_mode(self) -> None:
+        # A history that is only a system prompt (no human turn yet) must
+        # still surface the system prompt at text/full verbosity.
+        out = fmt([system("You are a helpful assistant.")], verbosity="text")
+        assert "--- System ---" in out
+        assert "You are a helpful assistant." in out
+
+    def test_system_only_history_renders_in_full_mode(self) -> None:
+        out = fmt([system("You are a helpful assistant.")], verbosity="full")
+        assert "--- System ---" in out
+        assert "You are a helpful assistant." in out
+
+
+# ============================================================================
+# System messages are first-class in history rendering.
+#
+# POLICY: Rendering full conversation history WITHOUT system prompts is
+# misleading and is forbidden. System messages (the base agent prompt AND
+# runtime middleware hints such as the inter-agent reply hint) MUST be
+# rendered at every verbosity at or above "text" ("All assistant text").
+# They are intentionally omitted only from the most compact "final" view.
+# See DESIGN_FULL_DIALOG_FINAL_RESPONSE_PAIRS.md §"System messages".
+# ============================================================================
+
+
+class TestSystemMessagesVisible:
+    def test_leading_system_prompt_rendered_in_text_mode(self) -> None:
+        out = fmt(
+            [system("You are a helpful assistant."), human("q"), ai("a")],
+            verbosity="text",
+        )
+        assert "--- System ---" in out
+        assert "You are a helpful assistant." in out
+
+    def test_leading_system_prompt_rendered_in_full_mode(self) -> None:
+        out = fmt(
+            [system("You are a helpful assistant."), human("q"), ai("a")],
+            verbosity="full",
+        )
+        assert "--- System ---" in out
+        assert "You are a helpful assistant." in out
+
+    def test_midturn_system_hint_rendered_in_text_mode(self) -> None:
+        # The inter-agent reply hint is injected AFTER a HumanMessage.
+        out = fmt(
+            [
+                human("alpha -> beta :> please review"),
+                system("You just received a message from agent 'alpha'."),
+                ai("Sure, reviewing now."),
+            ],
+            verbosity="text",
+        )
+        assert "--- System ---" in out
+        assert "You just received a message from agent 'alpha'." in out
+        # And the assistant text is still present, in order.
+        assert "Sure, reviewing now." in out
+
+    def test_midturn_system_hint_rendered_in_full_mode_in_order(self) -> None:
+        out = fmt(
+            [
+                human("alpha -> beta :> please review"),
+                system("HINT: reply via send_message_to_agent."),
+                ai("On it.", tool_calls=[tc("execute", {"command": "ls"})]),
+            ],
+            verbosity="full",
+        )
+        assert "--- System ---" in out
+        assert "HINT: reply via send_message_to_agent." in out
+        # System hint must appear before the assistant text that follows it.
+        assert out.index("HINT: reply") < out.index("On it.")
+
+    def test_system_prompt_omitted_in_final_mode(self) -> None:
+        # "final" is the most compact view: one assistant block per turn.
+        # System messages are intentionally not surfaced there.
+        out = fmt(
+            [system("You are a helpful assistant."), human("q"), ai("a")],
+            verbosity="final",
+        )
+        assert "--- System ---" not in out
+        assert "You are a helpful assistant." not in out
+
+    def test_system_only_history_renders_in_text_mode(self) -> None:
+        # A history that is only a system prompt (no human turn yet) must
+        # still surface the system prompt at text/full verbosity.
+        out = fmt([system("You are a helpful assistant.")], verbosity="text")
+        assert "--- System ---" in out
+        assert "You are a helpful assistant." in out
+
+    def test_system_only_history_renders_in_full_mode(self) -> None:
+        out = fmt([system("You are a helpful assistant.")], verbosity="full")
+        assert "--- System ---" in out
+        assert "You are a helpful assistant." in out

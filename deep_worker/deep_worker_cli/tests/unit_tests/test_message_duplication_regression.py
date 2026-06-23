@@ -16,6 +16,7 @@ ARCHITECTURE PRINCIPLE:
 
 from __future__ import annotations
 
+import asyncio
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, Mock, call, patch
 
@@ -210,18 +211,42 @@ class TestAgentServiceMessageNotification:
         # Message subscribers now live on AgentProcess (shared state
         # across connections) — see agent_service.py ~line 521/1069.
         # We inject a stub AgentProcess carrying a set.
+        # Mock subscribers must carry ____conn__ for _asyncreq (used by
+        # _notify_subscribers), which accesses it via
+        # object.__getattribute__(proxy, "____conn__") then calls
+        # conn.async_request(handler, proxy, method, args, kwargs).
+        # We provide a minimal mock that dispatches to on_message.
+        async def _mock_async_request(
+            _handler: object,
+            proxy: object,
+            method: str,
+            args: tuple[object, ...],
+            kwargs: tuple[object, ...] | None = None,
+        ) -> None:
+            await getattr(proxy, method)(*args, **(kwargs or {}))
+            return None
+
+        _mock_conn = MagicMock()
+        _mock_conn.async_request = _mock_async_request
+
         mock_sub1 = MagicMock()
+        mock_sub1.____conn__ = _mock_conn
         mock_sub1.on_message = AsyncMock()
         mock_sub2 = MagicMock()
+        mock_sub2.____conn__ = _mock_conn
         mock_sub2.on_message = AsyncMock()
 
         stub_agent_process = MagicMock()
         stub_agent_process._message_subscribers = {mock_sub1, mock_sub2}
         service._agent_process = stub_agent_process
 
-        # Notify subscribers
+        # Notify subscribers (fire-and-forget — yield to event loop)
         test_message = {"type": "user", "content": "Test", "role": "user"}
         await service._notify_subscribers(test_message)
+        for _ in range(10):
+            await asyncio.sleep(0.01)
+            if mock_sub1.on_message.call_count and mock_sub2.on_message.call_count:
+                break
 
         # Production JSON-serialises the message dict ONCE before
         # dispatching to every subscriber.

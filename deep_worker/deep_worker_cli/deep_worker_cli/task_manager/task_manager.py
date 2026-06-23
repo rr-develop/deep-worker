@@ -281,6 +281,17 @@ class TaskManager:
                 from codex_provider.native_tools import NATIVE_TOOLS
                 manager_tools.extend(NATIVE_TOOLS)
 
+            # Same rationale for grok: its built-ins always run locally and
+            # the model may invoke one in the manager turn. The matching
+            # passthrough BaseTool must be bound or ToolNode raises
+            # ``Tool '<name>' not found``. See
+            # grok_provider/docs/DESIGN_GROK_PROVIDER.md §11A.4.
+            if self.config.provider == "grok":
+                from grok_provider.builtin_tool_passthrough import (
+                    build_passthrough_tools,
+                )
+                manager_tools.extend(build_passthrough_tools())
+
             # Create manager agent with TaskManager system prompt
             # CRITICAL: Use colon ':' not underscore '_' to avoid conflicts
             # with agent names that contain '_tm' suffix
@@ -416,10 +427,14 @@ class TaskManager:
                 return f"TaskManager:> {message}"
 
         except Exception as e:
-            # Let a usage/session-limit error propagate (see
-            # _evaluate_with_manager): the agent must surface ERROR, not
-            # silently end the TaskManager loop. Incident observed 2026-05-21.
-            if type(e).__name__ == "ClaudeUsageLimitError":
+            # Let a fatal error (any provider's usage/session-limit, etc.)
+            # propagate (see _evaluate_with_manager): the agent must surface
+            # ERROR + failover, not silently end the TaskManager loop.
+            # (observed live); codex regression 2026-06-17 (see a related
+            # internal incident analysis (not included here)).
+            # Provider-agnostic via is_fatal_exception.
+            from deep_worker_cli.exceptions import is_fatal_exception
+            if is_fatal_exception(e):
                 self.state = 'inactive'
                 raise
             logger.exception(f"[TaskManager] Error during evaluation: {e}")
@@ -494,12 +509,17 @@ class TaskManager:
             return content
 
         except Exception as e:
-            # A usage/session-limit hit must NOT be swallowed into None — that
+            # A fatal hit (any provider's usage/session-limit, auth-fatal,
+            # checkpoint-corrupt, …) must NOT be swallowed into None — that
             # made the evaluation fail silently and the agent settle to idle
-            # with no error (incident observed 2026-05-21). Let it propagate so the
-            # invoke path transitions the agent to ERROR with a clear message.
-            # Detected by class name to keep this module provider-agnostic.
-            if type(e).__name__ == "ClaudeUsageLimitError":
+            # with no error (observed live; codex regression
+            # 2026-06-17, see a related internal incident analysis (not
+            # included here)). Let it propagate so the invoke
+            # path (agent_process.py) runs set_error + _schedule_failover. We
+            # reuse the SINGLE provider-agnostic registry is_fatal_exception
+            # instead of hard-coding one provider's class name.
+            from deep_worker_cli.exceptions import is_fatal_exception
+            if is_fatal_exception(e):
                 raise
             logger.exception(f"[TaskManager] Error invoking manager agent: {e}")
             return None

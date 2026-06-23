@@ -53,6 +53,16 @@ class CodexProtocolError(RuntimeError):
     top-level ``{"type":"error"}`` event."""
 
 
+class CodexUsageLimitError(CodexProtocolError):
+    """Raised when the Codex CLI reports that the account-level usage cap
+    has been hit. Subclass of ``CodexProtocolError`` so existing handlers
+    that catch the parent still work.
+
+    The marker in the error message:
+        "Codex stream error: You've hit your usage limit. ... try again at <TIME>."
+    """
+
+
 # ---------------------------------------------------------------------------
 # Event taxonomy — minimal mirror of what the live CLI emits.
 # We model only what we actually use; unknown ``item.completed`` types
@@ -137,7 +147,9 @@ def parse_event(line: str) -> ThreadEvent:
     """Parse one JSONL line into a typed event.
 
     Raises ``CodexProtocolError`` on malformed JSON, unknown top-level
-    event types, or explicit ``error`` events.
+    event types, or explicit ``error`` events.  Raises
+    ``CodexUsageLimitError`` (a subclass of ``CodexProtocolError``) when
+    the error event carries the ``You've hit your usage limit`` marker.
     """
     try:
         obj = json.loads(line)
@@ -175,9 +187,22 @@ def parse_event(line: str) -> ThreadEvent:
         item = obj.get("item", {}) or {}
         return ItemStartedEvent(item=_coerce_item(item))
     if t == "error":
-        raise CodexProtocolError(
-            f"Codex stream error: {obj.get('message', 'unknown error')}"
+        # Codex sends errors in two shapes:
+        #   flat:  {"type":"error","message":"..."}
+        #   nested: {"type":"error","status":<int>,"error":{"message":"...","type":"..."}}
+        nested_err = obj.get("error") or {}
+        msg = (
+            (obj.get("message") or nested_err.get("message"))
+            or "unknown error"
         )
+        status = obj.get("status")
+        parts = [f"Codex stream error: {msg}"]
+        if status is not None:
+            parts.append(f"(status={status})")
+        error_text = " ".join(parts)
+        if "You've hit your usage limit" in msg:
+            raise CodexUsageLimitError(error_text)
+        raise CodexProtocolError(error_text)
     raise CodexProtocolError(f"Unknown event type from codex exec: {t!r}")
 
 
@@ -231,7 +256,7 @@ class ExecArgs:
     # therefore quote string values themselves (``'"disabled"'``,
     # ``'"live"'``) so the resulting argv parses as TOML.
     config_overrides: tuple[tuple[str, str], ...] = ()
-    # Per-agent MCP server isolation (observed 2026-05-20).
+    # Per-agent MCP server isolation (learned from a related internal incident).
     #
     # The agent's OWN proxy MCP server, injected per-invocation via
     # ``--config mcp_servers.<name>.url=...``. When set, ``_build_argv``
@@ -384,7 +409,7 @@ class ExecHandle:
         # ``CodexChatModel.ainvoke`` — which only ever observes the
         # END_OF_STREAM sentinel on ``ainvoke_queue`` — can re-raise the
         # real cause instead of returning an empty response and stalling
-        # the agent (observed 2026-05-20).
+        # the agent (observed live).
         self.pump_error: BaseException | None = None
 
     async def aclose(self) -> None:
@@ -498,7 +523,7 @@ class CodexExecRunner:
         argv.extend(["-s", args.sandbox_mode])
         argv.extend(["--config", f'approval_policy="{args.approval_policy}"'])
 
-        # ── Per-agent MCP isolation (observed 2026-05-20) ──
+        # ── Per-agent MCP isolation (observed live) ──
         # Do NOT load the shared ``~/.codex/config.toml``. That file is
         # global to every codex process on the host and used to
         # accumulate one ``[mcp_servers.deepworker_<pid>]`` entry per
@@ -539,7 +564,7 @@ class CodexExecRunner:
         # working directory in :meth:`spawn`; Codex reads that file and
         # prepends its contents as a ``user`` message at the start of every
         # turn (see ``core/src/agents_md.rs`` in the Codex binary).
-        # See ``docs/INVESTIGATION_2026_05_18_CODEX_SYSTEM_PROMPT_DELIVERY.md``
+        # See a related internal investigation analysis (not included here)
         # for the full investigation.
 
         # Q5: native-tool deny-list via per-feature ``--disable`` flags.
@@ -690,6 +715,26 @@ class CodexExecRunner:
                 if not line:
                     continue
                 yield parse_event(line)
+
+            # ── Non‑zero exit check (SIGKILL / crash / error) ──────────
+            # If the subprocess exited while we were still reading,
+            # ``readline`` returned EOF before the process was ready to
+            # close — the JSONL stream ended prematurely.  Wait for the
+            # actual exit code now and raise if it indicates failure.
+            # This catches ``kill -9`` (exit code -9), segfaults, etc.
+            # and surfaces them as a ``CodexProtocolError`` through the
+            # event pump's error path instead of silently returning a
+            # partial / empty assistant message.
+            #
+            # If ``returncode`` is still ``None`` the process is still
+            # alive — EOF happened because aclose/cancel closed the pipe,
+            # not because the process crashed.
+            ret = await process.wait()
+            if ret != 0:
+                sig_hint = " (SIGKILL)" if ret == -9 else ""
+                raise CodexProtocolError(
+                    f"codex exec exited with abnormal code {ret}{sig_hint}"
+                )
         finally:
             # Whether the consumer drained naturally or threw GeneratorExit,
             # make sure the subprocess goes down.
@@ -709,7 +754,7 @@ class CodexExecRunner:
 # ---------------------------------------------------------------------------
 def _find_codex_path() -> str:
     """Resolution: ``CODEX_PATH`` env → ``shutil.which("codex")`` →
-    raise. We do NOT fall back to vendored binaries (the openai_sdk
+    raise. We do NOT fall back to vendored binaries (the OpenAI Agents SDK
     extension does that; we don't have a vendored copy)."""
     override = os.environ.get("CODEX_PATH")
     if override:

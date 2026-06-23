@@ -135,10 +135,11 @@ exercised it live against `codex-cli 0.130.0`:
      bodies registered by `codex_provider.native_tools`. The bound
      tool set is extended with `NATIVE_TOOLS` whenever a
      CodexChatModel-backed agent is created, i.e. in both
-     `deep_worker_cli/process/agent_process.py` (main agent) and
-     `deep_worker_cli/task_manager/task_manager.py`
+     the CLI's `process/agent_process.py` (main agent) and
+     the CLI's `task_manager/task_manager.py`
      (`-tm` manager agent — symmetric injection so a native tool call
      during a manager turn does not crash it).
+
    - the tool body parks on an `asyncio.Future` that the background
      event-pump task created at the same `item.started` event,
    - when Codex emits `item.completed` the pump resolves the
@@ -185,7 +186,7 @@ exercised it live against `codex-cli 0.130.0`:
 
 **Scope (in):** architecture, terminology discipline, state model,
 lifecycle, leak surface, concurrency invariants, integration
-touchpoints with `deep_worker_cli`.
+touchpoints with the CLI.
 
 **Scope (out, explicitly):** writing the provider package, tests,
 packaging changes, modifications to `claude_code_provider` or to any
@@ -246,7 +247,7 @@ all, and what's the right shape". The implementation is a follow-up.
 
 ## 2. Background — how providers plug in today
 
-`deep_worker/deep_worker_cli/deep_worker_cli/config.py:1404-1670`
+The CLI's `config.py:1404-1670`
 holds the single provider registry — `create_model(provider,
 model_name)`. The `claude-code` branch lives at `config.py:1647-1666`
 and sets the precedent for a "local sibling package" provider.
@@ -366,7 +367,7 @@ loads the WHOLE list and tries to connect to every declared server at
 startup. Dead ports (agent long gone) hang for the full
 `ProxyMCPServer` timeout — **120 s per stale server** — before failover.
 
-**Production incident (observed 2026-05-20):** the config had
+**Production incident (observed live):** the config had
 accumulated 21 dead `deepworker_<pid>` entries. A turn that needed a
 tool spent ~10 minutes timing out against dead servers one-by-one
 before stumbling onto a live one and "suddenly working". Simple
@@ -402,8 +403,8 @@ test above used no env key.
 
 ### 4.5 The Python wrapper in the Agents SDK (reference, not necessarily a runtime dep)
 
-`agents/extensions/experimental/codex/exec.py:61-228` (in the upstream
-OpenAI Agents SDK)
+The OpenAI Agents SDK's
+`src/agents/extensions/experimental/codex/exec.py:61-228`
 spawns `codex exec --experimental-json [resume <uuid>] -` via
 `asyncio.create_subprocess_exec` and yields each stdout line.
 Per-turn subprocess; the `Codex` class holds no long-lived process.
@@ -516,9 +517,8 @@ is a UUID instead of a string, and the "client" is a short-lived
 restarted agent does not "forget" — without it, a fresh process starts at
 `sent_count=0` / `codex_session_uuid=None`, replays the whole history into an
 empty Codex session, and drops every AIMessage / tool result. The on-disk
-layer (`codex_provider/session_state.py` — the per-agent state file
-(`codex_session_state.json`) under the agent's data directory), the
-lazy-seed in
+layer (`codex_provider/session_state.py`, stored in the agent's local
+state directory as `codex_session_state.json`), the lazy-seed in
 `CodexClientState.get_or_create`, the `persist()` call sites, and the
 single resume fallback (stale/missing session → one fresh-session retry with
 full-history replay) are specified in
@@ -562,7 +562,7 @@ The MCP server is hosted **inside the deep-worker agent process** as
 an asyncio task running a small HTTP listener bound to
 `127.0.0.1:<random-free-port>`. Concretely: an
 `mcp.server.streamable_http` instance (the Python MCP SDK already
-ships this — the Python MCP SDK's `mcp/server/streamable_http.py`),
+ships this — `mcp/server/streamable_http.py`),
 mounted on a small ASGI app and `asyncio.create_task`-ed during
 `bind_tools()` or first `ainvoke()`. **No `subprocess.Popen`, no
 `multiprocessing.Process`, no `os.fork`.** The handler functions are
@@ -612,21 +612,43 @@ This is **not** "external process for the proxy" — it's "TCP loopback
 between two things in the same agent process, plus a Codex subprocess
 that connects to the listener". The listener itself is asyncio.
 
-### 7.4 The Future-based handler — identical in spirit to `claude_code_provider/proxy_mcp_server.py`
+### 7.4 The Future-based handler — job-handle by default (identical to `claude_code_provider/proxy_mcp_server.py`)
+
+**HARD POLICY (2026-06-16, common to ALL providers — no exceptions; see
+`docs/POLICIES.md` §7.1.)** Every tool is waited on with a FINITE bound so
+it can never hang the turn forever. On the wait elapsing the live Future is
+**parked as a job** (work is NOT cancelled — `shield`) and the handler
+returns a **non-error** `in_progress` job-handle. A timeout is **never**
+`is_error`. The only opt-out is explicit (`long_running=False` + a required
+`timeout`); a timeout-less opt-out is rejected at construction.
 
 ```python
-async def handler(args: dict) -> MCPResult:
+async def handler(args: dict) -> list[dict]:
     call_id = f"{tool_name}_{counter}_{id(args)}"
-    fut: asyncio.Future[MCPResult] = asyncio.Future()
+    fut: asyncio.Future[MCPResult] = asyncio.get_event_loop().create_future()
     self.pending_calls[call_id] = {"future": fut, "name": tool_name, "args": args}
+    mode, wait_seconds = self._wait_policy.get(
+        tool_name, ("job_handle", self._long_running_wait_seconds))  # default 120s
     try:
-        return await asyncio.wait_for(fut, timeout=120.0)
+        # shield: the timeout fires WITHOUT cancelling the real work.
+        result = await asyncio.wait_for(asyncio.shield(fut), timeout=wait_seconds)
+        return result.get("content", [])
     except asyncio.TimeoutError:
-        return {"content": [{"type": "text", "text": "Tool execution timeout"}],
-                "is_error": True}
+        # Park the live Future as a job — work continues, picked up by
+        # wait_for_job / kill_job. NON-error in_progress notice.
+        self._jobs[call_id] = {"future": fut, "tool_name": tool_name, "args": args}
+        return [{"type": "text", "text":
+            f"Tool '{tool_name}' is still running after {wait_seconds:g}s. "
+            f"status: in_progress. job_id: {call_id}. "
+            f"actions: wait_for_job(job_id=\"{call_id}\") or kill_job(job_id=\"{call_id}\")."}]
     finally:
-        self.pending_calls.pop(call_id, None)
+        self.pending_calls.pop(call_id, None)  # parked Future stays in self._jobs
 ```
+
+> ⚠️ The pre-2026-06-16 design returned an `is_error` block on timeout and
+> dropped the call (work lost). That is now FORBIDDEN — it both lied to the
+> agent (a still-running tool is not an error) and lost in-flight work. Do
+> not reintroduce a bare `await future` or a timeout that cancels/erroring.
 
 End-to-end timing of one full tool round-trip:
 
@@ -939,10 +961,11 @@ design respects that.
    TaskManager + subagents). For a typical agent that's
    O(1)–O(N_subagents). Acceptable.
 2. **`ProxyMCPServer` HTTP listener** — one per agent process. Bound
-   on first `bind_tools`; torn down on agent shutdown. Pending Futures
-   auto-expire via 120 s timeout. `ainvoke` waiters for newly-created
-   pending calls are one-shot Futures removed in `finally`. No leak
-   from runaway tool calls.
+   on first `bind_tools`; torn down on agent shutdown. A pending Future's
+   handler wait is bounded (default 120 s); on elapse the Future is moved
+   out of `pending_calls` into `self._jobs` (the job-handle) — still
+   one-shot and dropped once resolved or the job is killed. No leak from
+   runaway tool calls (see §7.4 for the job-handle policy).
 
 ### Short-lived objects (per turn)
 
@@ -965,7 +988,7 @@ design respects that.
 | a related internal incident analysis (not included here) | rpyc dispatch task pin | No rpyc here. N/A. |
 | a related internal incident analysis (not included here) | exception tracebacks stored on long-lived objects | Risk: an exception from a failed Codex turn could be cached on `state.current_exec` if cleared improperly. Mitigation: `state.current_exec = None` in `finally`; traceback is not retained on `_ThreadState`. |
 | a related internal incident analysis (not included here) | cleanup task GC | No periodic cleanup loop here. N/A. |
-| a related internal incident analysis (not included here) | rpyc AsyncResult held past `await` | No rpyc-style awaitables here. The asyncio.Future in the MCP handler is local and dropped after either resolution or timeout. |
+| related internal incident analyses (not included here, AsyncResult retention) | rpyc AsyncResult held past `await` | No rpyc-style awaitables here. The asyncio.Future in the MCP handler is local; it is dropped on resolution, or moved to the bounded `self._jobs` job registry on the wait elapsing (and dropped when that job resolves or is killed). Either way it is one-shot and never retained indefinitely. |
 
 ---
 
@@ -1027,8 +1050,7 @@ they appear.)
 
 - **D1 — "Depend on the upstream Agents SDK Codex extension."**
   Import `Codex`, `Thread`, `CodexExec` from
-  `agents/extensions/experimental/codex/` (in the upstream OpenAI Agents
-  SDK). We
+  the OpenAI Agents SDK's `src/agents/extensions/experimental/codex/`. We
   write only a `BaseChatModel` wrapper on top of their primitives.
   ~50–100 LOC of our code. Cost: runtime dep on the `agents` package
   and on an upstream-experimental submodule that OpenAI may change
@@ -1095,9 +1117,13 @@ Unit tests (mocked subprocess):
   `_working_dir` setter works; Pydantic `model_dump` excludes
   callables.
 - `test_proxy_mcp_server.py` — handler creates Future, `resolve_call`
-  sets result, `wait_for(timeout=120)` returns `is_error` block,
-  server starts on `127.0.0.1:0` with random free port, `codex mcp
-  add` registration is idempotent.
+  sets result, on the bounded wait elapsing the handler parks the live
+  Future as a job and returns a **non-error** `in_progress` job-handle
+  (never `is_error`), server starts on `127.0.0.1:0` with random free
+  port, `codex mcp add` registration is idempotent.
+- `test_job_handle_by_default.py` / `test_job_handle_integration.py` —
+  pin the job-handle-by-default policy (§7.4); the integration test
+  proves the production 120 s wait by mocking ONLY the clock.
 
 Integration tests (live `codex` binary, cross-process per the
 project's mandatory rule — proxy and exec are in separate processes
@@ -1142,7 +1168,7 @@ A reviewer can validate this document without running anything:
    `effective_session_id` / `rotate_session` precedent — Codex design
    renames these to `codex_session_uuid` and "drop on summarization",
    same effect, clearer names.
-8. Read the Python MCP SDK's `mcp/server/streamable_http.py`
+8. Read the Python MCP SDK's `server/streamable_http.py`
    — Python MCP SDK ships an in-process HTTP server we mount on
    asyncio. No external process is needed for the proxy.
 

@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch, AsyncMock, MagicMock
 
 import pytest
@@ -129,6 +130,38 @@ class TestParseEvent:
         from codex_provider.exec_runner import parse_event
         with pytest.raises(CodexProtocolError):
             parse_event(json.dumps({"type": "error", "message": "stream dead"}))
+
+    def test_error_with_nested_message_and_status(self) -> None:
+        """Codex emits ``{"type":"error","status":400,...}`` with the
+        message nested under ``error.message``, NOT at the top level.
+        ``parse_event`` MUST extract both the nested message and the
+        status code so the error reason (e.g. unsupported model) is not
+        lost (issue #60)."""
+        from codex_provider.exec_runner import parse_event
+        raw = {
+            "type": "error",
+            "status": 400,
+            "error": {
+                "type": "invalid_request_error",
+                "message": (
+                    "The 'gpt-5.2' model is not supported when "
+                    "using Codex with a ChatGPT account."
+                ),
+            },
+        }
+        with pytest.raises(CodexProtocolError) as excinfo:
+            parse_event(json.dumps(raw))
+        msg = str(excinfo.value)
+        assert "gpt-5.2" in msg, f"nested error message must be in output, got: {msg}"
+        assert "400" in msg, f"status code must be in output, got: {msg}"
+
+    def test_error_with_top_level_message_still_works(self) -> None:
+        """A flat ``{"type":"error","message":"..."}`` (the old format)
+        must still produce a sensible error."""
+        from codex_provider.exec_runner import parse_event
+        with pytest.raises(CodexProtocolError) as excinfo:
+            parse_event(json.dumps({"type": "error", "message": "flat error"}))
+        assert "flat error" in str(excinfo.value)
 
     def test_unknown_type_raises(self) -> None:
         from codex_provider.exec_runner import parse_event
@@ -283,7 +316,7 @@ class TestBuildCommandArgs:
 
 
 class TestMcpServerIsolation:
-    """Per-agent MCP server isolation (incident observed 2026-05-20).
+    """Per-agent MCP server isolation (learned from a related internal incident).
 
     ROOT CAUSE of that incident: the provider used to register its proxy
     MCP server into the GLOBAL ``~/.codex/config.toml`` via
@@ -321,7 +354,7 @@ class TestMcpServerIsolation:
             "codex exec must pass --ignore-user-config so it does not load "
             "the shared ~/.codex/config.toml and inherit stale "
             "deepworker_<pid> MCP servers from other agents "
-            "(incident observed 2026-05-20)"
+            "(observed live)"
         )
 
     def test_own_mcp_server_injected_when_provided(self) -> None:
@@ -397,7 +430,7 @@ class TestBuildEnv:
 # ---------------------------------------------------------------------------
 # spawn() + event stream (mocked subprocess)
 # ---------------------------------------------------------------------------
-def _make_mock_process(stdout_lines: list[bytes], returncode: int = 0) -> MagicMock:
+def _make_mock_process(stdout_lines: list[bytes], returncode: int | None = 0) -> MagicMock:
     """Build a mock asyncio.subprocess.Process that replays ``stdout_lines``."""
     proc = MagicMock()
     proc.returncode = returncode
@@ -473,6 +506,48 @@ class TestSpawn:
         await handle.aclose()
         # We should have asked the subprocess to terminate
         assert mock_proc.terminate.called or mock_proc.kill.called
+
+    async def test_nonzero_exit_after_eof_raises_error(self) -> None:
+        """When the subprocess exits with a non-zero code (e.g. SIGKILL =
+        exit code -9), the event generator should raise so the pump
+        surfaces it as pump_error instead of silently returning partial
+        data (issue #53)."""
+        lines = [
+            (json.dumps({"type": "turn.started"}) + "\n").encode(),
+        ]
+        # Process already exited with -9 (SIGKILL) when we hit EOF
+        mock_proc = _make_mock_process(lines, returncode=-9)
+
+        runner = CodexExecRunner(executable_path="/usr/bin/codex")
+        with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=mock_proc)):
+            handle = await runner.spawn(ExecArgs(prompt="hi"))
+            collected: list[Any] = []
+            with pytest.raises(CodexProtocolError,
+                               match="abnormal code -9.*SIGKILL"):
+                async for ev in handle.events:
+                    collected.append(ev)
+
+        # We should have collected the first event before the abnormal exit
+        assert len(collected) == 1
+        assert isinstance(collected[0], TurnStartedEvent)
+
+    async def test_exit_none_after_eof_does_not_raise(self) -> None:
+        """When ``process.wait()`` returns ``None`` (process still alive),
+        e.g. when aclose/cancel closes the pipe, we must NOT raise a false
+        positive — the process is still running, EOF just means the pipe
+        was closed."""
+        lines = [
+            (json.dumps({"type": "turn.started"}) + "\n").encode(),
+        ]
+        mock_proc = _make_mock_process(lines, returncode=0)
+
+        runner = CodexExecRunner(executable_path="/usr/bin/codex")
+        with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=mock_proc)):
+            handle = await runner.spawn(ExecArgs(prompt="hi"))
+            collected = [ev async for ev in handle.events]
+
+        assert len(collected) == 1
+        assert isinstance(collected[0], TurnStartedEvent)
 
 
 # ---------------------------------------------------------------------------

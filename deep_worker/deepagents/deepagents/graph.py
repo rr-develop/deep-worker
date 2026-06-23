@@ -20,6 +20,7 @@ from langgraph.types import Checkpointer
 
 from deepagents.backends import StateBackend
 from deepagents.backends.protocol import BackendFactory, BackendProtocol
+from deepagents.middleware.bounded_tool_call import BoundedToolCallMiddleware
 from deepagents.middleware.filesystem import FilesystemMiddleware
 from deepagents.middleware.memory import MemoryMiddleware
 from deepagents.middleware.message_timestamps import MessageTimestampMiddleware
@@ -48,6 +49,63 @@ def get_default_model() -> ChatAnthropic:
     )
 
 
+def _bind_tools_for_middleware(
+    model: BaseChatModel,
+    tools: Sequence[BaseTool | Callable | dict[str, Any]] | None,
+) -> BaseChatModel:
+    """Return the model variant that should be handed to middleware.
+
+    The 2026-06-13 incident — SummarizationMiddleware unbound-model capture
+    (see a related internal incident analysis (not included here)).
+
+    LangChain's ``bind_tools`` contract returns a NEW model instance —
+    the raw ``model`` we received from the caller carries no tool
+    inventory. ``SummarizationMiddleware`` keeps the reference it gets
+    at construction time (``self.model = model``) and calls
+    ``self.model.ainvoke(prompt)`` in ``_acreate_summary``. If we give
+    it the raw, pre-bind model, that summary call goes through an
+    instance whose tool metadata is empty — and for providers that
+    share a singleton client across instances
+    (``ClaudeCodeChatModel._client_manager``) the empty rebind
+    silently propagates ``tools_metadata=[]`` into the next
+    ``ProxyMCPServer`` rebuild on session rotation. The Claude CLI then
+    has zero ``mcp__deepworker__*`` tools.
+
+    This helper performs the bind once at agent-build time so all three
+    ``SummarizationMiddleware`` sites in ``create_deep_agent`` see the
+    same bound instance the turn-node uses. The model passed to
+    ``create_agent(model, tools=...)`` is left untouched — LangGraph
+    binds it internally for the turn-node — so the bind is purely
+    additive: middleware sees a bound model, the rest of the wiring is
+    unchanged.
+
+    Args:
+        model: The raw chat model the caller handed to ``create_deep_agent``.
+        tools: The tool list the caller will pass to ``create_agent``;
+            ``None`` or empty means there is nothing to bind, return as-is.
+
+    Returns:
+        The bind_tools-result when tools are present and ``model`` is
+        bindable, otherwise ``model`` unchanged. Best-effort: any failure
+        falls back to the raw model so a model without ``bind_tools`` (or
+        a binding that raises for some unexpected tool shape) cannot
+        break agent construction.
+    """
+    if not tools:
+        return model
+    bind = getattr(model, "bind_tools", None)
+    if bind is None:
+        return model
+    try:
+        return cast(BaseChatModel, bind(list(tools)))
+    except Exception:  # noqa: BLE001
+        # Never break agent construction over the middleware-binding path.
+        # The middleware will still receive `model` and the only loss is
+        # the bug fix — the agent runs exactly as it did before the
+        # 2026-06-13 incident was patched.
+        return model
+
+
 def create_deep_agent(
     model: str | BaseChatModel | None = None,
     tools: Sequence[BaseTool | Callable | dict[str, Any]] | None = None,
@@ -67,6 +125,7 @@ def create_deep_agent(
     name: str | None = None,
     cache: BaseCache | None = None,
     summarization_history_prefix: str | None = None,
+    summarization_on_summarized: Callable[[str], None] | None = None,
 ) -> CompiledStateGraph:
     """Create a deep agent.
 
@@ -158,12 +217,40 @@ def create_deep_agent(
     # path here so the path quoted in the synthetic summary message
     # corresponds to an actual, human-inspectable file.
     def _summarization_extra_kwargs() -> dict[str, Any]:
-        if summarization_history_prefix is None:
-            return {}
-        return {"history_path_prefix": summarization_history_prefix}
+        kwargs: dict[str, Any] = {}
+        if summarization_history_prefix is not None:
+            kwargs["history_path_prefix"] = summarization_history_prefix
+        if summarization_on_summarized is not None:
+            kwargs["on_summarized"] = summarization_on_summarized
+        return kwargs
 
 
     backend = backend if backend is not None else (lambda rt: StateBackend(rt))
+
+    # ─────────────────────────────────────────────────────────────────────
+    # The 2026-06-13 incident — SummarizationMiddleware unbound-model capture.
+    #
+    # LangChain's ``bind_tools`` contract returns a NEW model instance; the
+    # original ``model`` parameter we received is left without any tool
+    # metadata. ``SummarizationMiddleware`` stores ``self.model = model``
+    # at construction time and calls ``self.model.ainvoke(prompt)`` from
+    # ``_acreate_summary``. If we pass the raw, pre-bind reference here
+    # the summary call goes through an instance with empty tools metadata
+    # — and for providers that share a singleton client (e.g.
+    # ``ClaudeCodeChatModel._client_manager``) that empty rebind silently
+    # propagates ``tools_metadata=[]`` into the next session-rotation,
+    # stripping every ``mcp__deepworker__*`` tool from the Claude CLI
+    # subprocess. The symptom was ``[MCP_DIAG] proxy_tool_count`` going
+    # 23 → 0 after the first summarization.
+    #
+    # Fix: compute the bound model ONCE here and hand it to every
+    # ``SummarizationMiddleware`` site. The turn-node model passed to
+    # ``create_agent`` is left untouched — LangGraph still calls
+    # ``bind_tools`` on it internally; we only change WHAT the middleware
+    # sees. See
+    # a related internal incident analysis (not included here).
+    # ─────────────────────────────────────────────────────────────────────
+    summarization_model = _bind_tools_for_middleware(model, tools)
 
     # Build general-purpose subagent with default middleware stack
     # Heterogeneous middleware stack — entries specialize StateT differently
@@ -178,7 +265,7 @@ def create_deep_agent(
         FilesystemMiddleware(backend=backend),
         MessageTimestampMiddleware(),
         SummarizationMiddleware(
-            model=model,
+            model=summarization_model,
             backend=backend,
             trigger=summarization_defaults["trigger"],
             keep=summarization_defaults["keep"],
@@ -215,13 +302,23 @@ def create_deep_agent(
 
             # Build middleware: base stack + skills (if specified) + user's middleware
             subagent_summarization_defaults = _compute_summarization_defaults(subagent_model)
+            # Same fix for the 2026-06-13 incident as the gp_middleware site above:
+            # hand the bind_tools-result to SummarizationMiddleware so the
+            # summary call carries the subagent's tool inventory. Per-
+            # subagent tools default to the parent's ``tools`` (see the
+            # ``processed_spec`` below), so we bind against the same list
+            # ``create_agent`` will use for the subagent's turn-node.
+            subagent_tools_for_bind = spec.get("tools", tools or [])
+            subagent_summarization_model = _bind_tools_for_middleware(
+                subagent_model, subagent_tools_for_bind
+            )
             # See explanation above the gp_middleware declaration.
             subagent_middleware: list[AgentMiddleware[Any, Any, Any]] = [
                 TodoListMiddleware(),
                 FilesystemMiddleware(backend=backend),
                 MessageTimestampMiddleware(),
                 SummarizationMiddleware(
-                    model=subagent_model,
+                    model=subagent_summarization_model,
                     backend=backend,
                     trigger=subagent_summarization_defaults["trigger"],
                     keep=subagent_summarization_defaults["keep"],
@@ -251,6 +348,12 @@ def create_deep_agent(
     # Build main agent middleware stack
     # See explanation above the gp_middleware declaration.
     deepagent_middleware: list[AgentMiddleware[Any, Any, Any]] = [
+        # OUTERMOST tool-call wrapper (first = outermost): the single source
+        # of truth for the per-tool-call timeout (POLICIES.md §7.1). Its bound
+        # covers EVERY tool of EVERY provider and every inner tool-call
+        # middleware. No other place may wait on a tool. See
+        # docs/DESIGN_UNIFIED_BOUNDED_TOOL_WAIT.md.
+        BoundedToolCallMiddleware(),
         TodoListMiddleware(),
     ]
     if memory is not None:
@@ -266,7 +369,10 @@ def create_deep_agent(
                 subagents=all_subagents,
             ),
             SummarizationMiddleware(
-                model=model,
+                # The 2026-06-13 incident: use the bind_tools-result, NOT the
+                # raw ``model``. See the gp_middleware site above and
+                # a related internal incident analysis (not included here).
+                model=summarization_model,
                 backend=backend,
                 trigger=summarization_defaults["trigger"],
                 keep=summarization_defaults["keep"],

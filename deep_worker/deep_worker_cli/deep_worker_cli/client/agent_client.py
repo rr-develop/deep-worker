@@ -14,12 +14,23 @@ from typing import TYPE_CHECKING, Any
 from deep_worker_cli.exceptions import AgentNotFoundError, IPCConnectionError
 from deep_worker_cli.process.registry import ProcessRegistry
 
+# ============================================================================
+# CRITICAL: RPYC MUST BE IMPORTED FROM SOURCE CODE, NOT FROM PIP!
+# ============================================================================
+# ALWAYS import rpyc from the rpyc_async source checkout when available.
+# This ensures we use rpyc_async with AsyncioServer support.
+# ============================================================================
+_rpyc_async_path = Path(__file__).resolve().parents[4].parent / "rpyc_async"
+if _rpyc_async_path.exists() and str(_rpyc_async_path) not in sys.path:
+    sys.path.insert(0, str(_rpyc_async_path))
+
 import rpyc
 from rpyc.core.async_connect import async_connect
 from rpyc.utils.classic import obtain
 
 if TYPE_CHECKING:
     from deep_worker_cli.basesession.protocol_types import SessionInfo
+
 
 class AgentClient:
     """
@@ -211,11 +222,12 @@ class AgentClient:
                 # returns immediately without waiting for the agent's LLM
                 # turn to complete. Used by send_message_to_agent.
                 message = command.get("message", "")
+                reply_back = command.get("reply_back", True)
                 async_result = self._conn.async_request(
                     consts.HANDLE_ASYNC_CALLATTR,
                     self._root,
                     "exposed_enqueue_message",
-                    (message,),
+                    (message, reply_back),
                     ()
                 )
                 response_json_str = await async_result
@@ -284,6 +296,12 @@ class AgentClient:
                 raise IPCConnectionError(f"Unknown command type: {command_type}")
 
         except Exception as e:
+            # Connection is dead — reset state so subsequent calls fail
+            # fast at the "Not connected to agent" guard (line 171)
+            # instead of cascading more opaque RPyC errors.
+            self.connected = False
+            self._conn = None
+            self._root = None
             raise IPCConnectionError(f"RPyC communication error: {e}") from e
 
     async def get_status(self) -> "SessionInfo":

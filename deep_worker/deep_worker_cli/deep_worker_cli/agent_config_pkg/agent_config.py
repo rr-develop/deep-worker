@@ -50,7 +50,7 @@ class AgentConfig:
             raise ValueError("model must be a non-empty string or None")
 
         # Validate provider
-        valid_providers = ["deepseek", "gemini", "openai", "claude-code", "codex"]
+        valid_providers = ["deepseek", "gemini", "openai", "claude-code", "codex", "grok"]
         if self.provider not in valid_providers:
             raise ValueError(
                 f"provider must be one of {valid_providers}, got '{self.provider}'"
@@ -63,6 +63,10 @@ class AgentConfig:
                 self.api_key = None
             elif self.provider == "codex":
                 # Codex CLI uses cached login at ~/.codex/auth.json — no key needed.
+                self.api_key = None
+            elif self.provider == "grok":
+                # Grok CLI uses the supergrok subscription cache at
+                # ~/.grok/auth.json — no separate API key needed.
                 self.api_key = None
             elif self.provider == "deepseek":
                 self.api_key = os.getenv("DEEPSEEK_API_KEY")
@@ -108,7 +112,7 @@ class AgentConfig:
         passed (see ``config.py`` codex branch / DESIGN_CODEX_PROVIDER.md
         §15 Q2). ``None`` MUST be preserved through to ``create_model``;
         it must NOT be coerced to the literal ``"unknown"``, which the
-        Codex API rejects with HTTP 400 (incident observed 2026-05-20).
+        Codex API rejects with HTTP 400 (observed live).
         For display, use ``display_model`` instead.
         """
         if self.model:
@@ -134,8 +138,8 @@ class AgentConfig:
 
         Falls back to ``"unknown"`` when no concrete model can be
         resolved. NEVER feed this into ``create_model`` or persist it as
-        the launch_config model — that is what poisoned a live agent
-        (observed 2026-05-20). Use
+        the launch_config model — that is what poisoned an agent
+        observed live. Use
         ``resolved_model`` (which may be ``None``) for the data path.
         """
         return self.dynamic_display_model or self.resolved_model or "unknown"

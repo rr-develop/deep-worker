@@ -1,4 +1,4 @@
-// Web App - Main JavaScript
+// Deep-Worker-Web - Main JavaScript
 
 // State
 let ws = null;
@@ -34,7 +34,7 @@ function generateUUID() {
 
 // Initialize on page load
 document.addEventListener('DOMContentLoaded', () => {
-    console.log('Web App starting...');
+    console.log('Deep-Worker-Web starting...');
     loadAgents();
     connectWebSocket();
     setupEventListeners();
@@ -116,7 +116,7 @@ function getStatusDisplayLabel(agent) {
     return status;
 }
 
-// Get CSS class for status indicator dot (matches the legacy web app)
+// Get CSS class for status indicator dot (matches the web UI)
 //
 // IMPORTANT: the 'interrupted' check MUST come before any
 // status.includes('waiting') check. Otherwise — depending on string
@@ -131,7 +131,7 @@ function getStatusDotClass(status) {
     return '';
 }
 
-// Get CSS class for status text (matches the legacy web app)
+// Get CSS class for status text (matches the web UI)
 function getStatusTextClass(status) {
     if (status === 'ready' || status === 'idle') return 'status-text-ready';
     if (status === 'working' || status === 'running') return 'status-text-working';
@@ -145,7 +145,7 @@ function getStatusTextClass(status) {
 // (dead / not in the registry) rather than a transient failure against a live
 // agent. When true, the failed-op handler should remove the card — otherwise
 // a phantom card for an already-dead agent lingers and "Stop" appears to do
-// nothing (observed 2026-05-24). Backend signals this via a LookupError raised
+// nothing (observed live, 2026-05-24). Backend signals this via a LookupError raised
 // from request_stop ("Agent '<name>' not found"). We match on error_type AND
 // the message text so a backend wording/type tweak can't silently regress.
 // Pure function (no DOM/globals) so it is unit-testable in node.
@@ -303,7 +303,7 @@ async function sendMessage() {
     }
 }
 
-// Copy last response to clipboard (matches the legacy web app copyLastResponse)
+// Copy last response to clipboard (matches the web UI's copyLastResponse)
 async function copyLastResponse(event) {
     const content = document.getElementById('last-response-content');
     const text = content.textContent;
@@ -333,7 +333,7 @@ async function copyLastResponse(event) {
 // The error panel is SEPARATE from the Last Response panel. It is
 // persistent (never auto-dismissed), copyable, and shows the full
 // agent error text. It never overwrites the model's last response.
-// Incident observed 2026-05-20: errors used to be a transient toast that
+// observed live, 2026-05-20: errors used to be a transient toast that
 // vanished and could not be copied.
 
 // Show (or update) the persistent error panel with the given text.
@@ -374,13 +374,19 @@ async function copyLastError(event) {
 }
 
 // localStorage key for the persisted verbosity choice (per design §3.6 UI).
-const FULL_DIALOG_VERBOSITY_KEY = 'web_app.dialog_verbosity';
+const FULL_DIALOG_VERBOSITY_KEY = 'deep_worker_web.dialog_verbosity';
+
+// Allowed Full Dialog verbosity values. 'system_prompt' and 'tools' are
+// introspection modes (§9 of DESIGN_FULL_DIALOG_FINAL_RESPONSE_PAIRS.md):
+// they show the invariant startup system prompt and the provider-dependent
+// tool list instead of conversation turns.
+const FULL_DIALOG_VERBOSITY_VALUES = ['final', 'text', 'full', 'system_prompt', 'tools'];
 
 // Read verbosity from the dropdown; fall back to 'final'.
 function getFullDialogVerbosity() {
     const sel = document.getElementById('full-dialog-verbosity');
     const v = sel ? sel.value : 'final';
-    return (v === 'text' || v === 'full') ? v : 'final';
+    return FULL_DIALOG_VERBOSITY_VALUES.includes(v) ? v : 'final';
 }
 
 // Restore persisted verbosity choice into the dropdown on page load.
@@ -389,7 +395,7 @@ function restoreFullDialogVerbosity() {
     if (!sel) return;
     try {
         const saved = localStorage.getItem(FULL_DIALOG_VERBOSITY_KEY);
-        if (saved && ['final', 'text', 'full'].includes(saved)) {
+        if (saved && FULL_DIALOG_VERBOSITY_VALUES.includes(saved)) {
             sel.value = saved;
         }
     } catch (e) {
@@ -875,7 +881,7 @@ function handleWebSocketMessage(data) {
             // A client RPyC channel to the agent was flooded and quarantined.
             // This is a WARNING ONLY — the agent keeps working and its status
             // is unchanged. Show a non-blocking warning; do NOT touch the
-            // agent's status badge or the error panel. Incident observed 2026-05-22.
+            // agent's status badge or the error panel. observed live, 2026-05-22.
             handleChannelQuarantined(data);
             break;
 
@@ -929,7 +935,7 @@ function handleWebSocketMessage(data) {
             finalizeRequest(data.request_id);
             // If a stop/restart failed because the agent is GONE (not found /
             // not running), the card is a phantom — remove it so the UI is
-            // consistent and "Stop" visibly resolves it (observed 2026-05-24).
+            // consistent and "Stop" visibly resolves it (observed live, 2026-05-24).
             if (
                 (data.type === 'agent_stop_failed' || data.type === 'agent_restart_failed') &&
                 data.agent_name &&
@@ -1320,7 +1326,7 @@ function handleAgentInterruptResult(data) {
 // flooded and quarantined. The agent KEEPS WORKING and its status is
 // unchanged — so we show a non-blocking warning toast only, and deliberately
 // do NOT touch the agent's status badge or the "Last Error" panel.
-// Incident observed 2026-05-22.
+// observed live, 2026-05-22.
 function handleChannelQuarantined(data) {
     const { agent_name, peer, connid } = data;
     console.warn(
@@ -1406,7 +1412,7 @@ function showNotification(message, type = 'info') {
 // ==============================================================================
 
 async function restartServer() {
-    if (!confirm('Are you sure you want to restart the web app server?\n\nAll agent connections will be re-established after restart.')) {
+    if (!confirm('Are you sure you want to restart deep-worker-web server?\n\nAll agent connections will be re-established after restart.')) {
         return;
     }
 

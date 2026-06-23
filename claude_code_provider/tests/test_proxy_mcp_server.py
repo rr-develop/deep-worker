@@ -1,48 +1,128 @@
-"""Tests for ProxyMCPServer - in-process MCP server for tool delegation."""
+"""Tests for ProxyMCPServer — in-process MCP server for tool delegation.
+
+⚠ Contract after incident 2026-06-14 (POLICIES.md §7):
+
+1. The handler key is the Claude ``tool_use_id`` from MCP
+   ``_meta.claudecode/toolUseId``, propagated via the SDK's
+   ``_mcp_context`` ContextVar. There is NO synthetic id, NO
+   ``_call_counter``, NO ``id(args)``.
+
+2. The handler waits HONESTLY on its Future. For short-running tools:
+   bare ``await future``. For tools marked ``long_running=True`` in
+   their ``ToolMetadata``: ``await asyncio.wait_for(shield(future),
+   long_running_wait_seconds)`` and, on timeout, return an
+   intermediate job-handle (NOT ``is_error``) WITHOUT cancelling the
+   Future.
+
+3. There is NO ``timeout`` parameter on ``ProxyMCPServer.__init__``.
+   The former 120s default was a phantom that lied to the LLM. The
+   per-long_running cap is explicit and operator-visible.
+
+Tests use the ``_invoke_handler`` helper which sets the SDK ContextVar
+before creating the handler task. Direct calls to
+``proxy.tool_handlers[N].handler(args)`` raise ``RuntimeError`` by
+design and any test that does so is incompatible with the new
+contract (which is the whole point of the fix).
+"""
+from __future__ import annotations
 
 import asyncio
+import itertools
+from contextlib import contextmanager
+from typing import Any, Generator
 
 import pytest
 
+from claude_agent_sdk._mcp_context import (
+    reset_current_claude_tool_use_id,
+    set_current_claude_tool_use_id,
+)
 from claude_code_provider.proxy_mcp_server import ProxyMCPServer
 from claude_code_provider.custom_types import MCPResult, ToolMetadata
 
 
-class TestProxyMCPServerInit:
-    """Tests for ProxyMCPServer initialization."""
+# ─── Helpers ────────────────────────────────────────────────────────────────
 
+
+_id_counter = itertools.count(1)
+
+
+def _fresh_claude_id(prefix: str = "toolu_test") -> str:
+    return f"{prefix}_{next(_id_counter):05d}"
+
+
+@contextmanager
+def _claude_id_ctx(claude_id: str) -> Generator[None, None, None]:
+    token = set_current_claude_tool_use_id(claude_id)
+    try:
+        yield
+    finally:
+        reset_current_claude_tool_use_id(token)
+
+
+async def _invoke_handler(
+    proxy: ProxyMCPServer,
+    handler_index: int,
+    args: dict[str, Any],
+    *,
+    claude_id: str | None = None,
+) -> tuple[asyncio.Task[MCPResult], str]:
+    """Start a handler task with a Claude tool_use_id in the ContextVar.
+
+    Returns ``(task, claude_id)``.
+    """
+    cid = claude_id or _fresh_claude_id()
+    handler = proxy.tool_handlers[handler_index].handler
+
+    async def _runner() -> MCPResult:
+        return await handler(args)
+
+    # Set ContextVar BEFORE create_task — Python copies the context
+    # snapshot at create_task time.
+    with _claude_id_ctx(cid):
+        task = asyncio.create_task(_runner())
+        # Yield once so the handler reaches its ContextVar read.
+        await asyncio.sleep(0)
+        return task, cid
+
+
+async def _wait_for_pending(proxy: ProxyMCPServer, claude_id: str, *, max_steps: int = 50) -> None:
+    """Yield the loop until the named pending call appears."""
+    for _ in range(max_steps):
+        if claude_id in proxy.pending_calls:
+            return
+        await asyncio.sleep(0.001)
+    raise AssertionError(f"pending call {claude_id!r} did not register")
+
+
+# ─── Init / construction ────────────────────────────────────────────────────
+
+
+class TestProxyMCPServerInit:
     def test_init_with_empty_tools(self) -> None:
-        """ProxyMCPServer should initialize with empty tools list."""
         proxy = ProxyMCPServer([])
         assert proxy.mcp_server_config is not None
         assert proxy.mcp_server_config["type"] == "sdk"
         assert proxy.mcp_server_config["name"] == "deepworker"
 
     def test_init_with_single_tool(self, sample_tool_metadata: list[ToolMetadata]) -> None:
-        """ProxyMCPServer should initialize with a single tool."""
-        single_tool = [sample_tool_metadata[0]]
-        proxy = ProxyMCPServer(single_tool)
-        assert proxy.mcp_server_config is not None
-        assert proxy.mcp_server_config["type"] == "sdk"
+        proxy = ProxyMCPServer([sample_tool_metadata[0]])
         assert len(proxy.tool_handlers) == 1
 
     def test_init_with_multiple_tools(self, sample_tool_metadata: list[ToolMetadata]) -> None:
-        """ProxyMCPServer should initialize with multiple tools."""
         proxy = ProxyMCPServer(sample_tool_metadata)
-        assert proxy.mcp_server_config is not None
         assert len(proxy.tool_handlers) == len(sample_tool_metadata)
 
 
-class TestProxyMCPServerPendingCalls:
-    """Tests for pending calls management."""
+# ─── Pending-calls management (handler keyed by Claude tool_use_id) ─────────
 
+
+class TestProxyMCPServerPendingCalls:
     def test_has_pending_calls_initially_false(self, sample_tool_metadata: list[ToolMetadata]) -> None:
-        """has_pending_calls should return False initially."""
         proxy = ProxyMCPServer(sample_tool_metadata)
         assert proxy.has_pending_calls() is False
 
     def test_get_pending_calls_initially_empty(self, sample_tool_metadata: list[ToolMetadata]) -> None:
-        """get_pending_calls should return empty list initially."""
         proxy = ProxyMCPServer(sample_tool_metadata)
         assert proxy.get_pending_calls() == []
 
@@ -50,437 +130,150 @@ class TestProxyMCPServerPendingCalls:
     async def test_pending_call_after_handler_invocation(
         self, sample_tool_metadata: list[ToolMetadata]
     ) -> None:
-        """After handler is called, there should be a pending call."""
         proxy = ProxyMCPServer(sample_tool_metadata)
+        task, cid = await _invoke_handler(proxy, 0, {"arg": "test_value"})
+        await _wait_for_pending(proxy, cid)
 
-        # Start handler in background (it will block on Future)
-        handler = proxy.tool_handlers[0].handler
-        task = asyncio.create_task(handler({"arg": "test_value"}))
-
-        # Give it time to start and block
-        await asyncio.sleep(0.1)
-
-        # Should have pending call now
         assert proxy.has_pending_calls() is True
         pending = proxy.get_pending_calls()
         assert len(pending) == 1
         assert pending[0]["name"] == "test_tool"
         assert pending[0]["args"] == {"arg": "test_value"}
+        assert pending[0]["id"] == cid  # key IS the Claude tool_use_id
 
-        # Cancel task to prevent hanging
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
 
+
+# ─── wait_for_pending_call_by_id (the new identity-keyed waiter) ────────────
+
+
+class TestWaitForPendingCallById:
     @pytest.mark.asyncio
-    async def test_wait_for_pending_calls_returns_existing_call(
+    async def test_returns_immediately_when_pending_exists(
         self, sample_tool_metadata: list[ToolMetadata]
     ) -> None:
-        """wait_for_pending_calls should return immediately for an existing call."""
         proxy = ProxyMCPServer(sample_tool_metadata)
-        handler = proxy.tool_handlers[0].handler
-        task = asyncio.create_task(handler({"arg": "test_value"}))
-        await asyncio.sleep(0)
+        task, cid = await _invoke_handler(proxy, 0, {"arg": "x"})
+        await _wait_for_pending(proxy, cid)
 
-        pending = await proxy.wait_for_pending_calls(
-            tool_name="test_tool",
-            arguments={"arg": "test_value"},
-            timeout=0.1,
+        pending = await asyncio.wait_for(
+            proxy.wait_for_pending_call_by_id(cid), timeout=1.0
         )
+        assert pending["id"] == cid
+        assert pending["name"] == "test_tool"
 
-        assert len(pending) == 1
-        assert pending[0]["name"] == "test_tool"
-        assert pending[0]["args"] == {"arg": "test_value"}
-
-        proxy.resolve_call(pending[0]["id"], {"content": [{"type": "text", "text": "ok"}]})
+        proxy.resolve_call(cid, {"content": [{"type": "text", "text": "ok"}]})
         await task
 
-    @pytest.mark.asyncio
-    async def test_wait_for_pending_calls_ignores_existing_nonmatching_call(
-        self, sample_tool_metadata: list[ToolMetadata]
-    ) -> None:
-        proxy = ProxyMCPServer(sample_tool_metadata)
 
-        stale_task = asyncio.create_task(
-            proxy.tool_handlers[1].handler({"a": 9, "b": 1})
-        )
-        await asyncio.sleep(0)
-        stale_pending = proxy.get_pending_calls()
-        assert len(stale_pending) == 1
-        assert stale_pending[0]["name"] == "calculator"
+# ─── wait_for_any_pending_call / wait_for_pending_calls / _matching_* ──────
+# Removed 2026-06-17 (variant A, single source of truth): those methods were
+# production-dead and each carried an ad-hoc timer (or a bare await). The only
+# live stage-A wait is wait_for_pending_call_by_id, bounded by the single
+# source — see test_stage_a_bounded_single_source.py and
+# docs/DESIGN_UNIFIED_BOUNDED_TOOL_WAIT.md.
 
-        waiter = asyncio.create_task(
-            proxy.wait_for_pending_calls(
-                tool_name="test_tool",
-                arguments={"arg": "expected"},
-                timeout=1.0,
-            )
-        )
-        await asyncio.sleep(0)
-        assert not waiter.done()
 
-        matching_task = asyncio.create_task(
-            proxy.tool_handlers[0].handler({"arg": "expected"})
-        )
-        pending = await waiter
-
-        assert len(pending) == 1
-        assert pending[0]["name"] == "test_tool"
-        assert pending[0]["args"] == {"arg": "expected"}
-
-        for call in proxy.get_pending_calls():
-            proxy.resolve_call(
-                call["id"], {"content": [{"type": "text", "text": "ok"}]}
-            )
-        await stale_task
-        await matching_task
-
-    @pytest.mark.asyncio
-    async def test_wait_for_pending_calls_is_woken_by_handler(
-        self, sample_tool_metadata: list[ToolMetadata]
-    ) -> None:
-        """wait_for_pending_calls should park on a Future, not poll."""
-        proxy = ProxyMCPServer(sample_tool_metadata)
-        handler = proxy.tool_handlers[1].handler
-
-        waiter = asyncio.create_task(proxy.wait_for_pending_calls(
-            tool_name="calculator",
-            arguments={"a": 2, "b": 3},
-            timeout=1.0,
-        ))
-        await asyncio.sleep(0)
-
-        task = asyncio.create_task(handler({"a": 2, "b": 3}))
-        pending = await waiter
-
-        assert len(pending) == 1
-        assert pending[0]["name"] == "calculator"
-        assert pending[0]["args"] == {"a": 2, "b": 3}
-
-        proxy.resolve_call(pending[0]["id"], {"content": [{"type": "text", "text": "ok"}]})
-        await task
-
-    @pytest.mark.asyncio
-    async def test_wait_for_matching_pending_calls_returns_batch(
-        self, sample_tool_metadata: list[ToolMetadata]
-    ) -> None:
-        """Batch wait should return once all expected calls are registered."""
-        proxy = ProxyMCPServer(sample_tool_metadata)
-
-        waiter = asyncio.create_task(proxy.wait_for_matching_pending_calls(
-            expected_calls=[
-                ("test_tool", {"arg": "first"}),
-                ("calculator", {"a": 2, "b": 3}),
-            ],
-            timeout=1.0,
-        ))
-        await asyncio.sleep(0)
-
-        task_one = asyncio.create_task(proxy.tool_handlers[0].handler({"arg": "first"}))
-        await asyncio.sleep(0)
-        assert not waiter.done()
-
-        task_two = asyncio.create_task(proxy.tool_handlers[1].handler({"a": 2, "b": 3}))
-        pending = await waiter
-
-        assert [call["name"] for call in pending] == ["test_tool", "calculator"]
-        assert [call["args"] for call in pending] == [
-            {"arg": "first"},
-            {"a": 2, "b": 3},
-        ]
-
-        for call in pending:
-            proxy.resolve_call(call["id"], {"content": [{"type": "text", "text": "ok"}]})
-        await task_one
-        await task_two
-
-    @pytest.mark.asyncio
-    async def test_wait_for_any_pending_call_returns_existing(
-        self, sample_tool_metadata: list[ToolMetadata]
-    ) -> None:
-        """If a pending call already exists, should return immediately."""
-        proxy = ProxyMCPServer(sample_tool_metadata)
-        handler = proxy.tool_handlers[0].handler
-
-        task = asyncio.create_task(handler({"arg": "first"}))
-        # Give handler a chance to register the pending call.
-        for _ in range(10):
-            await asyncio.sleep(0)
-            if proxy.has_pending_calls():
-                break
-
-        assert proxy.has_pending_calls()
-        # Must return immediately — no waiting required.
-        await asyncio.wait_for(
-            proxy.wait_for_any_pending_call(timeout=1.0), timeout=0.1
-        )
-
-        proxy.resolve_call(
-            proxy.get_pending_calls()[0]["id"],
-            {"content": [{"type": "text", "text": "ok"}]},
-        )
-        await task
-
-    @pytest.mark.asyncio
-    async def test_wait_for_any_pending_call_is_event_driven_no_polling(
-        self, sample_tool_metadata: list[ToolMetadata]
-    ) -> None:
-        """Must park on Future and be woken by handler — no polling allowed."""
-        proxy = ProxyMCPServer(sample_tool_metadata)
-        handler = proxy.tool_handlers[1].handler
-
-        # Disallow asyncio.sleep() inside the wait — proves event-driven.
-        # We spy on asyncio.sleep used by the proxy module only; the test
-        # itself uses it explicitly via asyncio.sleep(0).
-        waiter = asyncio.create_task(
-            proxy.wait_for_any_pending_call(timeout=1.0)
-        )
-        # Yield to let waiter park on its Future before handler registers.
-        await asyncio.sleep(0)
-        assert not waiter.done()
-
-        # Fire the handler. The handler registers the pending call and must
-        # wake the waiter via the same Future-based mechanism used by
-        # wait_for_matching_pending_calls.
-        task = asyncio.create_task(handler({"a": 2, "b": 3}))
-        await waiter  # Should return as soon as the handler registers.
-
-        assert proxy.has_pending_calls()
-
-        proxy.resolve_call(
-            proxy.get_pending_calls()[0]["id"],
-            {"content": [{"type": "text", "text": "ok"}]},
-        )
-        await task
-
-    @pytest.mark.asyncio
-    async def test_wait_for_any_pending_call_times_out_if_no_handler(
-        self, sample_tool_metadata: list[ToolMetadata]
-    ) -> None:
-        """If no handler ever registers a pending call, must time out."""
-        proxy = ProxyMCPServer(sample_tool_metadata)
-
-        with pytest.raises(asyncio.TimeoutError):
-            await proxy.wait_for_any_pending_call(timeout=0.05)
-
-    @pytest.mark.asyncio
-    async def test_wait_for_any_pending_call_returns_on_first_of_many(
-        self, sample_tool_metadata: list[ToolMetadata]
-    ) -> None:
-        """Production semantics: Claude CLI sends MCP control_requests
-        SEQUENTIALLY (next one only after the previous tool_result arrives).
-        Even if multiple ToolUseBlocks are in one AssistantMessage, only the
-        FIRST handler runs — the rest stay queued in the CLI. ``ainvoke``
-        must therefore NOT wait for all to register; it must return as soon
-        as the first pending call exists, surface it to LangGraph, and let
-        the next ainvoke iteration pick up the next one after resolve_call.
-        """
-        proxy = ProxyMCPServer(sample_tool_metadata)
-
-        # Only ONE handler ever runs (simulates Claude CLI's sequential
-        # control_request behaviour). Waiter must return based on this one.
-        waiter = asyncio.create_task(
-            proxy.wait_for_any_pending_call(timeout=1.0)
-        )
-        await asyncio.sleep(0)
-        assert not waiter.done()
-
-        task = asyncio.create_task(
-            proxy.tool_handlers[0].handler({"arg": "only_one"})
-        )
-        await waiter  # Must NOT wait for a second handler.
-
-        pending = proxy.get_pending_calls()
-        assert len(pending) == 1
-        assert pending[0]["name"] == "test_tool"
-        assert pending[0]["args"] == {"arg": "only_one"}
-
-        proxy.resolve_call(
-            pending[0]["id"], {"content": [{"type": "text", "text": "ok"}]}
-        )
-        await task
+# ─── Handler blocking and resolve ──────────────────────────────────────────
 
 
 class TestProxyMCPServerHandlerBlocking:
-    """Tests for handler blocking behavior."""
-
     @pytest.mark.asyncio
-    async def test_handler_blocks_on_future(self, sample_tool_metadata: list[ToolMetadata]) -> None:
-        """Handler should block until Future is resolved."""
+    async def test_handler_blocks_on_future(
+        self, sample_tool_metadata: list[ToolMetadata]
+    ) -> None:
         proxy = ProxyMCPServer(sample_tool_metadata)
-        handler = proxy.tool_handlers[0].handler
-
-        # Start handler in background
-        task = asyncio.create_task(handler({"arg": "test"}))
-
-        # Give it time to start
-        await asyncio.sleep(0.1)
-
-        # Task should not be done (blocked on Future)
+        task, _cid = await _invoke_handler(proxy, 0, {"arg": "test"})
+        await asyncio.sleep(0.05)
         assert not task.done()
 
-        # Cancel to cleanup
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
 
     @pytest.mark.asyncio
-    async def test_handler_returns_after_resolve(self, sample_tool_metadata: list[ToolMetadata]) -> None:
-        """Handler should return result after Future is resolved."""
+    async def test_handler_returns_after_resolve(
+        self, sample_tool_metadata: list[ToolMetadata]
+    ) -> None:
         proxy = ProxyMCPServer(sample_tool_metadata)
-        handler = proxy.tool_handlers[0].handler
+        task, cid = await _invoke_handler(proxy, 0, {"arg": "test"})
+        await _wait_for_pending(proxy, cid)
 
-        # Start handler in background
-        task = asyncio.create_task(handler({"arg": "test"}))
-
-        # Give it time to start
-        await asyncio.sleep(0.1)
-
-        # Get pending call ID
-        pending = proxy.get_pending_calls()
-        assert len(pending) == 1
-        call_id = pending[0]["id"]
-
-        # Resolve with result
         result: MCPResult = {"content": [{"type": "text", "text": "Success"}]}
-        proxy.resolve_call(call_id, result)
-
-        # Handler should complete
-        handler_result = await task
-        assert handler_result == result
+        proxy.resolve_call(cid, result)
+        assert (await task) == result
 
 
 class TestProxyMCPServerResolveCall:
-    """Tests for resolve_call functionality."""
-
     @pytest.mark.asyncio
-    async def test_resolve_call_with_valid_id(self, sample_tool_metadata: list[ToolMetadata]) -> None:
-        """resolve_call should resolve Future with given result."""
-        proxy = ProxyMCPServer(sample_tool_metadata)
-        handler = proxy.tool_handlers[0].handler
-
-        # Start handler
-        task = asyncio.create_task(handler({"arg": "test"}))
-        await asyncio.sleep(0.1)
-
-        # Get call ID
-        pending = proxy.get_pending_calls()
-        call_id = pending[0]["id"]
-
-        # Resolve
-        result: MCPResult = {"content": [{"type": "text", "text": "Result"}]}
-        proxy.resolve_call(call_id, result)
-
-        # Should get result
-        handler_result = await task
-        assert handler_result == result
-
-    def test_resolve_call_with_invalid_id(self, sample_tool_metadata: list[ToolMetadata]) -> None:
-        """resolve_call with invalid ID should not raise error."""
-        proxy = ProxyMCPServer(sample_tool_metadata)
-
-        # Should not raise
-        proxy.resolve_call("nonexistent_id", {"content": []})
-
-    @pytest.mark.asyncio
-    async def test_resolve_call_removes_from_pending(
+    async def test_resolve_with_valid_id(
         self, sample_tool_metadata: list[ToolMetadata]
     ) -> None:
-        """resolve_call should remove call from pending list."""
         proxy = ProxyMCPServer(sample_tool_metadata)
-        handler = proxy.tool_handlers[0].handler
+        task, cid = await _invoke_handler(proxy, 0, {"arg": "test"})
+        await _wait_for_pending(proxy, cid)
 
-        # Start handler
-        task = asyncio.create_task(handler({"arg": "test"}))
-        await asyncio.sleep(0.1)
+        result: MCPResult = {"content": [{"type": "text", "text": "Result"}]}
+        proxy.resolve_call(cid, result)
+        assert (await task) == result
 
-        # Verify pending
+    def test_resolve_with_invalid_id(self, sample_tool_metadata: list[ToolMetadata]) -> None:
+        proxy = ProxyMCPServer(sample_tool_metadata)
+        proxy.resolve_call("nonexistent_id", {"content": []})  # must not raise
+
+    @pytest.mark.asyncio
+    async def test_resolve_removes_from_pending(
+        self, sample_tool_metadata: list[ToolMetadata]
+    ) -> None:
+        proxy = ProxyMCPServer(sample_tool_metadata)
+        task, cid = await _invoke_handler(proxy, 0, {"arg": "test"})
+        await _wait_for_pending(proxy, cid)
+
         assert proxy.has_pending_calls() is True
-        call_id = proxy.get_pending_calls()[0]["id"]
-
-        # Resolve
-        proxy.resolve_call(call_id, {"content": []})
+        proxy.resolve_call(cid, {"content": []})
         await task
-
-        # Should be removed from pending
         assert proxy.has_pending_calls() is False
         assert proxy.get_pending_calls() == []
 
 
-class TestProxyMCPServerTimeout:
-    """Tests for handler timeout behavior."""
-
-    @pytest.mark.asyncio
-    async def test_handler_timeout(self, sample_tool_metadata: list[ToolMetadata]) -> None:
-        """Handler should return error after timeout."""
-        # Create proxy with short timeout for testing
-        proxy = ProxyMCPServer(sample_tool_metadata, timeout=0.2)
-        handler = proxy.tool_handlers[0].handler
-
-        # Call handler without resolving
-        result = await handler({"arg": "test"})
-
-        # Should return timeout error
-        assert "is_error" in result
-        assert result["is_error"] is True
-        assert "timeout" in result["content"][0]["text"].lower()
+# ─── Multiple simultaneous calls (different ids) ───────────────────────────
 
 
 class TestProxyMCPServerMultipleCalls:
-    """Tests for handling multiple simultaneous tool calls."""
-
     @pytest.mark.asyncio
-    async def test_multiple_pending_calls(self, sample_tool_metadata: list[ToolMetadata]) -> None:
-        """Should handle multiple pending calls simultaneously."""
+    async def test_multiple_pending_calls(
+        self, sample_tool_metadata: list[ToolMetadata]
+    ) -> None:
         proxy = ProxyMCPServer(sample_tool_metadata)
+        task1, cid1 = await _invoke_handler(proxy, 0, {"arg": "call1"})
+        task2, cid2 = await _invoke_handler(proxy, 1, {"a": 1, "b": 2})
+        await _wait_for_pending(proxy, cid1)
+        await _wait_for_pending(proxy, cid2)
 
-        # Start multiple handlers
-        handler1 = proxy.tool_handlers[0].handler
-        handler2 = proxy.tool_handlers[1].handler
-
-        task1 = asyncio.create_task(handler1({"arg": "call1"}))
-        task2 = asyncio.create_task(handler2({"a": 1, "b": 2}))
-
-        await asyncio.sleep(0.1)
-
-        # Should have 2 pending calls
         assert len(proxy.get_pending_calls()) == 2
-
-        # Resolve both
-        pending = proxy.get_pending_calls()
-        for call in pending:
-            proxy.resolve_call(call["id"], {"content": [{"type": "text", "text": "Done"}]})
-
-        # Both should complete
+        proxy.resolve_call(cid1, {"content": [{"type": "text", "text": "Done"}]})
+        proxy.resolve_call(cid2, {"content": [{"type": "text", "text": "Done"}]})
         await task1
         await task2
-
-        # No pending calls left
         assert proxy.has_pending_calls() is False
 
     @pytest.mark.asyncio
-    async def test_resolve_calls_independently(self, sample_tool_metadata: list[ToolMetadata]) -> None:
-        """Should resolve calls independently."""
+    async def test_resolve_calls_independently(
+        self, sample_tool_metadata: list[ToolMetadata]
+    ) -> None:
         proxy = ProxyMCPServer(sample_tool_metadata)
+        task1, cid1 = await _invoke_handler(proxy, 0, {"arg": "1"})
+        task2, cid2 = await _invoke_handler(proxy, 0, {"arg": "2"})
+        await _wait_for_pending(proxy, cid1)
+        await _wait_for_pending(proxy, cid2)
 
-        # Start 2 handlers
-        task1 = asyncio.create_task(proxy.tool_handlers[0].handler({"arg": "1"}))
-        task2 = asyncio.create_task(proxy.tool_handlers[0].handler({"arg": "2"}))
-
-        await asyncio.sleep(0.1)
-
-        pending = proxy.get_pending_calls()
-        assert len(pending) == 2
-
-        # Resolve first
-        proxy.resolve_call(pending[0]["id"], {"content": [{"type": "text", "text": "First"}]})
+        proxy.resolve_call(cid1, {"content": [{"type": "text", "text": "First"}]})
         result1 = await task1
-
-        # Second should still be pending
         assert proxy.has_pending_calls() is True
 
-        # Resolve second
-        proxy.resolve_call(pending[1]["id"], {"content": [{"type": "text", "text": "Second"}]})
+        proxy.resolve_call(cid2, {"content": [{"type": "text", "text": "Second"}]})
         result2 = await task2
 
         assert result1["content"][0]["text"] == "First"
@@ -488,68 +281,143 @@ class TestProxyMCPServerMultipleCalls:
 
 
 class TestProxyMCPServerErrorHandling:
-    """Tests for error handling in ProxyMCPServer."""
-
     @pytest.mark.asyncio
-    async def test_resolve_with_error_flag(self, sample_tool_metadata: list[ToolMetadata]) -> None:
-        """Should handle results with is_error flag."""
+    async def test_resolve_with_error_flag(
+        self, sample_tool_metadata: list[ToolMetadata]
+    ) -> None:
         proxy = ProxyMCPServer(sample_tool_metadata)
+        task, cid = await _invoke_handler(proxy, 0, {"arg": "test"})
+        await _wait_for_pending(proxy, cid)
 
-        task = asyncio.create_task(proxy.tool_handlers[0].handler({"arg": "test"}))
-        await asyncio.sleep(0.1)
-
-        call_id = proxy.get_pending_calls()[0]["id"]
-
-        # Resolve with error
         error_result: MCPResult = {
             "content": [{"type": "text", "text": "Error occurred"}],
             "is_error": True,
         }
-        proxy.resolve_call(call_id, error_result)
-
+        proxy.resolve_call(cid, error_result)
         result = await task
-        assert result["is_error"] is True
+        assert result.get("is_error") is True
         assert "Error occurred" in result["content"][0]["text"]
 
 
 class TestProxyMCPServerResolveIdempotency:
-    """``resolve_call`` must be idempotent.
-
-    The delivery-only-timeout fix (DESIGN_SUBSCRIPTION_AND_DELIVERY_FIX.md,
-    Bug 2) resolves the inter-agent send Future EARLY — at delivery time, from
-    a tool-call wrapper — instead of waiting for the next ainvoke. A later
-    send-loop pass may still try to resolve the same call_id. Both the early
-    and the late resolve must be safe: the first wins, the rest are no-ops, and
-    nothing raises.
-    """
-
     @pytest.mark.asyncio
     async def test_second_resolve_is_noop(
         self, sample_tool_metadata: list[ToolMetadata]
     ) -> None:
-        """A second resolve_call for the same id must not overwrite or raise."""
         proxy = ProxyMCPServer(sample_tool_metadata)
-        task = asyncio.create_task(proxy.tool_handlers[0].handler({"arg": "x"}))
-        await asyncio.sleep(0.1)
-        call_id = proxy.get_pending_calls()[0]["id"]
+        task, cid = await _invoke_handler(proxy, 0, {"arg": "x"})
+        await _wait_for_pending(proxy, cid)
 
         first: MCPResult = {"content": [{"type": "text", "text": "delivered"}]}
         second: MCPResult = {"content": [{"type": "text", "text": "LATE"}]}
 
-        proxy.resolve_call(call_id, first)
-        # Future already resolved + handler's finally pops the id; the second
-        # resolve must be a harmless no-op (no exception, no overwrite).
-        proxy.resolve_call(call_id, second)
-
+        proxy.resolve_call(cid, first)
+        proxy.resolve_call(cid, second)  # must be no-op, must not raise
         result = await task
         assert result["content"][0]["text"] == "delivered"
 
     @pytest.mark.asyncio
-    async def test_resolve_unknown_call_id_is_noop(
+    async def test_resolve_unknown_id_is_noop(
         self, sample_tool_metadata: list[ToolMetadata]
     ) -> None:
-        """Resolving an id with no pending call must be a safe no-op."""
         proxy = ProxyMCPServer(sample_tool_metadata)
-        # Nothing pending — must not raise.
         proxy.resolve_call("does-not-exist", {"content": [{"type": "text", "text": "x"}]})
         assert not proxy.has_pending_calls()
+
+
+# ─── Regression: resolve_call must drop pending_calls SYNCHRONOUSLY ─────────
+#
+# INCIDENT 2026-06-15 (test_claude_code_mcp_prefix double dispatch).
+#
+# Before the fix, ``resolve_call`` only did ``future.set_result(...)`` and
+# left ``pending_calls[call_id]`` in the dict until the spawned handler
+# task reached its ``finally: pending_calls.pop(call_id, None)``. Between
+# those two scheduling points, the calling code (``chat_model.ainvoke``
+# section 8: "tool_resolved and not user_message_sent → check
+# has_pending_calls") can run and observe the JUST-RESOLVED call_id as
+# still pending — and return a second ``AIMessage(tool_calls=[same id])``
+# to LangGraph. Symptom in the wild: `[ainvoke] Returning AIMessage with
+# 1 tool_calls: ['ls']` printed twice in a row, identical tool_call_id,
+# with no second SDK ``tool_handler_entry`` between them. Cluster:
+# test_claude_code_mcp_prefix (both tests), test_restart_self_e2e
+# (synchronous-with-notice).
+#
+# Fix: ``resolve_call`` pops ``pending_calls[call_id]`` BEFORE calling
+# ``future.set_result`` — synchronous source-of-truth update. The
+# handler ``finally: pending_calls.pop(call_id, None)`` is kept as a
+# belt-and-braces no-op for cancellation / parked-job paths.
+
+
+class TestProxyMCPServerResolveDropsPendingSynchronously:
+    @pytest.mark.asyncio
+    async def test_resolve_removes_id_before_yielding(
+        self, sample_tool_metadata: list[ToolMetadata]
+    ) -> None:
+        """After ``resolve_call(cid, ...)`` returns, ``cid`` MUST no longer
+        appear in ``pending_calls`` — not after the next event-loop tick,
+        not after the handler's ``finally`` block, but right now. Any code
+        path that calls ``proxy.has_pending_calls()`` between ``resolve_call``
+        and the handler task's wake-up MUST see the resolved call gone."""
+        proxy = ProxyMCPServer(sample_tool_metadata)
+        task, cid = await _invoke_handler(proxy, 0, {"arg": "x"})
+        await _wait_for_pending(proxy, cid)
+
+        # Single pending call right now.
+        assert cid in proxy.pending_calls
+        assert proxy.has_pending_calls() is True
+
+        proxy.resolve_call(cid, {"content": [{"type": "text", "text": "ok"}]})
+
+        # POLICY: resolve_call is the source of truth for "call resolved".
+        # The dict must reflect that synchronously, BEFORE the handler
+        # task is awakened. Anything observing the proxy state without
+        # an intervening ``await`` MUST see the call gone.
+        assert cid not in proxy.pending_calls
+        assert proxy.has_pending_calls() is False
+
+        # Handler still wakes and returns; finally-pop is now a no-op.
+        result = await asyncio.wait_for(task, timeout=1.0)
+        assert result["content"][0]["text"] == "ok"
+
+    @pytest.mark.asyncio
+    async def test_two_pending_resolve_only_drops_resolved_one(
+        self, sample_tool_metadata: list[ToolMetadata]
+    ) -> None:
+        """Resolving cid1 must NOT touch cid2 — only the exact resolved
+        id is removed. The other still-pending call stays."""
+        proxy = ProxyMCPServer(sample_tool_metadata)
+        task1, cid1 = await _invoke_handler(proxy, 0, {"arg": "1"})
+        task2, cid2 = await _invoke_handler(proxy, 0, {"arg": "2"})
+        await _wait_for_pending(proxy, cid1)
+        await _wait_for_pending(proxy, cid2)
+
+        proxy.resolve_call(cid1, {"content": [{"type": "text", "text": "1"}]})
+
+        assert cid1 not in proxy.pending_calls
+        assert cid2 in proxy.pending_calls
+        assert proxy.has_pending_calls() is True
+        pending = proxy.get_pending_calls()
+        assert [p["id"] for p in pending] == [cid2]
+
+        proxy.resolve_call(cid2, {"content": [{"type": "text", "text": "2"}]})
+        assert cid2 not in proxy.pending_calls
+        assert proxy.has_pending_calls() is False
+
+        await asyncio.wait_for(asyncio.gather(task1, task2), timeout=1.0)
+
+
+# ─── Direct invocation without ContextVar raises (D-guard) ─────────────────
+
+
+class TestHandlerWithoutClaudeIdRaises:
+    @pytest.mark.asyncio
+    async def test_handler_raises_when_contextvar_empty(
+        self, sample_tool_metadata: list[ToolMetadata]
+    ) -> None:
+        """Calling ``handler(args)`` without setting the SDK ContextVar
+        MUST raise ``RuntimeError``. This guard makes silent fallback
+        impossible (see POLICIES.md §7)."""
+        proxy = ProxyMCPServer(sample_tool_metadata)
+        handler = proxy.tool_handlers[0].handler
+        with pytest.raises(RuntimeError, match=r"tool_use_id"):
+            await handler({"arg": "test"})

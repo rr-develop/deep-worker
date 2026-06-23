@@ -1,6 +1,7 @@
 """Custom tools for the CLI agent."""
 
 import logging
+import os
 import shutil
 import subprocess
 import sys
@@ -30,7 +31,7 @@ logger = logging.getLogger(__name__)
 # CRITICAL: CLAUDE_CODE_PROVIDER MUST BE IMPORTED FROM SOURCE CODE, NOT FROM PIP/VENV!
 # ============================================================================
 # Path calculation: __file__ is at deep_worker/deep_worker_cli/deep_worker_cli/tools.py
-# .parent x4 = the repository root
+# .parent x4 = repository root
 _repo_root = Path(__file__).parent.parent.parent.parent
 _claude_code_provider_path = _repo_root / "claude_code_provider"
 if not _claude_code_provider_path.exists():
@@ -464,6 +465,171 @@ def make_restart_agent_tool(sender_name: str) -> BaseTool:
 
 
 # ===========================================================================
+# SELF-RESTART TOOL (a related issue)
+# ===========================================================================
+
+
+def write_restart_notice(data_dir: Path, *, cause: str, message: str) -> Path:
+    """Write the ``.restart_notice.json`` the next process consumes on startup.
+
+    THE single source of truth for the notice format ``{ts, cause, message}``.
+    A process that finds this file on start loads it into
+    ``_pending_restart_notice`` and runs ``_auto_continue_after_restart`` —
+    i.e. it CONTINUES the pending task instead of going idle. Used by BOTH the
+    ``restart_self`` tool (cause="self") and provider failover
+    (cause="failover") so failover-restarted agents resume their work
+    (the 2026-06-17 incident, a live agent). Returns the notice path.
+    """
+    from datetime import datetime, timezone
+    import json as _json
+
+    data_dir.mkdir(parents=True, exist_ok=True)
+    notice_path = data_dir / ".restart_notice.json"
+    notice = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "cause": cause,
+        "message": message,
+    }
+    notice_path.write_text(_json.dumps(notice))
+    from deep_worker_cli.storage_paths import ensure_private_file
+    ensure_private_file(notice_path)
+    return notice_path
+
+
+def make_restart_self_tool(sender_name: str) -> BaseTool:
+    """Create a tool that allows an agent to restart its own process.
+
+    Unlike ``restart_agent`` (which explicitly forbids self-restart), this
+    tool restarts the agent SYNCHRONOUSLY at the moment of the call.
+
+    Concretely, the tool:
+
+      1. Writes a ``.restart_notice.json`` file into the agent's data
+         directory containing ``{ts, cause: "self"}``. The newly-started
+         process consumes this notice on startup and delivers it as a
+         ``SystemMessage`` to the next ``ainvoke`` so the model learns
+         it was restarted.
+      2. Spawns ``deep-worker --restart <name>`` as a detached subprocess
+         IMMEDIATELY (no flag-file, no "after the turn completes"). The
+         ``deep-worker --restart`` driver stops the running agent (this
+         very process) via SIGTERM, then launches a fresh process with
+         the same saved launch_config.
+
+    The tool returns the success/failure dict like any other regular
+    tool. Calling it does NOT put the agent into idle — control flow
+    in the agent is the same as for any other tool call.
+    """
+
+    @tool("restart_self")
+    async def restart_self() -> dict[str, Any]:
+        """Restart your own agent process synchronously.
+
+        This is a regular tool — it does NOT defer anything. The agent
+        is restarted at call time. The new process loads from the same
+        on-disk checkpointer (conversation history, pending task) and
+        receives a SYSTEM notification of the restart in its next turn.
+
+        Usage policy:
+        - Only use when explicitly asked by the user to restart/refresh.
+        - Only use when you detect a critical code change that requires
+          a restart to take effect.
+        - Do NOT use for speculative cleanup, housekeeping, or optimization.
+        """
+        data_dir = Path.home() / Path("~/.deep_worker").name / sender_name
+
+        # 1. Write the restart-notice the new process will consume (shared
+        #    writer — same format used by provider failover).
+        try:
+            notice_path = write_restart_notice(
+                data_dir,
+                cause="self",
+                message=(
+                    f"Agent '{sender_name}' was restarted by its own "
+                    f"restart_self tool call."
+                ),
+            )
+        except OSError as exc:
+            return {
+                "success": False,
+                "error": "notice_write_error",
+                "message": f"Cannot write restart notice: {exc}",
+            }
+
+        # 2. Locate the deep-worker driver.
+        cmd = shutil.which("deep-worker")
+        if cmd is None:
+            return {
+                "success": False,
+                "error": "command_unavailable",
+                "message": (
+                    "deep-worker is not on PATH; cannot perform restart. "
+                    "The restart-notice file was written but no restart "
+                    "subprocess was spawned."
+                ),
+            }
+
+        # 3. Spawn the restart subprocess SYNCHRONOUSLY. After this
+        #    Popen returns the replacement process is already
+        #    fork/exec'd and will start independently.
+        try:
+            subprocess.Popen(
+                [cmd, "--restart", sender_name],
+                start_new_session=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError as exc:
+            return {
+                "success": False,
+                "error": "spawn_failed",
+                "message": f"Could not spawn deep-worker --restart: {exc}",
+            }
+
+        # 4. ⚠️ CRITICAL — sever the current LangGraph turn IMMEDIATELY.
+        #
+        # Without this hard-exit the *old* process would keep running:
+        #   - The LLM stream would finalise the assistant message,
+        #   - The turn would commit to the checkpointer,
+        #   - The *new* process, once started, would observe a fully-
+        #     ended turn and its auto-continuation would be treated as
+        #     a *separate* idle-state turn — exactly the failure mode
+        #     reported on 2026-06-12 ("I don't see that you
+        #     restarted … after that you're in idle, which is NOT RIGHT").
+        #
+        # Behaviour with hard-exit:
+        #   - The old process dies before LangGraph commits the turn,
+        #   - The checkpointer keeps the last state (pre-tool, with the
+        #     restart_self tool call pending),
+        #   - The new process resumes from that state, consumes the
+        #     restart-notice, and its auto-continuation IS the same
+        #     logical turn — continuing work, not "idle + notice".
+        #
+        # We use ``os._exit`` (not ``sys.exit``) so no atexit handlers,
+        # asyncio cleanup, or finally-blocks run — anything that tries
+        # to commit state in this process MUST NOT do so. The
+        # checkpointer's last write (from before this tool call) is the
+        # one the new process will read.
+        #
+        # The return value below is unreachable in production; it
+        # remains for tests that patch ``os._exit`` and for the
+        # signature contract.
+        os._exit(0)
+
+        return {  # pragma: no cover  -- unreachable in production
+            "success": True,
+            "message": (
+                f"Agent '{sender_name}' is being restarted now. "
+                f"The new process will receive a system notice about "
+                f"this restart."
+            ),
+            "restart_notice": str(notice_path),
+        }
+
+    return restart_self
+
+
+# ===========================================================================
 # INTER-AGENT MESSAGING TOOL
 # ===========================================================================
 #
@@ -531,6 +697,22 @@ class _SendMessageToAgentArgs(BaseModel):
             "reader of the conversation can see who said what to whom)."
         ),
     )
+    reply_back: bool = Field(
+        True,
+        description=(
+            "Controls whether the receiving agent is expected to reply back "
+            "to you (the sender) via send_message_to_agent, or to respond "
+            "directly to the user. "
+            "When True (the default), the recipient will be instructed to "
+            "reply using send_message_to_agent back to you. Use this for "
+            "requests, commands, or questions that need a response from the "
+            "target agent. "
+            "When False, the recipient will be instructed to respond directly "
+            "to the user instead of replying to you. Use this when you want "
+            "the target agent to produce a result for the user rather than "
+            "communicating back to you."
+        ),
+    )
 
 
 def make_send_message_to_agent_tool(sender_name: str) -> BaseTool:
@@ -557,6 +739,7 @@ def make_send_message_to_agent_tool(sender_name: str) -> BaseTool:
     async def send_message_to_agent(
         agent_name: str,
         message: str,
+        reply_back: bool = True,
     ) -> dict[str, Any]:
         """Send a message to another running deep-worker agent.
 
@@ -569,29 +752,41 @@ def make_send_message_to_agent_tool(sender_name: str) -> BaseTool:
         It is delivered fire-and-forget: this call returns once the target
         has accepted the message, NOT once the target finishes replying.
 
-        Usage policy:
+        The ``reply_back`` parameter controls how the receiving agent
+        handles the response. True (default): the receiving agent MUST
+        reply via send_message_to_agent. False: the receiving agent
+        responds directly to the user.
 
-        - Do NOT use this tool by default. Only use it when:
-          1. The human user explicitly asks you to pass a message or
-             command to another agent (e.g. "tell beta to ...", "send
-             this to agent alpha"), OR
-          2. You previously received an `agent:<name>:> ...` message from
-             another agent and want to reply to that sender.
+        Usage policy for OUTGOING messages (initiating contact):
+        Do NOT use this tool to initiate conversations on your own,
+        broadcast to multiple agents, or send unsolicited status updates.
+        Only use it when:
+        1. The human user explicitly asks you to pass a message or
+           command to another agent, OR
+        2. You were previously instructed by another agent or by the
+           user to do so.
 
-        - Do not initiate agent-to-agent conversations on your own, do not
-          broadcast, and do not send unsolicited status updates.
+        Usage policy for INCOMING messages (replying to a peer):
+        When you receive a message from another agent (content starts
+        with ``<sender> -> <your-name> :> ...``), you MUST reply using
+        ``send_message_to_agent`` unless ``reply_back=False`` was
+        specified. This is NOT optional.
 
         Args:
             agent_name: Registry name of the target agent. Must refer to a
                 currently running agent.
             message: The text to deliver. Must be non-empty.
+            reply_back: Whether the receiving agent should reply via
+                send_message_to_agent (True, default) or respond directly
+                to the user (False).
 
         Returns:
             A dict describing the outcome. On success:
 
                 {"success": True,
                  "target_agent": "<agent_name>",
-                 "delivered_content": "<sender> -> <agent_name> :> <message>"}
+                 "delivered_content": "<sender> -> <agent_name> :> <message>",
+                 "reply_back": True}
 
             On failure (NEVER raises — always returns a dict):
 
@@ -690,6 +885,7 @@ def make_send_message_to_agent_tool(sender_name: str) -> BaseTool:
                 resp = await client._send_command({
                     "command": "enqueue_message",
                     "message": prefixed,
+                    "reply_back": reply_back,
                 })
                 if not resp.get("success"):
                     return {
@@ -725,6 +921,7 @@ def make_send_message_to_agent_tool(sender_name: str) -> BaseTool:
                 "success": True,
                 "target_agent": target,
                 "delivered_content": prefixed,
+                "reply_back": reply_back,
             }
         finally:
             # Always disconnect. Swallow errors during teardown so we

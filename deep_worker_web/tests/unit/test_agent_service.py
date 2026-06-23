@@ -1,5 +1,6 @@
 """Tests for AgentService."""
 
+import asyncio
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -8,6 +9,15 @@ import pytest
 from app.schemas.agent_schemas import AgentStatus
 from app.services.agent_service import AgentService
 from tests.fixtures.mock_registry import MockProcessRegistry
+
+
+def _resolved(value: object) -> "asyncio.Future[object]":
+    """A pre-resolved Future carrying ``value`` — matches the shape of
+    ``AgentService.ensure_connecting`` (a non-async method returning an
+    awaitable), so it can be ``await``ed in tests."""
+    fut: "asyncio.Future[object]" = asyncio.get_event_loop().create_future()
+    fut.set_result(value)
+    return fut
 
 
 @pytest.fixture
@@ -120,7 +130,7 @@ class TestAgentServiceConnection:
     async def test_is_connected_returns_false_when_conn_closed(
         self, agent_service: AgentService
     ) -> None:
-        """Regression for a related internal incident analysis (not included here).
+        """Regression for the 2026-04-27 incident.
 
         ``is_connected`` previously checked only the local
         ``_connections`` dict. After the peer process died and rpyc
@@ -361,8 +371,11 @@ class TestAgentServiceSendMessageFireAndForget:
         agent_service._connections["test-agent-1"] = mock_conn
 
         # Send message
-        result = await agent_service.send_message("test-agent-1", "hello")
+        result = await agent_service.send_message(
+            "test-agent-1", "hello", request_id="request-123"
+        )
         assert result["success"] is True
+        assert result["request_id"] == "request-123"
 
         # Wait for fire-and-forget callback to execute
         await asyncio.sleep(0.5)
@@ -373,6 +386,7 @@ class TestAgentServiceSendMessageFireAndForget:
         assert response_msg is not None
         assert response_msg["agent_name"] == "test-agent-1"
         assert response_msg["success"] is True
+        assert response_msg["request_id"] == "request-123"
 
     async def test_send_message_broadcasts_error_callback(
         self, agent_service: AgentService
@@ -488,15 +502,20 @@ class TestAgentServiceSendMessageFireAndForget:
     async def test_send_message_not_connected_auto_connects(
         self, agent_service: AgentService
     ) -> None:
-        """Test that send_message auto-connects if not connected."""
+        """send_message uses the NON-BLOCKING ensure_connecting gate: when
+        not connected it returns a failure result immediately (and a
+        background connect is kicked off) — it never blocks on connect.
+        See the 2026-06-15 incident."""
         await agent_service.initialize()
 
-        # Mock connect_to_agent
-        agent_service.connect_to_agent = AsyncMock(return_value=False)
+        # Not connected → ensure_connecting reports False (non-blocking).
+        agent_service.ensure_connecting = MagicMock(  # type: ignore[method-assign]
+            return_value=_resolved(False)
+        )
 
         # Send message to unconnected agent
         result = await agent_service.send_message("test-agent-1", "hello")
 
-        # Should fail to connect and return error
+        # Should report the not-connected failure without blocking.
         assert result["success"] is False
-        assert "Failed to connect" in result["error"]
+        assert "not connected" in result["error"].lower()

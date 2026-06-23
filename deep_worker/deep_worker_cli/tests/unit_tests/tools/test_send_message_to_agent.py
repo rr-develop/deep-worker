@@ -475,3 +475,133 @@ class TestHITLWiring:
         assert isinstance(text, str)
         assert "beta" in text
         assert "please review my report" in text
+
+
+# ===========================================================================
+# reply_back parameter
+# ===========================================================================
+
+
+class TestReplyBackParameter:
+    """send_message_to_agent(..., reply_back=True/False)."""
+
+    def test_reply_back_default_is_true(self) -> None:
+        """The schema must default reply_back to True."""
+        tool = make_send_message_to_agent_tool("alpha")
+        schema = tool.args_schema
+        fields = schema.model_fields if hasattr(schema, "model_fields") else schema.__fields__
+        reply_back_field = fields["reply_back"]
+        # Pydantic v2: .default is the default value
+        assert reply_back_field.default is True
+
+    def test_reply_back_can_be_set_to_false(self) -> None:
+        """reply_back must accept False."""
+        tool = make_send_message_to_agent_tool("alpha")
+        assert "reply_back" in (tool.args_schema.model_fields
+                                if hasattr(tool.args_schema, "model_fields")
+                                else tool.args_schema.__fields__)
+
+    async def test_reply_back_true_passed_in_delivery_command(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """reply_back=True must be forwarded in the enqueue_message command."""
+        captured: dict[str, Any] = {}
+
+        class _CapturingClient:
+            def __init__(self, target: str) -> None:  # noqa: ARG002
+                pass
+
+            async def __aenter__(self) -> "_CapturingClient":
+                return self
+
+            async def __aexit__(self, *args: Any) -> None:
+                pass
+
+            async def connect(self) -> None:
+                pass
+
+            async def disconnect(self) -> None:
+                pass
+
+            async def _send_command(self, cmd: dict) -> dict:
+                captured.update(cmd)
+                return {"success": True, "delivered_content": (
+                    "alpha -> beta :> hello"
+                )}
+
+        monkeypatch.setattr(
+            "deep_worker_cli.tools.AgentClient", _CapturingClient
+        )
+
+        tool = make_send_message_to_agent_tool("alpha")
+        await _ainvoke(tool, agent_name="beta", message="hello")
+        assert captured.get("reply_back") is True
+
+    async def test_reply_back_false_passed_in_delivery_command(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """reply_back=False must be forwarded in the enqueue_message command."""
+        captured: dict[str, Any] = {}
+
+        class _CapturingClient:
+            def __init__(self, target: str) -> None:  # noqa: ARG002
+                pass
+
+            async def __aenter__(self) -> "_CapturingClient":
+                return self
+
+            async def __aexit__(self, *args: Any) -> None:
+                pass
+
+            async def connect(self) -> None:
+                pass
+
+            async def disconnect(self) -> None:
+                pass
+
+            async def _send_command(self, cmd: dict) -> dict:
+                captured.update(cmd)
+                return {"success": True, "delivered_content": (
+                    "alpha -> beta :> hello"
+                )}
+
+        monkeypatch.setattr(
+            "deep_worker_cli.tools.AgentClient", _CapturingClient
+        )
+
+        tool = make_send_message_to_agent_tool("alpha")
+        await _ainvoke(tool, agent_name="beta", message="hello", reply_back=False)
+        assert captured.get("reply_back") is False
+
+    async def test_reply_back_included_in_tool_result(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """reply_back must appear in the tool result dict for middleware."""
+        class _FakeClient:
+            def __init__(self, target: str) -> None:  # noqa: ARG002
+                pass
+
+            async def __aenter__(self) -> "_FakeClient":
+                return self
+
+            async def __aexit__(self, *args: Any) -> None:
+                pass
+
+            async def connect(self) -> None:
+                pass
+
+            async def disconnect(self) -> None:
+                pass
+
+            async def _send_command(self, cmd: dict) -> dict:
+                return {"success": True, "delivered_content": (
+                    "alpha -> beta :> hello"
+                )}
+
+        monkeypatch.setattr(
+            "deep_worker_cli.tools.AgentClient", _FakeClient
+        )
+
+        tool = make_send_message_to_agent_tool("alpha")
+        result = await _ainvoke(tool, agent_name="beta", message="hello", reply_back=False)
+        assert result.get("reply_back") is False

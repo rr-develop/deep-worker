@@ -1,4 +1,4 @@
-"""Configuration for the web application.
+"""Configuration for deep-worker-web application.
 
 CRITICAL SECURITY REQUIREMENT:
 ==============================
@@ -6,17 +6,18 @@ This application MUST ONLY run on 127.0.0.1, on one of the two
 APPROVED ports — and no other:
 
 - 7887 when the active checkout is the production / hot-fix tree
-  (branch: master)
-- 7888 when the active checkout is the developer tree (branch: dev)
+  located at /path/to/production  (branch: master)
+- 7888 when the active checkout is the developer tree located at
+  /path/to/dev  (branch: dev)
 
 Why two ports?
 --------------
-Two co-existing checkouts of the same project live on this host:
+Two co-existing clones of the same project live on this host:
 
-* The production tree — the canonical, "running" copy. The agents
-  and the web app instance the user actively relies on are served
-  from here. Hot-fixes go to its `master` branch.
-* The developer tree — the developer scratch copy on the `dev`
+* /path/to/production — the canonical, "running" copy. The agents
+  and the deep_worker_web instance the user actively relies on are
+  served from here. Hot-fixes go to its `master` branch.
+* /path/to/dev — the developer scratch copy on the `dev`
   branch. Risky refactors happen here so they cannot accidentally
   break the running agents or the running web server.
 
@@ -39,6 +40,8 @@ Violating these requirements creates serious security risks.
 
 from __future__ import annotations
 
+import os
+import subprocess
 from pathlib import Path
 
 from pydantic_settings import BaseSettings
@@ -48,60 +51,80 @@ from pydantic_settings import BaseSettings
 # Port selection based on checkout location
 # ---------------------------------------------------------------------------
 
-# Paths to the two canonical checkouts and the port each one MUST use.
-# Keep these in sync with run.py and the project README.
-_PROD_TREE = Path("/path/to/project").resolve()
-_DEV_TREE = Path("/path/to/dev-tree").resolve()
+# Paths to the known checkouts and the port each one MUST use.
+# Keep these in sync with deep_worker_web/run.py and the project README.
+_PROD_TREE = Path("/path/to/production").resolve()
+_DEV_TREE = Path("/path/to/dev").resolve()
+_FIXES_TREE = Path("/path/to/fixes").resolve()
+_TASKS_TREE = Path("/path/to/tasks").resolve()
 
 _PROD_PORT = 7887
 _DEV_PORT = 7888
+_FIXES_PORT = 7889
+_TASKS_PORT = 7890
 
+# Every approved (tree, port) pair. validate_security() refuses anything
+# outside this whitelist.
+_APPROVED_BINDINGS: dict[Path, int] = {
+    _PROD_TREE: _PROD_PORT,
+    _DEV_TREE: _DEV_PORT,
+    _FIXES_TREE: _FIXES_PORT,
+    _TASKS_TREE: _TASKS_PORT,
+}
 
-def _approved_bindings() -> dict[Path, int]:
-    """Build the approved (checkout -> port) whitelist.
-
-    The two canonical trees are the production checkout (7887) and the
-    developer checkout (7888). On the maintainer's host those two paths
-    exist (as symlinks to the real trees), so each tree keeps a fixed,
-    non-conflicting port and the two servers can run side by side.
-
-    On a machine without that symlink farm — a fresh clone of the
-    published project — the canonical paths do not exist. The running
-    checkout is then approved on the production port, so the server
-    starts and validates from any clone instead of refusing to run
-    from an unrecognised path.
-    """
-    bindings: dict[Path, int] = {}
-    if _PROD_TREE.exists():
-        bindings[_PROD_TREE] = _PROD_PORT
-    if _DEV_TREE.exists():
-        bindings[_DEV_TREE] = _DEV_PORT
-    checkout_root = _detect_checkout_root()
-    if checkout_root not in bindings:
-        bindings[checkout_root] = _PROD_PORT
-    return bindings
+# Name of the active checkout (for logs / status broadcasts)
+_CHECKOUT_NAME: dict[Path, str] = {
+    _PROD_TREE: "production",
+    _DEV_TREE: "dev",
+    _FIXES_TREE: "fixes",
+    _TASKS_TREE: "tasks",
+}
 
 
 def _detect_checkout_root() -> Path:
     """Return the absolute path of the checkout this file lives in.
 
-    This module sits at ``deep_worker_web/app/config.py``; walking
-    two parents up yields the checkout root. We resolve symlinks so that
+    This module sits at the web app package root (``deep_worker_web/``); walking
+    two parents up yields ``<repo>``. We resolve symlinks so that
     matches against ``_APPROVED_BINDINGS`` keys are stable regardless
     of how the directory was referenced when the process started.
     """
-    # config.py -> app/ -> <repo root>
+    # config.py -> app/ -> deep_worker_web/ -> <repo root>
     return Path(__file__).resolve().parents[2]
-
-
-# Every approved (tree, port) pair. validate_security() refuses anything
-# outside this whitelist.
-_APPROVED_BINDINGS: dict[Path, int] = _approved_bindings()
 
 
 def _default_port_for(checkout_root: Path) -> int:
     """Pick the default port based on the checkout the code runs from."""
     return _APPROVED_BINDINGS.get(checkout_root, _PROD_PORT)
+
+
+def get_git_commit_info(tree_root: str | None) -> tuple[str, str]:
+    """Return (commit_sha, describe) for the git tree at *tree_root*.
+
+    Both values default to ``"unknown"`` on any error so the caller
+    never crashes.
+    """
+    if not tree_root:
+        return "unknown", "unknown"
+    try:
+        sha = subprocess.run(
+            ["git", "-C", tree_root, "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+        if not sha:
+            sha = "unknown"
+    except Exception:
+        sha = "unknown"
+    try:
+        describe = subprocess.run(
+            ["git", "-C", tree_root, "describe", "--always", "--dirty"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+        if not describe:
+            describe = sha
+    except Exception:
+        describe = sha
+    return sha, describe
 
 
 _CHECKOUT_ROOT = _detect_checkout_root()
@@ -122,7 +145,7 @@ class Settings(BaseSettings):
     # them, but glibc never returns the freed arenas to the OS, so
     # RSS grows into the multi-GB range purely from heap
     # fragmentation — no Python object is leaking. The 2026-04-27
-    # incident took the web app to 9.2 GB this way.
+    # incident took the web server to 9.2 GB this way.
     # KEEP THIS FALSE BY DEFAULT. Opt in via DEEP_WORKER_WEB_DEBUG=1
     # only for short-lived debugging sessions.
     # See a related internal incident analysis (not included here).
@@ -169,7 +192,7 @@ class Settings(BaseSettings):
                 f"{p} -> {port}" for p, port in _APPROVED_BINDINGS.items()
             )
             raise ValueError(
-                "SECURITY ERROR: the web app is running from an "
+                "SECURITY ERROR: deep_worker_web is running from an "
                 f"unrecognised checkout: {_CHECKOUT_ROOT}\n"
                 f"Approved (checkout -> port) pairs: {approved}\n"
                 "Move the code into one of the approved trees before "
@@ -181,14 +204,13 @@ class Settings(BaseSettings):
                 f"SECURITY ERROR: checkout {_CHECKOUT_ROOT} must bind to "
                 f"port {expected}, but settings.port is {self.port}.\n"
                 "This pairing is enforced so the production server "
-                "(the production tree, 7887) and the developer server "
-                "(the developer tree, 7888) can run side by side "
+                "(/path/to/production, 7887) and the developer server "
+                "(/path/to/dev, 7888) can run side by side "
                 "without colliding."
             )
 
         return True
 
 
-# Initialize settings and validate security immediately
+# Initialize settings (security is validated explicitly in run.py)
 settings = Settings()
-settings.validate_security()

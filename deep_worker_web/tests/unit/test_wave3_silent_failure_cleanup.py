@@ -83,10 +83,11 @@ async def test_broadcast_message_logs_callback_exceptions(caplog) -> None:
 
 @pytest.mark.asyncio
 async def test_reconcile_spawn_is_supervised(monkeypatch, caplog) -> None:
-    """``_reconcile_from_registry`` spawns ``connect_to_agent`` as a
-    background task for each newly-discovered agent. If that task
-    crashes, the exception must reach ``app.utils.supervisor`` —
-    never disappear at GC time."""
+    """``_reconcile_from_registry`` spawns the single-flight background
+    connect for each newly-discovered agent (the 2026-06-15 incident). If
+    that task crashes, the exception must be LOGGED via the connect
+    done-callback (``_on_connect_done``) — never disappear silently at
+    GC time as asyncio's "Task exception was never retrieved"."""
     svc = AgentService(registry=_FakeRegistry())
 
     class _Agent:
@@ -100,44 +101,41 @@ async def test_reconcile_spawn_is_supervised(monkeypatch, caplog) -> None:
         svc._registry, "list_all", lambda: [_Agent()]
     )
 
-    # Make connect_to_agent blow up so the spawned task fails.
+    # Make the background connect worker blow up so the spawned task fails.
     async def boom(name: str) -> bool:
         raise RuntimeError("synthetic connect failure")
 
-    svc.connect_to_agent = boom  # type: ignore[assignment]
+    svc._do_connect = boom  # type: ignore[assignment]
 
     # ``_reconcile_from_registry`` also calls
     # ``AgentInfo.model_dump(mode="json")`` on discovered agents.
-    # Stub that out using a minimal info dict via monkeypatching
-    # the constructor of AgentInfo -> but simpler: patch the
-    # broadcast so we don't care about message shape.
+    # Patch the broadcast so we don't care about message shape.
     svc._broadcast_message = AsyncMock(return_value=None)  # type: ignore[assignment]
 
     # Need ``started_at`` to be a datetime for AgentInfo(..., started_at=...).
     from datetime import datetime, timezone
     _Agent.started_at = datetime.now(timezone.utc)  # type: ignore[attr-defined]
 
-    with caplog.at_level(logging.ERROR, logger="app.utils.supervisor"):
+    with caplog.at_level(logging.WARNING, logger="app.services.agent_service"):
         await svc._reconcile_from_registry()
-        # The spawned task is fire-and-forget; give the loop a
-        # tick so its done-callback fires.
+        # The spawned connect is fire-and-forget; give the loop a tick so
+        # its done-callback (_on_connect_done) fires and logs the crash.
         await asyncio.sleep(0.02)
 
-    # The record MUST come from ``app.utils.supervisor`` — that's
-    # the marker that the create_task site was wrapped with the
-    # ``supervise()`` helper. Default asyncio emits "Task exception
-    # was never retrieved" under the ``asyncio`` logger at GC time;
-    # that is what we want to eliminate, so matching on it would
-    # give false positives.
+    # The failure MUST be surfaced by the connect done-callback — the
+    # marker that the create_task(self._do_connect(...)) site is
+    # supervised. Default asyncio emits "Task exception was never
+    # retrieved" under the ``asyncio`` logger at GC time; matching on it
+    # would be a false positive, so we require our explicit log.
     matches = [
         rec for rec in caplog.records
-        if rec.name == "app.utils.supervisor"
-        and "synthetic connect failure" in (rec.exc_text or "")
+        if rec.name == "app.services.agent_service"
+        and "synthetic connect failure" in rec.getMessage()
     ]
     assert matches, (
-        "the create_task(self.connect_to_agent(...)) site in "
-        "_reconcile_from_registry must be wrapped with supervise(); "
-        "records by logger name: "
+        "the create_task(self._do_connect(...)) site in "
+        "_start_background_connect must surface crashes via its "
+        "done-callback (_on_connect_done); records by logger name: "
         + "; ".join(f"{rec.name}:{rec.getMessage()}" for rec in caplog.records)
     )
 

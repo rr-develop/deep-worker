@@ -3,7 +3,7 @@
 **Status:** 📋 PROPOSED
 **Date:** 2026-04-19
 **Related bug:** Full Dialog truncates conversation, dropping the agent's
-final answer (observed on a real agent: 96 of 104 text-bearing AIMessages lost).
+final answer (observed on a production agent: 96 of 104 text-bearing AIMessages lost).
 
 ---
 
@@ -41,7 +41,7 @@ Because the first text-bearing AIMessage usually says something trivial
 like *"I'll search for these phrases and fix them."*, **the user sees the
 preamble and never the actual conclusion**.
 
-### Measured impact (real agent, 2026-04-19)
+### Measured impact (production agent, 2026-04-19)
 
 | Metric | Value |
 |---|---|
@@ -100,17 +100,58 @@ post-mortem inspection of what happened to the agent.
 When the agent's own context overflows, the model's summarization step
 injects a synthetic `HumanMessage` whose body begins with
 *"You are in the middle of a conversation that has been summarized…"*
-(visible as `msg[0]` in the fixture). This is **not** a message
+(visible as `msg[0]` in the affected-agent fixture). This is **not** a message
 anyone sent — it is the agent's internal context-management bookkeeping.
 Rendering it as a user turn would actively mislead the reader. It is the
 only `HumanMessage` flavour that is filtered.
+
+### System messages are first-class in history rendering (POLICY)
+
+**Rendering full conversation history WITHOUT system prompts is misleading
+and is an outright lie. It is ABSOLUTELY UNACCEPTABLE and is forbidden.**
+
+`SystemMessage`s carry two things that are essential to understanding what
+the agent actually saw:
+
+1. The agent's **base system prompt** (the leading SystemMessage), and
+2. **Runtime middleware hints** injected mid-conversation — most notably the
+   inter-agent reply hint from `InterAgentReplyMiddleware`, which tells the
+   receiving agent to reply via `send_message_to_agent`. This hint is
+   injected as a SystemMessage right after the incoming peer message.
+
+Historically both the agent-side serializer (`serialize_message` in
+`process/message_dict_cache.py`) and the web renderer
+(`dialog_formatter.split_into_turns`) silently dropped every SystemMessage:
+the serializer emitted `{"type": "SystemMessage", "id": ...}` with **no
+`content`**, and the renderer matched only `HumanMessage`/`AIMessage`, so the
+SystemMessage fell through and vanished. A reader inspecting the Full Dialog
+therefore saw an inter-agent request followed directly by the agent's reply,
+with **no trace** of the hint that was actually in the agent's context — a
+rendering that misrepresents history.
+
+**Required behaviour (binding):**
+
+- System messages MUST be rendered at every verbosity **at or above `text`**
+  (i.e. `text` — "All assistant text" — and `full`).
+- They are rendered under a dedicated `--- System ---` header, in
+  chronological order relative to the assistant text and tool-calls of the
+  same turn (so a mid-turn hint appears between the user message and the
+  assistant response that followed it).
+- A leading system prompt (before any HumanMessage) is rendered as a
+  standalone `--- System ---` preamble block.
+- They are intentionally omitted only from the most compact `final` view,
+  whose contract is strictly "one final assistant text per user turn".
+
+Any future history-rendering surface (web, CLI, exports) MUST honour this
+policy. Producing a "full" or "text" history view that hides system messages
+is a regression, not an optimisation.
 
 ### Test coverage gap
 
 `get_agent_dialog_formatted` has **zero unit tests** today:
 
 ```
-$ grep -r "get_agent_dialog_formatted\|dialog-text" deep_worker_web/tests/unit/
+$ grep -r "get_agent_dialog_formatted\|dialog-text" tests/unit/
 (no matches)
 ```
 
@@ -139,9 +180,12 @@ smoke tests that just check the endpoint returns *some* text containing
    - `?verbosity=final` (default): every user-side turn + that turn's
      final assistant text only.
    - `?verbosity=text`: every user-side turn + **all** intermediate
-     text-bearing AIMessages of that turn.
+     text-bearing AIMessages of that turn + **all SystemMessages**
+     (base prompt and middleware hints), under `--- System ---` headers.
    - `?verbosity=full`: like `text` plus **compact** tool-call summaries
      (one line per call: tool name + truncated args).
+   - System messages are first-class at `text`/`full` and forbidden to hide
+     there (see §1 "System messages are first-class in history rendering").
 7. **Comprehensive unit tests** must accompany the change.
 
 ### Non-goals
@@ -325,7 +369,7 @@ in a new tab. The default selected option is `final` so the no-click
 flow matches the no-query-param flow.
 
 Persistence: the chosen verbosity is saved in `localStorage` so the user
-doesn't have to reselect it every time. Key: `deep_worker_web.dialog_verbosity`.
+doesn't have to reselect it every time. Key: `dialog_verbosity`.
 
 ### 3.7 Pseudocode (reference implementation)
 
@@ -382,7 +426,7 @@ def _split_into_turns(self, history):
 
 ## 4. Test plan (TDD)
 
-All tests live in `deep_worker_web/tests/unit/test_dialog_formatting.py`.
+All tests live in `tests/unit/test_dialog_formatting.py`.
 They feed `get_agent_dialog_formatted` (or its pure helper) a synthetic
 `history` list — no RPyC, no real agent, fast and deterministic.
 
@@ -470,7 +514,7 @@ They feed `get_agent_dialog_formatted` (or its pure helper) a synthetic
 
 | # | Name | Setup | Expectation |
 |---|---|---|---|
-| 41 | `test_regression_demo_site_final_answer_visible` | replay the §1 fixture (TaskManager-Human + 5 text AIs after, including `"Confirmed: zero..."`) | rendered output **contains** `"Confirmed: zero"`; turn header is `--- TaskManager ---` |
+| 41 | `test_regression_final_answer_visible` | replay the §1 fixture (TaskManager-Human + 5 text AIs after, including `"Confirmed: zero..."`) | rendered output **contains** `"Confirmed: zero"`; turn header is `--- TaskManager ---` |
 
 ### 4.8 Helper purity
 
@@ -573,3 +617,123 @@ checkpointer (no RPyC).
       its selection in `localStorage`.
 - [ ] `USER_GUIDE.md` documents the verbosity modes, the three
       user-side message sources, and the no-limit guarantee.
+
+---
+
+## 9. 2026-06-23 follow-up — two introspection modes: `system_prompt` and `tools`
+
+**Status:** ✅ IMPLEMENTED
+**Request:** add two more entries to the Full Dialog verbosity combo (4th and
+5th, after `full`) so the operator can inspect, on demand:
+
+1. **`system_prompt`** — the *invariant (startup) system prompt* the agent was
+   built with. This is the provider-AGNOSTIC role/instruction text produced by
+   the CLI's `agent.get_system_prompt()` and passed to
+   `create_deep_agent(system_prompt=...)`. It is the SAME text regardless of
+   provider (claude-code / deepseek / openai / …). It deliberately does NOT
+   include the per-provider tool surface — that is mode #5.
+2. **`tools`** — the list of tools currently available to the agent. This MAY
+   depend on the active provider (the tool surface is bound per provider /
+   per session). Rendered as `name` + one-line description, one per tool.
+
+### 9.1 Why these are NOT history turns
+
+Modes 1–3 (`final`/`text`/`full`) render the conversation, which lives in the
+checkpoint `messages` channel. The system prompt and tool list do NOT live in
+the checkpoint:
+
+- The system prompt is regenerated from agent configuration on every model
+  request (LangChain factory prepends `request.system_message`); it is never
+  persisted to `state["messages"]`. (See the cross-provider analysis in a
+  related internal incident analysis (not included here) — the invariant
+  base prompt is a function of agent
+  config, not of stored history.)
+- The tool inventory is computed at agent-build time
+  (`AgentProcess._extract_final_tool_metadata`, which reads the compiled
+  graph's `tools` node) and is provider-dependent.
+
+Therefore these two modes bypass `get_history` entirely and call dedicated
+RPyC methods, then format the result as plain text. They are NOT routed
+through `split_into_turns` / `render_dialog`.
+
+### 9.2 Wire contract
+
+```
+GET /api/agents/{name}/dialog-text?verbosity=system_prompt
+GET /api/agents/{name}/dialog-text?verbosity=tools
+```
+
+Same `text/plain` response. `verbosity` Literal is widened to
+`final | text | full | system_prompt | tools`; unknown values → 422.
+
+### 9.3 Agent-side handlers (source of truth)
+
+- `AgentProcess._handle_get_system_prompt()` →
+  `{"success": True, "system_prompt": <str>, "provider": <str>, "model": <str>}`.
+  The invariant text is captured at build time into `self._invariant_system_prompt`
+  (set in `start()` right where the system prompt is resolved) so the reported
+  value is EXACTLY what the agent was constructed with — not a re-derivation
+  that could drift. Falls back to recomputing via `get_system_prompt()` if the
+  attribute is missing (e.g. legacy process).
+- `AgentProcess._handle_get_tools()` →
+  `{"success": True, "provider": <str>, "tools": [{"name","description"}...]}`.
+  Tool list is read from the compiled graph via the existing
+  `_extract_final_tool_metadata(self.agent)` helper (single source of truth,
+  same inventory the model actually binds). Each metadata entry is reduced to
+  `name` + `description`; the JSON input schema is intentionally omitted from
+  the plain-text view (too noisy) but the name/description pair is enough to
+  answer "does the agent currently have tool X?".
+
+Exposed over RPyC as `exposed_get_system_prompt` / `exposed_get_tools`
+(callable as `root.get_system_prompt()` / `root.get_tools()`), each returning
+a JSON-serialized string like the other `exposed_*` methods.
+
+### 9.4 Web rendering
+
+`AgentService.get_agent_dialog_formatted` branches BEFORE the history fetch:
+
+- `verbosity == "system_prompt"` → call `root.get_system_prompt()`, render:
+
+  ```
+  --- System Prompt (invariant, provider=<p>, model=<m>) ---
+  <full invariant system prompt text>
+  ```
+
+- `verbosity == "tools"` → call `root.get_tools()`, render:
+
+  ```
+  --- Available Tools (provider=<p>, count=<n>) ---
+  - <name>: <description first line>
+  - ...
+  ```
+
+Both reuse the same non-blocking connect gate, 30s timeout, and legacy-error
+handling as the history path. A pure formatter pair
+(`render_system_prompt`, `render_tools`) lives in `dialog_formatter.py` so it
+is unit-testable without RPyC.
+
+### 9.5 UI
+
+`static/index.html` adds two `<option>`s to `#full-dialog-verbosity` after
+`full`:
+
+```html
+<option value="system_prompt">System prompt (invariant)</option>
+<option value="tools">Available tools</option>
+```
+
+`main.js` widens the accepted set in `getFullDialogVerbosity()` /
+`restoreFullDialogVerbosity()` to include the two new values so the choice
+persists and is forwarded on the button click.
+
+### 9.6 Tests (TDD)
+
+- `dialog_formatter`: `render_system_prompt` / `render_tools` pure-function
+  tests (header shape, empty/edge cases, Cyrillic, missing description).
+- agent-side: `_handle_get_system_prompt` returns the captured invariant and
+  falls back when the attribute is absent; `_handle_get_tools` reduces
+  metadata to name/description and tolerates a tool-less agent.
+- web service: `get_agent_dialog_formatted(verbosity="system_prompt"|"tools")`
+  calls the right RPyC method and renders via the pure formatter
+  (RPyC root mocked).
+- router: `verbosity=system_prompt` / `tools` accepted; `verbosity=zzz` → 422.

@@ -14,12 +14,40 @@ Direct execution makes tools invisible to LangGraph and dwcli.
 """
 
 import asyncio
+import itertools
 from typing import Any
 
 import pytest
 
+from claude_agent_sdk._mcp_context import (
+    reset_current_claude_tool_use_id,
+    set_current_claude_tool_use_id,
+)
 from claude_code_provider.proxy_mcp_server import ProxyMCPServer
 from claude_code_provider.custom_types import ToolMetadata
+
+
+# Helper: invoke a handler with a Claude tool_use_id in the SDK ContextVar
+# (required by the post-2026-06-14 contract — see incident document).
+_id_counter = itertools.count(1)
+
+
+async def _start_handler(
+    proxy: ProxyMCPServer, handler_index: int, args: dict[str, Any]
+) -> tuple[asyncio.Task[Any], str]:
+    cid = f"toolu_direct_{next(_id_counter):05d}"
+    handler = proxy.tool_handlers[handler_index].handler
+
+    async def _runner() -> Any:
+        return await handler(args)
+
+    token = set_current_claude_tool_use_id(cid)
+    try:
+        task = asyncio.create_task(_runner())
+        await asyncio.sleep(0)
+        return task, cid
+    finally:
+        reset_current_claude_tool_use_id(token)
 
 
 @pytest.fixture
@@ -38,18 +66,15 @@ class TestProxyFutureArchitecture:
         """Handler must block on Future — NOT execute tool directly."""
         proxy = ProxyMCPServer(tools_metadata)
 
-        handler = proxy.tool_handlers[0].handler
-        # Start handler — it should block on Future
-        task = asyncio.create_task(handler({"path": "/tmp"}))
+        task, cid = await _start_handler(proxy, 0, {"path": "/tmp"})
         await asyncio.sleep(0.05)
 
         # Handler must be pending (blocked on Future), not done
         assert not task.done(), "Handler returned immediately — proxy is broken!"
         assert proxy.has_pending_calls(), "No pending calls — Future not created!"
 
-        # Resolve it
-        pending = proxy.get_pending_calls()
-        proxy.resolve_call(pending[0]["id"], {
+        # Resolve it — by the Claude tool_use_id (the key is the same one).
+        proxy.resolve_call(cid, {
             "content": [{"type": "text", "text": "file1.txt"}],
         })
 
@@ -61,17 +86,17 @@ class TestProxyFutureArchitecture:
         """Pending calls must contain tool name and args for LangGraph."""
         proxy = ProxyMCPServer(tools_metadata)
 
-        handler = proxy.tool_handlers[0].handler
-        task = asyncio.create_task(handler({"path": "/tmp"}))
+        task, cid = await _start_handler(proxy, 0, {"path": "/tmp"})
         await asyncio.sleep(0.05)
 
         pending = proxy.get_pending_calls()
         assert len(pending) == 1
         assert pending[0]["name"] == "ls"
         assert pending[0]["args"] == {"path": "/tmp"}
+        assert pending[0]["id"] == cid  # key IS the Claude tool_use_id
 
         # Cleanup
-        proxy.resolve_call(pending[0]["id"], {
+        proxy.resolve_call(cid, {
             "content": [{"type": "text", "text": "ok"}],
         })
         await task
@@ -81,12 +106,10 @@ class TestProxyFutureArchitecture:
         """resolve_call must unblock the Future handler and return result to Claude."""
         proxy = ProxyMCPServer(tools_metadata)
 
-        handler = proxy.tool_handlers[0].handler
-        task = asyncio.create_task(handler({"path": "/tmp"}))
+        task, cid = await _start_handler(proxy, 0, {"path": "/tmp"})
         await asyncio.sleep(0.05)
 
-        pending = proxy.get_pending_calls()
-        proxy.resolve_call(pending[0]["id"], {
+        proxy.resolve_call(cid, {
             "content": [{"type": "text", "text": "resolved result"}],
         })
 
@@ -99,11 +122,8 @@ class TestProxyFutureArchitecture:
         """Multiple tools called concurrently — all must be pending."""
         proxy = ProxyMCPServer(tools_metadata)
 
-        h1 = proxy.tool_handlers[0].handler  # ls
-        h2 = proxy.tool_handlers[1].handler  # read_file
-
-        task1 = asyncio.create_task(h1({"path": "/tmp"}))
-        task2 = asyncio.create_task(h2({"path": "/tmp/file.txt"}))
+        task1, _ = await _start_handler(proxy, 0, {"path": "/tmp"})
+        task2, _ = await _start_handler(proxy, 1, {"path": "/tmp/file.txt"})
         await asyncio.sleep(0.05)
 
         pending = proxy.get_pending_calls()

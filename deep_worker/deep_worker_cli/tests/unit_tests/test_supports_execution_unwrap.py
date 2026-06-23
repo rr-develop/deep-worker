@@ -1,9 +1,8 @@
 """Regression: ``_supports_execution`` must see through proxy backend wrappers.
 
-Part of the 2026-05-28 execute-unavailable incident (a related
-internal incident analysis, not included here).
+Part of a related internal incident analysis (not included here).
 
-Commit 9b8b570 wrapped the agent's final backend in an OUTER proxy
+A recent commit wrapped the agent's final backend in an OUTER proxy
 (``PrivateSummariesBackend`` in deep_worker_cli — a ``BackendProtocol`` that
 delegates to an inner ``_backend``). ``_supports_execution`` only special-cased
 ``CompositeBackend``, so for the real chain
@@ -56,7 +55,7 @@ class TestSupportsExecutionUnwrap:
         proxy = _Proxy(CompositeBackend(default=_sandbox(), routes={}))
         assert _supports_execution(proxy) is True, (
             "execute is filtered out of the tool list when this returns False — "
-            "the model then has no execute tool (the 2026-05-28 incident)."
+            "the model then has no execute tool (observed live, 2026-05-28)."
         )
 
     def test_proxy_directly_over_sandbox(self) -> None:

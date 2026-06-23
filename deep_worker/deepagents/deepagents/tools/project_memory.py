@@ -38,63 +38,17 @@ def _ensure_semantic_search() -> tuple[Any, type[Exception]]:
     return _semantic_search
 
 
-@tool
-def project_memory(
-    query: str,
-    top_k: int = 5,
-    runtime: Any = None,
-    working_dir: str | None = None,
-) -> str:
-    """Recall relevant knowledge from the project's codebase.
+def _run_project_search(query: str, resolved_dir: "Path", top_k: int) -> str:
+    """Heavy, BLOCKING body of ``project_memory`` — loads a torch embedding
+    model and queries LanceDB.
 
-    Search the project's semantic index to find code, documentation,
-    and implementation details related to your query.
-
-    Use this tool to:
-    - Understand how features are implemented
-    - Find where specific functionality is located
-    - Discover related code patterns across files
-    - Learn about project architecture and conventions
-    - Find usage examples or similar implementations
-
-    Args:
-        query: Natural language question about the project.
-               Examples:
-               - "How is user authentication implemented?"
-               - "Where is the HTTP client configured?"
-               - "Find async database query examples"
-        top_k: Number of results to return (default: 5, max: 20).
-        runtime: Tool runtime context (injected automatically by LangGraph).
-        working_dir: Working directory override (used by MCP direct execution
-                     when runtime is not available).
-
-    Returns:
-        Formatted search results with file paths and code excerpts,
-        or an error message if search fails.
-
-    Example:
-        >>> project_memory("semantic search indexing", top_k=3)
-        Project Memory: 'semantic search indexing'
-
-        --- Result 1 (score=0.892) [python] ---
-        File: semantic_search/semantic_search/indexer.py
-        Type: parent
-
-        def index_repository(
-            repo_path: Path,
-            config: IndexConfig | None = None,
-            ...
+    ⚠️ MUST run OFF the agent's event-loop thread (via ``asyncio.to_thread``
+    — see ``project_memory`` below). LanceDB bridges to its own background
+    event loop with a blocking ``run_coroutine_threadsafe(...).result()``;
+    run inline on the agent loop it holds the GIL while waiting and
+    deadlocks LanceDB's loop (cf. the history_memory deadlock observed
+    live on 2026-06-15). See docs/DESIGN_NO_LOOP_BLOCKING_TOOLS.md.
     """
-    # Determine working directory: runtime state > working_dir kwarg > cwd
-    resolved_dir: Path
-    if runtime is not None:
-        working_dir_value = runtime.state.get("working_dir")
-        resolved_dir = Path(working_dir_value) if working_dir_value else Path.cwd()
-    elif working_dir is not None:
-        resolved_dir = Path(working_dir)
-    else:
-        resolved_dir = Path.cwd()
-
     # Validate top_k
     if not 1 <= top_k <= 20:
         return "Error: top_k must be between 1 and 20"
@@ -135,3 +89,75 @@ def project_memory(
         )
 
     return "\n".join(lines)
+
+
+@tool
+async def project_memory(
+    query: str,
+    top_k: int = 5,
+    runtime: Any = None,
+    working_dir: str | None = None,
+) -> str:
+    """Recall relevant knowledge from the project's codebase.
+
+    Search the project's semantic index to find code, documentation,
+    and implementation details related to your query.
+
+    Use this tool to:
+    - Understand how features are implemented
+    - Find where specific functionality is located
+    - Discover related code patterns across files
+    - Learn about project architecture and conventions
+    - Find usage examples or similar implementations
+
+    Args:
+        query: Natural language question about the project.
+               Examples:
+               - "How is user authentication implemented?"
+               - "Where is the HTTP client configured?"
+               - "Find async database query examples"
+        top_k: Number of results to return (default: 5, max: 20).
+        runtime: Tool runtime context (injected automatically by LangGraph).
+        working_dir: Working directory override (used by MCP direct execution
+                     when runtime is not available).
+
+    Returns:
+        Formatted search results with file paths and code excerpts,
+        or an error message if search fails.
+
+    Example:
+        >>> project_memory("semantic search indexing", top_k=3)
+        Project Memory: 'semantic search indexing'
+
+        --- Result 1 (score=0.892) [python] ---
+        File: <project>/semantic_search/semantic_search/indexer.py
+        Type: parent
+
+        def index_repository(
+            repo_path: Path,
+            config: IndexConfig | None = None,
+            ...
+    """
+    # Determine working directory: runtime state > working_dir kwarg > cwd
+    resolved_dir: Path
+    if runtime is not None:
+        working_dir_value = runtime.state.get("working_dir")
+        resolved_dir = Path(working_dir_value) if working_dir_value else Path.cwd()
+    elif working_dir is not None:
+        resolved_dir = Path(working_dir)
+    else:
+        resolved_dir = Path.cwd()
+
+    # ⚠️ MANDATORY OFFLOAD — DO NOT run the search inline here.
+    # ``_run_project_search`` loads a torch embedding model and queries
+    # LanceDB (own background event loop, blocking ``.result()`` bridge).
+    # Inline on the agent loop it holds the GIL while blocked and deadlocks
+    # LanceDB's loop (cf. the deadlock observed live on 2026-06-15). ``asyncio.to_thread``
+    # releases the GIL during the wait. Keep this tool ``async`` and keep
+    # the ``to_thread``. See docs/DESIGN_NO_LOOP_BLOCKING_TOOLS.md +
+    # tests/test_no_loop_blocking_summarization.py.
+    import asyncio  # noqa: PLC0415
+
+    return await asyncio.to_thread(
+        _run_project_search, query, resolved_dir, top_k
+    )

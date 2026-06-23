@@ -5,6 +5,7 @@ from pathlib import Path
 from deep_worker_cli.storage_paths import (
     STORAGE_VERSION_AGENT_ROOT,
     STORAGE_VERSION_AGENT_ROOT_WITH_JSONL,
+    STORAGE_VERSION_WITH_PREFERRED_PROVIDER,
     CURRENT_STORAGE_VERSION,
     STORAGE_VERSION_DEEPAGENTS_PER_AGENT,
     agent_root,
@@ -18,10 +19,10 @@ from deep_worker_cli.storage_paths import (
 )
 
 
-def test_new_agent_starts_on_v4(tmp_path: Path, monkeypatch) -> None:
+def test_new_agent_starts_on_v5(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
 
-    assert CURRENT_STORAGE_VERSION == STORAGE_VERSION_AGENT_ROOT_WITH_JSONL
+    assert CURRENT_STORAGE_VERSION == STORAGE_VERSION_WITH_PREFERRED_PROVIDER
     assert detect_storage_version("new_agent") == CURRENT_STORAGE_VERSION
     assert threads_db_path("new_agent") == (
         tmp_path / Path("~/.deep_worker").name / "new_agent" / "threads.db"

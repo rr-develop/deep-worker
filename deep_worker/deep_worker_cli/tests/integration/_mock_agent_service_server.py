@@ -2,9 +2,9 @@
 
 Used by the cross-process integration tests in this directory to honour
 the project-wide rule that **rpyc_async MUST NEVER drive server+client
-in the same process** (see the dev-agent ``AGENTS.md`` and
-``docs/RPYC_NETREF_DEADLOCK_ANALYSIS.md`` for the deadlock that
-otherwise triggers on the first ``HANDLE_INSPECT``).
+in the same process** (see the ``AGENTS.md`` file in the user's agent
+data directory and ``docs/RPYC_NETREF_DEADLOCK_ANALYSIS.md`` for the
+deadlock that otherwise triggers on the first ``HANDLE_INSPECT``).
 
 Lifecycle
 ---------
@@ -32,8 +32,8 @@ import signal
 import sys
 from pathlib import Path
 
-# The rpyc-async source checkout must be on sys.path BEFORE importing rpyc.
-_RPYC_ASYNC = Path("rpyc_async")
+# The local rpyc_async checkout must be on sys.path BEFORE importing rpyc.
+_RPYC_ASYNC = Path(__file__).resolve().parents[4] / "rpyc_async"
 if str(_RPYC_ASYNC) not in sys.path:
     sys.path.insert(0, str(_RPYC_ASYNC))
 
@@ -67,6 +67,7 @@ async def _main() -> int:
             self.working_dir = working_dir
             self.resolved_model = None
             self.provider = None
+            self.model = None
 
     class _MockAgent:
         def __init__(self, name: str, working_dir: str) -> None:

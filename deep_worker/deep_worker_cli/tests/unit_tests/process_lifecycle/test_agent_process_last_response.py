@@ -207,3 +207,54 @@ class TestHandleGetLastResponse:
         assert result["last_response"]["content"] == "I'll search for that"
         assert "tool_calls" in result["last_response"]
         assert result["last_response"]["tool_calls"][0]["name"] == "web_search"
+
+
+class TestHandleGetLastResponseDatabaseError:
+    """Tests for database corruption handling in _handle_get_last_response."""
+
+    @pytest.mark.asyncio
+    async def test_database_error_returns_error_response(self):
+        """DatabaseError from aget_state should return error dict with success=False."""
+        from deep_worker_cli.process.agent_process import AgentProcess
+        from unittest.mock import AsyncMock, MagicMock
+
+        process = AgentProcess.__new__(AgentProcess)
+        process.name = "test-agent"
+
+        mock_agent = AsyncMock()
+        mock_agent.aget_state = AsyncMock(
+            side_effect=__import__("aiosqlite").DatabaseError("database disk image is malformed")
+        )
+        process.agent = mock_agent
+
+        result = await process._handle_get_last_response()
+
+        assert result["success"] is False
+        assert "disk image" in result["error"] or "corrupted" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_database_error_logs_error(self):
+        """DatabaseError should be logged with 'corrupted' or 'disk image' message."""
+        import logging
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from deep_worker_cli.process.agent_process import AgentProcess
+
+        process = AgentProcess.__new__(AgentProcess)
+        process.name = "test-agent"
+
+        mock_agent = AsyncMock()
+        mock_agent.aget_state = AsyncMock(
+            side_effect=__import__("aiosqlite").DatabaseError("database disk image is malformed")
+        )
+        process.agent = mock_agent
+
+        with patch("logging.Logger.warning") as mock_log:
+            # Re-get logger since _handle_get_last_response creates its own
+            result = await process._handle_get_last_response()
+
+        assert result["success"] is False
+        # The log should mention the corruption
+        mock_log.assert_called_once()
+        log_msg = mock_log.call_args[0][0]
+        assert "corruption" in log_msg or "disk image" in log_msg

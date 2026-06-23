@@ -1,7 +1,7 @@
 """Regression: ainvoke must NOT drop the final TextBlock when a turn both
 sends a new HumanMessage AND resolves a prior tool call.
 
-Incident (observed 2026-05-21): the TaskManager manager-agent ran a
+Incident (observed live, 2026-05-21): the TaskManager manager-agent ran a
 verify react-loop. On the turn that produced its STATUS/REASONING/MESSAGE
 verdict, ``ainvoke`` was driven with ``new_messages`` containing BOTH a
 resolved ``ToolMessage`` (from the previous react step) AND a fresh
@@ -26,7 +26,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
-_claude_sdk_path = Path(__file__).parent.parent.parent.parent / "claude_agent_sdk"
+_claude_sdk_path = Path(__file__).parent.parent.parent.parent / "claude_sdk" / "src"
 if _claude_sdk_path.exists() and str(_claude_sdk_path) not in sys.path:
     sys.path.insert(0, str(_claude_sdk_path))
 
@@ -54,13 +54,14 @@ def _result_message() -> ResultMessage:
 
 @pytest.mark.asyncio
 async def test_text_preserved_when_human_message_and_tool_resolved_same_turn() -> None:
-    """The live repro: a turn that resolves a prior tool AND sends a new
+    """The observed repro: a turn that resolves a prior tool AND sends a new
     HumanMessage, then receives a single verdict TextBlock, must return that
     text — not an empty AIMessage."""
     mock_client = MagicMock()
     mock_proxy = MagicMock()
     mock_proxy.has_pending_calls.return_value = False
     mock_proxy.get_pending_calls.return_value = []
+    mock_proxy.wait_for_any_pending_call = AsyncMock(return_value=None)
 
     verdict = (
         "STATUS: done\n"
@@ -113,7 +114,7 @@ async def test_text_preserved_when_human_message_and_tool_resolved_same_turn() -
     assert isinstance(result, AIMessage)
     assert result.content == verdict, (
         "ainvoke dropped the verdict TextBlock on a mixed query+resolve turn "
-        "(observed 2026-05-21): the manager's STATUS/REASONING/MESSAGE was "
+        "(observed live, 2026-05-21): the manager's STATUS/REASONING/MESSAGE was "
         "lost, making the evaluation silently fail."
     )
 
@@ -127,6 +128,7 @@ async def test_text_preserved_when_only_tool_resolved() -> None:
     mock_proxy = MagicMock()
     mock_proxy.has_pending_calls.return_value = False
     mock_proxy.get_pending_calls.return_value = []
+    mock_proxy.wait_for_any_pending_call = AsyncMock(return_value=None)
 
     verdict = (
         "STATUS: in_progress\n"
@@ -171,7 +173,7 @@ async def test_text_preserved_when_only_tool_resolved() -> None:
     assert isinstance(result, AIMessage)
     assert result.content == verdict, (
         "ainvoke dropped the verdict TextBlock on a tool-resolve-only turn "
-        "(observed 2026-05-21 second failure)."
+        "(observed live, 2026-05-21 second failure)."
     )
 
 

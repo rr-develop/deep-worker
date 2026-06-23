@@ -183,7 +183,13 @@ def parse_manager_response(result_text: str) -> tuple[Literal['done', 'in_progre
         line_clean = line.replace('**', '').replace('##', '').strip()
 
         if line_clean.startswith('STATUS:'):
-            status_text = line_clean.replace('STATUS:', '').strip().lower()
+            status_text_raw = line_clean.replace('STATUS:', '', 1).strip().lower()
+            if not status_text_raw:
+                raise ValueError(
+                    f"Empty STATUS value after 'STATUS:'. "
+                    f"Full response: {result_text[:200]}"
+                )
+            status_text = status_text_raw.split()[0]
             if status_text in ('done', 'in_progress', 'unable'):
                 status = status_text
             else:

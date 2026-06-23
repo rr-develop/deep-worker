@@ -10,7 +10,7 @@ the agent's status push is wired through
 call leaks a task that holds an ``AsyncResult`` slot on the
 connection's ``_request_callbacks``. Long-running agents will
 eventually trip the inbound-backpressure quarantine on web
-(see ``rpyc_async/docs/DESIGN_INBOUND_BACKPRESSURE.md``).
+(see the rpyc_async inbound-backpressure design notes).
 
 Contract: ``_dispatch_status_event`` schedules each subscriber's
 ``on_message`` via ``fire_and_forget_async`` with a finite timeout,
@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -37,6 +37,24 @@ def _make_bare_agent_process() -> AgentProcess:
     return agent
 
 
+def _make_mock_netref(on_message_func):
+    """Create a MagicMock whose ``____conn__`` evaluates
+    ``async_request(8, _, 'on_message', args, kwargs)`` by calling
+    ``on_message_func(args[0])`` — matching the real
+    ``asyncreq(subscriber, HANDLE_CALLATTR, 'on_message', ...)``
+    call in production code."""
+    class _Conn:
+        async def async_request(self, handler, _proxy, name, args, kwargs):
+            if handler == 8 and name == "on_message":
+                return await on_message_func(args[0])
+            raise NotImplementedError(
+                f"unexpected async_request handler={handler}"
+            )
+    netref = MagicMock()
+    object.__setattr__(netref, "____conn__", _Conn())
+    return netref
+
+
 @pytest.mark.asyncio
 async def test_dispatch_status_event_returns_immediately_when_subscriber_hangs() -> None:
     """A hung subscriber must not block the SessionManager's setter."""
@@ -46,8 +64,7 @@ async def test_dispatch_status_event_returns_immediately_when_subscriber_hangs()
         await hang_forever.wait()
 
     agent = _make_bare_agent_process()
-    cb = MagicMock()
-    cb.on_message = hung_on_message
+    cb = _make_mock_netref(hung_on_message)
     agent._message_subscribers.add(cb)
 
     try:
@@ -73,8 +90,7 @@ async def test_dispatch_status_event_delivers_to_healthy_subscriber() -> None:
         delivered_event.set()
 
     agent = _make_bare_agent_process()
-    cb = MagicMock()
-    cb.on_message = good_on_message
+    cb = _make_mock_netref(good_on_message)
     agent._message_subscribers.add(cb)
 
     await agent._dispatch_status_event({"type": "status_change"})
@@ -103,8 +119,7 @@ async def test_dispatch_status_event_logs_subscriber_failure(
         raise RuntimeError("peer gone")
 
     agent = _make_bare_agent_process()
-    cb = MagicMock()
-    cb.on_message = bad_on_message
+    cb = _make_mock_netref(bad_on_message)
     agent._message_subscribers.add(cb)
 
     # MUST NOT raise out of the caller (SessionManager.set_status).
@@ -143,8 +158,7 @@ async def test_dispatch_status_event_task_is_pinned_in_INFLIGHT() -> None:
         await release.wait()
 
     agent = _make_bare_agent_process()
-    cb = MagicMock()
-    cb.on_message = slow_on_message
+    cb = _make_mock_netref(slow_on_message)
     agent._message_subscribers.add(cb)
 
     inflight_before = len(h._INFLIGHT)
@@ -184,10 +198,8 @@ async def test_dispatch_status_event_one_broken_subscriber_does_not_starve_other
         raise RuntimeError("broken")
 
     agent = _make_bare_agent_process()
-    good = MagicMock()
-    good.on_message = good_on_message
-    bad = MagicMock()
-    bad.on_message = bad_on_message
+    good = _make_mock_netref(good_on_message)
+    bad = _make_mock_netref(bad_on_message)
     agent._message_subscribers.add(good)
     agent._message_subscribers.add(bad)
 
@@ -226,8 +238,7 @@ async def test_dead_subscriber_is_evicted_after_push_error() -> None:
         error_seen.set()
         raise RuntimeError("peer gone")
 
-    dead = MagicMock()
-    dead.on_message = dead_on_message
+    dead = _make_mock_netref(dead_on_message)
     agent._message_subscribers.add(dead)
 
     await agent._dispatch_status_event({"type": "status_change"})
@@ -240,7 +251,7 @@ async def test_dead_subscriber_is_evicted_after_push_error() -> None:
 
     assert dead not in agent._message_subscribers, (
         "a subscriber whose on_message failed must be evicted so the "
-        "agent stops pushing status to a dead peer (observed 2026-05-20)"
+        "agent stops pushing status to a dead peer (observed live, 2026-05-20)"
     )
 
 
@@ -254,8 +265,7 @@ async def test_healthy_subscriber_is_not_evicted() -> None:
     async def good_on_message(_payload: str) -> None:
         delivered.set()
 
-    good = MagicMock()
-    good.on_message = good_on_message
+    good = _make_mock_netref(good_on_message)
     agent._message_subscribers.add(good)
 
     await agent._dispatch_status_event({"type": "status_change"})
@@ -284,10 +294,8 @@ async def test_eviction_lets_live_subscriber_keep_receiving() -> None:
         dead_err.set()
         raise RuntimeError("dead")
 
-    live = MagicMock()
-    live.on_message = live_on_message
-    dead = MagicMock()
-    dead.on_message = dead_on_message
+    live = _make_mock_netref(live_on_message)
+    dead = _make_mock_netref(dead_on_message)
     agent._message_subscribers.add(live)
     agent._message_subscribers.add(dead)
 

@@ -41,7 +41,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # The single tool whose successful result we resolve early. Kept in sync with
-# deep_worker_cli's SendMessageCompletionMiddleware.TOOL_NAME by value.
+# the CLI's SendMessageCompletionMiddleware.TOOL_NAME by value.
 _TOOL_NAME = "send_message_to_agent"
 
 
@@ -106,6 +106,15 @@ class InterAgentDeliveryResolveMiddleware(AgentMiddleware):
             self._model.resolve_pending_tool(
                 thread_id, result.tool_call_id, _mcp_content(result.content)
             )
+            # After resolve_call, Claude finishes turn #1 in the
+            # background (UserMessage(ToolResultBlock) +
+            # AssistantMessage(TextBlock) + ResultMessage). We must
+            # drain that tail here, otherwise the next ainvoke's
+            # receive_response would read it BEFORE Claude reacts to
+            # the peer reply we send via client.query — see
+            # a related internal incident analysis (not included here).
+            if hasattr(self._model, "drain_after_inter_agent_send"):
+                await self._model.drain_after_inter_agent_send(thread_id)
         except Exception:  # noqa: BLE001 — must never break a tool turn
             logger.debug(
                 "InterAgentDeliveryResolveMiddleware: early resolve skipped",

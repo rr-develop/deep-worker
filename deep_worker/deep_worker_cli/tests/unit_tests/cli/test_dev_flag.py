@@ -1,7 +1,7 @@
 """Unit tests for the --dev flag in deep-worker.
 
 The --dev flag selects the development codebase instead of the
-production tree. The shell launcher
+production one. The shell launcher
 performs the actual tree switch BEFORE Python starts. These tests cover
 the Python-side contract:
 
@@ -16,7 +16,7 @@ the Python-side contract:
 
 The bash dispatch itself is covered in tests/integration_tests/test_dev_launcher.py.
 
-Design doc: docs/DESIGN_DEV_FLAG.md
+Design doc: `docs/DESIGN_DEV_FLAG.md`
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ def saved_launch_config_dev() -> dict:
     return {
         "provider": "claude-code",
         "model": "opus",
-        "working_dir": "/path/to/dev-tree",
+        "working_dir": "/path/to/dev",
         "skip_permissions": True,
         "task_manager": True,
         "memory_only": False,
@@ -58,7 +58,7 @@ def saved_launch_config_prod() -> dict:
     return {
         "provider": "claude-code",
         "model": "opus",
-        "working_dir": "/path/to/production-tree",
+        "working_dir": "/path/to/prod",
         "skip_permissions": True,
         "task_manager": True,
         "memory_only": False,
@@ -194,7 +194,16 @@ class TestBuildLaunchConfigDevTree:
         from deep_worker_cli.cli.agent_command import build_launch_config
 
         import os
-        with patch.dict("os.environ", {}, clear=False):
+        # Point the dev-tree-root detection at a path that is NOT this
+        # checkout, so the running-from-dev-tree auto-detect (fix
+        # 2026-06-18) does not fire — this test isolates the flag/env
+        # sources. The test suite itself runs from the dev tree,
+        # so without the override the third source would (correctly) be True.
+        with patch.dict(
+            "os.environ",
+            {"DEEP_WORKER_DEV_TREE_ROOT_OVERRIDE": "/nonexistent/not-dev"},
+            clear=False,
+        ):
             os.environ.pop("DEEP_WORKER_DEV_TREE", None)
             cfg = build_launch_config(default_args)
 
@@ -205,11 +214,69 @@ class TestBuildLaunchConfigDevTree:
         from deep_worker_cli.cli.agent_command import build_launch_config
 
         for value in ("0", "false", "False", "", "no"):
-            with patch.dict("os.environ", {"DEEP_WORKER_DEV_TREE": value}):
+            with patch.dict(
+                "os.environ",
+                {
+                    "DEEP_WORKER_DEV_TREE": value,
+                    # Isolate the env source from the running-tree source.
+                    "DEEP_WORKER_DEV_TREE_ROOT_OVERRIDE": "/nonexistent/not-dev",
+                },
+            ):
                 cfg = build_launch_config(default_args)
             assert cfg["dev_tree"] is False, (
                 f"DEEP_WORKER_DEV_TREE={value!r} must not be treated as True"
             )
+
+    def test_persists_dev_tree_true_when_running_from_dev_tree(
+        self, default_args
+    ) -> None:
+        """REGRESSION (observed live, 2026-06-18): an agent launched DIRECTLY from
+        the dev checkout (no bash launcher, no --dev, no env) must still
+        persist dev_tree=True, because its code tree IS the dev tree. Without
+        this, a web-UI restart respawns on the prod tree where a dev-only
+        provider (grok) is unknown to argparse --provider choices and the
+        agent dies at startup.
+
+        We point the dev-tree-root override at THIS checkout's repo root so
+        the detection matches regardless of where the dev tree
+        physically is in CI.
+        """
+        from deep_worker_cli.cli.agent_command import (
+            _repo_root,
+            build_launch_config,
+        )
+
+        import os
+        with patch.dict(
+            "os.environ",
+            {"DEEP_WORKER_DEV_TREE_ROOT_OVERRIDE": str(_repo_root)},
+            clear=False,
+        ):
+            os.environ.pop("DEEP_WORKER_DEV_TREE", None)
+            default_args.dev_tree = False
+            cfg = build_launch_config(default_args)
+
+        assert cfg["dev_tree"] is True
+
+    def test_not_dev_tree_when_running_from_prod_tree(
+        self, default_args
+    ) -> None:
+        """The mirror of the regression: when the running code tree is NOT
+        the canonical dev tree (prod), and no flag/env is set, dev_tree stays
+        False so prod agents keep restarting on the prod tree."""
+        from deep_worker_cli.cli.agent_command import build_launch_config
+
+        import os
+        with patch.dict(
+            "os.environ",
+            {"DEEP_WORKER_DEV_TREE_ROOT_OVERRIDE": "/nonexistent/prod"},
+            clear=False,
+        ):
+            os.environ.pop("DEEP_WORKER_DEV_TREE", None)
+            default_args.dev_tree = False
+            cfg = build_launch_config(default_args)
+
+        assert cfg["dev_tree"] is False
 
 
 # ===========================================================================
@@ -259,7 +326,7 @@ class TestMergeRestartConfigDevTree:
         legacy_saved = {
             "provider": "claude-code",
             "model": "opus",
-            "working_dir": "/path/to/production-tree",
+            "working_dir": "/path/to/prod",
             "skip_permissions": True,
             "task_manager": False,
             "memory_only": False,

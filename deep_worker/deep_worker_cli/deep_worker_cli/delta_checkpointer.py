@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import AsyncIterator, Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any, cast
@@ -44,6 +44,49 @@ logger = logging.getLogger(__name__)
 
 # Delta format version
 _DELTA_VERSION = 2
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Channels we deliberately DO NOT persist (the 2026-05-30 incident).
+# ═══════════════════════════════════════════════════════════════════════════
+# ``__pregel_tasks`` is a LangGraph-internal reserved channel of type
+# ``Topic[Send](accumulate=False)`` — its value is the list of ``Send``
+# operations for the CURRENT super-step, consumed within that step and never
+# carried over (see pregel/main.py:680 + pregel/_algo.py:888-890). It is also
+# unwritable from user code (``pregel/_write.py`` raises "Cannot write to the
+# reserved channel TASKS"). Persisting it gave a live agent a 1.6 GB threads.db
+# (92% of weight was a single full-replace copy of TASKS on every super-step;
+# fanning out to sub-agents made each Send object ≈ 500 KB). The pregel loop
+# treats TASKS as conditionally present on resume (``if TASKS in
+# channel_values`` — pregel/_loop.py:758), so simply omitting it is safe.
+# See docs/DESIGN_FIX_DELTA_CHECKPOINTER_DROP_TASKS.md.
+#
+# Single source of truth — applied in the delta path AND the full-snapshot
+# path AND on the always-rewritten channel_versions / versions_seen maps.
+# 🚫 DO NOT special-case TASKS anywhere else; extend this set instead.
+_EPHEMERAL_CHANNELS: frozenset[str] = frozenset({"__pregel_tasks"})
+
+
+def _strip_ephemeral(d: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Return a copy of ``d`` with every key in ``_EPHEMERAL_CHANNELS`` removed.
+
+    ``None`` is treated as the empty dict (callers may pass missing fields).
+    Accepts any ``Mapping`` (callers pass ``dict``, ``TypedDict``,
+    ``ChannelVersions``, …) — the value type is invariant under ``dict``
+    so a permissive ``Mapping`` keeps type-checker quiet without runtime change.
+    """
+    if not d:
+        return {}
+    return {k: v for k, v in d.items() if k not in _EPHEMERAL_CHANNELS}
+
+
+def _strip_ephemeral_versions_seen(
+    seen: Mapping[str, Mapping[str, Any]] | None,
+) -> dict[str, dict[str, Any]]:
+    """``versions_seen`` is ``{node: {channel: version}}``; strip ephemeral
+    keys from EVERY inner per-node map."""
+    if not seen:
+        return {}
+    return {node: _strip_ephemeral(vmap) for node, vmap in seen.items()}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -247,12 +290,24 @@ class DeltaSqliteCheckpointer(BaseCheckpointSaver):
                     "checkpoint_id": parent_checkpoint_id,
                 }
             }
+        # Cache MUST mirror on-disk semantics: ephemeral channels
+        # (``_EPHEMERAL_CHANNELS``, e.g. ``__pregel_tasks``) are NEVER persisted
+        # — if we cached the un-stripped checkpoint, the next ``aget_tuple``
+        # would return them and reconstructed user state would diverge from a
+        # cold read. Strip them here so reads are consistent regardless of
+        # cache vs. disk path. See DESIGN_FIX_DELTA_CHECKPOINTER_DROP_TASKS.md.
+        cached_checkpoint = cast("Checkpoint", dict(checkpoint))
+        cached_checkpoint["channel_values"] = _strip_ephemeral(checkpoint.get("channel_values"))
+        cached_checkpoint["channel_versions"] = _strip_ephemeral(checkpoint.get("channel_versions"))
+        cached_checkpoint["versions_seen"] = _strip_ephemeral_versions_seen(
+            checkpoint.get("versions_seen")
+        )
         self._cache[key] = ThreadCacheEntry(
             thread_id=thread_id,
             checkpoint_ns=ns,
             checkpoint_id=cp_id,
             parent_checkpoint_id=parent_checkpoint_id,
-            checkpoint=checkpoint,
+            checkpoint=cached_checkpoint,
             metadata=metadata,
             version=next_version,
             parent_config=parent_config,
@@ -282,6 +337,20 @@ class DeltaSqliteCheckpointer(BaseCheckpointSaver):
     async def setup(self) -> None:
         if self._is_setup:
             return
+        # Apply PRAGMA settings for corruption resilience:
+        #   journal_mode=WAL  — concurrent reads don't block writes;
+        #                       crash recovery on reopen (wal replay).
+        #   synchronous=NORMAL — safe with WAL; prevents fsync on every
+        #                        transaction while guaranteeing crash safety
+        #                        within the WAL protocol.
+        # See DESIGN_FIX_SQLITE_DB_CORRUPTION.md (#4114e536).
+        pragmas = [
+            "PRAGMA journal_mode=WAL",
+            "PRAGMA synchronous=NORMAL",
+        ]
+        for pragma in pragmas:
+            async with self.conn.executescript(pragma):
+                pass
         async with self.conn.executescript(_CREATE_TABLES_SQL):
             pass
         await self.conn.commit()
@@ -578,8 +647,15 @@ class DeltaSqliteCheckpointer(BaseCheckpointSaver):
         need_full = is_root or is_summarization or is_interval or prev_state is None
 
         if need_full:
-            # Full snapshot
+            # Full snapshot — strip ephemeral channels (TASKS) from
+            # ``channel_values`` AND from the always-written ``channel_versions``
+            # / ``versions_seen`` maps. See _EPHEMERAL_CHANNELS docstring.
             to_store = dict(checkpoint)
+            to_store["channel_values"] = _strip_ephemeral(checkpoint.get("channel_values"))
+            to_store["channel_versions"] = _strip_ephemeral(checkpoint.get("channel_versions"))
+            to_store["versions_seen"] = _strip_ephemeral_versions_seen(
+                checkpoint.get("versions_seen")
+            )
             to_store["is_full_snapshot"] = True
             type_str, serialized = self.serde.dumps_typed(to_store)
         else:
@@ -663,6 +739,10 @@ class DeltaSqliteCheckpointer(BaseCheckpointSaver):
         delta_meta: dict[str, str] = {}
 
         for channel in updated:
+            # Drop LangGraph-internal ephemeral channels (currently TASKS).
+            # See _EPHEMERAL_CHANNELS at module top.
+            if channel in _EPHEMERAL_CHANNELS:
+                continue
             if channel not in new_cv:
                 continue
             new_val = new_cv[channel]
@@ -684,6 +764,9 @@ class DeltaSqliteCheckpointer(BaseCheckpointSaver):
                 delta_values[channel] = new_val
                 delta_meta[channel] = "replace"
 
+        # ``channel_versions`` / ``versions_seen`` are written wholesale on
+        # every delta; strip ephemeral channels from them too so TASKS cannot
+        # leak back in through the version maps (the observed bloat path).
         result: dict[str, Any] = {
             "v": _DELTA_VERSION,
             "id": checkpoint["id"],
@@ -691,8 +774,10 @@ class DeltaSqliteCheckpointer(BaseCheckpointSaver):
             "is_full_snapshot": False,
             "delta_channel_values": delta_values,
             "delta_meta": delta_meta,
-            "channel_versions": checkpoint.get("channel_versions", {}),
-            "versions_seen": checkpoint.get("versions_seen", {}),
+            "channel_versions": _strip_ephemeral(checkpoint.get("channel_versions")),
+            "versions_seen": _strip_ephemeral_versions_seen(
+                checkpoint.get("versions_seen")
+            ),
             "pending_sends": checkpoint.get("pending_sends", []),
         }
         return result
@@ -782,12 +867,33 @@ class DeltaSqliteCheckpointer(BaseCheckpointSaver):
         task_id: str,
         task_path: str = "",
     ) -> None:
+        # ──────────────────────────────────────────────────────────────────
+        # Incident (observed live) — the SECOND half of the ephemeral-channel
+        # fix. The 2026-05-30 fix stripped ``__pregel_tasks`` from ``aput``
+        # (delta payload + full snapshot + ``channel_versions`` +
+        # ``versions_seen``) but left ``aput_writes`` untouched, so every
+        # super-step kept inserting a full ``__pregel_tasks`` payload
+        # (0.5–4 MB / row) into the ``writes`` table. On a live agent that
+        # path accumulated 4 596 rows totalling 2.43 GB — 96 % of a
+        # 2.84 GB threads.db. Worse, on cold start LangGraph's
+        # ``aget_tuple`` merges these pending writes into the
+        # reconstructed in-RAM state, rehydrating the ephemeral payload
+        # into the agent's memory. Single source of truth is the same
+        # ``_EPHEMERAL_CHANNELS`` set used by ``aput``; ``idx`` becomes
+        # non-contiguous when entries are skipped, which is harmless —
+        # SQLite's primary key only requires uniqueness, not contiguity,
+        # and no reader iterates by sequential ``idx``. See
+        # a related internal incident analysis (not included here).
+        # ──────────────────────────────────────────────────────────────────
         await self.setup()
         thread_id = config["configurable"]["thread_id"]
         checkpoint_ns = config["configurable"].get("checkpoint_ns", "")
         checkpoint_id = config["configurable"]["checkpoint_id"]
 
+        wrote_any = False
         for idx, (channel, value) in enumerate(writes):
+            if channel in _EPHEMERAL_CHANNELS:
+                continue
             type_str, serialized = self.serde.dumps_typed(value)
             await self.conn.execute(
                 "INSERT OR IGNORE INTO writes "
@@ -795,7 +901,9 @@ class DeltaSqliteCheckpointer(BaseCheckpointSaver):
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (thread_id, checkpoint_ns, checkpoint_id, task_id, idx, channel, type_str, serialized),
             )
-        await self.conn.commit()
+            wrote_any = True
+        if wrote_any:
+            await self.conn.commit()
 
     # ------------------------------------------------------------------
     # alist — list checkpoints

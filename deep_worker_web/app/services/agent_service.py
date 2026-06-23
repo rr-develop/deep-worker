@@ -66,7 +66,7 @@ from app.utils.supervisor import supervise
 # ============================================================================
 # CRITICAL: RPYC MUST BE IMPORTED FROM SOURCE CODE, NOT FROM PIP!
 # ============================================================================
-# Import rpyc from the rpyc_async source directory to ensure AsyncioServer support
+# Import rpyc from the /path/to/rpyc_async source directory to ensure AsyncioServer support
 # ============================================================================
 _rpyc_async_path = Path("/path/to/rpyc_async")
 if _rpyc_async_path.exists() and str(_rpyc_async_path) not in sys.path:
@@ -139,6 +139,18 @@ class AgentService:
     - Broadcasts events to registered callbacks (WebSocket connections)
     """
 
+    # Upper bound on a SINGLE background connect attempt (TCP + the eager
+    # RPyC ``HANDLE_GETROOT`` handshake). ``async_connect``'s own timeout
+    # only covers ``sock_connect``; the handshake is otherwise unbounded
+    # and parks forever against a deadlocked peer. This bound lives in the
+    # BACKGROUND connect task only — never in an HTTP handler — so it does
+    # not block the UI. See the 2026-06-15 incident.
+    _CONNECT_TIMEOUT: float = 5.0
+    # Reconnect backoff: first failure waits this long before another
+    # attempt is allowed, doubling each consecutive failure up to the cap.
+    _RECONNECT_BACKOFF_START: float = 1.0
+    _RECONNECT_BACKOFF_MAX: float = 30.0
+
     def __init__(
         self,
         registry: Any | None = None,
@@ -161,7 +173,7 @@ class AgentService:
             # docs/DESIGN_DEV_FLAG.md.
             #
             # __file__ here =
-            #   <TREE>/<web-app-dir>/app/services/agent_service.py
+            #   <TREE>/<web-app>/app/services/agent_service.py
             # parent x3 = <TREE>.
             _tree_root = Path(__file__).resolve().parent.parent.parent.parent
             deep_worker_path = (
@@ -211,6 +223,33 @@ class AgentService:
         # Background monitoring task
         self._monitor_task: asyncio.Task[None] | None = None
         self._shutdown_event = asyncio.Event()
+
+        # ── Single-flight connect machinery ──────────────────────────
+        # The 2026-06-15 incident: a stuck peer used to spawn a fresh connect
+        # per HTTP request and per registry event, each parking forever on
+        # the unbounded eager RPyC handshake. That stormed connections,
+        # leaked half-open sockets, and (because handlers awaited the
+        # connect) hung the per-agent UI.
+        #
+        # Invariants enforced here, ALL on the existing event loop — no
+        # threads, no polling, no sleeps:
+        #   * at most ONE in-flight connect task per agent;
+        #   * HTTP handlers never await connect establishment
+        #     (``ensure_connecting`` is non-blocking);
+        #   * a dead/stuck peer is retried with capped exponential backoff,
+        #     never in an infinite per-event loop.
+        #
+        # ``_connecting`` holds the live connect task per agent (a STRONG
+        # ref, dropped in the task's done-callback — same anti-GC
+        # discipline as fire_and_forget_async._INFLIGHT).
+        self._connecting: dict[str, asyncio.Task[bool]] = {}
+        # ``_reconnect_not_before`` is a per-agent loop-time deadline; no
+        # new connect is launched before it. Set on failure, cleared on
+        # success.
+        self._reconnect_not_before: dict[str, float] = {}
+        # Per-agent current backoff (seconds), grows on each consecutive
+        # failure up to ``_RECONNECT_BACKOFF_MAX``.
+        self._reconnect_backoff: dict[str, float] = {}
 
         # Lazily initialised lifecycle orchestrator (requires a running
         # event loop to spawn tasks — created on first access via
@@ -280,7 +319,7 @@ class AgentService:
             # session_metadata.json. This is the DURABLE source: it
             # survives even when the agent's live in-memory status has
             # diverged (e.g. error persisted to disk but exposed_get_status
-            # reverted to idle — an incident observed 2026-05-20), so the web
+            # reverted to idle — the case observed live on 2026-05-20), so the web
             # UI shows the error detail on PAGE LOAD instead of an
             # error-with-no-explanation. The live RPyC poll later refreshes
             # this; the disk read just guarantees the snapshot is never
@@ -291,7 +330,8 @@ class AgentService:
 
     def _seed_status_from_metadata(self, info: AgentInfo) -> None:
         """Best-effort: fill ``status`` + ``error_message`` from the
-        agent's ``<agent-data-dir>/<name>/session_metadata.json``.
+        agent's ``session_metadata.json`` under its data directory in the
+        user's home.
 
         Never raises — a missing/corrupt file just leaves the defaults.
         """
@@ -455,46 +495,140 @@ class AgentService:
         """
         return self._roots.get(agent_name)
 
+    def ensure_connecting(self, agent_name: str) -> "asyncio.Future[bool]":
+        """NON-BLOCKING connectivity trigger for HTTP handlers.
+
+        Returns a *resolved* awaitable carrying the CURRENT connectivity:
+
+        * ``True``  — a live connection already exists; the caller may
+          use ``get_root`` immediately.
+        * ``False`` — not connected (yet). A single-flight BACKGROUND
+          connect has been (re)triggered (subject to backoff). The
+          caller MUST NOT wait for it — return ``503 connecting`` (or a
+          cached last-known value) so the UI never blocks on a slow or
+          deadlocked peer.
+
+        This is the method HTTP handlers call. It awaits ``is_connected``
+        (a flag read — no RPC, no round-trip) and otherwise returns
+        immediately, honoring the mandate that NO handler may block on
+        connect establishment — not even for the duration of a timeout.
+
+        Implemented as ``async`` so call sites keep the ``await`` shape,
+        but it contains no blocking await on the connect itself.
+        """
+        return asyncio.ensure_future(self._ensure_connecting(agent_name))
+
+    async def _ensure_connecting(self, agent_name: str) -> bool:
+        if await self.is_connected(agent_name):
+            return True
+        # Not connected → kick a single-flight background connect (no await).
+        self._start_background_connect(agent_name)
+        return False
+
+    def _start_background_connect(self, agent_name: str) -> None:
+        """Ensure (at most) one in-flight connect task exists for an
+        agent, respecting the reconnect backoff. Pure scheduling — never
+        awaits the connect. Runs entirely on the current event loop."""
+        # Already connecting? single-flight — do nothing.
+        existing = self._connecting.get(agent_name)
+        if existing is not None and not existing.done():
+            return
+        # Backoff gate: don't relaunch before the deadline.
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # No running loop (shouldn't happen in the web server) — skip.
+            return
+        not_before = self._reconnect_not_before.get(agent_name)
+        if not_before is not None and loop.time() < not_before:
+            return
+        if agent_name not in self._agents:
+            logger.error(f"Agent {agent_name} not found in registry")
+            return
+
+        task: asyncio.Task[bool] = loop.create_task(
+            self._do_connect(agent_name),
+            name=f"connect_to_agent:{agent_name}",
+        )
+        # STRONG ref while in flight; dropped + outcome handled in the
+        # done-callback (the event-driven "connect finished" hook). Same
+        # anti-GC discipline as fire_and_forget_async._INFLIGHT.
+        self._connecting[agent_name] = task
+        task.add_done_callback(
+            lambda t, n=agent_name: self._on_connect_done(n, t)
+        )
+
+    def _on_connect_done(
+        self, agent_name: str, task: "asyncio.Task[bool]"
+    ) -> None:
+        """Done-callback for a background connect. Clears the in-flight
+        slot and arms/clears reconnect backoff based on the outcome.
+        Event-driven — invoked by the loop when the task completes."""
+        # Only clear the slot if it is still THIS task (a newer one may
+        # have replaced it after a backoff window).
+        if self._connecting.get(agent_name) is task:
+            self._connecting.pop(agent_name, None)
+
+        ok = False
+        if task.cancelled():
+            ok = False
+        else:
+            exc = task.exception()
+            if exc is None:
+                ok = bool(task.result())
+            else:
+                logger.warning(
+                    "Background connect to %s failed: %s", agent_name, exc
+                )
+        if ok:
+            self._clear_reconnect_backoff(agent_name)
+        else:
+            self._arm_reconnect_backoff(agent_name)
+
+    def _arm_reconnect_backoff(self, agent_name: str) -> None:
+        """Grow the per-agent backoff and set the next-attempt deadline.
+        Caps at ``_RECONNECT_BACKOFF_MAX`` so a permanently dead agent is
+        retried at a bounded rate, never in an infinite tight loop."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        cur = self._reconnect_backoff.get(agent_name)
+        nxt = (
+            self._RECONNECT_BACKOFF_START
+            if cur is None
+            else min(cur * 2.0, self._RECONNECT_BACKOFF_MAX)
+        )
+        self._reconnect_backoff[agent_name] = nxt
+        self._reconnect_not_before[agent_name] = loop.time() + nxt
+
+    def _clear_reconnect_backoff(self, agent_name: str) -> None:
+        self._reconnect_backoff.pop(agent_name, None)
+        self._reconnect_not_before.pop(agent_name, None)
+
     async def connect_to_agent(self, agent_name: str) -> bool:
-        """Establish RPyC connection to an agent.
+        """Establish (or reuse) an RPyC connection to an agent.
 
-        This connects to the agent's RPyC server and subscribes to
-        message callbacks.
+        Single-flight gate. This is now a thin coordinator over the
+        background ``_do_connect`` worker:
 
-        Concurrency contract — ONE CONNECTION PER (CLIENT, AGENT) PAIR
-        ---------------------------------------------------------------
-        Per principle 6 in the module docstring, this coroutine is
-        the *only* path that may create or replace
-        ``self._connections[agent_name]`` *within this AgentService
-        instance*. Callers inside this instance issuing parallel
-        requests for the same agent MUST share the one connection
-        held in ``self._connections[agent_name]`` — they do not each
-        get their own. RPyC multiplexes many in-flight async calls
-        over a single connection, so duplicating connections from
-        the same client is forbidden.
+        * If already connected → return ``True`` (fast path, flag read).
+        * Otherwise (re)trigger the one background connect task and
+          AWAIT IT. Callers that genuinely need the connection outcome
+          (lifecycle/monitor paths) use this. HTTP handlers must instead
+          use ``ensure_connecting`` (non-blocking).
+
+        Concurrent callers for the SAME agent share the ONE in-flight
+        task — this is the single-flight gate the old docstring said a
+        future change "MUST add". It eliminates the connect storm and
+        half-open socket pile-up against a stuck peer
+        (the 2026-06-15 incident).
 
         This rule does NOT forbid *other* clients (a different
         ``AgentService`` instance, another web server, a ``dwcli``
-        process, etc.) from connecting to the same agent at the same
-        time — those are separate (client, agent) pairs and the
-        agent's ``AsyncioServer`` accepts them.
-
-        Today the fast path
-        (``if await self.is_connected(...): return True``) and the
-        write
-        (``self._connections[agent_name] = conn``) form a
-        check-then-act window. A future change MUST add a per-agent
-        single-flight gate (e.g. ``asyncio.Lock`` keyed by
-        ``agent_name`` or an in-flight ``asyncio.Task`` dedup map)
-        before this code is exercised by genuinely concurrent
-        first-callers in production. Until that lands, callers that
-        intentionally fan out to multiple handlers (the web UI's
-        parallel `/status` + `/history` + `/agent` queries, the
-        ``test_concurrent_requests_to_agent`` integration test, etc.)
-        MUST warm the connection with one sequential call before
-        issuing the parallel batch — see
-        ``tests/integration/test_api_agents_integration.py::TestAgentsAPIWithRealAgent::test_concurrent_requests_to_agent``
-        for the pattern.
+        process, etc.) from connecting to the same agent — those are
+        separate (client, agent) pairs and the agent's ``AsyncioServer``
+        accepts them.
 
         Args:
             agent_name: Name of the agent to connect to.
@@ -502,17 +636,39 @@ class AgentService:
         Returns:
             True if connection successful, False otherwise.
         """
-        # Check if already connected
         if await self.is_connected(agent_name):
             logger.debug(f"Already connected to {agent_name}")
             return True
-        
-        # Get agent info
+
+        if agent_name not in self._agents:
+            logger.error(f"Agent {agent_name} not found in registry")
+            return False
+
+        # Reuse the in-flight connect if one exists; otherwise start it.
+        self._start_background_connect(agent_name)
+        task = self._connecting.get(agent_name)
+        if task is None:
+            # Suppressed by backoff (recent failure). Report current state
+            # without blocking on a fresh attempt.
+            return await self.is_connected(agent_name)
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return False
+
+    async def _do_connect(self, agent_name: str) -> bool:
+        """Background connect worker (one per agent via the single-flight
+        gate). Bounds the WHOLE connect — TCP + eager RPyC handshake — in
+        ``asyncio.wait_for`` so a deadlocked peer cannot park it forever.
+        This timeout lives here, in the background task, never in an HTTP
+        handler."""
         agent = self._agents.get(agent_name)
         if not agent:
             logger.error(f"Agent {agent_name} not found in registry")
             return False
-        
+
         try:
             logger.info(f"Connecting to agent {agent_name} on port {agent.rpyc_port}")
 
@@ -522,14 +678,22 @@ class AgentService:
             # serving, and eager-fetches conn.root — so we don't need
             # run_in_executor, a separate enable_asyncio_serving call,
             # or a root access afterwards.
-            conn = await async_connect(
-                "127.0.0.1",
-                agent.rpyc_port,
-                config={"allow_public_attrs": True},
-                timeout=5.0,  # 5s max — dead agents fail fast
+            #
+            # async_connect's own ``timeout`` covers only sock_connect;
+            # the eager HANDLE_GETROOT handshake is unbounded and would
+            # park forever on a deadlocked peer (the 2026-06-15 incident).
+            # The outer wait_for bounds the ENTIRE connect.
+            conn = await asyncio.wait_for(
+                async_connect(
+                    "127.0.0.1",
+                    agent.rpyc_port,
+                    config={"allow_public_attrs": True},
+                    timeout=self._CONNECT_TIMEOUT,
+                ),
+                timeout=self._CONNECT_TIMEOUT,
             )
             root = conn.root
-            
+
             # Store connection and root
             self._connections[agent_name] = conn
             self._roots[agent_name] = root
@@ -551,17 +715,25 @@ class AgentService:
 
             # Query and update agent status
             await self._update_agent_status(agent_name, root)
-            
+
             logger.info(f"Successfully connected to agent {agent_name}")
             return True
-            
+
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Connect to %s timed out after %.1fs (peer unresponsive); "
+                "will retry with backoff",
+                agent_name,
+                self._CONNECT_TIMEOUT,
+            )
+            self._evict_connection(agent_name)
+            return False
         except Exception as e:
             logger.error(f"Failed to connect to agent {agent_name}: {e}")
-            # Cleanup partial connection
-            if agent_name in self._connections:
-                del self._connections[agent_name]
-            if agent_name in self._roots:
-                del self._roots[agent_name]
+            # Cleanup partial connection. Use _evict_connection so any
+            # armed asyncio reader is unregistered before we drop the
+            # last ref (the 2026-05-27 incident).
+            self._evict_connection(agent_name)
             return False
 
     async def disconnect_from_agent(self, agent_name: str) -> None:
@@ -826,14 +998,14 @@ class AgentService:
                     # path too (not only the subscribe-push path). The
                     # agent's exposed_get_status returns the human-
                     # readable cause under the "error" key when
-                    # status == "error" (incident observed 2026-05-20).
+                    # status == "error" (observed live, 2026-05-20).
                     err = response.get("error")
                     if status_str == "error" and err:
                         broadcast_msg["error_message"] = err
                         # Persist into the AgentInfo mirror so
                         # GET /api/agents (page load) and a UI re-select
                         # carry the error detail — not only the live WS
-                        # push. Incident observed 2026-05-20.
+                        # push. observed live, 2026-05-20.
                         info.error_message = err
                     else:
                         # Recovered (or no error) → clear so a stale
@@ -871,7 +1043,12 @@ class AgentService:
             name=f"get_status_{agent_name}",
         )
 
-    async def send_message(self, agent_name: str, message: str) -> dict[str, Any]:
+    async def send_message(
+        self,
+        agent_name: str,
+        message: str,
+        request_id: str | None = None,
+    ) -> dict[str, Any]:
         """Send a message to an agent using fire-and-forget pattern.
 
         Returns immediately. Results delivered via WebSocket callbacks.
@@ -879,15 +1056,23 @@ class AgentService:
         Args:
             agent_name: Name of the agent.
             message: Message to send.
+            request_id: Optional opaque correlation id returned in callbacks.
 
         Returns:
             Immediate response indicating message was sent. Actual agent response
             will be delivered via WebSocket with type="agent_response" or "agent_error".
         """
         # Connect if not connected
-        if not await self.is_connected(agent_name):
-            if not await self.connect_to_agent(agent_name):
-                return {"success": False, "error": "Failed to connect to agent"}
+        # NON-BLOCKING connect gate: never wait on a slow/stuck peer.
+        # ensure_connecting returns the current connectivity and kicks a
+        # single-flight background connect if needed. A stuck agent yields
+        # an immediate "connecting" result instead of hanging the handler.
+        if not await self.ensure_connecting(agent_name):
+            return {
+                "success": False,
+                "error": "Agent not connected (connecting…)",
+                "request_id": request_id,
+            }
 
         from rpyc.utils.helpers import fire_and_forget_async
 
@@ -942,6 +1127,7 @@ class AgentService:
             await self._broadcast_message({
                 "type": "agent_response",
                 "agent_name": agent_name,
+                "request_id": request_id,
                 "success": True,
                 "response": response_text,  # Send only serializable text
             })
@@ -953,6 +1139,7 @@ class AgentService:
             await self._broadcast_message({
                 "type": "agent_error",
                 "agent_name": agent_name,
+                "request_id": request_id,
                 "success": False,
                 "error": str(exc),
                 "error_type": type(exc).__name__,
@@ -985,6 +1172,7 @@ class AgentService:
             "success": True,
             "message": "Message sent to agent (response will arrive via WebSocket)",
             "agent_name": agent_name,
+            "request_id": request_id,
         }
 
     async def send_approval(
@@ -1003,9 +1191,12 @@ class AgentService:
         Returns:
             Response dict with success status.
         """
-        if not await self.is_connected(agent_name):
-            if not await self.connect_to_agent(agent_name):
-                return {"success": False, "error": "Failed to connect to agent"}
+        # NON-BLOCKING connect gate: never wait on a slow/stuck peer.
+        # ensure_connecting returns the current connectivity and kicks a
+        # single-flight background connect if needed. A stuck agent yields
+        # an immediate "connecting" result instead of hanging the handler.
+        if not await self.ensure_connecting(agent_name):
+            return {"success": False, "error": "Agent not connected (connecting…)"}
 
         root = self._roots[agent_name]
 
@@ -1044,9 +1235,12 @@ class AgentService:
         self, agent_name: str, enabled: bool
     ) -> dict[str, Any]:
         """Enable or disable TaskManager for an agent."""
-        if not await self.is_connected(agent_name):
-            if not await self.connect_to_agent(agent_name):
-                return {"success": False, "error": "Failed to connect to agent"}
+        # NON-BLOCKING connect gate: never wait on a slow/stuck peer.
+        # ensure_connecting returns the current connectivity and kicks a
+        # single-flight background connect if needed. A stuck agent yields
+        # an immediate "connecting" result instead of hanging the handler.
+        if not await self.ensure_connecting(agent_name):
+            return {"success": False, "error": "Agent not connected (connecting…)"}
 
         root = self._roots[agent_name]
         try:
@@ -1101,9 +1295,12 @@ class AgentService:
 
     async def reset_task_manager(self, agent_name: str) -> dict[str, Any]:
         """Reset TaskManager for an agent."""
-        if not await self.is_connected(agent_name):
-            if not await self.connect_to_agent(agent_name):
-                return {"success": False, "error": "Failed to connect to agent"}
+        # NON-BLOCKING connect gate: never wait on a slow/stuck peer.
+        # ensure_connecting returns the current connectivity and kicks a
+        # single-flight background connect if needed. A stuck agent yields
+        # an immediate "connecting" result instead of hanging the handler.
+        if not await self.ensure_connecting(agent_name):
+            return {"success": False, "error": "Agent not connected (connecting…)"}
 
         root = self._roots[agent_name]
         try:
@@ -1143,9 +1340,12 @@ class AgentService:
         Returns:
             Dict with ``success`` and ``message`` (or ``error``) keys.
         """
-        if not await self.is_connected(agent_name):
-            if not await self.connect_to_agent(agent_name):
-                return {"success": False, "error": "Failed to connect to agent"}
+        # NON-BLOCKING connect gate: never wait on a slow/stuck peer.
+        # ensure_connecting returns the current connectivity and kicks a
+        # single-flight background connect if needed. A stuck agent yields
+        # an immediate "connecting" result instead of hanging the handler.
+        if not await self.ensure_connecting(agent_name):
+            return {"success": False, "error": "Agent not connected (connecting…)"}
 
         root = self._roots[agent_name]
         try:
@@ -1218,9 +1418,12 @@ class AgentService:
             type="history_response" or "history_error".
         """
         # Connect if not connected
-        if not await self.is_connected(agent_name):
-            if not await self.connect_to_agent(agent_name):
-                return {"success": False, "error": "Failed to connect to agent"}
+        # NON-BLOCKING connect gate: never wait on a slow/stuck peer.
+        # ensure_connecting returns the current connectivity and kicks a
+        # single-flight background connect if needed. A stuck agent yields
+        # an immediate "connecting" result instead of hanging the handler.
+        if not await self.ensure_connecting(agent_name):
+            return {"success": False, "error": "Agent not connected (connecting…)"}
 
         from rpyc.utils.helpers import fire_and_forget_async
         import uuid
@@ -1294,9 +1497,12 @@ class AgentService:
             type="last_response_result" or "last_response_error".
         """
         # Connect if not connected
-        if not await self.is_connected(agent_name):
-            if not await self.connect_to_agent(agent_name):
-                return {"success": False, "error": "Failed to connect to agent"}
+        # NON-BLOCKING connect gate: never wait on a slow/stuck peer.
+        # ensure_connecting returns the current connectivity and kicks a
+        # single-flight background connect if needed. A stuck agent yields
+        # an immediate "connecting" result instead of hanging the handler.
+        if not await self.ensure_connecting(agent_name):
+            return {"success": False, "error": "Agent not connected (connecting…)"}
 
         from rpyc.utils.helpers import fire_and_forget_async
         import uuid
@@ -1368,9 +1574,12 @@ class AgentService:
             type="detailed_status_response" or "detailed_status_error".
         """
         # Connect if not connected
-        if not await self.is_connected(agent_name):
-            if not await self.connect_to_agent(agent_name):
-                return {"success": False, "error": "Failed to connect to agent"}
+        # NON-BLOCKING connect gate: never wait on a slow/stuck peer.
+        # ensure_connecting returns the current connectivity and kicks a
+        # single-flight background connect if needed. A stuck agent yields
+        # an immediate "connecting" result instead of hanging the handler.
+        if not await self.ensure_connecting(agent_name):
+            return {"success": False, "error": "Agent not connected (connecting…)"}
 
         from rpyc.utils.helpers import fire_and_forget_async
         import uuid
@@ -1493,8 +1702,91 @@ class AgentService:
 
         from app.services.dialog_formatter import (
             render_dialog,
+            render_system_prompt,
+            render_tools,
             split_into_turns,
         )
+
+        # Introspection modes (§9 of
+        # docs/DESIGN_FULL_DIALOG_FINAL_RESPONSE_PAIRS.md): the system prompt
+        # and tool list do NOT live in the checkpoint and are NOT conversation
+        # turns. Bypass the history fetch entirely and call the dedicated RPyC
+        # methods, then render via the pure formatters.
+        # Marker substring of the AttributeError raised when the running agent
+        # process PREDATES this feature (its RPyC service has no
+        # ``get_system_prompt`` / ``get_tools``). RPyC surfaces it as an
+        # AttributeError on the netref attribute access. We turn it into a
+        # clear, plain-text instruction instead of a raw 500 + remote
+        # traceback. (Same spirit as the LEGACY_NONE_MARKER path below.)
+        def _is_missing_method_error(exc: Exception) -> bool:
+            msg = str(exc)
+            return (
+                "has no attribute 'get_system_prompt'" in msg
+                or "has no attribute 'get_tools'" in msg
+                or "has no attribute 'exposed_get_system_prompt'" in msg
+                or "has no attribute 'exposed_get_tools'" in msg
+            )
+
+        _STALE_AGENT_HINT = (
+            "This view requires a newer agent runtime than the one currently "
+            "running for '{name}'. Restart the agent (🔄 Restart, or "
+            "`deep-worker --restart {name}`) to enable it."
+        )
+
+        if verbosity == "system_prompt":
+            try:
+                raw = await asyncio.wait_for(root.get_system_prompt(), timeout=30.0)
+            except asyncio.TimeoutError:
+                logger.error(f"Timeout getting system prompt for '{agent_name}'")
+                raise asyncio.TimeoutError(
+                    f"Agent '{agent_name}' did not respond within 30s"
+                )
+            except Exception as e:
+                if _is_missing_method_error(e):
+                    # Stale agent (no RPyC method). The invariant system prompt
+                    # is a PURE function of agent config, so compute it
+                    # web-side from session_metadata.json — no restart needed.
+                    local = self._compute_invariant_system_prompt_locally(agent_name)
+                    if local is not None:
+                        return local
+                    return (
+                        "--- System Prompt (unavailable) ---\n"
+                        + _STALE_AGENT_HINT.format(name=agent_name)
+                    )
+                raise
+            payload = json.loads(raw) if isinstance(raw, str) else raw
+            if not payload.get("success"):
+                error_msg = str(payload.get("error", "Unknown error"))
+                raise ValueError(f"Agent returned error: {error_msg}")
+            return render_system_prompt(
+                payload.get("system_prompt", ""),
+                provider=payload.get("provider"),
+                model=payload.get("model"),
+            )
+
+        if verbosity == "tools":
+            try:
+                raw = await asyncio.wait_for(root.get_tools(), timeout=30.0)
+            except asyncio.TimeoutError:
+                logger.error(f"Timeout getting tools for '{agent_name}'")
+                raise asyncio.TimeoutError(
+                    f"Agent '{agent_name}' did not respond within 30s"
+                )
+            except Exception as e:
+                if _is_missing_method_error(e):
+                    return (
+                        "--- Available Tools (unavailable) ---\n"
+                        + _STALE_AGENT_HINT.format(name=agent_name)
+                    )
+                raise
+            payload = json.loads(raw) if isinstance(raw, str) else raw
+            if not payload.get("success"):
+                error_msg = str(payload.get("error", "Unknown error"))
+                raise ValueError(f"Agent returned error: {error_msg}")
+            return render_tools(
+                payload.get("tools", []),
+                provider=payload.get("provider"),
+            )
 
         # Marker for legacy agents that crash on ``limit=None``. Pre-fix
         # ``_handle_get_history`` does ``total - limit - offset``, which
@@ -1562,6 +1854,50 @@ class AgentService:
         except Exception as e:
             logger.error(f"Error getting formatted history for '{agent_name}': {e}", exc_info=True)
             raise ValueError(f"Failed to retrieve dialog: {e}")
+
+    def _compute_invariant_system_prompt_locally(self, agent_name: str) -> str | None:
+        """Compute the invariant system prompt WEB-SIDE for a stale agent.
+
+        The invariant (startup) system prompt is a pure function of agent
+        configuration (assistant_id + working_dir), so when the running agent
+        process predates the RPyC ``get_system_prompt`` method we can still
+        produce the exact same text by calling ``get_system_prompt`` here,
+        seeding working_dir / provider / model from ``session_metadata.json``.
+        Returns None if config can't be read (then the caller shows the hint).
+        """
+        import json
+        from pathlib import Path
+
+        from app.services.dialog_formatter import render_system_prompt
+
+        try:
+            data_dir = Path.home() / Path("~/.deep_worker").name / agent_name
+            meta_file = data_dir / "session_metadata.json"
+            if not meta_file.exists():
+                return None
+            data = json.loads(meta_file.read_text())
+            cfg = data.get("launch_config")
+            if not isinstance(cfg, dict):
+                return None
+            working_dir = cfg.get("working_dir")
+            provider = cfg.get("provider")
+            model = cfg.get("model")
+            from deep_worker_cli.agent import get_system_prompt
+            project_memory_dir = Path(working_dir) if working_dir else None
+            system_prompt = get_system_prompt(
+                assistant_id=agent_name,
+                sandbox_type=None,
+                project_memory_dir=project_memory_dir,
+            )
+            return render_system_prompt(
+                system_prompt, provider=provider, model=model
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                f"web-side system prompt computation failed for "
+                f"'{agent_name}': {e}"
+            )
+            return None
 
     def register_message_callback(
         self, callback: Callable[[dict[str, Any]], Awaitable[None]]
@@ -1720,7 +2056,7 @@ class AgentService:
             # working and its status is unchanged. Forward as a dedicated
             # top-level event so the frontend can show a warning banner
             # WITHOUT touching the agent's displayed status / error panel.
-            # Incident observed 2026-05-22.
+            # observed live, 2026-05-22.
             await self._broadcast_message({
                 "type": "channel_quarantined",
                 "agent_name": agent_name,
@@ -1857,17 +2193,13 @@ class AgentService:
                 "agent": agent_info.model_dump(mode="json"),
             })
 
-            # Fire-and-forget connect: schedules its own work internally,
-            # we don't await it here because the registry reader has to
-            # return quickly so the inotify fd stays drained. Supervised
-            # so any crash in ``connect_to_agent`` lands in the
-            # ``app.utils.supervisor`` log instead of vanishing as a
-            # GC-time "Task exception was never retrieved" asyncio
-            # warning with no traceback.
-            supervise(
-                self.connect_to_agent(name),
-                name=f"connect_to_agent:{name}",
-            )
+            # Single-flight background connect: pure scheduling, returns
+            # instantly so the registry reader keeps the inotify fd
+            # drained. At most one in-flight connect per agent; failures
+            # arm a capped backoff (no per-event connect storm against a
+            # stuck peer — the 2026-06-15 incident). The connect task's own
+            # done-callback handles outcome/logging.
+            self._start_background_connect(name)
 
         # Terminated agents
         for name in known_names - current_names:
@@ -1897,10 +2229,10 @@ class AgentService:
                 info.rpyc_port = proc_info.rpyc_port
             if not await self.is_connected(name):
                 logger.debug(f"Attempting to reconnect to {name}")
-                supervise(
-                    self.connect_to_agent(name),
-                    name=f"reconnect_to_agent:{name}",
-                )
+                # Single-flight + backoff-aware (see above). A stuck agent
+                # is NOT reconnected on every inotify event — the backoff
+                # deadline gates relaunches (the 2026-06-15 incident).
+                self._start_background_connect(name)
 
     async def monitor_agents(self) -> None:
         """Event-driven agent-registry monitor.

@@ -165,5 +165,68 @@ class TestAgentClientRPyC:
                 await client.connect()
 
 
+    @pytest.mark.asyncio
+    async def test_connection_state_reset_on_rpyc_failure(self):
+        """Regression test for issue #63.
+
+        When _send_command catches an RPyC error (e.g. EOFError from a
+        dropped connection), the connection state must be reset so
+        subsequent calls fail fast with "Not connected to agent"
+        instead of cascading opaque RPyC errors.
+        """
+        from pathlib import Path
+        from datetime import datetime
+        from deep_worker_cli.exceptions import IPCConnectionError
+
+        mock_agent_info = AgentProcessInfo(
+            name="test_agent",
+            pid=12345,
+            pid_file=Path("/tmp/test.pid"),
+            working_dir="/tmp",
+            started_at=datetime.fromisoformat("2026-02-15T10:00:00"),
+            rpyc_port=18861,
+            last_activity=datetime.fromisoformat("2026-02-15T10:00:00"),
+        )
+
+        with patch("deep_worker_cli.client.agent_client.ProcessRegistry") as mock_registry_cls:
+            mock_registry = MagicMock(spec=ProcessRegistry)
+            mock_registry.lookup.return_value = mock_agent_info
+            mock_registry_cls.return_value = mock_registry
+
+            with patch(
+                "deep_worker_cli.client.agent_client.async_connect",
+                new_callable=AsyncMock,
+            ) as mock_async_connect:
+                mock_conn = MagicMock()
+                mock_conn.root = MagicMock()
+
+                # First call to async_request raises EOFError (dropped connection)
+                mock_conn.async_request = MagicMock(side_effect=EOFError("Connection closed"))
+
+                mock_async_connect.return_value = mock_conn
+
+                client = AgentClient("test_agent")
+                await client.connect()
+
+                assert client.connected is True
+                assert client._conn is mock_conn
+
+                # First call fails with RPyC communication error
+                with pytest.raises(IPCConnectionError, match="RPyC communication error") as exc:
+                    await client._send_command({"command": "status"})
+
+                # State must be reset after failure
+                assert client.connected is False, (
+                    "connected should be False after RPyC failure — "
+                    "fixes cascading errors (issue #63)"
+                )
+                assert client._conn is None
+                assert client._root is None
+
+                # Second call must fail fast at the guard check
+                with pytest.raises(IPCConnectionError, match="Not connected to agent"):
+                    await client._send_command({"command": "status"})
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

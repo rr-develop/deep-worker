@@ -131,7 +131,9 @@ async def test_stop_task_manager_returns_503_when_root_is_none(
     svc = MagicMock()
     svc.get_agent = AsyncMock(return_value=_agent_info("vc_x"))
     svc.is_connected = AsyncMock(return_value=False)
-    svc.connect_to_agent = AsyncMock(return_value=False)
+    # Router now uses the non-blocking ensure_connecting gate
+    # (the 2026-06-15 incident); not connected → returns False (awaitable).
+    svc.ensure_connecting = AsyncMock(return_value=False)
     svc.get_root = MagicMock(return_value=None)
 
     cli = await client_factory(svc)
@@ -171,7 +173,8 @@ async def test_stop_task_manager_returns_200_when_connected_without_tm_feature(
     svc = MagicMock()
     svc.get_agent = AsyncMock(return_value=_agent_info("vc_x"))
     svc.is_connected = AsyncMock(return_value=True)
-    svc.connect_to_agent = AsyncMock(return_value=True)
+    # Connected → ensure_connecting returns True (awaitable).
+    svc.ensure_connecting = AsyncMock(return_value=True)
     svc.get_root = MagicMock(return_value=bare_root)
 
     cli = await client_factory(svc)

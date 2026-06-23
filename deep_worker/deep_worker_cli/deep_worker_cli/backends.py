@@ -111,7 +111,56 @@ class CLIShellBackend(LocalShellBackend):
     def __init__(self, *args: object, **kwargs: object) -> None:
         super().__init__(*args, **kwargs)  # type: ignore[arg-type]
         self._jobs: dict[str, _BackgroundJob] = {}
+        # Alias map: the originating tool call's ``tool_use_id`` → canonical
+        # ``job_N``. Background jobs are keyed in ``_jobs`` by ``job_N`` only;
+        # this lets the model reach a job by EITHER id. See the mj2_vac
+        # incident (2026-06-17): the model passed the execute call's
+        # ``toolu_…`` tool_use_id instead of the advertised ``job_1`` and got
+        # "no background job" forever. Both id spaces must resolve.
+        self._job_aliases: dict[str, str] = {}
         self._job_counter = itertools.count(1)
+
+    @staticmethod
+    def _current_tool_use_id() -> str | None:
+        """The tool_use_id of the in-flight tool call, if a provider set it.
+
+        The claude-code provider stashes it in a ContextVar (vendored SDK
+        ``_mcp_context``) for the duration of each tool handler. Best-effort:
+        returns ``None`` when the provider/context is absent (other providers,
+        direct backend use, tests) — the job is then reachable only by its
+        ``job_N`` id, which is always valid."""
+        try:
+            # Optional, provider-only vendored SDK; not a deep_worker_cli
+            # dependency, so ``ty`` can't resolve it. Guarded at runtime.
+            from claude_agent_sdk._mcp_context import (  # noqa: PLC0415  # ty: ignore[unresolved-import]
+                get_current_claude_tool_use_id,
+            )
+        except Exception:  # noqa: BLE001 — provider not installed / no context
+            return None
+        try:
+            tid = get_current_claude_tool_use_id()
+        except Exception:  # noqa: BLE001
+            return None
+        return tid or None
+
+    def _resolve_job(self, job_id: str) -> _BackgroundJob | None:
+        """Look up a parked job by EITHER its canonical ``job_N`` id or the
+        ``tool_use_id`` alias of the ``execute`` call that spawned it."""
+        job = self._jobs.get(job_id)
+        if job is not None:
+            return job
+        canonical = self._job_aliases.get(job_id)
+        if canonical is not None:
+            return self._jobs.get(canonical)
+        return None
+
+    def _drop_job(self, job: _BackgroundJob) -> None:
+        """Remove a finished/killed job from ``_jobs`` and purge every alias
+        that points at it — no stale alias, no leak."""
+        self._jobs.pop(job.job_id, None)
+        stale = [a for a, canon in self._job_aliases.items() if canon == job.job_id]
+        for alias in stale:
+            self._job_aliases.pop(alias, None)
 
     def _format_partial(self, stdout: bytes, stderr: bytes) -> str:
         """Format already-captured output for an in-flight/finished job."""
@@ -177,21 +226,34 @@ class CLIShellBackend(LocalShellBackend):
             msg = f"timeout must be positive, got {effective_timeout}"
             raise ValueError(msg)
 
+        # Retry loop for transient OSError (e.g. ConnectionRefusedError)
+        # during subprocess creation. Retry once after 0.5s sleep.
+        # Other exception types (ValueError, TimeoutError, etc.) are NOT
+        # transient — they fall through to the outer handler directly.
+        # See DESIGN_FIX_EXECUTE_TOOL_CONNECTION_REFUSED_RETRY.md (#1192).
         try:
-            # Create async subprocess - DOES NOT block event loop!
-            # start_new_session=True puts the command in its OWN process
-            # group so that, if it is later killed as a background job, we can
-            # signal the WHOLE group (shell + its children, e.g. the `sleep`
-            # in `sleep 30 && echo`). Signalling only the shell pid leaks the
-            # child (observed live 2026-05-22).
-            proc = await asyncio.create_subprocess_shell(
-                command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=self._env,
-                cwd=str(self.cwd),
-                start_new_session=True,
-            )
+            for _attempt in (1, 2):
+                try:
+                    proc = await asyncio.create_subprocess_shell(
+                        command,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        env=self._env,
+                        cwd=str(self.cwd),
+                        start_new_session=True,
+                    )
+                except OSError as exc:
+                    if _attempt == 1:
+                        logger.warning(
+                            "execute() subprocess creation failed (attempt 1/2), "
+                            "retrying after 0.5s: %s: %s",
+                            type(exc).__name__,
+                            exc,
+                        )
+                        await asyncio.sleep(0.5)
+                        continue  # retry once
+                    raise  # second failure → outer except Exception
+                break  # success → proceed to pipe reading
 
             # Drain the pipes in a dedicated task so that, if the initial
             # wait times out, the command can keep running in the background
@@ -223,6 +285,12 @@ class CLIShellBackend(LocalShellBackend):
                     reader=reader,
                     started_at=_time.monotonic(),
                 )
+                # Also reach this job by the originating tool_use_id, so the
+                # model can't get stuck if it passes ``toolu_…`` instead of
+                # the advertised ``job_N`` (mj2_vac, 2026-06-17).
+                _tool_use_id = self._current_tool_use_id()
+                if _tool_use_id and _tool_use_id != job_id:
+                    self._job_aliases[_tool_use_id] = job_id
                 return ExecuteResponse(
                     output=(
                         f"Command still running after {effective_timeout}s timeout — "
@@ -230,6 +298,8 @@ class CLIShellBackend(LocalShellBackend):
                         f"  • wait_for_job(job_id=\"{job_id}\", timeout=<seconds>) "
                         f"to wait for it to finish\n"
                         f"  • kill_job(job_id=\"{job_id}\") to stop it\n"
+                        f"Pass job_id exactly as shown above (\"{job_id}\") — it is "
+                        f"NOT a tool_use_id.\n"
                         f"Command: {command}"
                     ),
                     exit_code=None,  # Still running — no exit code yet.
@@ -277,7 +347,7 @@ class CLIShellBackend(LocalShellBackend):
         """Build the final ExecuteResponse for a finished background job and
         drop it from the registry."""
         stdout_bytes, stderr_bytes = job.reader.result()
-        self._jobs.pop(job.job_id, None)
+        self._drop_job(job)
         output = self._format_partial(stdout_bytes, stderr_bytes)
         if output == "<no output yet>":
             output = "<no output>"
@@ -300,8 +370,11 @@ class CLIShellBackend(LocalShellBackend):
         Returns the job's full output + exit code when it finishes. If it is
         still running after ``timeout``, returns a message restating the same
         wait/kill options — the job is left running.
+
+        ``job_id`` may be either the canonical ``job_N`` id or the
+        ``tool_use_id`` of the ``execute`` call that spawned the job.
         """
-        job = self._jobs.get(job_id)
+        job = self._resolve_job(job_id)
         if job is None:
             return ExecuteResponse(
                 output=f"Error: no background job with id '{job_id}'.",
@@ -317,13 +390,15 @@ class CLIShellBackend(LocalShellBackend):
         try:
             await asyncio.wait_for(asyncio.shield(job.reader), timeout=effective_timeout)
         except asyncio.TimeoutError:
+            # Restate the CANONICAL job_N id (job.job_id), not whatever id the
+            # caller passed — this nudges the model back onto the stable id.
             return ExecuteResponse(
                 output=(
-                    f"Job '{job_id}' is STILL running after waiting "
+                    f"Job '{job.job_id}' is STILL running after waiting "
                     f"{effective_timeout}s — not killed.\n"
-                    f"  • wait_for_job(job_id=\"{job_id}\", timeout=<seconds>) "
+                    f"  • wait_for_job(job_id=\"{job.job_id}\", timeout=<seconds>) "
                     f"to keep waiting\n"
-                    f"  • kill_job(job_id=\"{job_id}\") to stop it\n"
+                    f"  • kill_job(job_id=\"{job.job_id}\") to stop it\n"
                     f"Command: {job.command}"
                 ),
                 exit_code=None,
@@ -334,8 +409,11 @@ class CLIShellBackend(LocalShellBackend):
 
     async def kill_job(self, job_id: str) -> ExecuteResponse:
         """Terminate a background job (SIGTERM, then SIGKILL) and return any
-        output captured before it died."""
-        job = self._jobs.get(job_id)
+        output captured before it died.
+
+        ``job_id`` may be either the canonical ``job_N`` id or the
+        ``tool_use_id`` of the ``execute`` call that spawned the job."""
+        job = self._resolve_job(job_id)
         if job is None:
             return ExecuteResponse(
                 output=f"Error: no background job with id '{job_id}'.",
@@ -375,12 +453,12 @@ class CLIShellBackend(LocalShellBackend):
             stdout_bytes, stderr_bytes = await asyncio.wait_for(job.reader, timeout=5.0)
         except (asyncio.TimeoutError, Exception):  # noqa: BLE001
             stdout_bytes, stderr_bytes = b"", b""
-        self._jobs.pop(job_id, None)
+        self._drop_job(job)
 
         captured = self._format_partial(stdout_bytes, stderr_bytes)
         return ExecuteResponse(
             output=(
-                f"Job '{job_id}' killed.\n"
+                f"Job '{job.job_id}' killed.\n"
                 f"Output captured before kill:\n{captured}"
             ),
             exit_code=job.proc.returncode,
@@ -407,8 +485,7 @@ def _format_execute_result(result: ExecuteResponse) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 🛑 PROTECTED INVARIANT — DO NOT BREAK (a related internal incident
-# analysis, not included here)
+# 🛑 PROTECTED INVARIANT — DO NOT BREAK (a related internal incident)
 # ═══════════════════════════════════════════════════════════════════════════
 # The agent's final backend may be wrapped in transparent proxies
 # (PrivateSummariesBackend → CompositeBackend → CLIShellBackend). Resolving the
@@ -422,7 +499,7 @@ def _format_execute_result(result: ExecuteResponse) -> str:
 #      _unwrap_proxy_backend follows) OR update _unwrap_proxy_backend.
 #   2. NEVER replace these `_unwrap_proxy_backend(...)` calls with a bare
 #      `isinstance(backend, CompositeBackend)` — that is exactly the regression
-#      (commit 9b8b570) that silently stripped the `execute` tool from an agent.
+#      (an earlier change) that silently stripped `execute` from an agent.
 #   3. Mirror ANY change here in deepagents `_supports_execution`.
 # Breakage symptom: agent reports "I have no execute tool" / "backend does not
 # support command execution". Covered by tests/unit_tests/test_sandbox_backend_unwrap.py.
@@ -472,7 +549,7 @@ def _get_sandbox_backend(
     ``PrivateSummariesBackend``) — without this, an agent whose final backend
     is ``PrivateSummariesBackend(CompositeBackend(CLIShellBackend))`` resolves
     to ``None`` and ``execute`` wrongly reports "backend does not support
-    command execution" (see a related internal incident analysis).
+    command execution" (a related internal incident).
 
     The returned backend must support a `timeout` kwarg on `execute()`
     (e.g., `CLIShellBackend`). The base `SandboxBackendProtocol` does not
@@ -676,7 +753,14 @@ class CLIFilesystemMiddleware(FilesystemMiddleware):
             return _format_execute_result(result)
 
         def sync_wait(
-            job_id: Annotated[str, "Background job id returned by execute on timeout."],
+            job_id: Annotated[
+                str,
+                "The background job id from execute's timeout message, e.g. "
+                "'job_1' or 'job_2'. Copy it VERBATIM from that message. This "
+                "is NOT a tool_use_id (a 'toolu_…' value) — do not pass one. "
+                "(The originating execute call's tool_use_id is also accepted "
+                "as a fallback, but the 'job_N' id is the correct value.)",
+            ],
             runtime: ToolRuntime[None, FilesystemState],
             timeout: Annotated[
                 int | None,
@@ -687,7 +771,14 @@ class CLIFilesystemMiddleware(FilesystemMiddleware):
             return _run_sync(job_id, timeout, runtime)
 
         async def async_wait(
-            job_id: Annotated[str, "Background job id returned by execute on timeout."],
+            job_id: Annotated[
+                str,
+                "The background job id from execute's timeout message, e.g. "
+                "'job_1' or 'job_2'. Copy it VERBATIM from that message. This "
+                "is NOT a tool_use_id (a 'toolu_…' value) — do not pass one. "
+                "(The originating execute call's tool_use_id is also accepted "
+                "as a fallback, but the 'job_N' id is the correct value.)",
+            ],
             runtime: ToolRuntime[None, FilesystemState],
             timeout: Annotated[  # noqa: ASYNC109
                 int | None,
@@ -725,7 +816,14 @@ class CLIFilesystemMiddleware(FilesystemMiddleware):
         )
 
         def sync_kill(
-            job_id: Annotated[str, "Background job id returned by execute on timeout."],
+            job_id: Annotated[
+                str,
+                "The background job id from execute's timeout message, e.g. "
+                "'job_1' or 'job_2'. Copy it VERBATIM from that message. This "
+                "is NOT a tool_use_id (a 'toolu_…' value) — do not pass one. "
+                "(The originating execute call's tool_use_id is also accepted "
+                "as a fallback, but the 'job_N' id is the correct value.)",
+            ],
             runtime: ToolRuntime[None, FilesystemState],
         ) -> str:
             sandbox = self._resolve_sandbox(runtime)
@@ -740,7 +838,14 @@ class CLIFilesystemMiddleware(FilesystemMiddleware):
             return _format_execute_result(result)
 
         async def async_kill(
-            job_id: Annotated[str, "Background job id returned by execute on timeout."],
+            job_id: Annotated[
+                str,
+                "The background job id from execute's timeout message, e.g. "
+                "'job_1' or 'job_2'. Copy it VERBATIM from that message. This "
+                "is NOT a tool_use_id (a 'toolu_…' value) — do not pass one. "
+                "(The originating execute call's tool_use_id is also accepted "
+                "as a fallback, but the 'job_N' id is the correct value.)",
+            ],
             runtime: ToolRuntime[None, FilesystemState],
         ) -> str:
             sandbox = self._resolve_sandbox(runtime)

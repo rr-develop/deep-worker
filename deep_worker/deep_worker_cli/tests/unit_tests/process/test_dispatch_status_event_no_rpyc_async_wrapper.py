@@ -49,11 +49,29 @@ def _make_bare_agent_process() -> AgentProcess:
     return agent
 
 
+def _make_mock_netref(on_message_func):
+    """Create a MagicMock whose ``____conn__`` evaluates
+    ``async_request(8, _, 'on_message', args, kwargs)`` by calling
+    ``on_message_func(args[0])`` — matching the real
+    ``asyncreq(subscriber, HANDLE_CALLATTR, 'on_message', ...)``
+    call in production code."""
+    class _Conn:
+        async def async_request(self, handler, _proxy, name, args, kwargs):
+            if handler == 8 and name == "on_message":
+                return await on_message_func(args[0])
+            raise NotImplementedError(
+                f"unexpected async_request handler={handler}"
+            )
+    netref = MagicMock()
+    object.__setattr__(netref, "____conn__", _Conn())
+    return netref
+
+
 @pytest.mark.asyncio
 async def test_dispatch_status_event_does_not_wrap_with_rpyc_async() -> None:
     agent = _make_bare_agent_process()
-    cb = MagicMock()
-    cb.on_message = AsyncMock()
+    on_message_mock = AsyncMock()
+    cb = _make_mock_netref(on_message_mock)
     agent._message_subscribers.add(cb)
 
     # Patch ``rpyc.async_`` at the source. If the implementation
@@ -71,8 +89,8 @@ async def test_dispatch_status_event_does_not_wrap_with_rpyc_async() -> None:
         "_dispatch_status_event must not wrap on_message with rpyc.async_; "
         "with rpyc_async the async netref already picks HANDLE_ASYNC_CALL"
     )
-    assert cb.on_message.await_count == 1
-    (arg,) = cb.on_message.await_args.args
+    assert on_message_mock.await_count == 1
+    (arg,) = on_message_mock.await_args.args
     payload = json.loads(arg)
     assert payload["type"] == "status_change"
     # status defaults to "idle" when session_manager is None (see
@@ -98,8 +116,7 @@ async def test_dispatch_status_event_awaits_async_callback_coroutine() -> None:
         await asyncio.sleep(0)
         delivered.append(payload)
 
-    cb = MagicMock()
-    cb.on_message = on_message
+    cb = _make_mock_netref(on_message)
     agent._message_subscribers.add(cb)
 
     await agent._dispatch_status_event({"type": "status_change"})
@@ -125,10 +142,8 @@ async def test_dispatch_status_event_survives_broken_subscriber() -> None:
         assert isinstance(payload, str)
         raise RuntimeError("peer gone")
 
-    good = MagicMock()
-    good.on_message = good_on_message
-    bad = MagicMock()
-    bad.on_message = bad_on_message
+    good = _make_mock_netref(good_on_message)
+    bad = _make_mock_netref(bad_on_message)
     agent._message_subscribers.add(good)
     agent._message_subscribers.add(bad)
 

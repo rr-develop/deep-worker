@@ -150,14 +150,14 @@ class TestDeltaBasics:
 
         # Second checkpoint: messages unchanged, only working_dir updated
         cp2, cp2_id = _make_checkpoint(msgs, parent_id=cp1_id, updated_channels=["working_dir"])
-        cp2["channel_values"]["working_dir"] = "/tmp/new"
+        cp2["channel_values"]["working_dir"] = "/path/to/new"
         config2 = await checkpointer.aput(config1, cp2, {}, {})
 
         # Verify messages preserved, working_dir updated
         loaded = await checkpointer.aget_tuple(config2)
         messages = loaded.checkpoint["channel_values"]["messages"]
         assert len(messages) == 1
-        assert loaded.checkpoint["channel_values"]["working_dir"] == "/tmp/new"
+        assert loaded.checkpoint["channel_values"]["working_dir"] == "/path/to/new"
 
 
 class TestBackwardCompatibility:
@@ -242,3 +242,31 @@ class TestThreadMetadata:
         assert row[0] == "test_agent"
         assert row[1] == 1  # 1 message
         assert row[2] == 1  # 1 checkpoint
+
+
+class TestPragmaSettings:
+    """WAL mode and synchronous=NORMAL are set on setup."""
+
+    @pytest.mark.asyncio
+    async def test_journal_mode_is_wal_after_setup(self, tmp_path):
+        """setup() should set journal_mode=WAL."""
+        db_path = str(tmp_path / "test_wal.db")
+        async with DeltaSqliteCheckpointer.from_conn_string(db_path) as cp:
+            await cp.setup()
+            cursor = await cp.conn.execute("PRAGMA journal_mode")
+            row = await cursor.fetchone()
+            # Returns "wal" (lowercase) on success
+            assert row is not None
+            assert row[0] == "wal"
+
+    @pytest.mark.asyncio
+    async def test_synchronous_is_normal_after_setup(self, tmp_path):
+        """setup() should set synchronous=NORMAL (1)."""
+        db_path = str(tmp_path / "test_sync.db")
+        async with DeltaSqliteCheckpointer.from_conn_string(db_path) as cp:
+            await cp.setup()
+            cursor = await cp.conn.execute("PRAGMA synchronous")
+            row = await cursor.fetchone()
+            assert row is not None
+            # NORMAL = 1
+            assert row[0] == 1

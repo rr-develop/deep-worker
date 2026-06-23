@@ -9,7 +9,8 @@
     "**/node_modules"
   ],
   "extraPaths": [
-    ".."
+    "..",
+    "../deep_worker/deepagents"
   ],
   "typeCheckingMode": "strict",
   "reportMissingImports": true,

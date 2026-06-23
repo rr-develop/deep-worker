@@ -33,7 +33,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import (
+    AIMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
 
 from deepagents.middleware.message_timestamps import CREATED_AT_KEY, TOOL_CALL_CREATED_AT_KEY
 
@@ -62,6 +67,17 @@ def serialize_message(msg: Any) -> dict[str, Any]:
         content = msg.content if isinstance(msg.content, str) else str(msg.content)
         msg_dict["content"] = content
 
+    elif isinstance(msg, SystemMessage):
+        # ⚠️ POLICY: SystemMessages MUST be serialized WITH their content.
+        # They carry the agent's base system prompt AND runtime middleware
+        # hints (e.g. the inter-agent reply hint from
+        # InterAgentReplyMiddleware). Dropping them silently from history
+        # produces a misleading "full" rendering — explicitly forbidden.
+        # See the full-dialog rendering design notes
+        # §"System messages are first-class in history rendering".
+        content = msg.content if isinstance(msg.content, str) else str(msg.content)
+        msg_dict["content"] = content
+
     elif isinstance(msg, AIMessage):
         content = msg.content
         if isinstance(content, str):
@@ -69,7 +85,7 @@ def serialize_message(msg: Any) -> dict[str, Any]:
         elif isinstance(content, list):
             # Concatenate text blocks (the only shape we currently emit
             # in streaming). Non-text blocks fall through silently — a
-            # plain-text history view is what the web client needs.
+            # plain-text history view is what the web UI needs.
             text_content = ""
             for block in content:
                 if isinstance(block, dict) and block.get("type") == "text":

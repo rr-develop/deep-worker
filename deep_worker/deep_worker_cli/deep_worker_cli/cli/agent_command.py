@@ -43,9 +43,56 @@ _PARSER_DEFAULTS = {
     "clean": False,
     "memory_only": False,
     "use_sqlite": False,
+    "history_memory": False,
     "auto_approve_send_message": False,
     "dev_tree": False,
+    "preferred_provider": None,
+    "no_update_preferred": False,
+    "fork": None,
+    "fork_from": None,
 }
+
+
+# ---------------------------------------------------------------------------
+# Persisted-boolean-options registry
+# ---------------------------------------------------------------------------
+#
+# Single source of truth for the booleans that survive an agent restart.
+#
+# Both restart paths (CLI ``deep-worker --restart`` and web
+# ``_spawn_subprocess``) must consult THIS list rather than maintain their own
+# parallel hard-coded sequence of ``if config.get(...)`` lines — that opt-in
+# pattern is what caused the 2026-06-05 ``-m`` regression and is structurally
+# unable to detect "you added an option but forgot to preserve it".
+#
+# Coverage rule (enforced by ``tests/unit_tests/cli/test_boolean_flags_registry.py``):
+#   Every boolean key in _PARSER_DEFAULTS MUST be either in _BOOLEAN_FLAGS
+#   (preserved) or in _NON_PRESERVED_BOOLEAN_OPTIONS (explicitly excluded).
+#
+# Format: (dest, cli_flag_for_true, cli_flag_for_false_or_None)
+#   - cli_flag_for_true: the form a respawn emits when the persisted value
+#     is True (e.g. "-m").
+#   - cli_flag_for_false: the --no-* counterpart, for CLI-side disabling at
+#     restart time (consumed by create_parser() / _explicit_cli_flags()).
+#
+# See docs/DESIGN_RESTART_OPTION_PRESERVATION.md.
+_BOOLEAN_FLAGS: tuple[tuple[str, str, str | None], ...] = (
+    ("skip_permissions",          "-sp",           "--no-skip-permissions"),
+    ("task_manager",              "-tm",           "--no-tm"),
+    ("auto_approve_send_message", "-asm",          "--no-auto-approve-send-message"),
+    ("memory_only",               "--memory-only", "--no-memory-only"),
+    ("history_memory",            "-m",            "--no-m"),
+    ("use_sqlite",                "--use-sqlite",  "--no-use-sqlite"),
+    ("dev_tree",                  "--dev",         "--no-dev"),
+)
+
+# Booleans that are intentionally NOT preserved across restart. Each entry
+# must have a written justification (one-shot intent, explicit per-launch
+# action, etc.). Adding to this set is a documented decision, not a default.
+_NON_PRESERVED_BOOLEAN_OPTIONS: frozenset[str] = frozenset({
+    "clean",                # Explicit per-launch action; never a persistent mode.
+    "no_update_preferred",  # One-shot failover override; not a persistent mode.
+})
 
 
 def normalize_model_arg(args: argparse.Namespace) -> None:
@@ -73,7 +120,7 @@ def normalize_model_arg(args: argparse.Namespace) -> None:
 
 def _get_agent_data_dir(name: str) -> Path:
     """Return the data directory for an agent."""
-    return Path("~/.deep_worker").expanduser() / name
+    return Path.home() / Path("~/.deep_worker").name / name
 
 
 def load_launch_config(name: str) -> dict | None:
@@ -102,7 +149,7 @@ def _explicit_cli_flags(argv: list[str] | None = None) -> set[str]:
     default": the parser default for ``--provider`` is ``"deepseek"``, so a
     user who runs ``--restart a --provider deepseek`` produces a value that
     equals the default and would be mistaken for "flag not passed" — the
-    saved provider would silently win (incident observed 2026-05-29).
+    saved provider would silently win (an incident observed live, 2026-05-29).
 
     To detect presence reliably we re-parse ``argv`` with a throwaway parser
     whose options default to ``argparse.SUPPRESS``. With SUPPRESS, a dest only
@@ -128,10 +175,39 @@ def _explicit_cli_flags(argv: list[str] | None = None) -> set[str]:
     detector.add_argument("--clean", action="store_true", default=argparse.SUPPRESS)
     detector.add_argument("--memory-only", dest="memory_only",
                           action="store_true", default=argparse.SUPPRESS)
+    detector.add_argument("-m", "--history-memory", dest="history_memory",
+                          action="store_true", default=argparse.SUPPRESS)
     detector.add_argument("--use-sqlite", dest="use_sqlite",
                           action="store_true", default=argparse.SUPPRESS)
     detector.add_argument("--dev", dest="dev_tree",
                           action="store_true", default=argparse.SUPPRESS)
+    detector.add_argument("--preferred-provider", dest="preferred_provider",
+                          default=argparse.SUPPRESS)
+    detector.add_argument("--no-update-preferred", dest="no_update_preferred",
+                          action="store_true", default=argparse.SUPPRESS)
+    detector.add_argument("--fork", dest="fork",
+                          default=argparse.SUPPRESS)
+    detector.add_argument("--from", dest="fork_from",
+                          default=argparse.SUPPRESS)
+
+    # --no-* counterparts (store_const with const=False, default=SUPPRESS).
+    # These extend the real parser's --no-* flags so that passing e.g.
+    # --no-skip-permissions puts "skip_permissions" into the explicit set.
+    detector.add_argument("--no-skip-permissions", dest="skip_permissions",
+                          action="store_const", const=False, default=argparse.SUPPRESS)
+    detector.add_argument("--no-task-manager", "--no-tm", dest="task_manager",
+                          action="store_const", const=False, default=argparse.SUPPRESS)
+    detector.add_argument("--no-auto-approve-send-message",
+                          dest="auto_approve_send_message",
+                          action="store_const", const=False, default=argparse.SUPPRESS)
+    detector.add_argument("--no-memory-only", dest="memory_only",
+                          action="store_const", const=False, default=argparse.SUPPRESS)
+    detector.add_argument("--no-history-memory", "--no-m", dest="history_memory",
+                          action="store_const", const=False, default=argparse.SUPPRESS)
+    detector.add_argument("--no-use-sqlite", dest="use_sqlite",
+                          action="store_const", const=False, default=argparse.SUPPRESS)
+    detector.add_argument("--no-dev", dest="dev_tree",
+                          action="store_const", const=False, default=argparse.SUPPRESS)
 
     # parse_known_args: ignore every other flag the real parser owns.
     ns, _ = detector.parse_known_args(argv)
@@ -151,7 +227,7 @@ def merge_restart_config(
     default" alone is unsafe for ``--provider``, whose default is a real
     provider name (``"deepseek"``): an explicit ``--provider deepseek`` would
     otherwise be indistinguishable from "not passed" and silently dropped
-    (incident observed 2026-05-29).
+    (an incident observed live, 2026-05-29).
 
     When the provider is overridden but ``--model`` is NOT explicitly given,
     the saved model is NOT inherited (it belongs to the OLD provider and would
@@ -183,7 +259,7 @@ def merge_restart_config(
     effective.provider = saved.get("provider", _PARSER_DEFAULTS["provider"])
     effective.model = saved.get("model", _PARSER_DEFAULTS["model"])
     # Heal legacy poison: older builds persisted an unspecified model as
-    # the literal "unknown" (incident observed 2026-05-20). Treat that
+    # the literal "unknown" (observed live). Treat that
     # as "no model specified" so the provider default kicks back in on
     # restart instead of forwarding the bad string to the API.
     if effective.model == "unknown":
@@ -192,12 +268,18 @@ def merge_restart_config(
     effective.skip_permissions = saved.get("skip_permissions", False)
     effective.task_manager = saved.get("task_manager", False)
     effective.memory_only = saved.get("memory_only", False)
+    effective.history_memory = saved.get("history_memory", False)
     effective.use_sqlite = saved.get("use_sqlite", False)
     effective.auto_approve_send_message = saved.get(
         "auto_approve_send_message", False
     )
     effective.dev_tree = saved.get("dev_tree", False)
     effective.clean = False  # NEVER inherit --clean
+
+    # External MCP CLI overrides — restore from saved launch_config so a
+    # restart reuses them (DESIGN_EXTERNAL_MCP_TOOLS.md §3.7).
+    effective.mcp_config_paths = list(saved.get("mcp_config_paths") or [])
+    effective.mcp_server_inline = list(saved.get("mcp_server_inline") or [])
 
     # Override with explicitly provided CLI args
     provider_overridden = _is_override(
@@ -212,7 +294,7 @@ def merge_restart_config(
     elif provider_overridden and effective.provider != saved.get("provider"):
         # Provider changed but no --model given: do NOT carry the old
         # provider's model forward. Reset so build_launch_config() resolves
-        # the new provider's default (incident observed 2026-05-29).
+        # the new provider's default (an incident observed live, 2026-05-29).
         effective.model = None
     if _is_override("dir", args.dir, _PARSER_DEFAULTS["dir"]):
         effective.dir = args.dir
@@ -227,6 +309,9 @@ def merge_restart_config(
     if _is_override("memory_only", args.memory_only,
                     _PARSER_DEFAULTS["memory_only"]):
         effective.memory_only = args.memory_only
+    if _is_override("history_memory", getattr(args, "history_memory", False),
+                    _PARSER_DEFAULTS["history_memory"]):
+        effective.history_memory = args.history_memory
     if _is_override("use_sqlite", args.use_sqlite,
                     _PARSER_DEFAULTS["use_sqlite"]):
         effective.use_sqlite = args.use_sqlite
@@ -243,6 +328,66 @@ def merge_restart_config(
         _PARSER_DEFAULTS["dev_tree"],
     ):
         effective.dev_tree = args.dev_tree
+    mcp_config_paths = list(getattr(args, "mcp_config_paths", None) or [])
+    mcp_server_inline = list(getattr(args, "mcp_server_inline", None) or [])
+    if _is_override("mcp_config_paths", mcp_config_paths, []):
+        effective.mcp_config_paths = mcp_config_paths
+    if _is_override("mcp_server_inline", mcp_server_inline, []):
+        effective.mcp_server_inline = mcp_server_inline
+
+    # ------------------------------------------------------------------
+    # preferred_provider logic
+    # ------------------------------------------------------------------
+    # Backfill: agents created before preferred_provider existed get
+    # preferred_provider = their current provider (first-run defaulting).
+    # This runs once and is sticky thereafter.
+    saved_pp = saved.get("preferred_provider")
+    if saved_pp:
+        effective.preferred_provider = saved_pp
+    else:
+        effective.preferred_provider = saved.get("provider", _PARSER_DEFAULTS["provider"])
+
+    # --preferred-provider X: override BOTH preferred_provider AND provider.
+    # The operator is explicitly setting a new long-term preference, so
+    # the active provider follows.
+    pp_explicit = _is_override(
+        "preferred_provider",
+        getattr(args, "preferred_provider", _PARSER_DEFAULTS["preferred_provider"]),
+        _PARSER_DEFAULTS["preferred_provider"],
+    )
+    if pp_explicit:
+        effective.preferred_provider = args.preferred_provider
+        effective.provider = args.preferred_provider
+
+    # --no-update-preferred: keep preferred_provider intact even when
+    # provider is overridden. Used by automatic failover so that a
+    # temporary provider switch does not overwrite the operator's
+    # long-term preference.
+    if getattr(args, "no_update_preferred", False):
+        # Restore preferred to saved (undo any provider-change side effect)
+        effective.preferred_provider = saved.get("preferred_provider") or saved.get(
+            "provider", _PARSER_DEFAULTS["provider"]
+        )
+
+    # preferred_model: operator's model on preferred_provider (for restore-on-idle).
+    saved_pp = effective.preferred_provider
+    saved_provider = saved.get("provider", _PARSER_DEFAULTS["provider"])
+    if saved.get("preferred_model"):
+        effective.preferred_model = saved.get("preferred_model")
+    elif saved_pp and saved_provider == saved_pp and saved.get("model"):
+        effective.preferred_model = saved.get("model")
+    else:
+        effective.preferred_model = None
+
+    if getattr(args, "no_update_preferred", False) and provider_overridden:
+        target = effective.provider
+        if target == effective.preferred_provider and effective.preferred_model:
+            # Restore-on-idle / failover return: keep opus (etc.), not provider default.
+            if not model_explicit:
+                effective.model = effective.preferred_model
+
+    if effective.provider == effective.preferred_provider and effective.model:
+        effective.preferred_model = effective.model
 
     return effective
 
@@ -265,7 +410,7 @@ def build_launch_config(args: argparse.Namespace) -> dict:
         # None — the codex CLI then picks its own current default. Do
         # NOT coerce to "unknown": that string would be read back on
         # restart and forwarded to CodexChatModel, which the API
-        # rejects with HTTP 400 (incident observed 2026-05-20).
+        # rejects with HTTP 400 (observed live).
         model = get_default_model_name(args.provider)
 
     working_dir = args.dir
@@ -277,8 +422,31 @@ def build_launch_config(args: argparse.Namespace) -> dict:
     # launcher's re-exec (which strips --dev from argv), from the
     # DEEP_WORKER_DEV_TREE=1 env var. Honor either source. Only the
     # exact string "1" counts as truthy — '0', 'false', '' do not.
-    dev_tree = getattr(args, "dev_tree", False) or (
-        os.environ.get("DEEP_WORKER_DEV_TREE") == "1"
+    #
+    # THIRD source (fix 2026-06-18): the code actually running. When an
+    # agent is launched DIRECTLY from the dev checkout (e.g.
+    # ``python3 -m deep_worker_cli.cli.agent_command <name> --provider grok``
+    # without going through the bash launcher / without ``--dev``), neither
+    # of the above is set, so ``dev_tree`` would persist as False even though
+    # ``tree_root`` (==``_repo_root``) IS the dev tree. A web-UI restart then
+    # reconstructs the spawn on the PROD tree (``_spawn_subprocess`` keys off
+    # ``dev_tree``), where a dev-only provider like ``grok`` is unknown to the
+    # argparse ``--provider`` choices → the agent dies at startup and never
+    # comes back (observed live). Deriving dev_tree from the
+    # real code tree keeps the persisted flag consistent with reality, so the
+    # flag never lies about which tree must be used on restart. The canonical
+    # dev tree path mirrors the bash launcher's DEV_TREE (override honored for
+    # tests).
+    _dev_tree_root = Path(
+        os.environ.get(
+            "DEEP_WORKER_DEV_TREE_ROOT_OVERRIDE", f"{_repo_root}_dev"
+        )
+    )
+    _running_from_dev_tree = _repo_root.resolve() == _dev_tree_root.resolve()
+    dev_tree = (
+        getattr(args, "dev_tree", False)
+        or (os.environ.get("DEEP_WORKER_DEV_TREE") == "1")
+        or _running_from_dev_tree
     )
 
     return {
@@ -288,12 +456,27 @@ def build_launch_config(args: argparse.Namespace) -> dict:
         "skip_permissions": args.skip_permissions,
         "task_manager": args.task_manager,
         "memory_only": args.memory_only,
+        "history_memory": getattr(args, "history_memory", False),
         "use_sqlite": args.use_sqlite,
         "clean": args.clean,
         "auto_approve_send_message": getattr(
             args, "auto_approve_send_message", False
         ),
         "dev_tree": dev_tree,
+        "preferred_provider": getattr(
+            args, "preferred_provider", args.provider
+        ),
+        "preferred_model": (
+            model
+            if args.provider
+            == getattr(args, "preferred_provider", args.provider)
+            else getattr(args, "preferred_model", None)
+        ),
+        # External MCP CLI overrides — persisted so that --restart preserves them.
+        "mcp_config_paths": list(getattr(args, "mcp_config_paths", None) or []),
+        "mcp_server_inline": list(getattr(args, "mcp_server_inline", None) or []),
+        "storage_version": 5,
+        "tree_root": str(_repo_root),
         "started_at": datetime.now().isoformat(),
         "pid": os.getpid(),
         "cli_args": " ".join(sys.argv[1:]),
@@ -364,9 +547,135 @@ async def restart_agent(args: argparse.Namespace) -> int:
     args.skip_permissions = effective.skip_permissions
     args.task_manager = effective.task_manager
     args.memory_only = effective.memory_only
+    args.history_memory = effective.history_memory
     args.use_sqlite = effective.use_sqlite
     args.auto_approve_send_message = effective.auto_approve_send_message
     args.clean = False  # Already handled above if needed
+    # Copy preferred_provider (may differ from args.provider when
+    # --provider was overridden but --no-update-preferred was set)
+    args.preferred_provider = getattr(effective, "preferred_provider", args.provider)
+
+    return await run_agent(args)
+
+
+async def do_fork(args: argparse.Namespace) -> int:
+    """Handle --fork command.
+
+    Forks (snapshot-copies) an existing agent's data directory and starts
+    the new agent with its own history.
+
+    Args:
+        args: Parsed command-line arguments.
+
+    Returns:
+        Exit code (0 success, 1 error).
+    """
+    from deep_worker_cli.fork_agent import fork_agent_data as _fork_data
+
+    new_name = args.name
+    old_name = args.fork
+
+    if not new_name:
+        print("Error: Agent name is required with --fork", file=sys.stderr)
+        return 1
+
+    if not old_name:
+        print("Error: --fork requires a source agent name", file=sys.stderr)
+        return 1
+
+    # --fork and --clean are incompatible
+    if getattr(args, "clean", False):
+        print(
+            "Error: --clean and --fork are incompatible. "
+            "A fork creates a new agent with its own data; "
+            "cleaning the source is a separate operation.",
+            file=sys.stderr,
+        )
+        return 1
+
+    from_msg = getattr(args, "fork_from", None)
+    if from_msg:
+        print(f"Forking with --from {from_msg} (truncate at message_id).")
+
+    # Resolve paths for pre-checks
+    src_dir = _get_agent_data_dir(old_name)
+    dst_dir = _get_agent_data_dir(new_name)
+
+    if not src_dir.is_dir():
+        print(
+            f"Error: Source agent '{old_name}' not found at {src_dir}.\n"
+            f"Start the source agent first:  deep-worker {old_name} --provider ... --model ...",
+            file=sys.stderr,
+        )
+        return 1
+
+    if dst_dir.exists():
+        print(
+            f"Error: Agent '{new_name}' already exists at {dst_dir}.\n"
+            f"Choose a different name or remove it first.",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Load saved launch_config from source
+    saved = load_launch_config(old_name)
+    if saved is None:
+        print(
+            f"Error: Source agent '{old_name}' has no launch configuration.\n"
+            f"Start the source agent first:  deep-worker {old_name} --provider ... --model ...",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Merge CLI overrides (same logic as --restart)
+    effective = merge_restart_config(saved, args)
+
+    # Build a complete launch_config via build_launch_config() (unlike
+    # run_agent()'s incomplete inline dict which misses dev_tree and
+    # preferred_provider — see DESIGN_FORK_AGENT.md ISSUE 2).
+    launch_config = build_launch_config(effective)
+    launch_config["name"] = new_name
+
+    # Fork the data
+    try:
+        _fork_data(old_name, new_name, message_id=from_msg)
+    except Exception as e:
+        # Partial copy cleanup
+        shutil.rmtree(dst_dir, ignore_errors=True)
+        print(f"Error during fork: {e}", file=sys.stderr)
+        return 1
+
+    # Write the merged launch_config to the new agent's metadata.
+    # We overwrite what fork_agent_data wrote (which copied the old
+    # metadata) with the fully merged config.
+    meta_path = dst_dir / "session_metadata.json"
+    launch_config["cli_args"] = " ".join(sys.argv[1:])
+    meta_data = {
+        "status": "idle",
+        "tasks_completed": 0,
+        "message_count": 0,
+        "error_message": None,
+        "last_activity": "",
+        "storage_version": launch_config.get("storage_version", 5),
+        "launch_config": launch_config,
+    }
+    meta_path.write_text(json.dumps(meta_data, indent=2, ensure_ascii=False))
+    os.chmod(meta_path, 0o600)
+
+    print(f"Forked agent '{new_name}' from '{old_name}'.")
+
+    # Apply effective args and delegate to run_agent
+    args.provider = effective.provider
+    args.model = effective.model
+    args.dir = effective.dir
+    args.skip_permissions = effective.skip_permissions
+    args.task_manager = effective.task_manager
+    args.memory_only = effective.memory_only
+    args.history_memory = effective.history_memory
+    args.use_sqlite = effective.use_sqlite
+    args.auto_approve_send_message = effective.auto_approve_send_message
+    args.clean = False
+    args.preferred_provider = getattr(effective, "preferred_provider", args.provider)
 
     return await run_agent(args)
 
@@ -404,7 +713,7 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--provider",
         default="deepseek",
-        choices=["deepseek", "gemini", "openai", "claude-code", "codex"],
+        choices=["deepseek", "gemini", "openai", "claude-code", "codex", "grok"],
         help="AI provider to use (default: deepseek)",
     )
 
@@ -415,6 +724,13 @@ def create_parser() -> argparse.ArgumentParser:
         dest="skip_permissions",
         help="Skip permissions (auto-approve dangerous operations)",
     )
+    parser.add_argument(
+        "--no-skip-permissions",
+        dest="skip_permissions",
+        action="store_const",
+        const=False,
+        help="Disable skip-permissions (useful with --restart to override a saved True value)",
+    )
 
     parser.add_argument(
         "-tm",
@@ -422,6 +738,13 @@ def create_parser() -> argparse.ArgumentParser:
         action="store_true",
         dest="task_manager",
         help="Enable TaskManager for AI-powered task evaluation and correction",
+    )
+    parser.add_argument(
+        "--no-task-manager", "--no-tm",
+        dest="task_manager",
+        action="store_const",
+        const=False,
+        help="Disable TaskManager (useful with --restart to override a saved True value)",
     )
 
     parser.add_argument(
@@ -437,6 +760,13 @@ def create_parser() -> argparse.ArgumentParser:
             "when -sp / --skip-permissions is also set (everything is "
             "already auto-approved in that case)."
         ),
+    )
+    parser.add_argument(
+        "--no-auto-approve-send-message",
+        dest="auto_approve_send_message",
+        action="store_const",
+        const=False,
+        help="Disable auto-approve-send-message (useful with --restart to override a saved True value)",
     )
 
     parser.add_argument(
@@ -480,8 +810,9 @@ def create_parser() -> argparse.ArgumentParser:
         action="store_true",
         dest="dev_tree",
         help=(
-            "Run the agent using the development codebase instead of the "
-            "production codebase. The flag is normally consumed by the "
+            "Run the agent using the development codebase "
+            "instead of the production codebase. The flag is normally "
+            "consumed by the "
             "bash launcher (deep-worker) BEFORE Python starts; it is also "
             "declared here so argparse does not reject it inside the dev "
             "tree after the re-exec, and so it can be persisted to "
@@ -489,13 +820,70 @@ def create_parser() -> argparse.ArgumentParser:
             "docs/DESIGN_DEV_FLAG.md."
         ),
     )
+    parser.add_argument(
+        "--no-dev",
+        dest="dev_tree",
+        action="store_const",
+        const=False,
+        help="Disable dev-tree mode (useful with --restart to override a saved True value)",
+    )
 
     parser.add_argument(
         "--restart",
         action="store_true",
         help="Restart agent with parameters from previous launch. "
              "Additional options override saved values. "
+             "Use --no-* flags (e.g. --no-tm, --no-skip-permissions) to "
+             "disable a previously saved boolean flag. "
              "--clean is NOT inherited; pass it explicitly if needed.",
+    )
+
+    parser.add_argument(
+        "--fork",
+        metavar="SOURCE_NAME",
+        default=None,
+        help="Fork (clone) an existing agent's data directory. "
+             "Creates a new agent with the source's launch config, "
+             "checkpoint history, summaries, and working data. "
+             "Optional --from <message_id> truncates history at that point. "
+             "Use --provider/--model/--dir/-sp/-tm/-m etc. to override "
+             "the source's saved launch config.",
+    )
+
+    parser.add_argument(
+        "--from",
+        metavar="MESSAGE_ID",
+        dest="fork_from",
+        default=None,
+        help="When used with --fork, truncate the new agent's history "
+             "at this message_id. Messages after this ID are dropped. "
+             "If the message_id is not found, the command fails with "
+             "a non-zero exit code.",
+    )
+
+    parser.add_argument(
+        "--preferred-provider",
+        default=None,
+        dest="preferred_provider",
+        help=(
+            "Set the preferred provider for this agent (overrides both "
+            "preferred_provider AND active provider). When omitted on a "
+            "restart, preferred_provider is inherited from the saved "
+            "launch config. Automatic failover always uses "
+            "--no-update-preferred to preserve your preference."
+        ),
+    )
+
+    parser.add_argument(
+        "--no-update-preferred",
+        action="store_true",
+        dest="no_update_preferred",
+        help=(
+            "When restarting with --provider, do NOT update the saved "
+            "preferred_provider. Intended for automatic failover so the "
+            "operator's original preference survives a temporary provider "
+            "switch. Also see --preferred-provider."
+        ),
     )
 
     parser.add_argument(
@@ -575,7 +963,7 @@ def create_parser() -> argparse.ArgumentParser:
         help=(
             "Remove conversation data older than DATE (ISO 8601 or relative "
             "like 30d, 1y). Prunes checkpoint threads AND offloaded summary "
-            "sections under the agent's data directory (summaries/) across ALL "
+            "sections under each agent's local summaries directory across ALL "
             "agents in the current $HOME (destructive and global — NEVER "
             "run in ad-hoc integration tests without an isolated HOME). "
             "If DATE resolves to a future timestamp, the command refuses "
@@ -585,12 +973,19 @@ def create_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
+        "--info",
+        action="store_true",
+        dest="info",
+        help="Show launch configuration and runtime status of an agent (read-only, offline).",
+    )
+
+    parser.add_argument(
         "--list-summaries",
         action="store_true",
         dest="list_summaries",
         help=(
-            "List offloaded conversation-history files from the agent's "
-            "data directory (summaries/). Use --agent NAME to filter, "
+            "List offloaded conversation-history files from "
+            "each agent's local summaries directory. Use --agent NAME to filter, "
             "--format json for machine-readable output."
         ),
     )
@@ -630,6 +1025,60 @@ def create_parser() -> argparse.ArgumentParser:
         help="Force SQLite persistence (even in test environment)",
     )
 
+    # --no-* counterparts live OUTSIDE the mutually exclusive group
+    # (they are not exclusive — they just set the flag to False).
+    parser.add_argument(
+        "--no-memory-only",
+        dest="memory_only",
+        action="store_const",
+        const=False,
+        help="Disable memory-only mode (useful with --restart to override a saved True value)",
+    )
+    parser.add_argument(
+        "--no-use-sqlite",
+        dest="use_sqlite",
+        action="store_const",
+        const=False,
+        help="Disable sqlite (useful with --restart to override a saved True value)",
+    )
+
+    parser.add_argument(
+        "-m", "--history-memory",
+        action="store_true",
+        dest="history_memory",
+        help="Enable semantic search over summarised conversation history "
+             "(indexes past messages for recall with the history_memory tool)",
+    )
+    parser.add_argument(
+        "--no-history-memory", "--no-m",
+        dest="history_memory",
+        action="store_const",
+        const=False,
+        help="Disable history-memory (useful with --restart to override a saved True value)",
+    )
+
+    # External MCP — see docs/DESIGN_EXTERNAL_MCP_TOOLS.md.
+    parser.add_argument(
+        "--mcp-config",
+        dest="mcp_config_paths",
+        action="append",
+        default=[],
+        help=(
+            "Path to an additional MCP config file (same JSON shape as "
+            "the default agent MCP config). Repeatable; later files override earlier."
+        ),
+    )
+    parser.add_argument(
+        "--mcp-server",
+        dest="mcp_server_inline",
+        action="append",
+        default=[],
+        help=(
+            "Inline MCP server, formatted '<name>={...json...}'. Repeatable. "
+            "Overrides any same-named entry from config files."
+        ),
+    )
+
     return parser
 
 
@@ -637,7 +1086,7 @@ def create_parser() -> argparse.ArgumentParser:
 #
 # An earlier version seeded ``claude_session_state.json`` with the imported
 # transcript's uuid so the claude-code provider would RESUME that real file.
-# That broke tool availability (observed with a live agent on 2026-05-24): the imported transcript is
+# That broke tool availability (observed live): the imported transcript is
 # an ORDINARY ``claude`` session created OUTSIDE deep_worker. Resuming it makes
 # the CLI restore THAT session's tool/permission configuration, which has no
 # ``mcp__deepworker__*`` tools. deep_worker only sets ``disallowed_tools`` (it
@@ -779,25 +1228,20 @@ async def run_agent(args: argparse.Namespace) -> int:
                 provider=args.provider,
             )
 
-        # Build launch_config for persistent storage
-        # This dict is saved to the agent's session metadata file
-        # so that launch parameters survive process termination.
-        launch_config = {
-            "provider": config.provider,
-            "model": config.resolved_model,
-            "working_dir": str(config.working_dir),
-            "skip_permissions": args.skip_permissions,
-            "task_manager": args.task_manager,
-            "memory_only": args.memory_only,
-            "use_sqlite": args.use_sqlite,
-            "clean": getattr(args, "clean", False),
-            "auto_approve_send_message": getattr(
-                args, "auto_approve_send_message", False
-            ),
-            "started_at": datetime.now().isoformat(),
-            "pid": os.getpid(),
-            "cli_args": " ".join(sys.argv[1:]),
-        }
+        # Build launch_config for persistent storage via the single source
+        # of truth, build_launch_config(). The previous hand-rolled inline
+        # dict here was MISSING ``dev_tree`` and ``preferred_provider`` — the
+        # same wart the fork path already avoided (see line ~593). A missing
+        # ``dev_tree`` is exactly what left a test agent un-restartable from the
+        # web UI on 2026-06-18: the metadata never recorded that the agent
+        # ran on the dev tree, so ``_spawn_subprocess`` rebuilt the launch on
+        # the prod tree where the ``grok`` provider is unknown to argparse.
+        # build_launch_config also auto-detects dev_tree from the running
+        # code tree, so a direct dev-checkout launch (no ``--dev``) is now
+        # persisted correctly. ``args`` is the effective namespace (merged on
+        # restart by merge_restart_config), which is what build_launch_config
+        # expects.
+        launch_config = build_launch_config(args)
 
         # Create and start agent
         agent = AgentProcess(
@@ -810,6 +1254,12 @@ async def run_agent(args: argparse.Namespace) -> int:
             launch_config=launch_config,
             auto_approve_send_message=getattr(
                 args, "auto_approve_send_message", False
+            ),
+            mcp_config_paths=[
+                Path(p) for p in (getattr(args, "mcp_config_paths", None) or [])
+            ],
+            mcp_server_inline=list(
+                getattr(args, "mcp_server_inline", None) or []
             ),
         )
 
@@ -1010,12 +1460,12 @@ def daemonize(name: str, log_dir: Path | None = None) -> None:
 
     Args:
         name: Agent name for log files
-        log_dir: Directory for log files (default: the agent's log directory
-            under its data directory)
+        log_dir: Directory for log files (default: the user data
+        directory's ``logs/`` subdirectory)
     """
     # Set up log directory
     if log_dir is None:
-        log_dir = Path("~/.deep_worker").expanduser() / "logs"
+        log_dir = Path.home() / Path("~/.deep_worker").name / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
 
     # Log file paths
@@ -1250,7 +1700,7 @@ async def remove_before_command(
     """Handle --remove-before command.
 
     Prunes BOTH checkpoint threads in per-agent SQLite DBs AND offloaded
-    summary sections under the agent's data directory (``summaries/``) across
+    summary sections under each agent's local summaries directory across
     ALL agents in the current ``$HOME``.
 
     Safety guard (DESIGN_REMOVE_BEFORE_FUTURE_CUTOFF_GUARD.md): when the
@@ -1305,8 +1755,8 @@ async def remove_before_command(
         )
         console.print(
             "  A future cutoff matches every existing thread and would "
-            "delete ALL data under the agents' data directory and "
-            "per-agent summaries/ subdirectories."
+            "delete ALL data under the agent data directories and "
+            "per-agent summaries."
         )
         console.print(
             "  If you truly intend this, re-run with [bold]--force[/bold]."
@@ -1364,7 +1814,8 @@ async def remove_before_command(
 async def list_summaries_command(agent_name: str | None, fmt: str) -> int:
     """Handle --list-summaries command.
 
-    Walks the agent's data directory (``summaries/*.md``) and prints one row per
+    Walks each agent's local summaries directory (``*.md`` files) and
+    prints one row per
     offloaded thread. Offline, read-only, no RPyC, no running-agent
     dependency.
 
@@ -1425,7 +1876,7 @@ async def list_summaries_command(agent_name: str | None, fmt: str) -> int:
             f"{latest:<26.26} {size_h:>8}"
         )
     console.print("=" * 78)
-    console.print("[dim]Files live under the agent's data directory (summaries/).[/dim]")
+    console.print("[dim]Files live under each agent's local summaries directory.[/dim]")
     return 0
 
 
@@ -1438,6 +1889,120 @@ def _human_size(n: int) -> str:
             return f"{n:.1f}{unit}"
         n //= 1024
     return f"{n}GB"
+
+
+def show_agent_info(name: str) -> int:
+    """Display launch configuration and runtime status of an agent.
+
+    Reads session_metadata.json and queries the process registry to produce
+    a formatted summary. This command is read-only and does not start or
+    restart the agent.
+
+    Returns:
+        0 on success, 1 if no metadata found.
+    """
+    import subprocess
+
+    from deep_worker_cli.process.registry import ProcessRegistry
+
+    data_dir = _get_agent_data_dir(name)
+    metadata_file = data_dir / "session_metadata.json"
+
+    if not metadata_file.exists():
+        print(
+            f"Error: No session metadata found for agent '{name}'.\n"
+            f"Agent has never been started, or its data directory "
+            f"({data_dir}) was removed.",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        metadata = json.loads(metadata_file.read_text())
+    except (json.JSONDecodeError, OSError) as exc:
+        print(
+            f"Error: Cannot read session metadata for agent '{name}': {exc}",
+            file=sys.stderr,
+        )
+        return 1
+
+    launch_config = metadata.get("launch_config") or {}
+    status = metadata.get("status", "unknown")
+    last_activity = metadata.get("last_activity", "")
+
+    # Resolve provider name (handle preferred_provider fallback)
+    provider = str(launch_config.get("provider", "unknown"))
+    preferred = str(launch_config.get("preferred_provider", ""))
+    if preferred:
+        provider = f"{provider} (preferred: {preferred})"
+
+    model = str(launch_config.get("model", "unknown"))
+    working_dir = str(launch_config.get("working_dir", ""))
+    tree_root = str(launch_config.get("tree_root", ""))
+    dev_tree = launch_config.get("dev_tree", False)
+
+    # Git commit info
+    commit = "unknown"
+    if tree_root:
+        try:
+            sha = subprocess.run(
+                ["git", "-C", tree_root, "rev-parse", "HEAD"],
+                capture_output=True, text=True, timeout=5,
+            ).stdout.strip()
+            if sha:
+                describe = subprocess.run(
+                    ["git", "-C", tree_root, "describe", "--always", "--dirty"],
+                    capture_output=True, text=True, timeout=5,
+                ).stdout.strip()
+                commit = describe if describe else sha
+        except Exception:
+            commit = "unknown"
+
+    tree_root_str = tree_root
+    if dev_tree:
+        tree_root_str = f"{tree_root} (dev_tree=true)"
+
+    # Process registry lookup
+    process_info = ProcessRegistry().lookup(name)
+    pid = launch_config.get("pid", "?")
+    running_str = ""
+    if process_info is not None:
+        pid = str(process_info.pid)
+        running_str = " (running)"
+    elif os.path.isdir(f"/proc/{pid}"):
+        running_str = " (running)"
+    else:
+        running_str = " (NOT RUNNING)"
+
+    started_at = str(launch_config.get("started_at", ""))
+    cli_args = str(launch_config.get("cli_args", ""))
+
+    flags = {
+        "skip_permissions": launch_config.get("skip_permissions", False),
+        "task_manager": launch_config.get("task_manager", False),
+        "history_memory": launch_config.get("history_memory", False),
+        "memory_only": launch_config.get("memory_only", False),
+        "use_sqlite": launch_config.get("use_sqlite", False),
+        "auto_approve_send_message": launch_config.get("auto_approve_send_message", False),
+        "clean": launch_config.get("clean", False),
+        "dev_tree": dev_tree,
+    }
+
+    print(f"agent: {name}")
+    print(f"provider: {provider}")
+    print(f"model: {model}")
+    print(f"working_dir: {working_dir}")
+    print(f"tree_root: {tree_root_str}")
+    print(f"commit: {commit}")
+    print(f"started_at: {started_at}")
+    print(f"pid: {pid}{running_str}")
+    print("flags:")
+    for flag_name, flag_value in flags.items():
+        print(f"  {flag_name}: {str(flag_value).lower()}")
+    print(f"cli_args: {cli_args}")
+    print(f"status: {status}")
+    print(f"last_activity: {last_activity}")
+    return 0
 
 
 def main() -> int:
@@ -1493,9 +2058,13 @@ def main() -> int:
 
     # Require agent name for all other operations
     if not args.name:
-        print("Error: Agent name is required (or use --list)", file=sys.stderr)
+        print("Error: Agent name is required (or use --list / --info)", file=sys.stderr)
         parser.print_help()
         return 2
+
+    # Handle --info option (read-only, offline — no agent start needed)
+    if getattr(args, "info", False):
+        return show_agent_info(args.name)
 
     # Validate agent name: prevent ':tm' suffix (reserved for TaskManager)
     if ":tm" in args.name:
@@ -1506,6 +2075,22 @@ def main() -> int:
             file=sys.stderr
         )
         return 1
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # --fork <source_name> [--from <message_id>]
+    # ──────────────────────────────────────────────────────────────────────────
+    fork_source = getattr(args, "fork", None)
+
+    if fork_source:
+        if getattr(args, "clean", False):
+            print(
+                "Error: --clean and --fork are incompatible. "
+                "A fresh fork is already clean; use --fork without --clean.",
+                file=sys.stderr,
+            )
+            return 2
+
+        return asyncio.run(do_fork(args))
 
     # --- --import-claude / --import-only (DESIGN_IMPORT_CLAUDE_SESSION.md) ----
     # Combination guards first (cheap, terminal-visible).
@@ -1657,7 +2242,7 @@ def main() -> int:
         import shutil
         # Remove per-agent data directory (contains session_metadata.json).
         # Fast (a few unlinks); no DB lock involved.
-        data_dir = Path("~/.deep_worker").expanduser() / args.name
+        data_dir = Path.home() / Path("~/.deep_worker").name / args.name
         if data_dir.exists():
             try:
                 shutil.rmtree(data_dir)
@@ -1669,7 +2254,7 @@ def main() -> int:
         # append. If we did this post-daemonize we'd unlink our own
         # active log-fd from the directory entry and silently lose all
         # future agent output.
-        log_dir = Path("~/.deep_worker").expanduser() / "logs"
+        log_dir = Path.home() / Path("~/.deep_worker").name / "logs"
         if log_dir.exists():
             for log_file in log_dir.glob(f"{args.name}.*"):
                 try:
@@ -1683,7 +2268,7 @@ def main() -> int:
     daemonize(args.name)
 
     # --- Post-daemonize (grandchild only) -------------------------------
-    # Output goes to the agent's log files under its data directory from here on.
+    # Output goes to the agent's log directory (<name>.{out,err}.log) from here on.
 
     if args.clean:
         # Database cleanup is the slow part (can wait up to 30s on SQLite

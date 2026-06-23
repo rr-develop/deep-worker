@@ -9,6 +9,7 @@ This module provides a LangChain BaseChatModel implementation that uses Claude C
 """
 
 import asyncio  # type: ignore[reportUnusedImport] — used in async methods
+import logging
 import sys
 from pathlib import Path
 from typing import Any, Callable
@@ -45,7 +46,16 @@ from pydantic import ConfigDict, PrivateAttr  # noqa: E402
 
 from claude_code_provider.client_manager import get_global_client_manager  # noqa: E402
 from claude_code_provider.custom_types import MCPResult, ToolMetadata  # noqa: E402
+from claude_code_provider.proxy_mcp_server import DispatchTimeout  # noqa: E402
 
+
+_logger = logging.getLogger(__name__)
+
+# NEVER use print() in this module — see docs/POLICIES.md §1 and
+# docs/DESIGN_NO_AGENT_ERROR_STATE_POLICY.md.  ``stderr`` can block
+# under load and BlockingIOError used to propagate up to the agent
+# invoke catch-all, flipping the whole agent into AgentStatus.ERROR.
+# Always use ``_logger.*`` (non-blocking handler).
 
 class ClaudeUsageLimitError(RuntimeError):
     """Raised when the Claude CLI reports the account's usage/session limit.
@@ -53,7 +63,7 @@ class ClaudeUsageLimitError(RuntimeError):
     The CLI surfaces an exhausted usage cap as a single degenerate response
     whose entire text is ``You've hit your session limit · resets <time>``.
     It is NOT a real answer. Returning it as ordinary ``AIMessage`` content
-    made the agent fail silently (observed 2026-05-21): the TaskManager kept
+    made the agent fail silently (observed live, 2026-05-21): the TaskManager kept
     "correcting" the useless reply, the agent settled to idle, and the web
     UI showed no error. Raising a typed error instead lets the agent process
     transition to ``status=ERROR`` with this human-readable message.
@@ -213,6 +223,51 @@ class ClaudeCodeChatModel(BaseChatModel):
     def tools_metadata(self) -> list[ToolMetadata]:
         """Get tools metadata."""
         return self._tools_metadata
+
+    async def drain_after_inter_agent_send(self, thread_id: str) -> None:
+        """Drain the rest of the current Claude turn after a successful
+        ``send_message_to_agent`` tool result was injected through the
+        proxy MCP Future.
+
+        Called from ``InterAgentDeliveryResolveMiddleware.awrap_tool_call``
+        right after ``resolve_pending_tool``. The reason: the proxy MCP
+        ``send_message_to_agent`` ``ToolUseBlock`` makes us break out of
+        ``receive_response`` early to surface the tool_call to LangGraph.
+        Claude only emits the corresponding ``UserMessage(ToolResultBlock)``
+        + closing ``AssistantMessage(TextBlock)`` + ``ResultMessage``
+        AFTER the MCP Future is resolved. If we don't read them here,
+        they stay buffered in the SDK queue and the NEXT ``ainvoke`` (the
+        one carrying the peer's reply) consumes that buffered tail
+        BEFORE Claude sees the actual reply, returns the buffered
+        ``TextBlock`` (e.g. "Message sent. Awaiting its reply.") to
+        LangGraph as A's assistant message, and ends the graph — so the
+        peer's reply is never actually processed in that ainvoke.
+
+        See a related internal incident analysis (not included here)
+        (12-step trace, "Experiment C").
+
+        Best-effort: any error here is logged and swallowed so a draining
+        glitch can never break an inter-agent turn.
+        """
+        try:
+            entry = self._client_manager.clients.get(thread_id)
+            if entry is None:
+                return
+            client, _proxy = entry
+            from claude_agent_sdk import ResultMessage as _RM
+            count = 0
+            async for ev in client.receive_response():
+                count += 1
+                if isinstance(ev, _RM):
+                    return
+                if count > 30:
+                    # Safety cap; in practice tail is 3-4 events.
+                    return
+        except Exception:  # noqa: BLE001
+            import logging as _logging
+            _logging.getLogger(__name__).exception(
+                "drain_after_inter_agent_send failed; swallowed"
+            )
 
     def resolve_pending_tool(
         self, thread_id: str, tool_call_id: str, content: MCPResult
@@ -399,30 +454,115 @@ class ClaudeCodeChatModel(BaseChatModel):
     ) -> "ClaudeCodeChatModel":
         """Bind tools to this model.
 
-        Extracts metadata from LangChain tools and returns a new model instance
-        with these tools configured. This follows LangChain's pattern of returning
-        new instances rather than mutating existing ones.
+        Returns a NEW ``ClaudeCodeChatModel`` whose ``_tools_metadata``
+        carries one ``ToolMetadata`` entry per input tool. The original
+        ``self`` is left unchanged (LangChain immutability contract).
+
+        ════════════════════════════════════════════════════════════════
+        ⚠ INPUT CONTRACT — DO NOT WEAKEN. READ THE 2026-06-12 AND
+        2026-06-13 (#2) INCIDENT ANALYSES BEFORE TOUCHING THIS METHOD.
+        ════════════════════════════════════════════════════════════════
+        The signature follows ``BaseChatModel.bind_tools`` (Liskov-
+        compliant override) but the RUNTIME contract narrows it to two
+        shapes per element:
+          1. ``BaseTool`` instance (already a LangChain tool).
+          2. plain ``Callable`` (``def`` / ``async def`` / lambda) —
+             normalised here via ``StructuredTool.from_function``.
+
+        ``dict`` and ``type`` items declared in the base signature are
+        NOT supported and raise ``TypeError`` at runtime with an
+        actionable message. **Silently dropping unknown items is
+        forbidden** — that "defensive" reflex is the root cause of
+        the MCP-tools-lost cluster (four incidents in three weeks). A
+        single dropped tool means the Claude CLI subprocess starts
+        without it, the agent then truthfully reports "I have no
+        ``read_file`` / ``execute`` / …", and the user spends hours
+        chasing the gap. Loud failure at startup beats silent failure
+        four hours into a session.
+
+        ⚠ INVARIANT (the 2026-06-12 incident): ``bind_tools([])`` is a
+        no-op that returns ``self`` unchanged. LangGraph internals and
+        ``SummarizationMiddleware`` call ``bind_tools([])`` 100s of
+        times per session as part of internal re-binding. Before the
+        2026-06-12 fix, that empty rebind silently wiped
+        ``_tools_metadata`` on the freshly-allocated instance and the
+        emptiness then flowed into ``ProxyMCPServer(tools_metadata=[])``
+        on the next session rotation. Keep the early-return.
+
+        ⚠ INVARIANT (the 2026-06-13 #2 incident): plain ``Callable`` tools
+        MUST be normalised, NOT skipped. ``agent_process.web_tools``
+        contains ``http_request`` / ``fetch_url`` / ``read_image`` as
+        bare ``def`` functions; LangGraph ``ToolNode`` wraps them in
+        ``StructuredTool`` internally and the agent CAN call them — but
+        if WE drop them on the way to ``ProxyMCPServer`` the CLI
+        subprocess has no MCP advertisement for them and Claude refuses
+        to use them after restart.
+
+        See a related internal incident analysis (not included here)
+        (MCP tools lost after restart).
 
         Args:
-            tools: List of LangChain tools to bind (only BaseTool instances supported)
-            **kwargs: Additional arguments (unused)
+            tools: Sequence of ``BaseTool`` instances and/or plain
+                ``Callable``s. Mixed input is the normal case (production
+                ``web_tools`` is exactly that).
+            **kwargs: Reserved for future use; ignored today.
 
         Returns:
-            New ClaudeCodeChatModel instance with tools bound
+            A new ``ClaudeCodeChatModel`` with ``_tools_metadata``
+            populated — one entry per input tool, in input order — or
+            ``self`` unchanged when ``tools`` is empty.
+
+        Raises:
+            TypeError: An element is neither a ``BaseTool`` nor a
+                ``Callable``. Message names the offending item and
+                hints at the ``@tool`` decorator.
         """
         import sys
         msg = f"[ClaudeCodeChatModel.bind_tools] Called with {len(tools)} tools\n"
         sys.stderr.write(msg)
         sys.stderr.flush()
-        # Extract metadata from LangChain tools
-        tools_metadata: list[ToolMetadata] = []
+        # ⚠️ Empty rebind is a no-op — see invariant above. Returning self
+        # preserves the previously-bound tools across LangGraph internal
+        # re-bind calls (which is the failure mode that caused the
+        # MCP-tools-lost-after-restart incident). Without this guard, a freshly-allocated model with
+        # empty _tools_metadata would propagate into ProxyMCPServer and
+        # strip every mcp__deepworker__* tool from the CLI subprocess.
+        if not tools:
+            return self
+        # Local import to keep module import cost low — StructuredTool
+        # pulls a non-trivial pydantic graph that we don't need on plain
+        # ``ainvoke``-only code paths.
+        from langchain_core.tools import StructuredTool  # noqa: PLC0415
+
+        # Normalise input to a list of BaseTool. Anything we cannot map
+        # raises TypeError — see a related internal incident analysis for
+        # why silent skip is forbidden.
+        normalised_tools: list[BaseTool] = []
         for tool_item in tools:
-            # Only process BaseTool instances
-            if not isinstance(tool_item, BaseTool):
+            if isinstance(tool_item, BaseTool):
+                normalised_tools.append(tool_item)
                 continue
+            if callable(tool_item):
+                # Plain function (decorated with nothing, or async def).
+                # ``StructuredTool.from_function`` derives a JSON schema
+                # from the signature + docstring — same mechanism
+                # LangGraph's ``ToolNode`` uses internally, so the agent
+                # side and the MCP side now see the SAME tool surface.
+                normalised_tools.append(StructuredTool.from_function(tool_item))
+                continue
+            # Loud failure: name the offender and tell the operator how
+            # to fix it. See module docstring "INPUT CONTRACT" block.
+            raise TypeError(
+                f"ClaudeCodeChatModel.bind_tools: unsupported tool form "
+                f"{type(tool_item).__name__}={tool_item!r}. Expected "
+                f"BaseTool or Callable. Did you forget to wrap a plain "
+                f"function with @tool? (Silent skip is forbidden — see "
+                f"a related internal incident analysis (not included here))"
+            )
 
-            tool: BaseTool = tool_item
-
+        # Extract metadata from the normalised list.
+        tools_metadata: list[ToolMetadata] = []
+        for tool in normalised_tools:
             # Get schema — try Pydantic first, fallback to function signature
             schema = {}
             if tool.args_schema:
@@ -603,6 +743,9 @@ class ClaudeCodeChatModel(BaseChatModel):
         # build new model instances, but the manager is stable), so it is True
         # for every turn after the CLI client is created and restore runs at
         # most once.
+        # Tool-call ids orphaned by a restart (populated on the restart
+        # turn below; applied to the proxy once it is available).
+        pending_orphan_ids: list[str] = []
         already_connected = self._client_manager.has_client(thread_id)
         if not already_connected:
             restore_source = messages
@@ -622,7 +765,8 @@ class ClaudeCodeChatModel(BaseChatModel):
             has_prior_turns = any(
                 isinstance(m, (AIMessage, ToolMessage)) for m in restorable
             )
-            if has_prior_turns and self._has_persisted_session(thread_id):
+            _is_restart = self._has_persisted_session(thread_id)
+            if has_prior_turns and _is_restart:
                 from claude_code_provider.session_restore import (  # noqa: PLC0415
                     resolve_restore_session,
                 )
@@ -630,6 +774,116 @@ class ClaudeCodeChatModel(BaseChatModel):
                     thread_id, restorable, cwd=self._working_dir or "/"
                 )
 
+            # Restart turn: a tool call the model requested but for which no
+            # ToolMessage result exists was orphaned by the restart. Detect
+            # those now so we can tell the proxy to reconcile them (inform
+            # the model, never wait). Without this the resumed CLI replays
+            # the dangling tool_use and the turn deadlocks on an id whose
+            # result never comes.
+            #
+            # CRITICAL: scan the FULL ``messages``, not ``restorable``. The
+            # orphaned call typically sits in the UNSENT tail (it was the
+            # in-flight call when the process died, after the last persisted
+            # ``sent_count``), so ``restorable = messages[:sent_count]``
+            # would miss it. And gate on ``_is_restart`` alone (persisted
+            # session) — NOT on ``resolve_restore_session`` succeeding —
+            # because the deadlock happens via the CLI replay regardless of
+            # whether our LangGraph-side restore synthesis fired.
+            # See docs/DESIGN_ORPHANED_TOOLCALL_ON_RESTART.md and the
+            # internal root-cause memo (2026-06-15).
+            if _is_restart:
+                from claude_code_provider.orphaned_tool_calls import (  # noqa: PLC0415
+                    find_orphaned_tool_calls,
+                    find_orphaned_tool_calls_in_transcript,
+                )
+
+                _orphan_ids: dict[str, str] = {}
+
+                # (1) LangGraph history — catches orphans that DID get
+                #     checkpointed (AIMessage tool_call with no ToolMessage).
+                for o in find_orphaned_tool_calls(
+                    [m for m in messages if not isinstance(m, SystemMessage)]
+                ):
+                    _orphan_ids.setdefault(o.id, o.name)
+
+                # (2) THE AUTHORITATIVE SOURCE — the resumed CLI transcript.
+                #     When the process is killed mid-tool-call the LangGraph
+                #     checkpoint never recorded the interrupted turn, but the
+                #     CLI ``.jsonl`` transcript ends with a dangling
+                #     ``tool_use`` (no ``tool_result``). On resume the CLI
+                #     REPLAYS that block and the turn deadlocks. We read the
+                #     exact transcript being resumed and reconcile its
+                #     dangling tool_use ids. Verified live 2026-06-15: the
+                #     orphan lives here, not in LangGraph history.
+                if resume_session_id:
+                    try:
+                        from claude_agent_sdk import (  # noqa: PLC0415
+                            get_session_messages,
+                        )
+
+                        _tx = get_session_messages(
+                            resume_session_id,
+                            directory=self._working_dir or "/",
+                        )
+                        for o in find_orphaned_tool_calls_in_transcript(
+                            _tx or []
+                        ):
+                            _orphan_ids.setdefault(o.id, o.name)
+                    except Exception as _exc:  # noqa: BLE001
+                        # Best-effort: never let transcript inspection break
+                        # the turn. Worst case we fall back to history-only.
+                        _logger.warning(
+                            "[RESTART] transcript orphan-scan skipped for "
+                            "%s: %r",
+                            resume_session_id, _exc,
+                        )
+
+                if _orphan_ids:
+                    pending_orphan_ids = list(_orphan_ids)
+                    _logger.warning(
+                        "[RESTART] %d orphaned tool call(s) detected "
+                        "(interrupted by restart): %s — will reconcile, "
+                        "not wait",
+                        len(_orphan_ids),
+                        list(_orphan_ids.items()),
+                    )
+
+        # [MCP_DIAG] Log the exact shape of arguments we pass to the
+        # first-path get_or_create_client. This is the BASELINE — fresh
+        # start where MCP is known to work. Compared against the
+        # rotation_recreate log below, the two must look identical.
+        _logger.info(
+            f"[MCP_DIAG] fresh_create thread={thread_id} "
+            f"resume_session={resume_session_id!r} "
+            f"system_prompt_is_none={system_prompt_content is None} "
+            f"system_prompt_len="
+            f"{len(system_prompt_content) if system_prompt_content else 0} "
+            f"tools_metadata_count={len(self._tools_metadata)}"
+        )
+        # [MCP_DIAG] Log the exact shape of arguments we pass to the
+        # first-path get_or_create_client. This is the BASELINE — fresh
+        # start where MCP is known to work. Compared against the
+        # rotation_recreate log below, the two must look identical.
+        _logger.info(
+            f"[MCP_DIAG] fresh_create thread={thread_id} "
+            f"resume_session={resume_session_id!r} "
+            f"system_prompt_is_none={system_prompt_content is None} "
+            f"system_prompt_len="
+            f"{len(system_prompt_content) if system_prompt_content else 0} "
+            f"tools_metadata_count={len(self._tools_metadata)}"
+        )
+        # [MCP_DIAG] Log the exact shape of arguments we pass to the
+        # first-path get_or_create_client. This is the BASELINE — fresh
+        # start where MCP is known to work. Compared against the
+        # rotation_recreate log below, the two must look identical.
+        _logger.info(
+            f"[MCP_DIAG] fresh_create thread={thread_id} "
+            f"resume_session={resume_session_id!r} "
+            f"system_prompt_is_none={system_prompt_content is None} "
+            f"system_prompt_len="
+            f"{len(system_prompt_content) if system_prompt_content else 0} "
+            f"tools_metadata_count={len(self._tools_metadata)}"
+        )
         # Get or create client for this thread (resume if we resolved one).
         client, proxy_mcp = await self._client_manager.get_or_create_client(
             thread_id=thread_id,
@@ -638,6 +892,13 @@ class ClaudeCodeChatModel(BaseChatModel):
             system_prompt=system_prompt_content,
             resume_session_id=resume_session_id,
         )
+
+        # Reconcile any tool calls orphaned by the restart: the proxy will
+        # return the interrupted-notice result immediately for these ids
+        # instead of parking on a Future that will never resolve. No
+        # timeout — structural. See DESIGN_ORPHANED_TOOLCALL_ON_RESTART.md.
+        if pending_orphan_ids:
+            proxy_mcp.mark_orphaned_tool_calls(pending_orphan_ids)
 
         # DEBUG: Log what we received (both to stderr AND to file)
         import sys
@@ -658,62 +919,206 @@ class ClaudeCodeChatModel(BaseChatModel):
                     f.write(f"[{timestamp}]   messages[{i}]: {type(msg).__name__} - {content_preview}\n")
                 f.flush()
         except Exception as e:
-            print(f"[DEBUG] Failed to write debug log: {e}", file=sys.stderr)
+            _logger.info(f"[DEBUG] Failed to write debug log: {e}")
 
         # ALSO print to stderr
-        print(f"\n[{timestamp}] ========== START AINVOKE ==========", file=sys.stderr, flush=True)
-        print(f"[{timestamp}] thread_id={thread_id}, sent_count={sent_count}, len(messages)={len(messages)}", file=sys.stderr, flush=True)
+        _logger.info(f"\n[{timestamp}] ========== START AINVOKE ==========")
+        _logger.info(f"[{timestamp}] thread_id={thread_id}, sent_count={sent_count}, len(messages)={len(messages)}")
 
-        print(f"\n[DEBUG ainvoke] ========== START ==========", file=sys.stderr)
-        print(f"[DEBUG ainvoke] Model instance id={id(self)}", file=sys.stderr)
-        print(f"[DEBUG ainvoke] ClientManager id={id(self._client_manager)}", file=sys.stderr)
-        print(f"[DEBUG ainvoke] thread_id={thread_id}", file=sys.stderr)
-        print(f"[DEBUG ainvoke] sent_count={sent_count}", file=sys.stderr)
-        print(f"[DEBUG ainvoke] _sent_count state={dict(self._client_manager._sent_count)}", file=sys.stderr)
-        print(f"[DEBUG ainvoke] len(messages)={len(messages)}", file=sys.stderr)
+        _logger.info(f"\n[DEBUG ainvoke] ========== START ==========")
+        _logger.info(f"[DEBUG ainvoke] Model instance id={id(self)}")
+        _logger.info(f"[DEBUG ainvoke] ClientManager id={id(self._client_manager)}")
+        _logger.info(f"[DEBUG ainvoke] thread_id={thread_id}")
+        _logger.info(f"[DEBUG ainvoke] sent_count={sent_count}")
+        _logger.info(f"[DEBUG ainvoke] _sent_count state={dict(self._client_manager._sent_count)}")
+        _logger.info(f"[DEBUG ainvoke] len(messages)={len(messages)}")
         for i, msg in enumerate(messages):
             content_preview = str(msg.content)[:80] if hasattr(msg, 'content') else 'no content'
-            print(f"[DEBUG ainvoke]   messages[{i}]: {type(msg).__name__} - {content_preview}", file=sys.stderr)
+            _logger.info(f"[DEBUG ainvoke]   messages[{i}]: {type(msg).__name__} - {content_preview}")
 
         # ⚠️ CRITICAL: Detect LangGraph summarization (message history reset).
         # When SummarizationMiddleware replaces N messages with a summary,
         # sent_count (from the old history) exceeds len(messages) (new, shorter).
         # We MUST rotate to a new Claude CLI session_id — otherwise the CLI
         # session still holds the full old history and will eventually hit
-        # "Prompt is too long" (observed after 1255 turns).
+        # "Prompt is too long" (observed on a production agent after 1255 turns).
         # DO NOT remove this rotation — it is the ONLY mechanism that prevents
         # Claude CLI session overflow for long-running agents.
         if sent_count > len(messages):
-            new_session_id = self._client_manager.rotate_session(thread_id)
-            print(
-                f"[DEBUG ainvoke] SESSION ROTATED: {thread_id} → {new_session_id} "
-                f"(old sent_count={sent_count}, new messages={len(messages)})",
-                file=sys.stderr,
-            )
+            # [MCP_DIAG] Why is this rotation firing? Two very different
+            # causes look identical at this point:
+            #   (A) Real LangGraph SummarizationMiddleware run — first
+            #       HumanMessage carries lc_source="summarization" and
+            #       its content starts with "Here is a summary of the
+            #       conversation to date:".
+            #   (B) Something else removed N messages from state
+            #       (ContextEditingMiddleware, RemoveMessage, interrupt
+            #       resume path…) — Δ is small (1–3), no summary marker.
+            # We've observed (B) firing per-turn in the log, which would
+            # respawn the CLI subprocess every turn and could plausibly
+            # break MCP. Tag every rotation with its cause so we can
+            # split the failure modes in the log post-mortem.
+            try:
+                first_human_idx = next(
+                    (i for i, m in enumerate(messages)
+                     if isinstance(m, HumanMessage)),
+                    -1,
+                )
+                rotation_cause = "unknown"
+                summary_marker = False
+                lc_source = None
+                first_human_preview = ""
+                if first_human_idx >= 0:
+                    fhm = messages[first_human_idx]
+                    fhm_content = (
+                        fhm.content if isinstance(fhm.content, str)
+                        else str(fhm.content)
+                    )
+                    first_human_preview = fhm_content[:120]
+                    summary_marker = fhm_content.startswith(
+                        "Here is a summary of the conversation to date:"
+                    )
+                    lc_source = (
+                        fhm.additional_kwargs.get("lc_source")
+                        if hasattr(fhm, "additional_kwargs")
+                        else None
+                    )
+                if summary_marker or lc_source == "summarization":
+                    rotation_cause = "summarization"
+                elif (sent_count - len(messages)) <= 3:
+                    rotation_cause = "small_delta_no_summary"
+                else:
+                    rotation_cause = "large_delta_no_summary"
+                _logger.info(
+                    f"[MCP_DIAG] rotation_trigger thread={thread_id} "
+                    f"cause={rotation_cause} "
+                    f"delta={sent_count - len(messages)} "
+                    f"sent_count={sent_count} len_messages={len(messages)} "
+                    f"summary_marker={summary_marker} "
+                    f"lc_source={lc_source!r} "
+                    f"first_human_idx={first_human_idx} "
+                    f"first_human_preview={first_human_preview!r}"
+                )
+            except Exception as exc:  # noqa: BLE001
+                # Diagnostic must never break the rotation path.
+                _logger.info(
+                    f"[MCP_DIAG] rotation_trigger probe_failed "
+                    f"thread={thread_id} err={exc!r}"
+                )
+
+            new_session_id = await self._client_manager.rotate_session(thread_id)
+            _logger.info(f"[DEBUG ainvoke] SESSION ROTATED: {thread_id} → {new_session_id} "
+                f"(old sent_count={sent_count}, new messages={len(messages)})")
             sent_count = 0
+            # ⚠️ rotate_session() popped + disconnected the old client from
+            # self.clients[thread_id], but the local ``client`` / ``proxy_mcp``
+            # variables (line 679) still reference the stale disconnected
+            # instance.  Any subsequent ``client.query(...)`` or
+            # ``client.receive_response()`` would raise CLIConnectionError
+            # ("MCP transport used before connect() completed").  Fetch a
+            # fresh client (and its associated ProxyMCPServer) here.
+            #
+            # resume_session_id is explicitly None — the old session was
+            # rotated away; do NOT try to resume an old transcript.
+            # [MCP_DIAG] Verify the system_prompt we pass on rotation is
+            # the same shape as on fresh start (it should be — same code
+            # path, but the symptom keeps insisting otherwise).
+            _logger.info(
+                f"[MCP_DIAG] rotation_recreate thread={thread_id} "
+                f"new_session={new_session_id} "
+                f"system_prompt_is_none={system_prompt_content is None} "
+                f"system_prompt_len="
+                f"{len(system_prompt_content) if system_prompt_content else 0} "
+                f"tools_metadata_count={len(self._tools_metadata)}"
+            )
+            # [MCP_DIAG] Verify the system_prompt we pass on rotation is
+            # the same shape as on fresh start (it should be — same code
+            # path, but the symptom keeps insisting otherwise).
+            _logger.info(
+                f"[MCP_DIAG] rotation_recreate thread={thread_id} "
+                f"new_session={new_session_id} "
+                f"system_prompt_is_none={system_prompt_content is None} "
+                f"system_prompt_len="
+                f"{len(system_prompt_content) if system_prompt_content else 0} "
+                f"tools_metadata_count={len(self._tools_metadata)}"
+            )
+            # [MCP_DIAG] Verify the system_prompt we pass on rotation is
+            # the same shape as on fresh start (it should be — same code
+            # path, but the symptom keeps insisting otherwise).
+            _logger.info(
+                f"[MCP_DIAG] rotation_recreate thread={thread_id} "
+                f"new_session={new_session_id} "
+                f"system_prompt_is_none={system_prompt_content is None} "
+                f"system_prompt_len="
+                f"{len(system_prompt_content) if system_prompt_content else 0} "
+                f"tools_metadata_count={len(self._tools_metadata)}"
+            )
+            client, proxy_mcp = await self._client_manager.get_or_create_client(
+                thread_id=thread_id,
+                tools_metadata=self._tools_metadata,
+                working_dir=self._working_dir,
+                system_prompt=system_prompt_content,
+                resume_session_id=None,
+            )
 
         # 5. Extract ONLY new messages (not yet sent to Claude)
         new_messages = messages[sent_count:]
 
-        print(f"[DEBUG ainvoke] len(new_messages)={len(new_messages)}", file=sys.stderr)
+        _logger.info(f"[DEBUG ainvoke] len(new_messages)={len(new_messages)}")
         for i, msg in enumerate(new_messages):
             content_preview = str(msg.content)[:80] if hasattr(msg, 'content') else 'no content'
-            print(f"[DEBUG ainvoke]   new_messages[{i}]: {type(msg).__name__} - {content_preview}", file=sys.stderr)
+            _logger.info(f"[DEBUG ainvoke]   new_messages[{i}]: {type(msg).__name__} - {content_preview}")
 
         # 6. Send each new message to Claude
         user_message_sent = False
         tool_resolved = False
 
+        # ⚠️ Runtime SystemMessages from LangGraph middleware (e.g. the
+        # InterAgentReplyMiddleware cognitive hint) must reach Claude in
+        # the SAME prompt as the user message they refer to. The Claude
+        # SDK has no public API to update ``system_prompt`` after
+        # ``connect()`` — the first SystemMessage of the conversation is
+        # the agent's default prompt and was passed via
+        # ``ClaudeAgentOptions.system_prompt`` at client creation. Any
+        # later SystemMessage is collected here and prepended (with a
+        # ``"System:> "`` line prefix) to the very next HumanMessage in
+        # ``new_messages``. We do NOT issue a separate ``client.query``
+        # for the hint, because that would make Claude run a whole turn
+        # responding to the hint first and only later see the actual
+        # peer message. See a related internal incident analysis (not
+        # included here).
+        _pending_system_chunks: list[str] = []
+        _first_system_seen_before = False
+        for _prior in messages:
+            if isinstance(_prior, SystemMessage) and _prior not in new_messages:
+                _first_system_seen_before = True
+                break
+        _first_system_consumed_in_pass = _first_system_seen_before
+        for _m in new_messages:
+            if isinstance(_m, SystemMessage):
+                if not _first_system_consumed_in_pass:
+                    _first_system_consumed_in_pass = True
+                else:
+                    _sc = _m.content if isinstance(_m.content, str) else str(_m.content)
+                    _pending_system_chunks.append(f"System:> {_sc}")
+
         for msg in new_messages:
             if isinstance(msg, HumanMessage):
                 # Send user message to Claude
                 content = msg.content if isinstance(msg.content, str) else str(msg.content)
+                # Prepend any runtime SystemMessage(s) that accumulated
+                # earlier in this send loop — see the pre-pass above
+                # for the rationale. Sent as one combined prompt so
+                # Claude sees the hint and the user message together.
+                if _pending_system_chunks:
+                    content = "\n\n".join(_pending_system_chunks + [content])
+                    _pending_system_chunks = []
                 # ⚠️ Use effective_session_id (rotated after summarization),
                 # NOT raw thread_id. See rotate_session() for details.
                 effective_sid = self._client_manager.get_effective_session_id(thread_id)
-                print(f"[DEBUG ainvoke] Sending HumanMessage to Claude:", file=sys.stderr)
-                print(f"[DEBUG ainvoke]   content='{content}'", file=sys.stderr)
-                print(f"[DEBUG ainvoke]   session_id='{effective_sid}'", file=sys.stderr)
+                _logger.info(f"[DEBUG ainvoke] Sending HumanMessage to Claude:")
+                _logger.info(f"[DEBUG ainvoke]   content={content[:300]!r}")
+                _logger.info(f"[DEBUG ainvoke]   session_id='{effective_sid}'")
                 await client.query(content, session_id=effective_sid)
                 user_message_sent = True
 
@@ -726,18 +1131,22 @@ class ClaudeCodeChatModel(BaseChatModel):
                 mcp_result: MCPResult = {
                     "content": _build_mcp_content(msg.content),
                 }
-                print(f"[DEBUG ainvoke] resolve_call for tool_call_id={msg.tool_call_id}", file=sys.stderr)
+                _logger.info(f"[DEBUG ainvoke] resolve_call for tool_call_id={msg.tool_call_id}")
                 proxy_mcp.resolve_call(msg.tool_call_id, mcp_result)
                 tool_resolved = True
 
             elif isinstance(msg, SystemMessage):
-                # ⚠️ CRITICAL: DO NOT REMOVE THIS BRANCH!
-                # SystemMessage contains middleware cognitive hints (e.g. project_memory
-                # instructions from ProjectMemoryMiddleware). The content is already
-                # forwarded to Claude SDK via system_prompt in get_or_create_client().
-                # We skip it here to avoid sending it as a user message.
-                # If this branch is removed, SystemMessage falls through to the
-                # default case and could be sent incorrectly.
+                # SystemMessages are routed at the top of this method:
+                #  * the FIRST SystemMessage of the conversation is the
+                #    agent's default prompt and is delivered to Claude
+                #    via ``ClaudeAgentOptions.system_prompt`` at client
+                #    creation — no re-delivery needed here.
+                #  * any LATER SystemMessage is a runtime middleware
+                #    cognitive hint; it was pre-collected into
+                #    ``_pending_system_chunks`` and will be prepended
+                #    (as a ``"System:> ..."`` line) to the next
+                #    HumanMessage in this same send loop.
+                # Either way nothing to do here.
                 pass
 
             elif isinstance(msg, AIMessage):
@@ -756,10 +1165,10 @@ class ClaudeCodeChatModel(BaseChatModel):
         pending_tool_calls: list[dict[str, Any]] | None = None
         proxy_tool_names = {tool["name"] for tool in self._tools_metadata}
 
-        print(f"[DEBUG ainvoke] user_message_sent={user_message_sent}, tool_resolved={tool_resolved}", file=sys.stderr)
+        _logger.info(f"[DEBUG ainvoke] user_message_sent={user_message_sent}, tool_resolved={tool_resolved}")
 
         if user_message_sent or tool_resolved:
-            print(f"[DEBUG ainvoke] Calling client.receive_response() [EVENT-BASED]...", file=sys.stderr)
+            _logger.info(f"[DEBUG ainvoke] Calling client.receive_response() [EVENT-BASED]...")
 
             # ═══════════════════════════════════════════════════════════════
             # PROXY ARCHITECTURE: receive_response with ToolUseBlock break
@@ -797,7 +1206,7 @@ class ClaudeCodeChatModel(BaseChatModel):
             # second wait would never complete: Claude is waiting for our
             # tool_result for #1 before sending the control_request for
             # #2, and we'd be waiting for #2 to register before returning
-            # #1 to LangGraph. Deadlock — exactly the freeze observed in live testing.
+            # #1 to LangGraph. Deadlock — exactly the test_dev freeze.
             #
             # Correct semantics: on the first proxy ToolUseBlock, wait
             # event-driven (Future, NO polling) for the corresponding
@@ -806,158 +1215,282 @@ class ClaudeCodeChatModel(BaseChatModel):
             # next ainvoke iteration (after LangGraph runs the tool and
             # we ``resolve_call`` it) will pick up the next pending call
             # the same way.
-            response_iter = client.receive_response().__aiter__()
-            saw_proxy_tool = False
-            expected_proxy_tool_call_id: str | None = None
-            expected_proxy_tool_name: str | None = None
-            expected_proxy_args: dict[str, Any] | None = None
-
-            while True:
-                try:
-                    event = await response_iter.__anext__()
-                except StopAsyncIteration:
-                    print("[DEBUG ainvoke] receive_response stream ended", file=sys.stderr)
-                    break
-
-                if isinstance(event, ClaudeAssistantMessage):
-                    for block in event.content:
-                        if isinstance(block, TextBlock):
-                            response_text += block.text
-                            print(f"[DEBUG ainvoke] Received TextBlock: '{block.text[:80]}'", file=sys.stderr)
-                        elif isinstance(block, ToolUseBlock):
-                            print(f"[DEBUG ainvoke] Received ToolUseBlock: {block.name}", file=sys.stderr)
-
-                    tool_blocks = [
-                        block for block in event.content
-                        if isinstance(block, ToolUseBlock)
-                    ]
-                    # Claude SDK prefixes proxy MCP tool names with
-                    # ``mcp__deepworker__`` (see ``_PROXY_MCP_TOOL_PREFIX``
-                    # at module top). Strip the prefix before comparing
-                    # against the bare names registered in ``ToolMetadata``,
-                    # otherwise every proxy tool is misclassified as a
-                    # built-in Claude tool and LangGraph never receives
-                    # the tool_call → agent hang.
-                    proxy_blocks = [
-                        block for block in tool_blocks
-                        if _strip_proxy_mcp_prefix(block.name) in proxy_tool_names
-                    ]
-
-                    if proxy_blocks:
-                        # First proxy ToolUseBlock — break out and let the
-                        # event-driven wait below pick up the control-channel
-                        # pending call. Do NOT keep iterating; Claude will not
-                        # send ResultMessage until we resolve.
-                        #
-                        # The visible block name/args are captured ONLY for
-                        # diagnostics. They are NOT a reliable matching key:
-                        # Claude streams the ToolUseBlock in the assistant
-                        # message with argument JSON that can differ from the
-                        # finalized args delivered to the MCP handler over the
-                        # control channel (live observation 2026-05-26:
-                        # visible grep(pattern='unsubscribe_messages') vs
-                        # control-channel grep(pattern='unsubscribe');
-                        # visible read_file(limit=30) vs control read_file(
-                        # limit=40)). The authoritative call — the one that
-                        # gets executed and later resolve_call'd by its
-                        # handler-assigned call_id — is whatever the proxy
-                        # registers in pending_calls. So we wait for ANY
-                        # handler registration, then surface get_pending_calls().
-                        first_proxy_block = proxy_blocks[0]
-                        expected_proxy_tool_call_id = first_proxy_block.id
-                        expected_proxy_tool_name = _strip_proxy_mcp_prefix(
-                            first_proxy_block.name
-                        )
-                        expected_proxy_args = dict(first_proxy_block.input or {})
-                        saw_proxy_tool = True
-                        print(
-                            f"[DEBUG ainvoke] MCP tool detected — breaking for LangGraph "
-                            f"(visible blocks in this AssistantMessage: "
-                            f"{[b.name for b in proxy_blocks]})",
-                            file=sys.stderr,
-                        )
-                        break
-                    if tool_blocks:
-                        # Built-in Claude tool (ToolSearch, WebSearch, etc.)
-                        # — Claude handles execution internally; keep
-                        # consuming events until ResultMessage.
-                        print("[DEBUG ainvoke] Built-in tool — continuing receive_response", file=sys.stderr)
-                        continue
-
-                elif isinstance(event, ResultMessage):
-                    print("[DEBUG ainvoke] Received ResultMessage", file=sys.stderr)
-                    # Persist the CLI's session uuid as a restore HINT for the
-                    # next restart (authoritative validation is still the
-                    # tail-match). DESIGN_HISTORY_RESTORE_ON_RESTART.md §3.4.
-                    _sid = getattr(event, "session_id", None)
-                    if _sid:
-                        self._client_manager.record_session_uuid(thread_id, _sid)
-                    break
-
-            # After breaking on a proxy ToolUseBlock, wait event-driven
-            # (Future, NOT polling) for the MCP handler task spawned by
-            # the SDK control channel to register its pending call. The
-            # ToolUseBlock arrives via the message stream BEFORE the
-            # corresponding control_request reaches the SDK control
-            # channel, so a tiny registration race is normal and the wait
-            # below typically resolves in milliseconds. The 30s timeout
-            # only bounds this registration race, NOT actual tool
-            # execution (handlers block on ``self.timeout`` once
-            # registered — see ``ProxyMCPServer._create_tool_handler``).
             #
-            # Recovery policy: if the wait times out, the Claude CLI
-            # subprocess itself is hung (evidence: observed 2026-05-19
-            # — 90+ s with no control_request delivered, Python side
-            # healthy, no 429/rate-limit, no API errors). Retrying
-            # in-place against the same subprocess is futile. Instead
-            # kill the stuck client and raise; the next ainvoke spawns
-            # a fresh Claude CLI subprocess and resumes the same
-            # session_id via the rotation tracking in ClientManager.
-            if (
-                saw_proxy_tool
-                and pending_tool_calls is None
-                and not proxy_mcp.has_pending_calls()
-            ):
-                try:
-                    # Wait for ANY handler to register a pending call. We
-                    # cannot match on the visible block's args (they may
-                    # diverge from the control-channel args — see capture
-                    # comment above), so the authoritative pending call(s)
-                    # are read from get_pending_calls() afterwards.
-                    await proxy_mcp.wait_for_any_pending_call(timeout=30.0)
-                except asyncio.TimeoutError as exc:
-                    print(
-                        f"[WARN ainvoke] wait_for_any_pending_call timed out "
-                        f"after 30s for thread_id={thread_id}; visible proxy "
-                        f"block tool={expected_proxy_tool_name!r} args="
-                        f"{expected_proxy_args!r}, but no MCP handler registered "
-                        f"a pending call; returning the visible block as a "
-                        f"normal tool_call fallback.",
-                        file=sys.stderr,
+            # ─────────────────────────────────────────────────────────
+            # A related issue: sequential multi-tool hang fix (2026-06-06)
+            # ─────────────────────────────────────────────────────────
+            # When Claude emits several ``ToolUseBlock`` items in one
+            # ``AssistantMessage``, the CLI dispatches MCP
+            # ``control_request`` messages **sequentially** — the next
+            # tool's handler only registers after we ``resolve_call``
+            # the current one.  The ``AssistantMessage`` containing
+            # ALL ToolUseBlocks was already consumed in a previous
+            # ``ainvoke`` iteration, so a fresh ``receive_response()``
+            # has nothing to yield and ``__anext__()`` hangs forever.
+            #
+            # Fix: when ``tool_resolved=True`` and no UserMessage was
+            # sent (meaning we are in the "return tool calls" loop),
+            # check ``proxy_mcp.has_pending_calls()`` before entering
+            # ``receive_response()``.  If a pending call already exists
+            # (or appears within a brief async wait), skip
+            # ``receive_response()`` entirely — the pending call is
+            # from a remaining ToolUseBlock in the already-consumed
+            # ``AssistantMessage`` and will be returned by section 9.
+            # ─────────────────────────────────────────────────────────
+            # ─────────────────────────────────────────────────────────
+            # POST-RESOLVE DISCRIMINATOR (no polling, no timeouts).
+            # After resolving a ToolMessage we have TWO possibilities and
+            # there is exactly one source of truth that tells us which:
+            #
+            #   (a) The previous ``ainvoke`` already-consumed an
+            #       ``AssistantMessage`` carrying MULTIPLE
+            #       ``ToolUseBlock``s. The handler for the next one of
+            #       those blocks has already registered its pending call
+            #       (sequential SDK dispatch). ``proxy_mcp.pending_calls``
+            #       is non-empty RIGHT NOW. We must skip
+            #       ``receive_response()`` — there is nothing left in the
+            #       Claude stream until we resolve this next pending
+            #       call. Section 9 returns the pending tool_calls.
+            #
+            #   (b) The just-resolved tool was the LAST one Claude wanted
+            #       to call in this turn. The next stream event from
+            #       ``receive_response()`` is the final text (and/or
+            #       ``ResultMessage``). ``proxy_mcp.pending_calls`` is
+            #       empty RIGHT NOW.
+            #
+            # Discriminator: ``proxy_mcp.has_pending_calls()`` — checked
+            # SYNCHRONOUSLY, after ``resolve_call`` has already
+            # popped the resolved id (see ``proxy_mcp_server.py``
+            # docstring on ``resolve_call`` — POLICY: sync source-of-
+            # truth). No ``wait_for_any_pending_call`` here: the
+            # absence of a pending call is itself the answer, not a
+            # "wait a bit more and see" — see the 2026-06-15 incident
+            # (test_claude_code_mcp_prefix hang) and the original
+            # tool→text hang. Waiting for "the next handler
+            # that might register" is a polling assumption with no
+            # finite ground truth: when the turn is over, no handler
+            # is coming, ever.
+            # ─────────────────────────────────────────────────────────
+            skip_receive_response = False
+            if tool_resolved and not user_message_sent:
+                if proxy_mcp.has_pending_calls():
+                    skip_receive_response = True
+                    _logger.info(
+                        f"[DEBUG ainvoke] Pending calls "
+                        f"({len(proxy_mcp.get_pending_calls())}) after "
+                        f"tool resolution — skipping receive_response "
+                        f"(case (a): more tools in same AssistantMessage)"
                     )
-                    if (
-                        expected_proxy_tool_call_id is not None
-                        and expected_proxy_tool_name is not None
-                        and expected_proxy_args is not None
-                    ):
-                        pending_tool_calls = [
-                            {
-                                "id": expected_proxy_tool_call_id,
-                                "name": expected_proxy_tool_name,
-                                "args": expected_proxy_args,
-                            }
+                else:
+                    _logger.info(
+                        f"[DEBUG ainvoke] No pending calls after tool "
+                        f"resolution — entering receive_response for "
+                        f"final text (case (b): last tool of the turn)"
+                    )
+
+            if not skip_receive_response:
+                response_iter = client.receive_response().__aiter__()
+                saw_proxy_tool = False
+                expected_proxy_tool_call_id: str | None = None
+                expected_proxy_tool_name: str | None = None
+
+                while True:
+                    try:
+                        event = await response_iter.__anext__()
+                    except StopAsyncIteration:
+                        _logger.info("[DEBUG ainvoke] receive_response stream ended")
+                        break
+
+                    if isinstance(event, ClaudeAssistantMessage):
+                        for block in event.content:
+                            if isinstance(block, TextBlock):
+                                response_text += block.text
+                                _logger.info(f"[DEBUG ainvoke] Received TextBlock: '{block.text[:80]}'")
+                            elif isinstance(block, ToolUseBlock):
+                                _logger.info(f"[DEBUG ainvoke] Received ToolUseBlock: {block.name}")
+
+                        tool_blocks = [
+                            block for block in event.content
+                            if isinstance(block, ToolUseBlock)
                         ]
-                    else:
+                        # ── Proxy classification: PREFIX-ONLY (do NOT match
+                        # on bare base name). ──
+                        # Claude Code exposes our MCP tools to the model ONLY
+                        # as ``mcp__deepworker__<tool>`` (the canonical MCP
+                        # naming — verified, see
+                        # docs/FACTS_TOOL_USE_ID_VS_BLOCK_ID.md). A real proxy
+                        # call therefore ALWAYS arrives prefixed. A BARE block
+                        # (e.g. ``execute``/``read_file``) is NOT one of our
+                        # calls even if its name collides with a base name we
+                        # registered — it is a built-in tool or a model
+                        # hallucination of a short name; the CLI does NOT route
+                        # it through our MCP server, so NO handler / pending
+                        # call ever appears for it.
+                        #
+                        # ⚠️ DO NOT revert to ``_strip_proxy_mcp_prefix(name)
+                        # in proxy_tool_names`` (accepts bare names). That
+                        # base-name match is what deadlocked a live agent
+                        # 2026-06-15: a bare built-in ``execute`` was treated
+                        # as our proxy ``execute``; chat_model parked on its
+                        # ``tool_use_id`` which never arrives over our control
+                        # channel. Identify OUR call ONLY by the prefixed name
+                        # + the control-channel tool_use_id.
+                        proxy_blocks = [
+                            block for block in tool_blocks
+                            if block.name.startswith(_PROXY_MCP_TOOL_PREFIX)
+                            and _strip_proxy_mcp_prefix(block.name)
+                            in proxy_tool_names
+                        ]
+
+                        if proxy_blocks:
+                            # First proxy ToolUseBlock — break out and let the
+                            # event-driven wait below pick up the control-channel
+                            # pending call. Do NOT keep iterating; Claude will not
+                            # send ResultMessage until we resolve.
+                            #
+                            # The visible block name/args are captured ONLY for
+                            # diagnostics. They are NOT a reliable matching key:
+                            # Claude streams the ToolUseBlock in the assistant
+                            # message with argument JSON that can differ from the
+                            # finalized args delivered to the MCP handler over the
+                            # control channel (observed live:
+                            # visible grep(pattern='unsubscribe_messages') vs
+                            # control-channel grep(pattern='unsubscribe');
+                            # visible read_file(limit=30) vs control read_file(
+                            # limit=40)). The authoritative call — the one that
+                            # gets executed and later resolve_call'd by its
+                            # handler-assigned call_id — is whatever the proxy
+                            # registers in pending_calls. So we wait for ANY
+                            # handler registration, then surface get_pending_calls().
+                            first_proxy_block = proxy_blocks[0]
+                            expected_proxy_tool_call_id = first_proxy_block.id
+                            expected_proxy_tool_name = _strip_proxy_mcp_prefix(
+                                first_proxy_block.name
+                            )
+                            saw_proxy_tool = True
+                            _logger.info(f"[DEBUG ainvoke] MCP tool detected — breaking for LangGraph "
+                                f"(visible blocks in this AssistantMessage: "
+                                f"{[b.name for b in proxy_blocks]})")
+                            break
+                        if tool_blocks:
+                            # Built-in Claude tool (ToolSearch, WebSearch, etc.)
+                            # — Claude handles execution internally; keep
+                            # consuming events until ResultMessage.
+                            _logger.info("[DEBUG ainvoke] Built-in tool — continuing receive_response")
+                            continue
+
+                    elif isinstance(event, ResultMessage):
+                        _logger.info("[DEBUG ainvoke] Received ResultMessage")
+                        # Persist the CLI's session uuid as a restore HINT for the
+                        # next restart (authoritative validation is still the
+                        # tail-match). DESIGN_HISTORY_RESTORE_ON_RESTART.md §3.4.
+                        _sid = getattr(event, "session_id", None)
+                        if _sid:
+                            self._client_manager.record_session_uuid(thread_id, _sid)
+                        break
+
+                # ── A: event-driven wait FOR THE EXACT id ──
+                # After breaking on a proxy ToolUseBlock we wait for the
+                # MCP handler to register the pending call with the SAME
+                # id (``ToolUseBlock.id`` == ``_meta.claudecode/
+                # toolUseId`` propagated through the SDK ContextVar — see
+                # POLICIES.md §7 / the 2026-06-14 incident). The wait is
+                # event-driven (Future), id-keyed, and HAS NO TIMEOUT.
+                #
+                # ⚠️ ``ToolUseBlock.id`` here = the per-call ``toolu_*``
+                # (the tool_use_id), NOT the message-block id (``msg_*``).
+                # Those are different namespaces and are NEVER equal
+                # (measured 0/46683 — see docs/FACTS_TOOL_USE_ID_VS_BLOCK_ID.md).
+                # The per-call ``toolu_*`` is the same on the stream and on
+                # the MCP control channel, so id-keying is correct — BUT
+                # only for OUR proxy call. KNOWN TRAP (deadlocked a live agent
+                # 2026-06-15): a built-in Claude tool and our proxy tool can
+                # share a base name (``execute`` vs
+                # ``mcp__deepworker__execute``); if the visible block of the
+                # BUILT-IN tool is misclassified as a proxy block, we wait
+                # here on ITS ``toolu_*`` forever — it never arrives over
+                # OUR control channel. ``expected_proxy_tool_call_id`` MUST
+                # come only from a block whose name actually starts with
+                # ``mcp__deepworker__``. A message block can also carry many
+                # calls (up to 52) — completion = ALL of them resolved, not
+                # just ``proxy_blocks[0]``.
+                #
+                # ⚠ DO NOT add a timeout here. The previous code wrapped
+                # this in ``asyncio.wait_for(..., timeout=5.0)`` and, on
+                # timeout, INJECTED THE VISIBLE BLOCK into
+                # ``pending_tool_calls`` as a fallback — which gave
+                # LangGraph ToolNode a tool_call without a matching MCP
+                # pending and produced the "three identical copies of one
+                # block" symptom (the real handler arrived later, never
+                # got ``resolve_call``-ed, returned an artificial error
+                # to Claude after its own 120s phantom timeout, Claude
+                # retried, ToolNode executed again).
+                #
+                # We only reach this wait for a block whose name is
+                # ``mcp__deepworker__<tool>`` AND whose stripped name is a
+                # tool we registered (prefix-only classification above).
+                # The CLI routes exactly those over the control channel, so
+                # the matching ``tools/call`` arrives and the id-keyed
+                # waiter resolves. A non-routable name (bare/built-in/
+                # unknown) never reaches here, so we never park on a call
+                # that won't come — this is the structural fix for the
+                # 2026-06-15 deadlock (see
+                # docs/FACTS_TOOL_USE_ID_VS_BLOCK_ID.md).
+                #
+                # NOTE: the earlier claim "the SDK GUARANTEES the
+                # control-channel message will arrive" was FALSE — it only
+                # holds for OUR prefixed tools, which is exactly what the
+                # classification now enforces. As a belt-and-braces escape
+                # hatch, ``ProxyMCPServer.cancel_pending_waiter`` +
+                # ``parse_no_such_tool`` let any future caller break a wait
+                # if the CLI reports ``No such tool available: <name>`` for
+                # an id we are holding. If the CLI is genuinely hung (no
+                # control request EVER), the operator's per-turn deadline
+                # surfaces it as an infrastructure error.
+                if (
+                    saw_proxy_tool
+                    and pending_tool_calls is None
+                    and not proxy_mcp.has_pending_calls()
+                ):
+                    if expected_proxy_tool_call_id is None:
+                        # Diagnostic guard (D): a visible ToolUseBlock
+                        # MUST have an id. If not, the Claude side
+                        # violated its own invariant — raise so the bug
+                        # is surfaced, not silently masked.
                         raise RuntimeError(
-                            "Claude emitted a proxy MCP ToolUseBlock, but no "
-                            "MCP handler registered a pending call and the "
-                            "visible block could not be reconstructed."
-                        ) from exc
+                            "Claude emitted a proxy MCP ToolUseBlock "
+                            "without a tool_use_id. The Claude side "
+                            "invariant is broken — escalate, do NOT "
+                            "patch around it. See POLICIES.md §7."
+                        )
+                    # Stage A is BOUNDED by the single source of truth
+                    # (variant A). If the control request never arrives, the
+                    # waiter raises DispatchTimeout. There is NO pending call to
+                    # execute, so we do NOT fabricate a tool_call (that would
+                    # run a phantom tool via ToolNode). Instead end the turn
+                    # with a NON-error in_progress notice as the assistant text:
+                    # the model is informed and continues / retries. Never
+                    # hangs, never errors (POLICIES.md §7.1).
+                    # See DESIGN_UNIFIED_BOUNDED_TOOL_WAIT.md.
+                    try:
+                        await proxy_mcp.wait_for_pending_call_by_id(
+                            expected_proxy_tool_call_id
+                        )
+                    except DispatchTimeout:
+                        from deepagents.middleware.bounded_tool_call import (  # noqa: PLC0415
+                            build_in_progress_notice,
+                            resolve_tool_wait_seconds,
+                        )
+                        response_text = build_in_progress_notice(
+                            tool_name=expected_proxy_tool_name or "tool",
+                            job_id=expected_proxy_tool_call_id,
+                            wait_seconds=resolve_tool_wait_seconds(),
+                        )
 
         # Usage-cap guard: when the account hits its limit, the CLI returns
         # the marker as the WHOLE turn (no tool calls, no real work). Detect
         # it on a text-only turn and raise so the agent surfaces ERROR rather
-        # than passing the useless reply downstream (observed 2026-05-21).
+        # than passing the useless reply downstream (observed live, 2026-05-21).
         if (
             pending_tool_calls is None
             and not proxy_mcp.has_pending_calls()
@@ -993,8 +1526,8 @@ class ClaudeCodeChatModel(BaseChatModel):
             return AIMessage(content=response_text, tool_calls=tool_calls)
 
         # 10. Return final answer
-        print(f"[DEBUG ainvoke] Returning AIMessage with content: '{response_text[:80]}'", file=sys.stderr)
-        print(f"[DEBUG ainvoke] ========== END ==========\n", file=sys.stderr)
+        _logger.info(f"[DEBUG ainvoke] Returning AIMessage with content: '{response_text[:80]}'")
+        _logger.info(f"[DEBUG ainvoke] ========== END ==========\n")
         return AIMessage(content=response_text)
 
     async def cleanup_thread(self, thread_id: str) -> None:

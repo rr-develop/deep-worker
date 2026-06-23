@@ -1,7 +1,7 @@
 """Regression: evicting a DEAD RPyC-netref subscriber must not crash the
 notify path (and must not leak the corpse).
 
-Incident (observed 2026-05-22): a web subscriber's RPyC channel died. In
+Incident (observed live, 2026-05-22): a web subscriber's RPyC channel died. In
 ``_notify_subscribers``:
 
   1. ``subscriber.on_message(...)`` raised ``EOFError('stream has been
@@ -107,6 +107,21 @@ async def test_live_subscriber_still_receives() -> None:
         def __init__(self) -> None:
             self.msgs: list[str] = []
             self._h = id(self)
+            # _asyncreq accesses ____conn__ via
+            # object.__getattribute__(proxy, "____conn__") and calls
+            # conn.async_request(handler, proxy, method, args, kwargs).
+            # We wire it to delegate to on_message.
+            class _MockConn:
+                @staticmethod
+                async def async_request(
+                    _handler: object,
+                    proxy: object,
+                    method: str,
+                    args: tuple[object, ...],
+                    kwargs: tuple[object, ...] | None = None,
+                ) -> None:
+                    await getattr(proxy, method)(*args, **(kwargs or {}))
+            self.____conn__ = _MockConn()
 
         async def on_message(self, payload: str) -> None:
             self.msgs.append(payload)

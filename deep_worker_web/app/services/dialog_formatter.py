@@ -148,32 +148,90 @@ def _user_header(kind: HumanKind, content: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+# Sentinel ``human`` payload used for a leading SystemMessage block that
+# precedes any real HumanMessage (e.g. the agent's base system prompt).
+# Such a block has no user line — only the system content(s).
+_SYSTEM_PREAMBLE_TYPE = "SystemPreamble"
+
+
 @dataclass
 class Turn:
     """One slice of conversation: a HumanMessage + everything until the next.
 
     ``stream`` is the in-order list of post-Human items as ``(kind, payload)``
-    tuples used by ``full`` mode to interleave text and tool-calls. The
-    parsed ``ai_text_messages`` list holds just the text-bearing AIMessages
-    used by ``final`` and ``text`` modes.
+    tuples used by ``full`` mode to interleave text, tool-calls and system
+    messages. The parsed ``ai_text_messages`` list holds just the
+    text-bearing AIMessages used by ``final`` and ``text`` modes.
+
+    ``system_messages`` holds the content of SystemMessages that appear
+    inside this turn (the base prompt, or runtime middleware hints such as
+    the inter-agent reply hint). They are rendered at ``text`` and ``full``
+    verbosity. ⚠️ POLICY: history rendered at ``text`` or higher MUST surface
+    system messages — a "full" rendering without them is misleading and is
+    forbidden. See DESIGN_FULL_DIALOG_FINAL_RESPONSE_PAIRS.md
+    §"System messages are first-class in history rendering".
     """
 
     human: dict[str, Any]
     ai_text_messages: list[str] = field(default_factory=list)
     stream: list[tuple[str, Any]] = field(default_factory=list)
-    # entries: ("text", str) | ("tool_call", dict)
+    # entries: ("text", str) | ("tool_call", dict) | ("system", str)
+    system_messages: list[str] = field(default_factory=list)
+
+
+def _extract_system_content(msg: dict[str, Any]) -> str:
+    """Pull displayable text out of a SystemMessage dict."""
+    c = msg.get("content", "")
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        # Same text-block handling as AIMessages, with a plain-string
+        # fallback so nothing is silently dropped.
+        parts: list[str] = []
+        for block in c:
+            if isinstance(block, dict) and block.get("type") == "text":
+                t = block.get("text", "")
+                if isinstance(t, str):
+                    parts.append(t)
+            elif isinstance(block, str):
+                parts.append(block)
+        if parts:
+            return "".join(parts)
+    return str(c)
 
 
 def split_into_turns(history: list[dict[str, Any]]) -> list[Turn]:
-    """Group a flat history list into turns keyed by HumanMessage."""
+    """Group a flat history list into turns keyed by HumanMessage.
+
+    SystemMessages are captured (never dropped): a SystemMessage before the
+    first HumanMessage becomes a leading ``SystemPreamble`` turn; a
+    SystemMessage inside a turn is recorded both in ``system_messages`` and
+    in ``stream`` (preserving chronological order for ``full`` mode).
+    """
     turns: list[Turn] = []
     current: Turn | None = None
+    preamble: Turn | None = None
     for msg in history:
         msg_type = msg.get("type")
         if msg_type == "HumanMessage":
             if current is not None:
                 turns.append(current)
             current = Turn(human=msg)
+            continue
+        if msg_type == "SystemMessage":
+            content = _extract_system_content(msg)
+            if current is None:
+                # Leading system block (base prompt) — accumulate into a
+                # synthetic preamble turn so it renders before the first
+                # user turn.
+                if preamble is None:
+                    preamble = Turn(human={"type": _SYSTEM_PREAMBLE_TYPE, "content": ""})
+                    turns.append(preamble)
+                preamble.system_messages.append(content)
+                preamble.stream.append(("system", content))
+            else:
+                current.system_messages.append(content)
+                current.stream.append(("system", content))
             continue
         if current is None:
             # AIMessage / ToolMessage before any HumanMessage — skip
@@ -206,10 +264,23 @@ def _render_assistant_block_final(turn: Turn) -> str:
 
 
 def _render_assistant_block_text(turn: Turn) -> str:
-    if not turn.ai_text_messages:
+    # ``text`` mode shows every text-bearing AIMessage AND every
+    # SystemMessage in this turn, in chronological order. System messages
+    # (base prompt / middleware hints) are first-class — omitting them
+    # would make the rendering misleading (forbidden by policy).
+    parts: list[str] = []
+    for kind, payload in turn.stream:
+        if kind == "text":
+            parts.append(f"--- Assistant ---\n{payload}")
+        elif kind == "system":
+            parts.append(f"--- System ---\n{payload}")
+    if not turn.ai_text_messages and not turn.system_messages:
         return f"--- Assistant ---\n{NO_RESPONSE_TEXT}"
-    body = "\n\n".join(turn.ai_text_messages)
-    return f"--- Assistant ---\n{body}"
+    if not turn.ai_text_messages:
+        # System-only turn (e.g. a leading system prompt): show systems,
+        # no assistant placeholder.
+        return "\n\n".join(parts)
+    return "\n\n".join(parts)
 
 
 def _render_assistant_block_full(turn: Turn) -> str:
@@ -219,11 +290,26 @@ def _render_assistant_block_full(turn: Turn) -> str:
     for kind, payload in turn.stream:
         if kind == "text":
             parts.append(f"--- Assistant ---\n{payload}")
+        elif kind == "system":
+            parts.append(f"--- System ---\n{payload}")
         elif kind == "tool_call":
             tc_name = payload.get("name", "?") if isinstance(payload, dict) else "?"
             line = format_tool_call(payload) if isinstance(payload, dict) else str(payload)
             parts.append(f"--- Assistant (tool: {tc_name}) ---\n{line}")
     return "\n\n".join(parts)
+
+
+def _render_system_preamble(turn: Turn, verbosity: Verbosity) -> str | None:
+    """Render a leading SystemMessage block (base prompt) that precedes any
+    HumanMessage. Visible at ``text``/``full``; omitted at ``final``.
+    Returns None when there is nothing to show at this verbosity.
+    """
+    if verbosity == "final":
+        return None
+    if not turn.system_messages:
+        return None
+    blocks = [f"--- System ---\n{content}" for content in turn.system_messages]
+    return "\n\n".join(blocks)
 
 
 def _render_turn(turn: Turn, kind: HumanKind, verbosity: Verbosity) -> str:
@@ -245,6 +331,50 @@ def _render_turn(turn: Turn, kind: HumanKind, verbosity: Verbosity) -> str:
     return f"{header}\n{body}\n\n{ai_block}"
 
 
+def render_system_prompt(
+    system_prompt: str,
+    provider: str | None,
+    model: str | None,
+) -> str:
+    """Render the invariant (startup) system prompt as a plain-text block.
+
+    This is mode #4 of the Full Dialog verbosity combo (§9 of
+    DESIGN_FULL_DIALOG_FINAL_RESPONSE_PAIRS.md). The system prompt is the
+    provider-AGNOSTIC role/instruction text the agent was built with — it
+    does NOT live in the checkpoint and is NOT a conversation turn, so it is
+    rendered standalone (not via ``split_into_turns``/``render_dialog``).
+    """
+    body = system_prompt if (system_prompt and system_prompt.strip()) else "(no system prompt)"
+    header = (
+        f"--- System Prompt (invariant, provider={provider}, model={model}) ---"
+    )
+    return f"{header}\n{body}"
+
+
+def render_tools(tools: list[dict[str, Any]], provider: str | None) -> str:
+    """Render the agent's available-tool list as a plain-text block.
+
+    Mode #5 of the verbosity combo (§9). The tool list MAY depend on the
+    active provider, so the provider is shown in the header. Each tool is a
+    ``- <name>: <description first line>`` line.
+    """
+    header = f"--- Available Tools (provider={provider}, count={len(tools)}) ---"
+    if not tools:
+        return f"{header}\n(no tools)"
+    lines: list[str] = []
+    for t in tools:
+        name = t.get("name", "?") if isinstance(t, dict) else "?"
+        desc = t.get("description", "") if isinstance(t, dict) else ""
+        if not isinstance(desc, str):
+            desc = str(desc)
+        first_line = desc.splitlines()[0] if desc.strip() else ""
+        if first_line:
+            lines.append(f"- {name}: {first_line}")
+        else:
+            lines.append(f"- {name}")
+    return header + "\n" + "\n".join(lines)
+
+
 def render_dialog(turns: list[Turn], verbosity: str = "final") -> str:
     """Render a list of Turns to a plain-text dialog at the requested verbosity."""
     if verbosity not in ("final", "text", "full"):
@@ -252,6 +382,13 @@ def render_dialog(turns: list[Turn], verbosity: str = "final") -> str:
 
     blocks: list[str] = []
     for turn in turns:
+        # A leading SystemMessage block (base prompt) has no user line.
+        # Render it as a standalone System block at text/full; skip at final.
+        if turn.human.get("type") == _SYSTEM_PREAMBLE_TYPE:
+            rendered = _render_system_preamble(turn, verbosity)
+            if rendered is not None:
+                blocks.append(rendered)
+            continue
         raw = turn.human.get("content", "")
         if not isinstance(raw, str):
             raw = str(raw)

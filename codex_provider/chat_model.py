@@ -177,7 +177,7 @@ def resolve_model_from_session_log(
     return None
 
 
-TOOL_CONTRACT = """\
+DEEP_WORKER_TOOL_CONTRACT = """\
 Deep-worker tool contract:
 - Use only the deep-worker MCP proxy tools (prefix `mcp__deepworker_*__`)
   for file, shell, web, task, memory, and agent operations.
@@ -608,7 +608,8 @@ class CodexChatModel(BaseChatModel):
         when set, Codex resumes the existing session
         (``codex exec resume <uuid>``); when ``None``, a fresh session starts.
         """
-        # Per-agent MCP isolation (observed 2026-05-20): pass THIS
+        # Per-agent MCP isolation (learned from a related internal
+        # incident): pass THIS
         # agent's own proxy server into the ExecArgs so it is injected
         # per-invocation via ``--config mcp_servers.<name>.url``, and
         # ``_build_argv`` also adds ``--ignore-user-config`` so the shared
@@ -683,7 +684,7 @@ class CodexChatModel(BaseChatModel):
                     # it recorded the cause on ``handle.pump_error``.
                     # Re-raise it here so the caller sees a real error
                     # instead of an empty assistant message — the latter
-                    # silently stalls the agent (observed 2026-05-20).
+                    # silently stalls the agent (observed live).
                     pump_error = getattr(handle, "pump_error", None)
                     if pump_error is not None:
                         raise pump_error
@@ -708,21 +709,29 @@ class CodexChatModel(BaseChatModel):
                         and it.server == self._proxy_mcp.server_name
                         and it.status == "in_progress"
                     ):
-                        # Proxy MCP tool starting — event-driven wait
-                        # for the HTTP handler's parked Future.
+                        # Proxy MCP tool starting — event-driven wait for the
+                        # HTTP handler's parked Future, BOUNDED by the SINGLE
+                        # source of truth (variant A; no independent 30s timer).
+                        # On timeout: NON-error in_progress, never raise, never
+                        # hang (POLICIES.md §7.1). See
+                        # DESIGN_UNIFIED_BOUNDED_TOOL_WAIT.md.
                         try:
                             pending_tool_calls = await self._proxy_mcp.wait_for_pending_calls(
                                 tool_name=it.tool,
                                 arguments=it.arguments,
-                                timeout=30.0,
                             )
-                        except asyncio.TimeoutError as exc:
+                        except asyncio.TimeoutError:
+                            from deepagents.middleware.bounded_tool_call import (  # noqa: PLC0415
+                                build_in_progress_notice,
+                                resolve_tool_wait_seconds,
+                            )
+                            final_text = build_in_progress_notice(
+                                tool_name=it.tool,
+                                job_id=getattr(it, "id", None) or it.tool,
+                                wait_seconds=resolve_tool_wait_seconds(),
+                            )
                             turn_done = True
-                            raise RuntimeError(
-                                "Codex MCP tool started, but the proxy MCP "
-                                "handler did not register a matching pending "
-                                f"call within 30s: {it.tool}"
-                            ) from exc
+                            break
                         if pending_tool_calls:
                             break
                     elif (
@@ -801,7 +810,8 @@ class CodexChatModel(BaseChatModel):
             # That global list is shared by every codex process on the
             # host, never gets cleaned, and made each ``codex exec``
             # connect to dozens of dead ``deepworker_<pid>`` ports —
-            # 120 s hang per stale server (observed 2026-05-20). Instead the server is injected per-invocation
+            # 120 s hang per stale server (observed in a related
+            # internal incident). Instead the server is injected per-invocation
             # via ``ExecArgs.mcp_server_name``/``mcp_server_port`` (see
             # the ExecArgs construction in ``ainvoke`` and
             # ``CodexExecRunner._build_argv``). Agents stay fully
@@ -873,10 +883,10 @@ def _flatten_message_content_to_text(content: Any) -> str:
 
 def _augment_base_instructions(system_prompt: str | None) -> str:
     if not system_prompt:
-        return TOOL_CONTRACT
-    if TOOL_CONTRACT in system_prompt:
+        return DEEP_WORKER_TOOL_CONTRACT
+    if DEEP_WORKER_TOOL_CONTRACT in system_prompt:
         return system_prompt
-    return f"{system_prompt.rstrip()}\n\n{TOOL_CONTRACT}"
+    return f"{system_prompt.rstrip()}\n\n{DEEP_WORKER_TOOL_CONTRACT}"
 
 
 class _suppress_errors:
@@ -915,7 +925,7 @@ class _suppress_errors:
 # REMOVED on 2026-05-20. That global, never-cleaned list accumulated one
 # ``[mcp_servers.deepworker_<pid>]`` entry per agent ever launched, and
 # every ``codex exec`` then tried to connect to all of them — each dead
-# port hanging for the 120 s proxy timeout (observed: "hangs 10 min then
+# port hanging for the 120 s proxy timeout (observed live: "hangs 10 min then
 # works"). The proxy server is now injected per-invocation via
 # ``ExecArgs.mcp_server_name`` / ``mcp_server_port`` +
 # ``--ignore-user-config`` (see ``CodexExecRunner._build_argv``). DO NOT

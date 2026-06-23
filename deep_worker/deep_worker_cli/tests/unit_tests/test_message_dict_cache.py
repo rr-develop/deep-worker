@@ -11,7 +11,12 @@ SQLite, agents, or RPyC.
 """
 from __future__ import annotations
 
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import (
+    AIMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
 
 from deep_worker_cli.process.message_dict_cache import (
     MessageDictCache,
@@ -58,6 +63,52 @@ class TestSerializerPure:
         assert out["tool_call_id"] == "call_1"
         assert out["name"] == "grep"
         assert out["content"] == "ok"
+
+    def test_system_message_shape(self) -> None:
+        # A SystemMessage MUST be serialized WITH its content so the
+        # history renderer can display it. Rendering full history without
+        # system prompts is misleading and forbidden (see
+        # deep_worker_web/docs/DESIGN_FULL_DIALOG_FINAL_RESPONSE_PAIRS.md
+        # §"System messages are first-class").
+        msg = SystemMessage(content="You are a helpful assistant.", id="s1")
+        out = serialize_message(msg)
+        assert out == {
+            "type": "SystemMessage",
+            "id": "s1",
+            "content": "You are a helpful assistant.",
+        }
+
+    def test_system_message_non_string_content(self) -> None:
+        msg = SystemMessage(content=["hint A", "hint B"], id="s2")
+        out = serialize_message(msg)
+        assert out["type"] == "SystemMessage"
+        assert out["id"] == "s2"
+        # Non-string content must be coerced to a string, never dropped.
+        assert "content" in out
+        assert "hint A" in out["content"]
+
+    def test_system_message_shape(self) -> None:
+        # A SystemMessage MUST be serialized WITH its content so the
+        # history renderer can display it. Rendering full history without
+        # system prompts is misleading and forbidden (see
+        # deep_worker_web/docs/DESIGN_FULL_DIALOG_FINAL_RESPONSE_PAIRS.md
+        # §"System messages are first-class").
+        msg = SystemMessage(content="You are a helpful assistant.", id="s1")
+        out = serialize_message(msg)
+        assert out == {
+            "type": "SystemMessage",
+            "id": "s1",
+            "content": "You are a helpful assistant.",
+        }
+
+    def test_system_message_non_string_content(self) -> None:
+        msg = SystemMessage(content=["hint A", "hint B"], id="s2")
+        out = serialize_message(msg)
+        assert out["type"] == "SystemMessage"
+        assert out["id"] == "s2"
+        # Non-string content must be coerced to a string, never dropped.
+        assert "content" in out
+        assert "hint A" in out["content"]
 
     def test_message_created_at_is_serialized(self) -> None:
         msg = HumanMessage(

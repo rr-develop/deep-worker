@@ -64,8 +64,8 @@ def isolate_global_state(
 
     The home isolation matters since the restart-persistence fix
     (DESIGN_HISTORY_RESTORE_ON_RESTART.md): ``CodexChatModel.ainvoke`` now
-    persists ``sent_count`` + ``codex_session_uuid`` to the per-agent state
-    file (``codex_session_state.json``) under the agent's data directory, and
+    persists ``sent_count`` + ``codex_session_uuid`` to the agent's local
+    state directory (``codex_session_state.json``), and
     ``CodexClientState.get_or_create`` lazily seeds from it. Without pointing
     ``Path.home()`` at a fresh tmp dir per test, these tests would write into
     the real home and a leaked file would seed a non-zero ``sent_count`` /
@@ -480,10 +480,12 @@ class TestAinvokeToolCalls:
         assert isinstance(result, AIMessage)
         assert result.tool_calls
         assert result.tool_calls[0]["name"] == "read_file"
+        # Variant A: the stage-A wait is bounded by the SINGLE source of truth
+        # (resolve_tool_wait_seconds), not a hardcoded 30s here — so no
+        # explicit timeout kwarg is passed.
         proxy.wait_for_pending_calls.assert_awaited_once_with(
             tool_name="read_file",
             arguments={"path": "/tmp/x"},
-            timeout=30.0,
         )
         # Text content should be empty or not contain the unreachable msg
         assert "unreachable" not in (result.content or "")
@@ -868,7 +870,7 @@ class _RaisingExecRunner:
 @pytest.mark.asyncio
 class TestAinvokeSurfacesPumpError:
     """A fatal codex stream error must propagate OUT of ainvoke, not be
-    swallowed into an empty AIMessage (observed 2026-05-20)."""
+    swallowed into an empty AIMessage (observed live)."""
 
     async def test_codex_protocol_error_propagates(self) -> None:
         from codex_provider.exec_runner import CodexProtocolError

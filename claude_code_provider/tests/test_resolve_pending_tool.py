@@ -15,6 +15,10 @@ import asyncio
 
 import pytest
 
+from claude_agent_sdk._mcp_context import (
+    reset_current_claude_tool_use_id,
+    set_current_claude_tool_use_id,
+)
 from claude_code_provider.chat_model import ClaudeCodeChatModel
 from claude_code_provider.proxy_mcp_server import ProxyMCPServer
 from claude_code_provider.custom_types import MCPResult, ToolMetadata
@@ -37,10 +41,21 @@ _TOOL_META: list[ToolMetadata] = [
 
 
 async def _register_pending(proxy: ProxyMCPServer) -> str:
-    """Drive the handler so a pending call exists; return its call_id."""
-    asyncio.create_task(
-        proxy.tool_handlers[0].handler({"agent_name": "beta", "message": "hi"})
-    )
+    """Drive the handler so a pending call exists; return its call_id.
+
+    Incident 2026-06-14: the handler MUST be invoked with a Claude
+    tool_use_id in the SDK ContextVar — the synthetic-id fallback is
+    gone. ``set_current_claude_tool_use_id`` is set BEFORE
+    ``create_task`` so the task's context snapshot captures the id.
+    """
+    cid = "toolu_resolve_pending"
+    token = set_current_claude_tool_use_id(cid)
+    try:
+        asyncio.create_task(
+            proxy.tool_handlers[0].handler({"agent_name": "beta", "message": "hi"})
+        )
+    finally:
+        reset_current_claude_tool_use_id(token)
     for _ in range(20):
         await asyncio.sleep(0)
         if proxy.has_pending_calls():

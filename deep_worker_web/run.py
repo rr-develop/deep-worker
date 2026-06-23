@@ -1,12 +1,12 @@
-"""Main entry point for the web application.
+"""Main entry point for deep-worker-web application.
 
 CRITICAL SECURITY NOTICE:
 ========================
 This application MUST ONLY run on 127.0.0.1 on one of two approved
 ports — and no other:
 
-- 7887 for the production / hot-fix checkout
-- 7888 for the developer checkout
+- 7887 for the production / hot-fix checkout at /path/to/production
+- 7888 for the developer checkout at /path/to/dev
 
 ``app.config`` derives the correct port from the checkout location
 at import time and refuses to start anywhere else.
@@ -25,12 +25,12 @@ import uvicorn
 from app.config import settings
 
 # Rotating log: ≤2 GB total. Path is hard-coded so the file can't be
-# silently redirected via shell `> /tmp/X.log` again (that leaked 64 GB
+# silently redirected via a shell output redirect again (that leaked 64 GB
 # once stdout/stderr were captured by uvicorn into an unrotated sink).
 # _setup_logging() also takes over sys.stdout/sys.stderr, so even
 # nohup-style redirects route through the RotatingFileHandler.
-_LOG_DIR = Path("/tmp/web_app")
-_LOG_FILE = _LOG_DIR / "web_app.log"
+_LOG_DIR = Path("/tmp/deep_worker_web")
+_LOG_FILE = _LOG_DIR / "deep_worker_web.log"
 _LOG_MAX_BYTES = 512 * 1024 * 1024
 _LOG_BACKUP_COUNT = 3
 
@@ -123,7 +123,7 @@ def signal_handler(sig: int, frame: FrameType | None) -> None:
 
 
 def main() -> None:
-    """Start the web app server."""
+    """Start the deep-worker-web server."""
     # Logging setup MUST come before anything else writes to stdout/stderr.
     # _enforce_rotating_logging() then aborts startup if rotation isn't active.
     _setup_logging()
@@ -132,9 +132,9 @@ def main() -> None:
     # Register signal handlers
     signal.signal(signal.SIGINT, signal_handler)
 
-    # Security validation (config.py already validates on import, but be explicit).
+    # Security validation (explicit check before server start).
     # `settings.validate_security()` enforces the (checkout -> port) pairing —
-    # 7887 for the production tree, 7888 for the developer tree — so a
+    # 7887 for /path/to/production, 7888 for /path/to/dev — so a
     # second sanity check here just re-runs it with a friendly error message
     # in case settings got mutated between import and main().
     print(f"🔒 SECURITY: Server will bind to {settings.host}:{settings.port} ONLY")
@@ -149,7 +149,7 @@ def main() -> None:
         sys.exit(1)
 
     print(f"✅ Security check passed: {settings.host}:{settings.port}")
-    print(f"🚀 Starting the web app server...")
+    print(f"🚀 Starting deep-worker-web server...")
     print(f"📝 Open http://{settings.host}:{settings.port} in your browser")
     print()
 

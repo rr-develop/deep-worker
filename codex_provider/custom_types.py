@@ -10,6 +10,8 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import Any, TypedDict
 
+from typing_extensions import NotRequired
+
 
 class ToolMetadata(TypedDict):
     """LangChain-tool metadata extracted by ``bind_tools`` and forwarded
@@ -18,11 +20,26 @@ class ToolMetadata(TypedDict):
     - ``name``         — tool name used by Codex when calling it.
     - ``description``  — text shown to the model.
     - ``input_schema`` — JSON Schema for the tool arguments.
+    - ``long_running`` — TRI-STATE wait policy (HARD POLICY, 2026-06-16,
+      identical across providers). Unset/``None`` (DEFAULT) and ``True``
+      → the job-handle mechanism: after ``long_running_wait_seconds`` the
+      handler parks the still-running Future as a job and returns a
+      NON-error ``in_progress`` notice (``job_id`` + ``wait_for_job`` /
+      ``kill_job``); work is NOT cancelled, the tool NEVER hangs forever.
+      ``False`` → an EXPLICIT opt-out, allowed ONLY together with an
+      explicit ``timeout``; opting out without a timeout is FORBIDDEN
+      (raises at construction). On its timeout the handler returns a
+      NON-error "timed out, still running" notice — never ``is_error``.
+    - ``timeout``      — REQUIRED iff ``long_running`` is explicitly
+      ``False``. Seconds to wait before the timeout notice. See
+      ``docs/POLICIES.md`` §7.1.
     """
 
     name: str
     description: str
     input_schema: dict[str, Any]
+    long_running: NotRequired[bool]
+    timeout: NotRequired[float]
 
 
 class MCPResult(TypedDict, total=False):
@@ -36,6 +53,18 @@ class MCPResult(TypedDict, total=False):
 
     content: list[dict[str, Any]]
     is_error: bool
+
+
+class JobHandle(TypedDict):
+    """An in-flight tool call parked as a background job after its wait
+    elapsed. The Future is NOT cancelled — the real work continues on the
+    LangGraph ToolNode side and is later resolved. The agent was handed an
+    intermediate handle and can ``wait_for_job`` / ``kill_job`` it.
+    """
+
+    future: "asyncio.Future[MCPResult]"
+    tool_name: str
+    args: dict[str, Any]
 
 
 class PendingCall(TypedDict):

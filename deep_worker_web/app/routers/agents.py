@@ -377,10 +377,10 @@ async def stop_task_manager(
     #   was started without ``--task-manager``, so ``root`` has no
     #   ``stop_task_manager`` method. This is a normal "nothing to
     #   do" state — respond 200 (pre-existing contract).
-    is_connected = await service.is_connected(agent_name)
-    if not is_connected:
-        # One attempt to reconnect, honouring fire-and-forget patterns.
-        is_connected = await service.connect_to_agent(agent_name)
+    # NON-BLOCKING: ensure_connecting returns current connectivity and
+    # kicks a single-flight background connect if needed — it never waits
+    # on a slow/stuck peer (the 2026-06-15 incident).
+    is_connected = await service.ensure_connecting(agent_name)
 
     root = service.get_root(agent_name) if is_connected else None
 
@@ -543,7 +543,7 @@ async def get_status(
 @router.get("/{agent_name}/dialog-text", response_class=PlainTextResponse)
 async def get_dialog_text(
     agent_name: str,
-    verbosity: Literal["final", "text", "full"] = "final",
+    verbosity: Literal["final", "text", "full", "system_prompt", "tools"] = "final",
     service: AgentService = Depends(get_agent_service),
 ) -> str:
     """Get full dialog text for an agent as plain text.
@@ -588,13 +588,15 @@ async def get_dialog_text(
             detail=f"Agent '{agent_name}' not found",
         )
 
-    # Connect if not connected
-    if not await service.is_connected(agent_name):
-        if not await service.connect_to_agent(agent_name):
-            raise HTTPException(
-                status_code=500,
-                detail=f"Failed to connect to agent '{agent_name}'",
-            )
+    # NON-BLOCKING connect gate: never wait on a slow/stuck peer. If the
+    # agent is not connected yet, a single-flight background connect is
+    # kicked off and we return 503 immediately (UI shows a retry banner)
+    # instead of hanging this handler (the 2026-06-15 incident).
+    if not await service.ensure_connecting(agent_name):
+        raise HTTPException(
+            status_code=503,
+            detail=f"Agent '{agent_name}' not connected (connecting…)",
+        )
 
     # Get formatted dialog text from agent
     try:
@@ -641,7 +643,7 @@ def load_launch_config(agent_name: str) -> dict[str, Any] | None:
     """Load launch_config from session_metadata.json."""
     import json
 
-    data_dir = Path("~/.deep_worker").expanduser() / agent_name
+    data_dir = Path.home() / Path("~/.deep_worker").name / agent_name
     metadata_file = data_dir / "session_metadata.json"
 
     if not metadata_file.exists():
@@ -679,20 +681,39 @@ def _spawn_subprocess(
     # so treat it (and an empty/None value) as "no model specified" and
     # omit ``--model`` entirely. The agent then picks its provider
     # default (codex CLI chooses its own current default). Passing
-    # ``--model unknown`` is exactly what sent an agent to ERROR with a
-    # Codex HTTP 400 on every web restart (observed 2026-05-20).
+    # ``--model unknown`` is exactly what sent a live agent to ERROR with a
+    # Codex HTTP 400 on every web restart (2026-05-20).
     resolved_model = model if model is not None else config.get("model")
     if isinstance(resolved_model, str) and resolved_model.strip() and \
             resolved_model.strip().lower() != "unknown":
         cmd += ["--model", resolved_model]
-    if config.get("skip_permissions"):
-        cmd.append("-sp")
-    if config.get("task_manager"):
-        cmd.append("-tm")
-    if config.get("memory_only"):
-        cmd.append("--memory-only")
-    if config.get("use_sqlite"):
-        cmd.append("--use-sqlite")
+    # Preserve every persisted boolean option across restart.
+    #
+    # We iterate the single source of truth (``_BOOLEAN_FLAGS`` in
+    # agent_command) rather than maintain a parallel hand-coded sequence
+    # of ``if config.get(...)`` lines. The opt-in pattern is what dropped
+    # ``-m`` (history_memory) on the 2026-06-05 web restart and would have
+    # silently dropped every future boolean too. The coverage test
+    # ``tests/unit_tests/cli/test_boolean_flags_registry.py`` enforces that
+    # adding a new bool to ``_PARSER_DEFAULTS`` requires classifying it,
+    # so this loop automatically picks it up.
+    #
+    # ``clean`` is intentionally separate: it lives in
+    # ``_NON_PRESERVED_BOOLEAN_OPTIONS`` and is governed exclusively by the
+    # explicit ``clean=`` argument to this function, never by saved config.
+    # See ``deep_worker_web/docs/DESIGN_RESTART_OPTION_PRESERVATION.md``.
+    from deep_worker_cli.cli.agent_command import _BOOLEAN_FLAGS
+    for _dest, _true_flag, _false_flag in _BOOLEAN_FLAGS:
+        if config.get(_dest):
+            cmd.append(_true_flag)
+
+    # External MCP ad-hoc layers are persistent launch options just like
+    # provider/model. Preserve each occurrence across a web-driven restart.
+    for _path in config.get("mcp_config_paths", []) or []:
+        cmd += ["--mcp-config", str(_path)]
+    for _server in config.get("mcp_server_inline", []) or []:
+        cmd += ["--mcp-server", str(_server)]
+
     if clean:
         cmd.append("--clean")
 
@@ -711,16 +732,16 @@ def _spawn_subprocess(
     # auto-detects dev_tree; this brings the web path in line. See
     # docs/DESIGN_DEV_FLAG.md.
     #
-    # __file__ here = <WEB_TREE>/<web-app-dir>/app/routers/agents.py;
+    # __file__ here = <WEB_TREE>/<web-app>/app/routers/agents.py;
     # parent x4 = <WEB_TREE> — the fallback tree for non-dev agents (prod when
-    # the web server runs from the production tree).
+    # the web server runs from /path/to/production).
     _web_tree_root = Path(__file__).resolve().parent.parent.parent.parent
     if config.get("dev_tree"):
         # DEEP_WORKER_DEV_TREE_ROOT_OVERRIDE mirrors the bash launcher's
-        # testing hook so tests don't need a real dev tree on disk.
+        # testing hook so tests don't need a real /path/to/dev.
         _tree_root = Path(
             os.environ.get(
-                "DEEP_WORKER_DEV_TREE_ROOT_OVERRIDE", "/path/to/dev-tree"
+                "DEEP_WORKER_DEV_TREE_ROOT_OVERRIDE", "/path/to/dev"
             )
         )
     else:
@@ -744,9 +765,18 @@ def _spawn_subprocess(
         env.pop("DEEP_WORKER_DEV_TREE", None)
     env["DEEP_WORKER_TREE_ROOT"] = str(_tree_root)
 
-    logger.info(f"Spawning agent: {' '.join(cmd)}")
+    _logged_cmd: list[str] = []
+    _redact_next = False
+    for _arg in cmd:
+        if _redact_next:
+            _logged_cmd.append("<redacted-inline-mcp-server>")
+            _redact_next = False
+            continue
+        _logged_cmd.append(_arg)
+        _redact_next = _arg == "--mcp-server"
+    logger.info("Spawning agent: %s", " ".join(_logged_cmd))
 
-    log_dir = Path("~/.deep_worker").expanduser() / "logs"
+    log_dir = Path.home() / Path("~/.deep_worker").name / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     err_log = log_dir / f"{agent_name}.spawn.log"
 

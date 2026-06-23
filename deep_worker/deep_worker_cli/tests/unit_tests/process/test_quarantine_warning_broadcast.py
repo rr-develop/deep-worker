@@ -1,12 +1,12 @@
 """Regression: an inbound-channel quarantine must surface as a WARNING that
 reaches live subscribers WITHOUT changing the agent's status.
 
-Incident (observed 2026-05-22): a flooding client tripped rpyc_async's
+Incident (observed live, 2026-05-22): a flooding client tripped rpyc_async's
 inbound quarantine, which cancelled the agent's invoke and the agent
 "spontaneously" went INTERRUPTED. After decoupling the invoke from the
 channel, the agent keeps working — and the quarantine is now reported as a
 non-blocking warning. The user's requirement: log it AND notify
-the web app, but do NOT alter agent state.
+the web UI, but do NOT alter agent state.
 
 Contract under test:
   * ``_broadcast_channel_quarantine_warning`` fans a ``channel_quarantined``
@@ -39,6 +39,23 @@ class _FakeSubscriber:
     async def on_message(self, payload: str) -> None:
         self.messages.append(payload)
 
+    def _setup_netref(self) -> None:
+        """Install ``____conn__`` so the class instance is accepted
+        as a netref by ``asyncreq``."""
+        on_message = self.on_message  # capture bound method
+
+        class _Conn:
+            def async_request(self, handler, _proxy, name, args, kwargs):
+                if handler == 8 and name == "on_message":
+                    async def _do():
+                        return await on_message(args[0])
+                    return _do()
+                raise NotImplementedError(
+                    f"unexpected async_request handler={handler}"
+                )
+
+        object.__setattr__(self, "____conn__", _Conn())
+
 
 def _make_agent() -> AgentProcess:
     agent = AgentProcess.__new__(AgentProcess)
@@ -62,6 +79,7 @@ _QUAR_INFO = {
 async def test_warning_reaches_subscribers() -> None:
     agent = _make_agent()
     sub = _FakeSubscriber()
+    sub._setup_netref()
     agent._message_subscribers.add(sub)
 
     await agent._broadcast_channel_quarantine_warning(_QUAR_INFO)
@@ -84,6 +102,7 @@ async def test_warning_does_not_change_status() -> None:
     # Agent is actively working.
     await agent.session_manager.set_status(AgentStatus.RUNNING)
     sub = _FakeSubscriber()
+    sub._setup_netref()
     agent._message_subscribers.add(sub)
 
     await agent._broadcast_channel_quarantine_warning(_QUAR_INFO)
@@ -93,7 +112,7 @@ async def test_warning_does_not_change_status() -> None:
             break
 
     # CRITICAL: status MUST be unchanged — quarantine is a warning, the agent
-    # keeps working (observed 2026-05-22).
+    # keeps working (observed live, 2026-05-22).
     assert agent.session_manager.status == AgentStatus.RUNNING, (
         "channel quarantine must NOT change agent status"
     )

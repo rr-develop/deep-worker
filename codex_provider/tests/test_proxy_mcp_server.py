@@ -12,8 +12,11 @@ and LangGraph's ToolNode. Behaviours under test:
   result; the awaiting MCP handler returns the value to Codex.
 * ``has_pending_calls`` / ``get_pending_calls`` expose what's parked
   so ``CodexChatModel.ainvoke`` can return ``tool_calls`` to LangGraph.
-* Timeout: if no ``resolve_call`` arrives within ``timeout`` seconds,
-  the handler returns an ``is_error`` MCP content block.
+* Wait policy (HARD POLICY, 2026-06-16): if no ``resolve_call`` arrives
+  within ``long_running_wait_seconds`` (default 120s), the handler PARKS
+  the still-running Future as a job and returns a NON-error ``in_progress``
+  job-handle (``wait_for_job`` / ``kill_job``) — never ``is_error``, never
+  cancelled, never a hang. See docs/POLICIES.md §7.1.
 * Lifecycle: ``start()`` binds an HTTP listener on a free localhost
   port; ``stop()`` shuts it down; pending Futures auto-expire.
 
@@ -78,7 +81,7 @@ class TestCallToolParkingFuture:
     async def test_call_tool_parks_future_and_blocks(
         self, metadata: list[ToolMetadata]
     ) -> None:
-        srv = ProxyMCPServer(metadata, timeout=5.0)
+        srv = ProxyMCPServer(metadata, long_running_wait_seconds=5.0)
 
         # Drive the handler in the background — it should not return
         # until we resolve the Future.
@@ -102,15 +105,26 @@ class TestCallToolParkingFuture:
         assert result[0]["text"] == "result-text"
         assert not srv.has_pending_calls()  # finally clause cleared it
 
-    async def test_timeout_returns_is_error(
+    async def test_timeout_returns_job_handle_not_error(
         self, metadata: list[ToolMetadata]
     ) -> None:
-        srv = ProxyMCPServer(metadata, timeout=0.1)  # 100 ms
+        """HARD POLICY (2026-06-16): on the wait elapsing, the handler returns
+        a NON-error in_progress job-handle (NOT is_error) and PARKS the live
+        Future — never an error, never cancelled, never a hang. See
+        docs/POLICIES.md §7.1 and test_job_handle_by_default.py."""
+        srv = ProxyMCPServer(metadata, long_running_wait_seconds=0.1)  # 100 ms
         result = await srv.call_tool_for_test("read_file", {"path": "/tmp/x"})
-        # On timeout the handler returns an is_error block, NOT raises.
-        # This way Codex sees a tool-error and continues.
-        assert any(block.get("type") == "text" and "timeout" in block.get("text", "").lower()
-                   for block in result)
+        # NON-error informational job-handle, not an error block.
+        assert not any(block.get("is_error") is True for block in result)
+        text = " ".join(b.get("text", "") for b in result)
+        assert "in_progress" in text
+        assert "wait_for_job" in text and "kill_job" in text
+        # The real Future is parked, not cancelled/lost.
+        reg = srv.get_job_registry()
+        assert len(reg) == 1
+        job = next(iter(reg.values()))
+        assert not job["future"].done()
+        job["future"].cancel()
 
     async def test_resolve_unknown_id_is_noop(
         self, metadata: list[ToolMetadata]
@@ -122,7 +136,7 @@ class TestCallToolParkingFuture:
     async def test_wait_for_pending_calls_returns_existing_call(
         self, metadata: list[ToolMetadata]
     ) -> None:
-        srv = ProxyMCPServer(metadata, timeout=5.0)
+        srv = ProxyMCPServer(metadata, long_running_wait_seconds=5.0)
 
         task = asyncio.create_task(srv.call_tool_for_test("read_file", {"path": "/tmp/x"}))
         await asyncio.sleep(0)
@@ -143,7 +157,7 @@ class TestCallToolParkingFuture:
     async def test_wait_for_pending_calls_is_woken_by_handler(
         self, metadata: list[ToolMetadata]
     ) -> None:
-        srv = ProxyMCPServer(metadata, timeout=5.0)
+        srv = ProxyMCPServer(metadata, long_running_wait_seconds=5.0)
 
         waiter = asyncio.create_task(srv.wait_for_pending_calls(
             tool_name="write_file",

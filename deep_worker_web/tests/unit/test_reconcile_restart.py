@@ -23,7 +23,7 @@ from tests.fixtures.mock_registry import MockProcessRegistry
 @pytest.fixture
 def mock_registry() -> MockProcessRegistry:
     registry = MockProcessRegistry()
-    registry.add_mock_agent("agent_a", pid=1000, rpyc_port=18861, working_dir="/tmp/vc")
+    registry.add_mock_agent("test-agent", pid=1000, rpyc_port=18861, working_dir="/tmp/vc")
     return registry
 
 
@@ -44,37 +44,40 @@ async def test_reconcile_refreshes_identity_and_reconnects_on_restart(
     await agent_service.initialize()
 
     # Established subscription bound to the ORIGINAL identity.
-    agent_service._connections["agent_a"] = _live_conn()
-    agent_service._roots["agent_a"] = MagicMock()
-    agent_service._callback_services["agent_a"] = MagicMock()
-    agent_service._record_conn_identity("agent_a", pid=1000, rpyc_port=18861)
+    agent_service._connections["test-agent"] = _live_conn()
+    agent_service._roots["test-agent"] = MagicMock()
+    agent_service._callback_services["test-agent"] = MagicMock()
+    agent_service._record_conn_identity("test-agent", pid=1000, rpyc_port=18861)
 
     # Agent restarts: registry now reports a new pid + port.
     mock_registry.add_mock_agent(
-        "agent_a", pid=2000, rpyc_port=18862, working_dir="/tmp/vc"
+        "test-agent", pid=2000, rpyc_port=18862, working_dir="/tmp/vc"
     )
 
     reconnected: list[str] = []
 
-    def fake_supervise(coro: object, name: str = "") -> None:
-        # Record the reconnect intent; close the coroutine to avoid a
-        # "never awaited" warning.
-        if name.startswith("reconnect_to_agent") or name.startswith("connect_to_agent"):
-            reconnected.append(name)
-        getattr(coro, "close", lambda: None)()
+    # reconcile now schedules reconnects via the single-flight
+    # _start_background_connect gate (the 2026-06-15 incident), not a raw
+    # supervise(connect_to_agent(...)). Record the intent there.
+    def fake_start(name: str) -> None:
+        reconnected.append(name)
 
-    with patch("app.services.agent_service.supervise", side_effect=fake_supervise):
+    with patch.object(
+        agent_service, "_start_background_connect", side_effect=fake_start
+    ):
         await agent_service._reconcile_from_registry()
 
     # In-memory identity refreshed to the NEW port...
-    assert agent_service._registry_identity("agent_a") == (2000, 18862), (
+    assert agent_service._registry_identity("test-agent") == (2000, 18862), (
         "reconcile must refresh _agents[name] with the restarted agent's "
         "current pid/port so the restart is detectable"
     )
     # ...the stale connection evicted (is_connected saw the mismatch)...
-    assert "agent_a" not in agent_service._connections
+    assert "test-agent" not in agent_service._connections
     # ...and a reconnect was scheduled.
-    assert reconnected, "reconcile must schedule a reconnect after a restart"
+    assert "test-agent" in reconnected, (
+        "reconcile must schedule a reconnect after a restart"
+    )
 
 
 async def test_reconcile_no_churn_when_identity_unchanged(
@@ -85,21 +88,22 @@ async def test_reconcile_no_churn_when_identity_unchanged(
     await agent_service.initialize()
 
     conn = _live_conn()
-    agent_service._connections["agent_a"] = conn
-    agent_service._roots["agent_a"] = MagicMock()
-    agent_service._callback_services["agent_a"] = MagicMock()
-    agent_service._record_conn_identity("agent_a", pid=1000, rpyc_port=18861)
+    agent_service._connections["test-agent"] = conn
+    agent_service._roots["test-agent"] = MagicMock()
+    agent_service._callback_services["test-agent"] = MagicMock()
+    agent_service._record_conn_identity("test-agent", pid=1000, rpyc_port=18861)
 
     reconnected: list[str] = []
 
-    def fake_supervise(coro: object, name: str = "") -> None:
+    def fake_start(name: str) -> None:
         reconnected.append(name)
-        getattr(coro, "close", lambda: None)()
 
-    with patch("app.services.agent_service.supervise", side_effect=fake_supervise):
+    with patch.object(
+        agent_service, "_start_background_connect", side_effect=fake_start
+    ):
         await agent_service._reconcile_from_registry()
 
-    assert agent_service._connections.get("agent_a") is conn
+    assert agent_service._connections.get("test-agent") is conn
     assert reconnected == [], "no reconnect/churn when nothing changed"
 
 

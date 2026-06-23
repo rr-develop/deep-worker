@@ -6,6 +6,8 @@ import logging
 import os
 import signal
 import socket
+import sqlite3
+import subprocess
 import sys
 import traceback
 import uuid
@@ -13,10 +15,45 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 
+# Timestamp helper for log messages (shared format with deep_worker_web)
+_TS_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+def _ts() -> str:
+    return datetime.now(UTC).strftime(_TS_FORMAT)
+
+
+def _get_git_commit_info(tree_root: str | None) -> tuple[str, str]:
+    """Return (commit_sha, describe) for the git tree at *tree_root*.
+
+    Both values default to ``"unknown"`` on any error (no .git, git not
+    in PATH, permission denied, etc.) so the caller never crashes.
+    """
+    if not tree_root:
+        return "unknown", "unknown"
+    try:
+        sha = subprocess.run(
+            ["git", "-C", tree_root, "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+        if not sha:
+            sha = "unknown"
+    except Exception:
+        sha = "unknown"
+    try:
+        describe = subprocess.run(
+            ["git", "-C", tree_root, "describe", "--always", "--dirty"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+        if not describe:
+            describe = sha
+    except Exception:
+        describe = sha
+    return sha, describe
+
 # ============================================================================
 # CRITICAL: RPYC_ASYNC MUST BE IMPORTED FROM SOURCE, NOT FROM PIP!
 # ============================================================================
-# Add rpyc_async to sys.path to use AsyncioServer from the rpyc_async source directory
+# Add rpyc_async to sys.path to use AsyncioServer from a local checkout
 # This enables true bidirectional async communication (156x faster!)
 # DO NOT use 'pip install rpyc' - it will use classic RPyC 5.0 without AsyncioServer
 # ============================================================================
@@ -31,6 +68,93 @@ from deep_worker_cli.agent_config_pkg.agent_config import AgentConfig
 from deep_worker_cli.process.registry import ProcessRegistry
 from deep_worker_cli.session.session_manager import SessionManager
 from deep_worker_cli.types import AgentProcessInfo, AgentStatus
+
+
+def _resolve_persisted_grok_display_model(agent_name: str) -> str | None:
+    """Return the modelId grok used in the most recent persisted session for
+    ``agent_name``, or ``None`` if it cannot be determined.
+
+    Grok stores per-session data under ``~/.grok/sessions/<urlencoded-cwd>/
+    <session_id>/`` (events.jsonl, updates.jsonl, chat_history.jsonl). Every
+    stream entry tags ``model_id`` / ``modelId``; we read the last one we can
+    find. Used at startup so the TUI displays the real model immediately
+    instead of "unknown" until the first session/prompt response lands.
+
+    Best-effort: never raises. Mirrors
+    :func:`_resolve_persisted_codex_display_model`.
+    """
+    try:
+        state_path = Path.home() / Path("~/.deep_worker").name / agent_name / "grok_session_state.json"
+        state_data = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(state_data, dict):
+        return None
+    session_state = state_data.get(agent_name)
+    if not isinstance(session_state, dict):
+        return None
+    session_id = session_state.get("session_id")
+    if not isinstance(session_id, str) or not session_id.strip():
+        return None
+
+    sessions_dir = Path.home() / ".grok" / "sessions"
+    if not sessions_dir.exists():
+        return None
+    try:
+        candidates = sorted(
+            sessions_dir.rglob(session_id),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:
+        return None
+    for candidate in candidates:
+        if not candidate.is_dir():
+            continue
+        # updates.jsonl is the richest stream; events.jsonl and
+        # chat_history.jsonl are good fallbacks. Latest-wins per file.
+        for filename in ("updates.jsonl", "events.jsonl", "chat_history.jsonl"):
+            path = candidate / filename
+            try:
+                text = path.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            model_name: str | None = None
+            for line in text.splitlines():
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                m = _extract_grok_model_id(obj)
+                if isinstance(m, str) and m.strip() and m.strip().lower() != "unknown":
+                    model_name = m.strip()
+            if model_name is not None:
+                return model_name
+    return None
+
+
+def _extract_grok_model_id(obj: Any) -> str | None:
+    """Pull a ``modelId`` / ``model_id`` value out of any nesting in ``obj``.
+
+    Grok places the model name at slightly different keys depending on the
+    stream — top-level for chat_history events, under ``_meta`` for ACP
+    session/update wrappers, etc. Recurses through dicts/lists to find one.
+    """
+    if isinstance(obj, dict):
+        for key in ("modelId", "model_id"):
+            v = obj.get(key)
+            if isinstance(v, str):
+                return v
+        for v in obj.values():
+            found = _extract_grok_model_id(v)
+            if found:
+                return found
+    elif isinstance(obj, list):
+        for item in obj:
+            found = _extract_grok_model_id(item)
+            if found:
+                return found
+    return None
 
 
 def _resolve_persisted_codex_display_model(agent_name: str) -> str | None:
@@ -151,13 +275,24 @@ def _message_attr(message: Any, key: str) -> Any:
     return getattr(message, key, None)
 
 
+_logger = logging.getLogger(__name__)
+
+
+# NEVER use print() in this module's hot paths (model invoke / catch-all /
+# notify) — see docs/POLICIES.md §1 and docs/DESIGN_NO_AGENT_ERROR_STATE_POLICY.md.
+# ``stderr`` can block under load and ``BlockingIOError`` propagates up to the
+# invoke catch-all, which used to flip the whole agent into AgentStatus.ERROR.
+# Always use ``_logger.*`` (non-blocking handler).
 def _log_error_context(
     *,
     error: str,
     input_message_id: str | None,
     messages: list[Any] | None = None,
+    recoverable: bool | None = None,
 ) -> None:
     fields = [f"error={error}"]
+    if recoverable is not None:
+        fields.append(f"recoverable={'true' if recoverable else 'false'}")
     if input_message_id:
         fields.append(f"input_message_id={input_message_id}")
     if messages:
@@ -168,7 +303,7 @@ def _log_error_context(
             fields.append(f"last_message_id={last_message_id}")
         if last_message_type:
             fields.append(f"last_message_type={last_message_type}")
-    print(f"[{_utc_log_timestamp()}] [INVOKE_ERROR] {' '.join(fields)}", file=sys.stderr)
+    _logger.error("[INVOKE_ERROR] %s", " ".join(fields))
 
 
 class AgentProcess:
@@ -244,6 +379,8 @@ class AgentProcess:
         use_sqlite: bool = False,
         launch_config: dict | None = None,
         auto_approve_send_message: bool = False,
+        mcp_config_paths: list[Path] | None = None,
+        mcp_server_inline: list[str] | None = None,
     ):
         """Initialize the agent process.
 
@@ -268,6 +405,8 @@ class AgentProcess:
                 while keeping HITL gates for all other side-effect tools.
                 Has no effect when ``skip_permissions`` is True
                 (everything is already auto-approved).
+            mcp_config_paths: Additional layered MCP configuration files.
+            mcp_server_inline: Highest-priority inline MCP server specs.
 
         Raises:
             ValueError: If both memory_only and use_sqlite are True
@@ -282,9 +421,25 @@ class AgentProcess:
         self.auto_approve_send_message = auto_approve_send_message
         self.enable_task_manager = enable_task_manager
         self.memory_only = memory_only
+        self.history_memory = bool(
+            (launch_config or {}).get("history_memory", False)
+        )
         self.use_sqlite = use_sqlite
         self.launch_config = launch_config
+        self.mcp_config_paths = list(mcp_config_paths or [])
+        self.mcp_server_inline = list(mcp_server_inline or [])
         self._checkpointer_ctx = None  # For lifecycle management
+        # Restart notice consumed on start() — delivered to the model
+        # as a SystemMessage on the next invoke. None when there is no
+        # pending notice (the common case).
+        self._pending_restart_notice: dict[str, Any] | None = None
+
+        # The underlying chat model. Assigned in ``start()`` after
+        # ``create_model`` returns. Used by ``_auto_continue_after_restart``
+        # to wait for MCP tool registration before triggering the first
+        # post-restart LLM turn — otherwise the model runs blind without
+        # tools and the agent can only respond in plain text.
+        self._model: Any | None = None
 
         # Auto-assign RPyC port if enabled
         if rpyc_port is True:
@@ -296,7 +451,7 @@ class AgentProcess:
 
         # Paths
         self.pid_file = pid_file or Path(f"/tmp/deep_worker_{name}.pid")
-        self.data_dir = data_dir or (Path("~/.deep_worker").expanduser() / name)
+        self.data_dir = data_dir or (Path.home() / Path("~/.deep_worker").name / name)
         from deep_worker_cli.storage_paths import (
             detect_storage_version,
             ensure_private_dir,
@@ -311,6 +466,14 @@ class AgentProcess:
         self.backend = None  # Will be initialized in start()
         self.session_manager: SessionManager | None = None
         self.task_manager = None  # Will be initialized in start() if enabled
+        # Invariant (startup) system prompt, captured at agent-build time in
+        # start(). Surfaced by the Full Dialog "system_prompt" introspection
+        # mode (§9 of DESIGN_FULL_DIALOG_FINAL_RESPONSE_PAIRS.md).
+        self._invariant_system_prompt: str | None = None
+
+        # External MCP client pool — started in start(), stopped
+        # in stop(). See docs/DESIGN_EXTERNAL_MCP_TOOLS.md.
+        self._external_mcp_pool: Any = None  # ExternalMCPClientPool | None
 
         # RPyC components
         self.rpyc_server: AsyncioServer | None = None
@@ -348,6 +511,10 @@ class AgentProcess:
         # These are used by exposed_interrupt_agent to cancel running tasks
         self.is_running: bool = False  # True when agent is executing
         self.current_worker_task: Any = None  # Current asyncio task for cancellation
+        # One conversation thread has one mutable LangGraph/provider state.
+        # Serialize complete top-level invocations, including every model/tool
+        # iteration inside them; a provider-level ainvoke lock is too narrow.
+        self._invoke_lock = asyncio.Lock()
 
         # Invoke tasks whose RPyC dispatch task was cancelled (channel drain /
         # inbound-quarantine) while the invoke kept running. Strong refs here
@@ -432,11 +599,11 @@ class AgentProcess:
            an auto-discard ``add_done_callback``, so a GC pass cannot
            silently drop a half-finished outbound RPC and pin its
            ``AsyncResult`` chain in ``Connection._request_callbacks``
-           (incidents 2026-05-08, 2026-05-11).
+           (the 2026-05-08 and 2026-05-11 incidents).
         3. *Timeout breaks the hang.* A subscriber whose ``on_message``
            never resolves used to accumulate one parked Task per
            ``set_status`` for the rest of the process's life
-           (incident observed 2026-05-19). With the timeout, each dispatched
+           (observed live, 2026-05-19). With the timeout, each dispatched
            Task settles within ``DWCLI_STATUS_PUSH_TIMEOUT_SEC``
            (default 10 s) and releases its slot.
 
@@ -471,11 +638,7 @@ class AgentProcess:
                 # Use the captured id() instead of touching the netref;
                 # attribute access on a dying peer would re-enter the
                 # same broken connection.
-                print(
-                    f"[AGENT] status push to subscriber id={_sid} failed: {exc!r}",
-                    file=sys.stderr,
-                    flush=True,
-                )
+                _logger.info(f"[AGENT] status push to subscriber id={_sid} failed: {exc!r}")
                 # EVICT the dead subscriber. on_disconnect deliberately
                 # does NOT clean up — it relies on a graceful
                 # exposed_unsubscribe_messages that never arrives when the
@@ -483,14 +646,14 @@ class AgentProcess:
                 # the dead MessageCallbackService netref lingers forever
                 # and EVERY status push goes only to the corpse (10 s
                 # timeout each), so the live UI never updates — the
-                # "stuck at idle while actually working" bug
-                # (incident observed 2026-05-20). A live web re-subscribes on its next
+                # the "stuck at idle while actually working" bug
+                # (observed live, 2026-05-20). A live web re-subscribes on its next
                 # connect_to_agent, so eviction is safe.
                 #
                 # Evict by IDENTITY: ``set.discard(netref)`` would call
                 # ``netref.__hash__`` → a sync RPyC round-trip over the
                 # already-dead channel → EOFError, which on the invoke path
-                # escaped and forced the agent to ERROR (incident observed 2026-05-22).
+                # escaped and forced the agent to ERROR (observed live, 2026-05-22).
                 # ``evict_subscriber_by_identity`` never crosses the wire.
                 from deep_worker_cli.rpyc_service.agent_service import (  # noqa: PLC0415
                     evict_subscriber_by_identity,
@@ -498,18 +661,38 @@ class AgentProcess:
                 evict_subscriber_by_identity(self._message_subscribers, _sub)
 
             try:
-                awaitable = subscriber.on_message(payload_str)
+                # Use async-flagged callattr directly instead of
+                # ``subscriber.on_message(payload_str)``, which goes
+                # through netref.__getattribute__ → syncreq(HANDLE_GETATTR)
+                # then method_netref.__call__ → syncreq(HANDLE_CALL) /
+                # asyncreq(HANDLE_ASYNC_CALL) depending on the peer's
+                # ____is_async__ flag. For a peer whose on_message is NOT
+                # a coroutine function, the method netref gets
+                # ____is_async__=False → syncreq(HANDLE_CALL) →
+                # sync_request(HANDLE_CALL) → GUARD FIRES → RuntimeError
+                # ("sync_request() was called from the asyncio loop").
+                #
+                # ``asyncreq(proxy, HANDLE_CALLATTR, ...)`` calls
+                # ``conn.async_request(HANDLE_CALLATTR, ...)`` — a single
+                # async message that never enters sync_request at all. The
+                # peer's _dispatch_request_async handles both sync and
+                # async on_message correctly (see §6.1 of a related
+                # design note). Fixes a related issue.
+                from rpyc.core.netref import asyncreq as _asyncreq  # noqa: PLC0415
+                awaitable = _asyncreq(
+                    subscriber,
+                    8,  # HANDLE_CALLATTR — get attr + call
+                    "on_message",
+                    (payload_str,),
+                    (),  # kwargs
+                )
             except Exception as exc:  # noqa: BLE001
                 # Construction-time failure (rare): the netref is so
                 # dead it can't even produce an AsyncResult. Log and
                 # move on; do not let one broken subscriber abort the
                 # whole snapshot fan-out.
-                print(
-                    f"[AGENT] status push to subscriber id={subscriber_id} "
-                    f"could not be dispatched: {exc!r}",
-                    file=sys.stderr,
-                    flush=True,
-                )
+                _logger.info(f"[AGENT] status push to subscriber id={subscriber_id} "
+                    f"could not be dispatched: {exc!r}")
                 # Same identity-based eviction as the _on_error path (a
                 # ``discard`` here would re-raise EOFError via __hash__).
                 from deep_worker_cli.rpyc_service.agent_service import (  # noqa: PLC0415
@@ -525,6 +708,88 @@ class AgentProcess:
                 name=f"status-push-{subscriber_id}",
             )
 
+        # Restore-on-idle (§7.2 of DESIGN_PROVIDER_FAILOVER): after
+        # pushing status to all subscribers, check whether we should
+        # restore the preferred provider now that the agent is idle.
+        await self._maybe_restore_preferred_provider(_payload)
+
+    # ------------------------------------------------------------------
+    # Restore-on-idle (§7.2)
+    # ------------------------------------------------------------------
+    async def _maybe_restore_preferred_provider(
+        self, payload: dict[str, Any]
+    ) -> None:
+        """Check if the agent should be restored to its preferred provider.
+
+        Fire-and-forget: this runs on every status change but only acts
+        when all conditions are met — never blocks the caller.
+
+        Fires only on ``status → idle`` / ``→ waiting_input`` transitions
+        and only when:
+        - ``current_provider != preferred_provider``
+        - ``preferred_provider`` is not ``"deepseek"``
+        - ``availability_tracker.is_restore_eligible(preferred_provider)``
+          is True (stricter than ``is_available`` — active limit blocks restore)
+        - No dedicated ``_restore_scheduled`` flag is already set (one per reopen).
+
+        When all conditions are met, schedules ``deep-worker --restart
+        <name> --provider <preferred> [--model <preferred_model>]
+        --no-update-preferred`` via ``asyncio.create_subprocess_exec``.
+        """
+        status = payload.get("status")
+        if status not in ("idle", "waiting_input"):
+            return
+
+        if not isinstance(self.launch_config, dict):
+            return
+        current_provider = self.launch_config.get("provider", "")
+        preferred_provider = self.launch_config.get("preferred_provider", "")
+        if not preferred_provider or preferred_provider == current_provider:
+            return
+        if preferred_provider == "deepseek":
+            return
+
+        from deep_worker_cli.runtime.availability_tracker import (  # noqa: PLC0415
+            AvailabilityTracker,
+        )
+        tracker = AvailabilityTracker()
+        if not tracker.is_restore_eligible(preferred_provider):
+            return
+
+        # Guard: only fire once per reopen. After a failover,
+        # ``record_failure`` stores ``available_after_utc``. When the
+        # reset window passes, ``is_restore_eligible`` flips back to True.
+        # Clear the entry so we don't re-fire on every idle transition
+        # until the NEXT failover.
+        tracker.clear(preferred_provider)
+
+        preferred_model = self.launch_config.get("preferred_model")
+        restore_cmd: list[str] = [
+            "deep-worker",
+            "--restart",
+            self.name,
+            "--provider",
+            preferred_provider,
+            "--no-update-preferred",
+        ]
+        if preferred_model:
+            restore_cmd.extend(["--model", str(preferred_model)])
+
+        _logger.info(f"[RESTORE-ON-IDLE] Agent '{self.name}' on {current_provider} is "
+            f"{status}; restoring preferred provider {preferred_provider} …")
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *restore_cmd,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            # Detach — do NOT await. The restart will kill this process.
+            asyncio.ensure_future(proc.wait())
+        except Exception as exc:
+            _logger.info(f"[RESTORE-ON-IDLE] Failed to schedule restore for "
+                f"'{self.name}': {exc!r}")
+
     def _on_inbound_quarantine(self, info: dict[str, Any]) -> None:
         """rpyc_async ``on_inbound_quarantine`` hook (sync, runs on the loop).
 
@@ -533,33 +798,25 @@ class AgentProcess:
         WARNING: the agent keeps working and its status MUST NOT change. We
         only log it and broadcast a non-status warning event to the live
         subscribers (the quarantined channel itself won't receive it — it's
-        the spammer — but other live channels, e.g. the web client, will).
+        the spammer — but other live channels, e.g. deep_worker_web, will).
 
         Quarantine (vs. closing the channel) is intentional: it stops the
         spammer from immediately opening a fresh connection. See
-        rpyc_async/docs/DESIGN_INBOUND_BACKPRESSURE.md.
+        the rpyc_async inbound-backpressure design notes.
         """
         connid = info.get("connid")
         peer = info.get("peer")
-        print(
-            f"[RPyC][WARNING] inbound channel quarantined: connid={connid} "
+        _logger.info(f"[RPyC][WARNING] inbound channel quarantined: connid={connid} "
             f"peer={peer} inbound_inflight={info.get('inbound_inflight')} "
             f"threshold={info.get('threshold')}. A client flooded this "
             f"channel; it is now ignored. The agent keeps working — status "
-            f"unchanged.",
-            file=sys.stderr,
-            flush=True,
-        )
+            f"unchanged.")
         # Schedule the async fan-out without blocking the dispatch path.
         try:
             loop = asyncio.get_event_loop()
             loop.create_task(self._broadcast_channel_quarantine_warning(info))
         except Exception as exc:  # noqa: BLE001
-            print(
-                f"[RPyC][WARNING] could not schedule quarantine broadcast: {exc!r}",
-                file=sys.stderr,
-                flush=True,
-            )
+            _logger.info(f"[RPyC][WARNING] could not schedule quarantine broadcast: {exc!r}")
 
     async def _broadcast_channel_quarantine_warning(self, info: dict[str, Any]) -> None:
         """Fan a ``channel_quarantined`` warning out to all live subscribers.
@@ -604,29 +861,30 @@ class AgentProcess:
                 _sid: int = subscriber_id,
                 _sub: Any = subscriber,
             ) -> None:
-                print(
-                    f"[AGENT] quarantine-warning push to subscriber id={_sid} "
-                    f"failed: {exc!r}",
-                    file=sys.stderr,
-                    flush=True,
-                )
+                _logger.info(f"[AGENT] quarantine-warning push to subscriber id={_sid} "
+                    f"failed: {exc!r}")
                 # Evict by identity — never ``discard`` a netref (its
-                # __hash__ crosses the dead wire → EOFError, incident
-                # observed 2026-05-22).
+                # __hash__ crosses the dead wire → EOFError (observed live,
+                # 2026-05-22).
                 from deep_worker_cli.rpyc_service.agent_service import (  # noqa: PLC0415
                     evict_subscriber_by_identity,
                 )
                 evict_subscriber_by_identity(self._message_subscribers, _sub)
 
             try:
-                awaitable = subscriber.on_message(payload_str)
-            except Exception as exc:  # noqa: BLE001
-                print(
-                    f"[AGENT] quarantine-warning push to subscriber "
-                    f"id={subscriber_id} could not be dispatched: {exc!r}",
-                    file=sys.stderr,
-                    flush=True,
+                # Same fix as _dispatch_status_event: use asyncreq +
+                # HANDLE_CALLATTR to avoid sync_request guard (a related issue).
+                from rpyc.core.netref import asyncreq as _asyncreq  # noqa: PLC0415
+                awaitable = _asyncreq(
+                    subscriber,
+                    8,  # HANDLE_CALLATTR
+                    "on_message",
+                    (payload_str,),
+                    (),  # kwargs
                 )
+            except Exception as exc:  # noqa: BLE001
+                _logger.info(f"[AGENT] quarantine-warning push to subscriber "
+                    f"id={subscriber_id} could not be dispatched: {exc!r}")
                 from deep_worker_cli.rpyc_service.agent_service import (  # noqa: PLC0415
                     evict_subscriber_by_identity,
                 )
@@ -655,11 +913,74 @@ class AgentProcess:
             # harmless and earlier.
             self._agent_event_loop = asyncio.get_running_loop()
 
+            # Emit a one-line startup diagnostic to the agent's stdout log
+            # (daemonized → ~/.deep_worker/logs/<name>.out.log).
+            # Includes git commit SHA and the full launch configuration so
+            # every agent start produces a grep-able breadcrumb.
+            lc = self.launch_config or {}
+            tree = str(lc.get("tree_root", ""))
+            commit, describe = _get_git_commit_info(tree)
+            pairs = [
+                ("agent", self.name),
+                ("provider", str(lc.get("provider", "unknown"))),
+                ("model", str(lc.get("model", "unknown"))),
+                ("tree", tree),
+                ("commit", commit),
+                ("describe", describe),
+                ("pid", str(os.getpid())),
+                ("tree_root", tree),
+                ("working_dir", str(lc.get("working_dir", ""))),
+                ("skip_permissions", str(lc.get("skip_permissions", False))),
+                ("task_manager", str(lc.get("task_manager", False))),
+                ("memory_only", str(lc.get("memory_only", False))),
+                ("history_memory", str(lc.get("history_memory", False))),
+                ("use_sqlite", str(lc.get("use_sqlite", False))),
+                ("dev_tree", str(lc.get("dev_tree", False))),
+                ("clean", str(lc.get("clean", False))),
+                ("auto_approve_send_message", str(lc.get("auto_approve_send_message", False))),
+                ("preferred_provider", str(lc.get("preferred_provider", ""))),
+                ("started_at", str(lc.get("started_at", ""))),
+            ]
+            line = " ".join(f"{k}={v}" for k, v in pairs)
+            print(f"[STARTUP] {line}", flush=True)
+
             # 1. Create PID file
             await self._create_pid_file()
 
             # 2. Setup signal handlers
             self._setup_signal_handlers()
+
+            # 2.1 Clear any stale legacy .restart_self flag from old code.
+            # The previous (deferred) restart_self design wrote a flag file
+            # in data_dir; it has been removed in favour of the synchronous
+            # restart-notice mechanism. A stale flag from a pre-upgrade
+            # process is harmless but should be cleaned up.
+            from deep_worker_cli.cli.agent_command import _get_agent_data_dir
+            stale_flag = _get_agent_data_dir(self.name) / ".restart_self"
+            if stale_flag.exists():
+                stale_flag.unlink()
+                msg = (
+                    f"{_ts()} [STARTUP] Cleared stale legacy .restart_self "
+                    f"flag from {stale_flag}\n"
+                )
+                sys.stdout.write(msg)
+                sys.stdout.flush()
+
+            # 2.2 Consume restart-notice if present. The new restart_self
+            # tool writes this file synchronously before spawning the
+            # restart subprocess; the new process picks it up here and
+            # will inject it as a SystemMessage on the next invoke.
+            self._pending_restart_notice = self._load_and_consume_restart_notice()
+            if self._pending_restart_notice is not None:
+                msg = (
+                    f"{_ts()} [STARTUP] Loaded restart-notice "
+                    f"(cause={self._pending_restart_notice.get('cause')!r}, "
+                    f"ts={self._pending_restart_notice.get('ts')!r}). "
+                    f"It will be delivered to the next invoke as a "
+                    f"SystemMessage.\n"
+                )
+                sys.stdout.write(msg)
+                sys.stdout.flush()
 
             # 2.5 Auto-migrate storage to latest version if needed
             # Must happen before session manager init so metadata reflects v4.
@@ -693,29 +1014,34 @@ class AgentProcess:
                 import dotenv
                 from pathlib import Path as PathLib
 
-                msg = f"[AGENT_INIT] Initializing agent '{self.name}'...\n"
+                msg = f"{_ts()} [AGENT_INIT] Initializing agent '{self.name}'...\n"
                 sys.stdout.write(msg)
                 sys.stdout.flush()
-                print(msg, file=sys.stderr)
+                _logger.info(msg)
 
                 # Set up logging to stderr so log_token_usage() output is visible
                 _log = logging.getLogger("deep_worker_cli")
                 if not _log.handlers:
                     _handler = logging.StreamHandler(sys.stderr)
-                    _handler.setFormatter(logging.Formatter("%(message)s"))
+                    _handler.setFormatter(
+                        logging.Formatter(
+                            "%(asctime)s %(levelname)s %(name)s: %(message)s",
+                            datefmt="%Y-%m-%d %H:%M:%S",
+                        )
+                    )
                     _log.addHandler(_handler)
                     _log.setLevel(logging.INFO)
 
-                # Load environment variables from the agent's data directory (.env) BEFORE importing config
+                # Load environment variables from ~/.deepagents/.env BEFORE importing config
                 # This is critical because config.py initializes Settings at module level
                 # and needs OPENAI_MODEL, OPENAI_BASE_URL, etc. to be set before import
                 deepagents_env = PathLib.home() / ".deepagents" / ".env"
                 if deepagents_env.exists():
                     dotenv.load_dotenv(deepagents_env)
-                    msg = f"[AGENT_INIT] Loaded environment from {deepagents_env}\n"
+                    msg = f"{_ts()} [AGENT_INIT] Loaded environment from {deepagents_env}\n"
                     sys.stdout.write(msg)
                     sys.stdout.flush()
-                    print(msg, file=sys.stderr)
+                    _logger.info(msg)
 
                 # ================================================================
                 # CRITICAL: Add deepagents to sys.path BEFORE imports
@@ -725,8 +1051,8 @@ class AgentProcess:
                 # divergence.
                 #
                 # The path is derived from __file__ so the SAME line works
-                # for BOTH the production tree and the developer tree.
-                # Hard-coding
+                # for BOTH the production tree (/path/to/production) and
+                # the developer tree (/path/to/dev). Hard-coding
                 # the prod path here used to defeat the --dev launcher
                 # dispatch: even after the bash launcher correctly re-execs
                 # into the dev tree, this insertion would prepend the prod
@@ -734,9 +1060,9 @@ class AgentProcess:
                 # docs/DESIGN_DEV_FLAG.md.
                 #
                 # __file__ here =
-                #   deep_worker/deep_worker_cli/deep_worker_cli/process/agent_process.py
+                #   <TREE>/deep_worker/deep_worker_cli/deep_worker_cli/process/agent_process.py
                 # parent x4 =
-                #   deep_worker
+                #   <TREE>/<package-root>
                 # ================================================================
                 deepagents_path = (
                     PathLib(__file__).resolve().parent.parent.parent.parent
@@ -775,6 +1101,17 @@ class AgentProcess:
                 if hasattr(model, '_working_dir'):
                     setattr(model, '_working_dir', str(self.config.working_dir))
 
+                # Expose the model on ``self`` so any post-init helper
+                # that needs it (e.g. provider failover, codex display-
+                # model resolution) can reach it. After the 2026-06-13 (#2)
+                # incident, the MCP-tools-ready barrier that
+                # used to live here was replaced by a deterministic
+                # prewarm of ClientManager — see
+                # ``_extract_final_tool_metadata`` and
+                # ``_prewarm_client_manager`` below, and the call site
+                # immediately after ``create_cli_agent`` returns.
+                self._model = model
+
                 set_resolved_model_callback = getattr(
                     model, "set_resolved_model_callback", None
                 )
@@ -799,8 +1136,20 @@ class AgentProcess:
                         persisted_model = _resolve_persisted_codex_display_model(self.name)
                         if persisted_model:
                             await _on_resolved_model(persisted_model)
+                    elif self.config.provider == "grok" and self.config.model is None:
+                        # Seed the TUI display with the modelId from grok's
+                        # own per-session log (~/.grok/sessions/...). Without
+                        # this seed the user sees "unknown" until the first
+                        # session/prompt response arrives, because the hot
+                        # path only updates the display from the response
+                        # _meta.modelId. See an incident observed
+                        # live on 2026-06-18.
+                        persisted_model = _resolve_persisted_grok_display_model(self.name)
+                        if persisted_model:
+                            await _on_resolved_model(persisted_model)
 
                 restart_tool_factory = getattr(cli_tools, "make_restart_agent_tool")
+                restart_self_tool_factory = getattr(cli_tools, "make_restart_self_tool")
 
                 # Prepare web tools
                 # - http_request and fetch_url work without API keys
@@ -814,6 +1163,7 @@ class AgentProcess:
                     web_search_delegation_tool,
                     read_image,
                     restart_tool_factory(self.name),
+                    restart_self_tool_factory(self.name),
                     make_send_message_to_agent_tool(self.name),
                 ]
 
@@ -831,6 +1181,23 @@ class AgentProcess:
                 if self.config.provider == "codex":
                     from codex_provider.native_tools import NATIVE_TOOLS
                     web_tools.extend(NATIVE_TOOLS)
+
+                # Grok-specific: register the built-in tool passthroughs.
+                # Grok CLI in ``agent stdio`` always runs its built-ins
+                # (Shell/Read/Edit/Glob/Grep/WebSearch/Task/Plan/...)
+                # locally and cannot be told not to (Q1 live-check). When
+                # the model calls one, ``grok_provider.chat_model`` records
+                # it as an honest LangGraph tool_call referencing the
+                # matching BaseTool from
+                # ``grok_provider.builtin_tool_passthrough``. The body parks
+                # on an asyncio.Future resolved by the ACP reader at
+                # ``tool_call_update status=completed`` — event-driven, no
+                # polling. See DESIGN_GROK_PROVIDER.md §11A.4.
+                if self.config.provider == "grok":
+                    from grok_provider.builtin_tool_passthrough import (
+                        build_passthrough_tools,
+                    )
+                    web_tools.extend(build_passthrough_tools())
 
                 # Determine checkpointer based on flags and environment
                 # Priority order:
@@ -860,8 +1227,15 @@ class AgentProcess:
                     self._checkpointer_ctx = get_checkpointer(agent_name=self.name)
                     checkpointer = await self._checkpointer_ctx.__aenter__()
 
-                # Create the agent with auto-approve for testing
+                # Bring up the external MCP servers (see
+                # docs/DESIGN_EXTERNAL_MCP_TOOLS.md) BEFORE create_cli_agent,
+                # so their tools enter the graph from the very start and land in
+                # _extract_final_tool_metadata (then Full Dialog
+                # verbosity=tools shows them, and the provider prewarm
+                # sees the correct final set).
+                self._external_mcp_pool = await self._start_external_mcp_pool()
 
+                # Create the agent with auto-approve for testing
                 self.agent, self.backend = create_cli_agent(
                     model=model,
                     assistant_id=self.name,
@@ -873,14 +1247,73 @@ class AgentProcess:
                     enable_shell=True,
                     project_memory_dir=Path(self.config.working_dir),
                     checkpointer=checkpointer,
+                    enable_history_memory=self.history_memory,
+                    external_mcp_tools=(
+                        self._external_mcp_pool.tools
+                        if self._external_mcp_pool is not None
+                        else None
+                    ),
+                    external_mcp_auto_approved_names=(
+                        self._external_mcp_pool.auto_approved_tool_names
+                        if self._external_mcp_pool is not None
+                        else None
+                    ),
                 )
 
+                # Capture the INVARIANT (startup) system prompt so the
+                # Full Dialog "system_prompt" introspection mode (§9 of
+                # deep_worker_web/docs/DESIGN_FULL_DIALOG_FINAL_RESPONSE_PAIRS.md)
+                # reports EXACTLY what the agent was built with. We pass no
+                # ``system_prompt`` override above, so ``create_cli_agent``
+                # resolves it via ``get_system_prompt`` with these same args —
+                # recomputing here yields the identical provider-agnostic text.
+                try:
+                    from deep_worker_cli.agent import get_system_prompt
+                    self._invariant_system_prompt = get_system_prompt(
+                        assistant_id=self.name,
+                        sandbox_type=None,
+                        project_memory_dir=Path(self.config.working_dir),
+                    )
+                except Exception:  # noqa: BLE001 — never block start()
+                    self._invariant_system_prompt = None
+
+                # ════════════════════════════════════════════════════════
+                # PREWARM ClientManager with the FINAL tool inventory.
+                # ════════════════════════════════════════════════════════
+                # The 2026-06-13 (#2) incident root-cause fix. The compiled
+                # agent already knows its final tool set (LangGraph's
+                # ToolNode.tools_by_name) — read it synchronously and
+                # seed ClientManager.clients[self.name] with a
+                # ProxyMCPServer built from that exact set. This makes
+                # the first ainvoke (including the one fired by
+                # _auto_continue_after_restart) hit a cache slot with
+                # the CORRECT proxy, instead of racing whichever
+                # bind_tools call happens to land first.
+                #
+                # ⚠ DO NOT replace this with a polling barrier on
+                # model._tools_metadata. Polling for "any non-empty
+                # set" is what caused the regression in the first
+                # place. See:
+                #   - a related internal incident analysis (not included here)
+                #   - claude_code_provider/client_manager.py
+                #     (rotate-on-mismatch — defence in depth).
+                # Both halves of the fix MUST coexist.
+                _final_metadata = self._extract_final_tool_metadata(self.agent)
+                _client_manager = getattr(model, "_client_manager", None)
+                if _client_manager is not None and _final_metadata:
+                    await self._prewarm_client_manager(
+                        client_manager=_client_manager,
+                        thread_id=self.name,
+                        tools_metadata=_final_metadata,
+                        working_dir=self.config.working_dir,
+                    )
+
             except Exception as e:
-                msg = f"[AGENT_INIT] Error initializing agent: {e}\n"
+                msg = f"{_ts()} [AGENT_INIT] Error initializing agent: {e}\n"
                 sys.stdout.write(msg)
                 sys.stdout.flush()
-                print(msg, file=sys.stderr)
-                print(traceback.format_exc(), file=sys.stderr)
+                _logger.info(msg)
+                _logger.info(traceback.format_exc())
                 # Agent remains None, fallback to echo mode
                 self.agent = None
 
@@ -903,75 +1336,439 @@ class AgentProcess:
                     )
                     await self.task_manager.start()
 
-                    msg = f"[AGENT_INIT] TaskManager started (manager_id: {self.name}:tm)\n"
+                    msg = f"{_ts()} [AGENT_INIT] TaskManager started (manager_id: {self.name}:tm)\n"
                     sys.stdout.write(msg)
                     sys.stdout.flush()
-                    print(msg, file=sys.stderr)
+                    _logger.info(msg)
 
                 except Exception as e:
-                    msg = f"[AGENT_INIT] Error initializing TaskManager: {e}\n"
+                    msg = f"{_ts()} [AGENT_INIT] Error initializing TaskManager: {e}\n"
                     sys.stdout.write(msg)
                     sys.stdout.flush()
-                    print(msg, file=sys.stderr)
-                    print(traceback.format_exc(), file=sys.stderr)
+                    _logger.info(msg)
+                    _logger.info(traceback.format_exc())
                     # TaskManager remains None, agent continues without TaskManager
                     self.task_manager = None
 
             # DEBUG: Log before RPyC server start
-            msg = f"[AGENT_INIT] Reached line before RPyC server start...\n"
+            msg = f"{_ts()} [AGENT_INIT] Reached line before RPyC server start...\n"
             sys.stdout.write(msg)
             sys.stdout.flush()
-            print(msg, file=sys.stderr)
+            _logger.info(msg)
 
             # 5. Start RPyC server if port is configured
-            msg = f"[AGENT_INIT] About to start RPyC server (port={self.rpyc_port})...\n"
+            msg = f"{_ts()} [AGENT_INIT] About to start RPyC server (port={self.rpyc_port})...\n"
             sys.stdout.write(msg)
             sys.stdout.flush()
-            print(msg, file=sys.stderr)
+            _logger.info(msg)
 
             if self.rpyc_port is not None:
                 await self._start_rpyc_server()  # Now async!
             else:
                 raise RuntimeError("RPyC port must be configured - IPC server has been removed")
 
-            msg = f"[AGENT_INIT] RPyC server started successfully\n"
+            msg = f"{_ts()} [AGENT_INIT] RPyC server started successfully\n"
             sys.stdout.write(msg)
             sys.stdout.flush()
-            print(msg, file=sys.stderr)
+            _logger.info(msg)
 
             # 6. Register in registry (ONLY after RPyC server is ready!)
             # This ensures clients can connect immediately after seeing the agent in registry
-            msg = f"[AGENT_INIT] About to register in registry...\n"
+            msg = f"{_ts()} [AGENT_INIT] About to register in registry...\n"
             sys.stdout.write(msg)
             sys.stdout.flush()
-            print(msg, file=sys.stderr)
+            _logger.info(msg)
 
             await self._register()
 
-            msg = f"[AGENT_INIT] Registered successfully\n"
+            msg = f"{_ts()} [AGENT_INIT] Registered successfully\n"
             sys.stdout.write(msg)
             sys.stdout.flush()
-            print(msg, file=sys.stderr)
+            _logger.info(msg)
 
             # 7. Enter event loop
             self.running = True
-            print(f"Agent '{self.name}' started (PID {os.getpid()})")
-            print(f"RPyC port: {self.rpyc_port}")
-            print(f"Working directory: {self.config.working_dir}")
+            print(f"{_ts()} Agent '{self.name}' started (PID {os.getpid()})")
+            print(f"{_ts()} RPyC port: {self.rpyc_port}")
+            print(f"{_ts()} Working directory: {self.config.working_dir}")
+
+            # 7.1 Auto-continue after restart. If a restart-notice was
+            # consumed at startup, the agent must NOT sit idle waiting
+            # for a new user message — it must immediately continue
+            # working on the pending task on the freshly-loaded code.
+            # Schedule a self-initiated invoke that delivers the
+            # SystemMessage; the model takes it from there.
+            if self._pending_restart_notice is not None:
+                asyncio.create_task(self._auto_continue_after_restart())
 
             # Main event loop: wait for shutdown signal - EVENT DRIVEN, NO POLLING
             # Wait for shutdown event instead of polling self.running
             await self.shutdown_event.wait()
             
-            print(f"Agent '{self.name}' event loop exiting...")
+            print(f"{_ts()} Agent '{self.name}' event loop exiting...")
 
             # Graceful shutdown after event loop exits
             await self.shutdown()
 
         except Exception as e:
-            print(f"Failed to start agent: {e}")
+            print(f"{_ts()} Failed to start agent: {e}")
             await self.shutdown()
             raise
+
+    def _load_and_consume_restart_notice(self) -> dict[str, Any] | None:
+        """Load and remove the ``.restart_notice.json`` file on startup.
+
+        The ``restart_self`` tool writes this file right before spawning
+        ``deep-worker --restart``. The newly-started process picks it up
+        here, removes it from disk, and stores the dict so it can be
+        injected as a ``SystemMessage`` on the next ``ainvoke``.
+
+        Returns:
+            The notice dict (``{ts, cause, message}``) on success, or
+            ``None`` if no notice exists or the file is corrupt. In
+            both error paths the file is unlinked so it cannot
+            re-fire on the next start.
+        """
+        notice_path = self.data_dir / ".restart_notice.json"
+        if not notice_path.exists():
+            return None
+
+        try:
+            import json as _json
+            notice = _json.loads(notice_path.read_text())
+        except (OSError, ValueError):
+            # json.JSONDecodeError is a subclass of ValueError so it is
+            # caught here. Corrupt notice = no notice.
+            notice = None
+
+        # Always remove the file (success or corrupt) — single-shot.
+        try:
+            notice_path.unlink()
+        except OSError:
+            pass
+
+        if not isinstance(notice, dict):
+            return None
+        return notice
+
+    def _format_restart_notice_message(self, notice: dict[str, Any]):
+        """Format a ``SystemMessage`` describing the restart event.
+
+        The message is purely informational — it does NOT ask the agent
+        to acknowledge or confirm. The agent is expected to continue
+        whatever work was in progress.
+        """
+        from langchain_core.messages import SystemMessage
+
+        ts = notice.get("ts", "<unknown>")
+        cause = notice.get("cause", "unknown")
+        extra = notice.get("message", "")
+
+        if cause == "self":
+            human_cause = "by its own restart_self tool call (self-initiated)"
+        else:
+            human_cause = f"by cause={cause}"
+
+        body = (
+            f"NOTICE: This agent process was restarted at {ts} "
+            f"{human_cause}. The new process is running with the latest "
+            f"on-disk code. Conversation history is preserved via the "
+            f"checkpointer. Continue with the work that was in progress."
+        )
+        if extra:
+            body += f" Details: {extra}"
+
+        return SystemMessage(content=body)
+
+    @staticmethod
+    def _extract_final_tool_metadata(agent: Any) -> list[Any]:
+        """Extract the FINAL tool inventory from a compiled LangGraph agent.
+
+        ════════════════════════════════════════════════════════════════
+        ⚠ WHY THIS EXISTS — DO NOT REPLACE WITH POLLING.
+        ════════════════════════════════════════════════════════════════
+        After ``create_cli_agent`` returns, the LangGraph factory has
+        already computed the FINAL tool set the model_node will use on
+        every turn. See ``langchain/agents/factory.py:880-905``:
+
+            available_tools = middleware_tools + regular_tools
+            tool_node = ToolNode(tools=available_tools, ...)
+            default_tools = list(tool_node.tools_by_name.values()) + ...
+
+        That ``tool_node`` is attached to the compiled graph at
+        ``graph.nodes["tools"]`` (LangGraph wraps it in a PregelNode but
+        the underlying object remains reachable). We read it
+        SYNCHRONOUSLY here — no polling, no waiting, no race with
+        ``bind_tools`` side effects.
+
+        Earlier code (now deleted) used ``_wait_for_mcp_tools_ready``
+        — a 30s polling barrier on ``model.tools_metadata`` that
+        returned True on the FIRST non-empty set. That was the EXACT
+        failure mode of the 2026-06-13 (#2) incident: the first non-empty
+        ``tools_metadata`` came from ``_bind_tools_for_middleware``
+        with the original caller-supplied 7 ``web_tools``, NOT the
+        final 23 tools. The barrier released early and the cached
+        ``ProxyMCPServer`` permanently held a stale, 4-of-7 inventory.
+
+        Reading the compiled graph is the deterministic alternative:
+        the value is known at agent-build time and never changes.
+
+        Args:
+            agent: A compiled LangGraph agent returned from
+                ``create_cli_agent`` (which itself wraps
+                ``create_agent`` from langchain).
+
+        Returns:
+            ``list[ToolMetadata]`` — one entry per tool found in the
+            agent's ``tools`` node, ``[]`` when the agent has no
+            ``tools`` node (legitimately tool-less agents). Each entry
+            has the same shape as ``ClaudeCodeChatModel._tools_metadata``
+            so it can be handed straight to
+            ``ClientManager.get_or_create_client``.
+        """
+        # Best-effort: the agent shape can drift between LangGraph
+        # versions. We tolerate missing pieces by returning [] (which
+        # means "no prewarm" — the first turn will go through the
+        # normal path) rather than raising and crashing start().
+        try:
+            nodes = getattr(agent, "nodes", None)
+            if not nodes:
+                return []
+            tools_node = nodes.get("tools") if hasattr(nodes, "get") else None
+            if tools_node is None:
+                return []
+            tools_by_name = getattr(tools_node, "tools_by_name", None)
+            if tools_by_name is None:
+                # LangGraph may wrap the ToolNode in a PregelNode that
+                # exposes the underlying object on ``.bound`` (or other
+                # attributes — verified empirically on this version).
+                # Probe a few common shapes before giving up.
+                for attr in ("bound", "node", "runnable"):
+                    inner = getattr(tools_node, attr, None)
+                    if inner is not None and hasattr(inner, "tools_by_name"):
+                        tools_by_name = inner.tools_by_name
+                        break
+            if tools_by_name is None:
+                return []
+        except Exception:  # noqa: BLE001 — never block start() over extraction
+            _logger.warning(
+                "[PREWARM] tool_node extraction failed; skipping prewarm "
+                "(first real turn will create the CLI client normally)",
+                exc_info=True,
+            )
+            return []
+
+        # Build ToolMetadata triples (name, description, input_schema).
+        # We reuse ``ClaudeCodeChatModel`` to derive the schema so the
+        # prewarm-created ProxyMCPServer advertises EXACTLY the same
+        # surface a regular turn's ``bind_tools`` would produce. No
+        # divergence between prewarm and turn paths.
+        from claude_code_provider.chat_model import ClaudeCodeChatModel  # noqa: PLC0415
+
+        tools_list = list(tools_by_name.values())
+        if not tools_list:
+            return []
+        try:
+            probe = ClaudeCodeChatModel(base_options=None).bind_tools(tools_list)
+            return list(probe.tools_metadata)
+        except Exception:  # noqa: BLE001
+            _logger.warning(
+                "[PREWARM] bind_tools probe failed; skipping prewarm",
+                exc_info=True,
+            )
+            return []
+
+    @staticmethod
+    async def _prewarm_client_manager(
+        client_manager: Any,
+        thread_id: str,
+        tools_metadata: list[Any],
+        working_dir: str | None,
+    ) -> None:
+        """Deterministically prime the ClientManager cache with the
+        FINAL tool inventory before any ``ainvoke`` can run.
+
+        ════════════════════════════════════════════════════════════════
+        ⚠ WHY THIS EXISTS — THE 2026-06-13 (#2) INCIDENT ROOT CAUSE FIX.
+        ════════════════════════════════════════════════════════════════
+        ``ClientManager`` caches one ``(ClaudeSDKClient, ProxyMCPServer)``
+        pair per ``thread_id``. The cached ``ProxyMCPServer`` is built
+        from whatever ``tools_metadata`` was passed on the FIRST
+        ``get_or_create_client`` call. After the 2026-06-13 (#2) incident
+        we also rotate-on-mismatch (see ``ClientManager``), but the
+        ROOT prevention is to make sure the first call lands with the
+        right inventory.
+
+        ``_extract_final_tool_metadata(self.agent)`` gives us that
+        inventory synchronously at start-time. Calling this prewarm
+        here, BEFORE ``_auto_continue_after_restart`` (or any other
+        code path that can trigger ``model.ainvoke``), guarantees the
+        cache slot is correct from the start.
+
+        Best-effort: any failure is logged and swallowed. The agent
+        still starts; the first real turn will go through the normal
+        create path and the rotate-on-mismatch guard will correct any
+        residual mistake.
+
+        ⚠ DO NOT replace this with a polling barrier. The whole point
+        is determinism. See the 2026-06-13 (#2) incident post-mortem.
+        """
+        if not tools_metadata:
+            # Nothing to prewarm — likely a tool-less agent or extraction
+            # gave up. Leave the cache slot empty; first real turn fills
+            # it normally.
+            return
+        # ════════════════════════════════════════════════════════════════
+        # ⚠ PREWARM MUST NOT OPEN THE CLAUDE CLI SESSION — THE
+        # 2026-06-15 INCIDENT (an agent forgot its history after restart).
+        # ════════════════════════════════════════════════════════════════
+        # Previously this called ``get_or_create_client(...)``, which
+        # actually spawned the Claude CLI subprocess with
+        # ``resume=None``. Because that set ``has_client(thread_id) =
+        # True`` BEFORE the first ``ainvoke``, the history-restore block
+        # in ``ClaudeCodeChatModel.ainvoke`` (gated on
+        # ``not has_client(thread_id)``) NEVER ran on restart, and the
+        # agent forgot its prior conversation.
+        #
+        # ``prepare_proxy_only`` does the prewarm half that we actually
+        # need (deterministic ``ProxyMCPServer`` with the FINAL tool
+        # inventory — the 2026-06-13 #2 incident) WITHOUT opening the CLI
+        # session. The first real ``ainvoke`` computes
+        # ``resume_session_id`` and the subsequent
+        # ``get_or_create_client(...)`` adopts our reserved proxy and
+        # finally connects WITH that resume.
+        #
+        # ⚠ DO NOT switch this back to ``get_or_create_client``. See
+        # ``test_client_manager_prewarm_no_connect.py``.
+        try:
+            await client_manager.prepare_proxy_only(
+                thread_id=thread_id,
+                tools_metadata=tools_metadata,
+                working_dir=working_dir,
+            )
+            _logger.info(
+                f"[PREWARM] ClientManager proxy reserved for "
+                f"thread_id={thread_id} with {len(tools_metadata)} tools "
+                f"(no CLI connect — first ainvoke will resume)"
+            )
+        except Exception as exc:  # noqa: BLE001
+            _logger.warning(
+                f"[PREWARM] prepare_proxy_only failed for "
+                f"thread_id={thread_id} ({exc!r}); first real turn will "
+                f"build the proxy from scratch. Agent start proceeds.",
+                exc_info=True,
+            )
+
+    async def _auto_continue_after_restart(self) -> None:
+        """Self-initiate an invoke right after a restart.
+
+        After ``restart_self`` triggers a real process restart, the new
+        process must NOT sit in idle waiting for the user to type
+        something. The restart-notice that was just loaded into
+        ``self._pending_restart_notice`` must be delivered to the model
+        immediately so it can resume work.
+
+        **Ordering invariant** (now satisfied by prewarm, not polling):
+        ``start()`` calls ``_prewarm_client_manager`` immediately after
+        ``create_cli_agent`` returns, which puts the FINAL-tool-inventory
+        ``ProxyMCPServer`` into the ``ClientManager`` cache before this
+        coroutine ever runs. The first ``ainvoke`` therefore hits the
+        cache and inherits the correct tools — no waiting, no polling.
+
+        Earlier versions of this method awaited
+        ``_wait_for_mcp_tools_ready`` (a 30s polling barrier). That
+        helper has been REMOVED — it returned True on the first non-
+        empty ``tools_metadata``, which was the 7-tool ``web_tools``
+        subset on restart, not the full 23-tool middleware-augmented
+        inventory. See the 2026-06-13 (#2) incident. DO NOT reintroduce
+        polling here; if the ordering ever breaks again, fix the
+        prewarm in ``start()``, not this entry point.
+
+        Errors here are swallowed and logged — failing the auto-continue
+        must never crash the agent. The user can always send a new
+        message manually if anything goes wrong.
+        """
+        try:
+            _logger.info(
+                f"[RESTART] Auto-continuing agent '{self.name}' "
+                f"after restart (pending notice present)"
+            )
+            await self._handle_invoke(
+                {
+                    "message": (
+                        "(automatic continuation after restart — "
+                        "respond according to the SYSTEM notice above)"
+                    ),
+                    "stream": True,
+                    "reply_back": False,
+                },
+                connection=None,
+                notify_callback=None,
+                approval_callback=None,
+            )
+        except Exception as exc:  # noqa: BLE001
+            _logger.warning(
+                f"[RESTART] Auto-continue after restart failed: {exc!r}"
+            )
+
+    async def _start_external_mcp_pool(self) -> Any:
+        """Build & start the ExternalMCPClientPool for this agent.
+
+        Layers (lowest → highest):
+            1. ``~/.deepagents/mcp.json``
+            2. ``<working_dir>/.deepagents/mcp.json``  (project)
+            3. ``~/.deepagents/<agent>/mcp.json``      (per-agent)
+            4. CLI ``--mcp-config`` / ``--mcp-server`` overrides
+
+        Returns the started pool, or ``None`` if pool creation failed (in
+        which case the agent boots without external MCP — degraded but
+        functional, per design §3.4).
+        """
+        try:
+            from deep_worker_cli.external_mcp.pool import (
+                ExternalMCPClientPool,
+            )
+            from deep_worker_cli.external_mcp.config import UnresolvedEnvError
+        except Exception as e:  # pragma: no cover — mcp SDK absent
+            _logger.info(f"external MCP disabled (import failed): {e}")
+            return None
+
+        from pathlib import Path
+
+        home = Path.home()
+        user_path = home / ".deepagents" / "mcp.json"
+        agent_path = home / ".deepagents" / self.name / "mcp.json"
+        working_dir = getattr(self.config, "working_dir", None)
+        project_path = None
+        if working_dir:
+            from deep_worker_cli.project_utils import find_project_root
+
+            start_path = Path(working_dir)
+            project_root = find_project_root(start_path) or start_path
+            project_path = project_root / ".deepagents" / "mcp.json"
+        cli_configs = list(getattr(self, "mcp_config_paths", []) or [])
+        cli_servers = list(getattr(self, "mcp_server_inline", []) or [])
+        try:
+            pool = await ExternalMCPClientPool.create(
+                user_path=user_path,
+                project_path=project_path,
+                agent_path=agent_path,
+                cli_configs=cli_configs,
+                cli_servers=cli_servers,
+            )
+            _logger.info(
+                f"external MCP pool ready for {self.name}: "
+                f"{len(pool.tools)} adapter tool(s)"
+            )
+            return pool
+        except UnresolvedEnvError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            _logger.warning(
+                f"external MCP pool failed to start for {self.name}: {e}",
+                exc_info=True,
+            )
+            return None
 
     async def cleanup(self) -> None:
         """Clean up resources, including checkpointer.
@@ -983,9 +1780,19 @@ class AgentProcess:
             try:
                 await self._checkpointer_ctx.__aexit__(None, None, None)
             except Exception as e:
-                print(f"Warning: Error closing checkpointer: {e}", file=sys.stderr)
+                _logger.info(f"Warning: Error closing checkpointer: {e}")
             finally:
                 self._checkpointer_ctx = None
+
+        # External MCP pool — properly shut down stdio clients and child
+        # processes. See docs/DESIGN_EXTERNAL_MCP_TOOLS.md §3.4.
+        if self._external_mcp_pool is not None:
+            try:
+                await self._external_mcp_pool.stop()
+            except Exception as e:  # noqa: BLE001
+                _logger.info(f"Warning: Error stopping external MCP pool: {e}")
+            finally:
+                self._external_mcp_pool = None
 
     async def shutdown(self) -> None:
         """Graceful shutdown of the agent."""
@@ -1018,7 +1825,13 @@ class AgentProcess:
         # 5. Unregister
         await self._unregister()
 
-        # 6. Cleanup files
+        # Note: the legacy deferred-restart mechanism (spawning
+        # deep-worker --restart from inside shutdown) was removed.
+        # ``restart_self`` now spawns the restart subprocess synchronously
+        # at call time, so by the time we reach shutdown the new process
+        # is already running independently.
+
+        # 7. Cleanup files
         await self._remove_pid_file()
 
         print(f"Agent '{self.name}' stopped")
@@ -1237,7 +2050,7 @@ class AgentProcess:
                 # NO TIMEOUT - connection can live for days/weeks
                 # Surface inbound-quarantine as a non-blocking WARNING (log +
                 # broadcast to live subscribers). Does NOT change agent status
-                # — the agent keeps working. Observed 2026-05-22.
+                # — the agent keeps working (observed live, 2026-05-22).
                 "on_inbound_quarantine": self._on_inbound_quarantine,
             }
         )
@@ -1316,8 +2129,8 @@ class AgentProcess:
         #   logger.info(f"... Successfully got state: {state}")
         #   logger.info(f"... Agent is initialized: {self.agent}")
         # That grew the agent log to 5.2 GB at ~46 KB/s and spiked RssAnon per
-        # call (observed 2026-05-23; first seen 2026-05-08, see
-        # a related internal incident analysis (not included here)). Keep ONLY
+        # call (observed live, 2026-05-23; first seen 2026-05-08, see a
+        # related internal incident analysis (not included here)). Keep ONLY
         # bounded breadcrumbs (sizes/counts, never content), and at DEBUG so a
         # polled hot path is silent by default. NEVER interpolate ``state``,
         # ``self.agent``, ``config``, or any message into a log record.
@@ -1400,13 +2213,99 @@ class AgentProcess:
             }
 
         except Exception as e:
+            import sqlite3
+            import aiosqlite
+            if isinstance(e, (aiosqlite.DatabaseError, sqlite3.DatabaseError)):
+                import traceback
+                _logger.info(f"[GET_HISTORY] Database corruption detected for agent "
+                    f"'{self.name}': {e}")
+                _logger.info(f"[GET_HISTORY] Run 'deep-worker --repair {self.name}' or "
+                    f"delete ~/.deep_worker/{self.name}/threads.db to recover.")
+                _logger.info(f"[GET_HISTORY] Traceback:\n{traceback.format_exc()}")
+                return {
+                    "success": False,
+                    "error": f"Database corrupted: {e}",
+                }
             import traceback
-            print(f"[GET_HISTORY] Exception: {e}", file=sys.stderr)
-            print(f"[GET_HISTORY] Traceback:\n{traceback.format_exc()}", file=sys.stderr)
+            _logger.info(f"[GET_HISTORY] Exception: {e}")
+            _logger.info(f"[GET_HISTORY] Traceback:\n{traceback.format_exc()}")
             return {
                 "success": False,
                 "error": f"Failed to retrieve history: {str(e)}",
             }
+
+    async def _handle_get_system_prompt(self) -> dict[str, Any]:
+        """Return the INVARIANT (startup) system prompt the agent was built with.
+
+        Mode #4 of the Full Dialog verbosity combo (§9 of
+        deep_worker_web/docs/DESIGN_FULL_DIALOG_FINAL_RESPONSE_PAIRS.md).
+
+        The invariant prompt is the provider-AGNOSTIC role/instruction text
+        passed to ``create_deep_agent(system_prompt=...)``. It is captured at
+        build time into ``self._invariant_system_prompt`` so the reported value
+        is EXACTLY what the agent was constructed with. If the attribute is
+        missing (e.g. a legacy process that predates this feature), recompute
+        it deterministically via ``get_system_prompt`` — it is a pure function
+        of agent configuration.
+        """
+        provider = getattr(getattr(self, "config", None), "provider", None)
+        model = getattr(getattr(self, "config", None), "model", None)
+        system_prompt = getattr(self, "_invariant_system_prompt", None)
+        if not isinstance(system_prompt, str) or not system_prompt:
+            try:
+                from pathlib import Path
+
+                from deep_worker_cli.agent import get_system_prompt
+                working_dir = getattr(
+                    getattr(self, "config", None), "working_dir", None
+                )
+                project_memory_dir = Path(working_dir) if working_dir else None
+                system_prompt = get_system_prompt(
+                    assistant_id=self.name,
+                    sandbox_type=None,
+                    project_memory_dir=project_memory_dir,
+                )
+            except Exception as e:  # noqa: BLE001
+                return {"success": False, "error": f"system prompt unavailable: {e}"}
+        return {
+            "success": True,
+            "system_prompt": system_prompt,
+            "provider": provider,
+            "model": model,
+        }
+
+    async def _handle_get_tools(self) -> dict[str, Any]:
+        """Return the agent's available tool list (name + description).
+
+        Mode #5 of the Full Dialog verbosity combo (§9). The tool inventory is
+        read from the compiled LangGraph agent via the existing
+        ``_extract_final_tool_metadata`` helper — the SAME inventory the model
+        binds on every turn (single source of truth). The list MAY depend on
+        the active provider. Each metadata entry is reduced to name +
+        description; the JSON input schema is intentionally omitted from this
+        view. Metadata entries may be dicts or ToolMetadata-like objects.
+        """
+        provider = getattr(getattr(self, "config", None), "provider", None)
+        try:
+            metadata = type(self)._extract_final_tool_metadata(self.agent)
+        except Exception as e:  # noqa: BLE001
+            return {"success": False, "error": f"tools unavailable: {e}"}
+
+        tools: list[dict[str, str]] = []
+        for m in metadata or []:
+            if isinstance(m, dict):
+                name = m.get("name", "?")
+                desc = m.get("description", "")
+            else:
+                name = getattr(m, "name", "?")
+                desc = getattr(m, "description", "")
+            tools.append(
+                {
+                    "name": str(name),
+                    "description": str(desc) if desc is not None else "",
+                }
+            )
+        return {"success": True, "provider": provider, "tools": tools}
 
     async def _handle_get_last_response(self) -> dict[str, Any]:
         """Get the last assistant (AIMessage) response from conversation history.
@@ -1498,8 +2397,192 @@ class AgentProcess:
             return {"success": True, "last_response": None}
 
         except Exception as e:
+            # Specific handling for database corruption — module-level
+            # imports avoid UnboundLocalError (sqlite3/aiosqlite are
+            # already imported at the top of this file).
+            if isinstance(e, (sqlite3.DatabaseError, __import__("aiosqlite").DatabaseError)):
+                logger.warning(
+                    "Database corruption detected in checkpointer DB for "
+                    "agent '%s': %s. Run 'deep-worker --repair %s' or delete "
+                    "~/.deep_worker/%s/threads.db to recover.",
+                    self.name, e, self.name, self.name,
+                )
+                return {"success": False, "error": f"Database corrupted: {e}"}
             logger.error(f"Error getting last response: {e}")
             return {"success": False, "error": f"Failed to get last response: {str(e)}"}
+
+    # ------------------------------------------------------------------
+    #    Failover scheduling (§7.1 of DESIGN_PROVIDER_FAILOVER)
+    # ------------------------------------------------------------------
+    async def _schedule_failover(self, provider: str, marker_text: str) -> None:
+        """Record ``provider`` failure in availability tracker and, if
+        a next available provider exists in the failover chain, schedule
+        a restart via ``deep-worker --restart <name> --provider <next>
+        --no-update-preferred``.
+
+        Fire-and-forget: runs as a background task so the caller's error
+        response is not delayed.
+
+        Args:
+            provider: The provider that hit the usage limit
+                (e.g. ``"claude-code"``, ``"codex"``).
+            marker_text: The raw error marker from the provider's error
+                event, which may contain a human-readable reset time.
+        """
+        from deep_worker_cli.runtime.availability_tracker import (  # noqa: PLC0415
+            AvailabilityTracker,
+        )
+        from deep_worker_cli.runtime.provider_chain import (  # noqa: PLC0415
+            PROVIDER_FAILOVER_CHAIN,
+        )
+        from dateutil import parser as dtparser  # noqa: PLC0415
+        from datetime import timezone  # noqa: PLC0415
+        import re  # noqa: PLC0415
+
+        try:
+            # Parse reset time from marker text (e.g. "resumes at <TIME>",
+            # "try again at <TIME>")
+            available_after_utc: datetime | None = None
+            for pattern in (
+                r"resumes?\s+(?:at|around)?\s*(.+?)(?:\s*\(|\.|$)",
+                r"try\s+again\s+(?:at|around|in)?\s*(.+?)(?:\s*\(|\.|$)",
+                r"resets?\s+(?:at|around)?\s*(.+?)(?:\s*\(|\.|$)",
+            ):
+                m = re.search(pattern, marker_text, re.IGNORECASE)
+                if m:
+                    try:
+                        parsed = dtparser.parse(m.group(1))
+                        if parsed and parsed.tzinfo is None:
+                            parsed = parsed.replace(tzinfo=timezone.utc)
+                        available_after_utc = parsed
+                    except (ValueError, TypeError):
+                        pass
+                    break
+
+            tracker = AvailabilityTracker()
+            was_available = tracker.record_failure(
+                provider=provider,
+                marker_text=marker_text,
+                agent_name=self.name,
+                available_after_utc=available_after_utc,
+            )
+
+            if provider == "deepseek":
+                # Deepseek is terminal — never failover.
+                return
+
+            # Find current position in failover chain
+            try:
+                current_idx = PROVIDER_FAILOVER_CHAIN.index(provider)
+            except ValueError:
+                # Unknown provider — don't attempt failover.
+                return
+
+            # Advance to the next available provider
+            for candidate in PROVIDER_FAILOVER_CHAIN[current_idx + 1:]:
+                if tracker.is_available(candidate):
+                    _logger.info(f"[FAILOVER] Agent '{self.name}' failed on {provider}; "
+                        f"scheduling restart with {candidate} …")
+                    # Write the restart-notice BEFORE spawning so the new
+                    # process consumes it on startup and
+                    # ``_auto_continue_after_restart`` CONTINUES the pending
+                    # task instead of going idle (the 2026-06-17 incident,
+                    # a live agent). Same notice format as ``restart_self``.
+                    try:
+                        from deep_worker_cli.tools import write_restart_notice  # noqa: PLC0415
+                        write_restart_notice(
+                            self.data_dir,
+                            cause="failover",
+                            message=(
+                                f"Agent '{self.name}' hit a usage limit on "
+                                f"provider '{provider}' and was automatically "
+                                f"restarted on '{candidate}'. Continue the "
+                                f"task you were working on."
+                            ),
+                        )
+                    except OSError as notice_exc:
+                        _logger.info(
+                            f"[FAILOVER] Could not write restart notice for "
+                            f"'{self.name}': {notice_exc!r} (agent will restart "
+                            f"but may sit idle instead of auto-continuing)"
+                        )
+                    proc = await asyncio.create_subprocess_exec(
+                        "deep-worker",
+                        "--restart",
+                        self.name,
+                        "--provider",
+                        candidate,
+                        "--no-update-preferred",
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.DEVNULL,
+                        start_new_session=True,
+                    )
+                    # Detach — do NOT await. The restart will kill this process.
+                    asyncio.ensure_future(proc.wait())
+                    return
+
+            _logger.info(f"[FAILOVER] Agent '{self.name}' failed on {provider}; "
+                f"no available provider in the failover chain — "
+                f"agent stays on {provider}.")
+
+        except Exception as exc:
+            _logger.info(f"[FAILOVER] Error scheduling failover for '{self.name}' "
+                f"(provider={provider}): {exc!r}")
+
+    async def _append_recoverable_error_to_history(
+        self,
+        *,
+        exc_name: str,
+        exc_repr: str,
+        input_message_id: str | None,
+    ) -> None:
+        """Append a SystemMessage describing a recoverable invoke failure.
+
+        Implements the No-Agent-Error-State Policy (docs/POLICIES.md §1):
+        an exception that does NOT belong to FATAL_EXCEPTION_TYPES is
+        converted into a SystemMessage so the model sees it on the next
+        turn and the conversation can simply continue.
+
+        Uses the agent's existing checkpointer via ``aupdate_state`` so
+        the new message is persisted exactly like any other graph state
+        update — no manual file IO, no new threads, no polling.
+        """
+        from langchain_core.messages import SystemMessage
+
+        if self.agent is None:
+            # Cannot persist without a graph — caller already settled to
+            # IDLE; the user will simply see the notify_callback payload.
+            return
+
+        content = (
+            f"[runtime] The previous turn failed with an internal error "
+            f"({exc_name}: {exc_repr}).  The error was caught by the "
+            f"agent runtime so the conversation can continue.  Reply to "
+            f"the user's last request, or wait for them to send the next "
+            f"message."
+        )
+        ref = input_message_id or "unknown"
+        sys_msg = SystemMessage(
+            content=content,
+            additional_kwargs={
+                "recoverable_error": True,
+                "exc_name": exc_name,
+                "input_message_id": ref,
+            },
+        )
+
+        # Use the thread_id we already maintain for the agent.
+        config = {"configurable": {"thread_id": getattr(self, "thread_id", self.name)}}
+        try:
+            await self.agent.aupdate_state(config, {"messages": [sys_msg]})
+        except Exception:
+            # We never re-raise from the recoverable path — see policy.
+            _logger.exception(
+                "[INVOKE] aupdate_state failed for recoverable error "
+                "(agent=%s, exc_name=%s)",
+                self.name,
+                exc_name,
+            )
 
     async def _handle_invoke(
         self,
@@ -1508,7 +2591,29 @@ class AgentProcess:
         notify_callback: Any = None,
         approval_callback: Any = None,
     ) -> dict[str, Any]:
-        """Handle agent invocation command.
+        """Serialize complete top-level turns for this agent thread."""
+        lock = getattr(self, "_invoke_lock", None)
+        if lock is None:
+            # Some focused tests construct AgentProcess via __new__. Production
+            # instances always create the lock in __init__.
+            lock = asyncio.Lock()
+            self._invoke_lock = lock
+        async with lock:
+            return await self._handle_invoke_owned(
+                command,
+                connection=connection,
+                notify_callback=notify_callback,
+                approval_callback=approval_callback,
+            )
+
+    async def _handle_invoke_owned(
+        self,
+        command: dict[str, Any],
+        connection: Any = None,
+        notify_callback: Any = None,
+        approval_callback: Any = None,
+    ) -> dict[str, Any]:
+        """Handle one invocation while holding the per-agent turn gate.
 
         Args:
             command: Command dictionary with 'message' and optional 'stream' keys
@@ -1526,6 +2631,7 @@ class AgentProcess:
         """
         message = command.get("message")
         stream = command.get("stream", True)  # Default to streaming to match deepagents
+        reply_back = command.get("reply_back", True)  # For inter-agent messaging
         input_message_id: str | None = None
         last_error_messages: list[Any] = []
 
@@ -1567,7 +2673,33 @@ class AgentProcess:
                 def _next_user_message(content: str) -> HumanMessage:
                     nonlocal input_message_id
                     input_message_id = f"user-{uuid.uuid4().hex}"
-                    return HumanMessage(content=content, id=input_message_id)
+                    return HumanMessage(
+                        content=content,
+                        id=input_message_id,
+                        additional_kwargs={"reply_back": reply_back},
+                    )
+
+                def _build_invoke_messages(content: str) -> list:
+                    """Build the messages list for this invoke.
+
+                    If a restart-notice is pending (set on startup by
+                    ``_load_and_consume_restart_notice``), prepend a
+                    SystemMessage informing the model of the restart.
+                    The notice is single-shot: it is cleared after
+                    being emitted so subsequent invokes do not
+                    re-deliver it.
+                    """
+                    human = _next_user_message(content)
+                    # Defensive: tests may construct AgentProcess without
+                    # going through __init__ (MagicMock); fall back to
+                    # "no pending notice" so the absence of the attribute
+                    # never breaks the invoke path.
+                    notice = getattr(self, "_pending_restart_notice", None)
+                    if notice is None:
+                        return [human]
+                    sys_msg = self._format_restart_notice_message(notice)
+                    self._pending_restart_notice = None
+                    return [sys_msg, human]
 
                 # Create status tracking callback
                 status_callback = StatusTrackingCallback(session_manager=self.session_manager)
@@ -1618,7 +2750,7 @@ class AgentProcess:
                     while True:
                         iteration += 1
                         if self.task_manager:
-                            print(f"[STREAM] TaskManager iteration {iteration}", file=sys.stderr)
+                            _logger.info(f"[STREAM] TaskManager iteration {iteration}")
 
                         # Notify user message at start (agent as source of truth)
                         # For TaskManager: only send on first iteration, subsequent corrective
@@ -1662,7 +2794,7 @@ class AgentProcess:
                         # data is safely persisted. With DeltaSqliteCheckpointer,
                         # each checkpoint is a small delta, not a full state copy.
                         async for chunk in self.agent.astream(
-                            {"messages": [_next_user_message(current_message)]},
+                            {"messages": _build_invoke_messages(current_message)},
                             stream_mode=["messages", "updates"],
                             subgraphs=True,
                             config=config,
@@ -1765,10 +2897,7 @@ class AgentProcess:
                             # LLM complain that the subordinate didn't do the work.
                             # See docs/DESIGN_SEND_MESSAGE_COMPLETION_MIDDLEWARE.md §5.4.
                             if self._is_outgoing_inter_agent_echo(self.name, full_response):
-                                print(
-                                    f"[STREAM] Skipping TaskManager: outgoing inter-agent message",
-                                    file=sys.stderr,
-                                )
+                                _logger.info(f"[STREAM] Skipping TaskManager: outgoing inter-agent message")
                                 break
 
                             corrective_prompt = await self.task_manager.on_subordinate_response(
@@ -1778,7 +2907,7 @@ class AgentProcess:
 
                             # If no corrective prompt, task is done or unable
                             if not corrective_prompt:
-                                print(f"[STREAM] TaskManager evaluation complete (done/unable)", file=sys.stderr)
+                                _logger.info(f"[STREAM] TaskManager evaluation complete (done/unable)")
                                 break
 
                             # Broadcast TaskManager corrective prompt to ALL subscribers
@@ -1793,10 +2922,10 @@ class AgentProcess:
                                     })
                                 except Exception as e:
                                     # Don't let notification failures stop TaskManager loop
-                                    print(f"[STREAM] Warning: Failed to notify subscribers of TaskManager prompt: {e}", file=sys.stderr)
+                                    _logger.info(f"[STREAM] Warning: Failed to notify subscribers of TaskManager prompt: {e}")
 
                             # Continue with corrective prompt
-                            print(f"[STREAM] TaskManager requesting corrections: {corrective_prompt[:100]}...", file=sys.stderr)
+                            _logger.info(f"[STREAM] TaskManager requesting corrections: {corrective_prompt[:100]}...")
                             current_message = corrective_prompt
                         else:
                             # No TaskManager - exit after first iteration
@@ -1821,6 +2950,12 @@ class AgentProcess:
                                 log_token_usage(logging.getLogger(__name__), self.name, rm, "stream")
                     except Exception:
                         pass
+
+                    # Note: the legacy deferred-restart mechanism (flag
+                    # file polled here) was removed. ``restart_self`` is
+                    # now synchronous — it spawns ``deep-worker --restart``
+                    # at call time, which SIGTERMs this process. No
+                    # post-turn flag detection is needed.
 
                     # Send final response
                     return {
@@ -1848,11 +2983,11 @@ class AgentProcess:
 
                         while True:
                             iteration += 1
-                            print(f"[INVOKE] TaskManager iteration {iteration}", file=sys.stderr)
+                            _logger.info(f"[INVOKE] TaskManager iteration {iteration}")
 
                             # Invoke agent
                             result = await self.agent.ainvoke(
-                                {"messages": [_next_user_message(current_message)]},
+                                {"messages": _build_invoke_messages(current_message)},
                                 config
                             )
 
@@ -1885,10 +3020,7 @@ class AgentProcess:
                             # reply to the user's task.
                             # See docs/DESIGN_SEND_MESSAGE_COMPLETION_MIDDLEWARE.md §5.4.
                             if self._is_outgoing_inter_agent_echo(self.name, content):
-                                print(
-                                    f"[INVOKE] Skipping TaskManager: outgoing inter-agent message",
-                                    file=sys.stderr,
-                                )
+                                _logger.info(f"[INVOKE] Skipping TaskManager: outgoing inter-agent message")
                                 break
 
                             # Send to TaskManager for evaluation
@@ -1899,7 +3031,7 @@ class AgentProcess:
 
                             # If no corrective prompt, task is done or unable
                             if not corrective_prompt:
-                                print(f"[INVOKE] TaskManager evaluation complete (done/unable)", file=sys.stderr)
+                                _logger.info(f"[INVOKE] TaskManager evaluation complete (done/unable)")
                                 break
 
                             # Broadcast TaskManager corrective prompt to ALL subscribers
@@ -1915,7 +3047,7 @@ class AgentProcess:
                                 )
 
                             # Continue with corrective prompt
-                            print(f"[INVOKE] TaskManager requesting corrections: {corrective_prompt[:100]}...", file=sys.stderr)
+                            _logger.info(f"[INVOKE] TaskManager requesting corrections: {corrective_prompt[:100]}...")
                             current_message = corrective_prompt
 
                         # Return final response
@@ -1940,7 +3072,7 @@ class AgentProcess:
                                 if messages:
                                     last = messages[-1]
                                     rm = getattr(last, 'response_metadata', None) or {}
-                                    print(f"[INVOKE_DEBUG] log_token_usage: rm={rm}", file=sys.stderr)
+                                    _logger.info(f"[INVOKE_DEBUG] log_token_usage: rm={rm}")
                                     log_token_usage(logging.getLogger(__name__), self.name, rm, "invoke")
                             except Exception:
                                 pass
@@ -1961,18 +3093,48 @@ class AgentProcess:
                         else:
                             # Terminal failure: settle status so the agent
                             # is not left dangling at RUNNING forever (the
-                            # incident observed 2026-05-20, "forever working" bug).
+                            # "forever working" bug, observed live 2026-05-20).
+                            # No-Agent-Error-State Policy: an empty model
+                            # response is recoverable — append a hint and
+                            # settle to IDLE so the user can just type
+                            # "continue".  See docs/POLICIES.md §1.
                             if self.session_manager:
                                 _log_error_context(
                                     error="No messages returned from agent",
                                     input_message_id=input_message_id,
                                     messages=last_error_messages,
+                                    recoverable=True,
                                 )
-                                await self.session_manager.set_error(
-                                    "No messages returned from agent"
-                                )
+                                try:
+                                    await self._append_recoverable_error_to_history(
+                                        exc_name="EmptyModelResponse",
+                                        exc_repr="The model returned no messages.",
+                                        input_message_id=input_message_id,
+                                    )
+                                except Exception as hist_err:
+                                    _logger.warning(
+                                        "[INVOKE] Failed to persist empty-response hint: %s",
+                                        hist_err,
+                                    )
+                                await self.session_manager.set_status(AgentStatus.IDLE)
+                            if notify_callback is not None:
+                                try:
+                                    await notify_callback({
+                                        "type": "system",
+                                        "role": "system",
+                                        "content": (
+                                            "The model returned an empty response; "
+                                            "send 'continue' to retry."
+                                        ),
+                                    })
+                                except Exception as notify_err:
+                                    _logger.warning(
+                                        "[INVOKE] Failed to notify empty response: %s",
+                                        notify_err,
+                                    )
                             return {
                                 "success": False,
+                                "recovered": True,
                                 "error": "No messages returned from agent",
                             }
 
@@ -1988,10 +3150,10 @@ class AgentProcess:
 
                         # Initial ainvoke with user message
                         result = await self.agent.ainvoke(
-                            {"messages": [_next_user_message(message)]},
+                            {"messages": _build_invoke_messages(message)},
                             config
                         )
-                        print(f"[INVOKE] Initial ainvoke: Got result with {len(result.get('messages', []))} messages", file=sys.stderr)
+                        _logger.info(f"[INVOKE] Initial ainvoke: Got result with {len(result.get('messages', []))} messages")
 
                         while iteration < max_iterations:
                             iteration += 1
@@ -1999,7 +3161,7 @@ class AgentProcess:
                             messages = result.get("messages", [])
                             last_error_messages = list(messages) if isinstance(messages, list) else []
                             if not messages:
-                                print(f"[INVOKE] No messages in result", file=sys.stderr)
+                                _logger.info(f"[INVOKE] No messages in result")
                                 break
 
                             # CRITICAL FIX: Notify ONLY NEW messages (not entire history)
@@ -2015,7 +3177,7 @@ class AgentProcess:
                                 last_broadcasted = self._last_broadcasted_count.get(thread_id, 0)
                                 new_messages = messages[last_broadcasted:]
 
-                                print(f"[INVOKE] Iteration {iteration}: Broadcasting {len(new_messages)} new messages (total={len(messages)}, last_broadcasted={last_broadcasted})", file=sys.stderr)
+                                _logger.info(f"[INVOKE] Iteration {iteration}: Broadcasting {len(new_messages)} new messages (total={len(messages)}, last_broadcasted={last_broadcasted})")
 
                                 # Broadcast ONLY new messages
                                 for msg in new_messages:
@@ -2097,14 +3259,18 @@ class AgentProcess:
                             elif hasattr(last_msg, "tool_calls"):
                                 has_tool_calls = bool(last_msg.tool_calls)
 
-                            print(f"[INVOKE] Iteration {iteration}: content='{content[:100] if content else '(empty)'}', role={role}, has_tool_calls={has_tool_calls}, has_interrupt={has_interrupt}", file=sys.stderr)
+                            _logger.info(f"[INVOKE] Iteration {iteration}: content='{content[:100] if content else '(empty)'}', role={role}, has_tool_calls={has_tool_calls}, has_interrupt={has_interrupt}")
 
-                            # If we have real content and no pending tool calls AND it's from assistant, this is final response
+                            # If we have real content and it's from assistant, this is final response.
                             # CRITICAL: Must check role in ('assistant', 'ai') to avoid treating tool results as final response!
                             # LangGraph uses 'ai' for AIMessage.type, while dicts may use 'assistant'
-                            if content and not has_tool_calls and role in ('assistant', 'ai'):
+                            # NOTE: do NOT require ``not has_tool_calls`` — the agent may produce text
+                            # thinking alongside tool calls (a related issue). The text IS a response; tool
+                            # calls without interrupt are handled below (break + continue to the
+                            # no-final-content check which sets final_content and returns success).
+                            if content and role in ('assistant', 'ai'):
                                 final_content = content
-                                print(f"[INVOKE] Got final response: {content[:100]}...", file=sys.stderr)
+                                _logger.info(f"[INVOKE] Got final response: {content[:100]}...")
                                 break
 
                             # If there's an interrupt, handle it properly:
@@ -2112,7 +3278,7 @@ class AgentProcess:
                             # 2. Resume with Command(resume=...) — do NOT re-send HumanMessage
                             if has_interrupt:
                                 interrupts = result["__interrupt__"]
-                                print(f"[INVOKE] Interrupt detected: {len(interrupts)} pending approvals", file=sys.stderr)
+                                _logger.info(f"[INVOKE] Interrupt detected: {len(interrupts)} pending approvals")
 
                                 # NOTE: Do NOT broadcast here — exposed_request_approval()
                                 # handles broadcasting with its own approval_id.
@@ -2128,13 +3294,13 @@ class AgentProcess:
                                         hitl_response[intr.id] = {
                                             "decisions": [{"type": "approve"} for _ in actions]
                                         }
-                                    print(f"[INVOKE] Auto-approving {len(interrupts)} interrupts (no approval callback)", file=sys.stderr)
+                                    _logger.info(f"[INVOKE] Auto-approving {len(interrupts)} interrupts (no approval callback)")
 
                                 # Resume graph with decisions (NOT with HumanMessage!)
                                 from langgraph.types import Command
                                 resume_input = Command(resume=hitl_response)
                                 result = await self.agent.ainvoke(resume_input, config)
-                                print(f"[INVOKE] Resumed after interrupt, got {len(result.get('messages', []))} messages", file=sys.stderr)
+                                _logger.info(f"[INVOKE] Resumed after interrupt, got {len(result.get('messages', []))} messages")
 
                                 # Re-evaluate the new result (loop continues from evaluation)
                                 continue
@@ -2142,53 +3308,133 @@ class AgentProcess:
                             # If we have tool calls but no interrupt, they should have been
                             # executed by ainvoke already. Break to avoid re-sending.
                             if has_tool_calls:
-                                print(f"[INVOKE] Tool calls detected without interrupt — ainvoke should have handled them", file=sys.stderr)
+                                _logger.info(f"[INVOKE] Tool calls detected without interrupt — ainvoke should have handled them")
                                 break
 
                             # If we got here with empty content and no tool calls,
                             # the agent finished but has nothing to say (shouldn't happen normally)
                             if not content:
-                                print(f"[INVOKE] Empty response with no tool calls at iteration {iteration}", file=sys.stderr)
+                                _logger.info(f"[INVOKE] Empty response with no tool calls at iteration {iteration}")
                                 break
 
                         if iteration >= max_iterations:
-                            print(f"[INVOKE] Max iterations reached without final response", file=sys.stderr)
-                            # Settle status — do not leave the agent
-                            # dangling at RUNNING (incident observed 2026-05-20).
+                            _logger.warning(
+                                "[INVOKE] Max iterations reached without final response"
+                            )
+                            # No-Agent-Error-State Policy: hitting the
+                            # iteration cap is recoverable — append a
+                            # hint and settle IDLE so the user can say
+                            # "continue".  See docs/POLICIES.md §1.
                             if self.session_manager:
                                 _log_error_context(
                                     error="Agent exceeded maximum iterations without producing final response",
                                     input_message_id=input_message_id,
                                     messages=last_error_messages,
+                                    recoverable=True,
                                 )
-                                await self.session_manager.set_error(
-                                    "Agent exceeded maximum iterations "
-                                    "without producing final response"
-                                )
+                                try:
+                                    await self._append_recoverable_error_to_history(
+                                        exc_name="MaxIterationsExceeded",
+                                        exc_repr=(
+                                            "The agent hit its per-turn iteration cap "
+                                            "without producing a final response."
+                                        ),
+                                        input_message_id=input_message_id,
+                                    )
+                                except Exception as hist_err:
+                                    _logger.warning(
+                                        "[INVOKE] Failed to persist max-iterations hint: %s",
+                                        hist_err,
+                                    )
+                                await self.session_manager.set_status(AgentStatus.IDLE)
+                            if notify_callback is not None:
+                                try:
+                                    await notify_callback({
+                                        "type": "system",
+                                        "role": "system",
+                                        "content": (
+                                            "The agent hit its iteration cap. "
+                                            "Send 'continue' to resume."
+                                        ),
+                                    })
+                                except Exception as notify_err:
+                                    _logger.warning(
+                                        "[INVOKE] Failed to notify max-iterations: %s",
+                                        notify_err,
+                                    )
                             return {
                                 "success": False,
-                                "error": "Agent exceeded maximum iterations without producing final response"
+                                "recovered": True,
+                                "error": "Agent exceeded maximum iterations without producing final response",
                             }
 
                         if not final_content:
-                            print(f"[INVOKE] No final content found after {iteration} iterations", file=sys.stderr)
-                            # Settle status — do not leave the agent
-                            # dangling at RUNNING (incident observed 2026-05-20).
-                            # This is the exact path the codex API-400
-                            # failure took: ainvoke returned an empty
-                            # assistant message and we fell through here.
+                            # Check if the last message had tool calls — the agent DID produce
+                            # a response (tool requests) but no text content (a related issue).
+                            _has_unhandled_tool_calls = False
+                            _tool_call_count = 0
+                            if last_error_messages:
+                                _last = last_error_messages[-1]
+                                if isinstance(_last, dict):
+                                    _tc = _last.get("tool_calls", [])
+                                else:
+                                    _tc = getattr(_last, "tool_calls", []) or []
+                                if _tc:
+                                    _has_unhandled_tool_calls = True
+                                    _tool_call_count = len(_tc)
+                                    _logger.info(f"[INVOKE] No text content but last message has "
+                                        f"{_tool_call_count} tool calls (type={_message_attr(_last, 'type')})")
+
+                            if _has_unhandled_tool_calls:
+                                # The agent produced tool calls but no text — more accurate than
+                                # "did not produce a response" (a related issue).
+                                _err = f"Agent produced {_tool_call_count} tool call(s) but no text response"
+                            else:
+                                _err = "Agent did not produce a response"
+
+                            _logger.warning(
+                                "[INVOKE] No final content found after %d iterations",
+                                iteration,
+                            )
+                            # No-Agent-Error-State Policy: missing text
+                            # content is recoverable — settle IDLE and
+                            # surface a SystemMessage so the next user
+                            # message ("continue") proceeds normally.
                             if self.session_manager:
                                 _log_error_context(
-                                    error="Agent did not produce a response",
+                                    error=_err,
                                     input_message_id=input_message_id,
                                     messages=last_error_messages,
+                                    recoverable=True,
                                 )
-                                await self.session_manager.set_error(
-                                    "Agent did not produce a response"
-                                )
+                                try:
+                                    await self._append_recoverable_error_to_history(
+                                        exc_name="NoFinalContent",
+                                        exc_repr=_err,
+                                        input_message_id=input_message_id,
+                                    )
+                                except Exception as hist_err:
+                                    _logger.warning(
+                                        "[INVOKE] Failed to persist no-final-content hint: %s",
+                                        hist_err,
+                                    )
+                                await self.session_manager.set_status(AgentStatus.IDLE)
+                            if notify_callback is not None:
+                                try:
+                                    await notify_callback({
+                                        "type": "system",
+                                        "role": "system",
+                                        "content": _err,
+                                    })
+                                except Exception as notify_err:
+                                    _logger.warning(
+                                        "[INVOKE] Failed to notify no-final-content: %s",
+                                        notify_err,
+                                    )
                             return {
                                 "success": False,
-                                "error": "Agent did not produce a response"
+                                "recovered": True,
+                                "error": _err,
                             }
 
                         # ============================================================
@@ -2232,24 +3478,20 @@ class AgentProcess:
                             },
                         }
             else:
-                # STRICT FAILURE: Agent MUST be initialized, NO SILENT FALLBACKS
+                # STRICT FAILURE: Agent MUST be initialized, NO SILENT FALLBACKS.
+                # This is genuinely fatal — the catch-all below will recognise
+                # AgentNotInitialisedError via FATAL_EXCEPTION_TYPES and set
+                # AgentStatus.ERROR.  See docs/POLICIES.md §1.
+                from deep_worker_cli.exceptions import AgentNotInitialisedError
+
                 error_msg = (
                     "CRITICAL: Agent not initialized! Cannot process requests.\n"
                     "This indicates a fatal initialization error that must be fixed.\n"
                     f"Agent state: {self.agent}\n"
                     "Check agent process logs for initialization errors."
                 )
-                print(f"[INVOKE] {error_msg}", file=sys.stderr)
-
-                if self.session_manager:
-                    _log_error_context(
-                        error="Agent not initialized",
-                        input_message_id=input_message_id,
-                        messages=last_error_messages,
-                    )
-                    await self.session_manager.set_error("Agent not initialized")
-
-                raise RuntimeError(error_msg)
+                _logger.error("[INVOKE] %s", error_msg)
+                raise AgentNotInitialisedError(error_msg)
 
         except asyncio.CancelledError:
             # Task was cancelled (interrupted) — this is a NORMAL state
@@ -2270,7 +3512,7 @@ class AgentProcess:
             #   user can see at a glance that the agent is paused
             #   mid-turn waiting for their next message — typically a
             #   correction.
-            print("[INVOKE] Agent task cancelled (interrupted)", file=sys.stderr)
+            _logger.info("[INVOKE] Agent task cancelled (interrupted)")
 
             # Notify cancellation via callback (if provided)
             if notify_callback is not None:
@@ -2289,19 +3531,28 @@ class AgentProcess:
             raise
 
         except Exception as e:
-            import traceback
-            print(f"[INVOKE] Exception occurred: {e}", file=sys.stderr)
-            print(f"[INVOKE] Traceback:\n{traceback.format_exc()}", file=sys.stderr)
+            # No-Agent-Error-State Policy (docs/POLICIES.md §1):
+            #   * Fatal exception (usage limit, corrupted checkpoint,
+            #     unrecoverable auth, not-initialised) -> AgentStatus.ERROR.
+            #   * Everything else is recoverable -> append a SystemMessage
+            #     to history, leave the agent IDLE so the user can simply
+            #     type "continue".
+            #
+            # NEVER use print() here — see docs/POLICIES.md §1.4 / design
+            # §4.6.  ``stderr`` blocking under load (BlockingIOError) is the
+            # exact failure mode this catch-all used to amplify.
+            from deep_worker_cli.exceptions import is_fatal_exception
 
-            # Usage/session-limit gets a clean, user-facing message instead
-            # of the raw "Agent invocation failed: ..." wrapper. The provider
-            # raises ClaudeUsageLimitError whose str() is the CLI marker (incl.
-            # the reset time). Detected by class name to keep this module
-            # provider-agnostic (codex agents never import the claude module).
-            # Observed 2026-05-21: the limit used to fail silently to idle.
-            if type(e).__name__ == "ClaudeUsageLimitError":
+            _logger.exception("[INVOKE] Unhandled exception in agent invocation")
+            is_fatal = is_fatal_exception(e)
+            exc_name = type(e).__name__
+
+            # Provider-specific fatal handling (usage limits): preserve the
+            # exact behaviour from before this refactor — clean user-facing
+            # message, notify TUI, set_error, schedule_failover.
+            if exc_name == "ClaudeUsageLimitError":
                 limit_msg = f"Claude usage limit reached — {str(e)}"
-                print(f"[INVOKE] {limit_msg}", file=sys.stderr)
+                _logger.info("[INVOKE] %s", limit_msg)
                 if notify_callback is not None:
                     try:
                         await notify_callback({
@@ -2310,48 +3561,169 @@ class AgentProcess:
                             "content": limit_msg,
                         })
                     except Exception as notify_err:
-                        print(f"[INVOKE] Warning: Failed to notify limit to TUI: {notify_err}", file=sys.stderr)
+                        _logger.warning(
+                            "[INVOKE] Failed to notify limit to TUI: %s",
+                            notify_err,
+                        )
                 if self.session_manager:
                     _log_error_context(
                         error=limit_msg,
                         input_message_id=input_message_id,
                         messages=last_error_messages,
+                        recoverable=False,
                     )
                     await self.session_manager.set_error(limit_msg)
+                await self._schedule_failover("claude-code", str(e))
                 return {
                     "success": False,
                     "error": limit_msg,
                 }
 
-            # CRITICAL: Notify error to TUI so users see what went wrong
-            # This matches deepagents architecture where errors are displayed via ErrorMessage
-            error_msg = f"Agent error: {str(e)}"
+            if exc_name == "CodexUsageLimitError":
+                limit_msg = f"Codex usage limit reached — {str(e)}"
+                _logger.info("[INVOKE] %s", limit_msg)
+                if notify_callback is not None:
+                    try:
+                        await notify_callback({
+                            "type": "error",
+                            "role": "system",
+                            "content": limit_msg,
+                        })
+                    except Exception as notify_err:
+                        _logger.warning(
+                            "[INVOKE] Failed to notify limit to TUI: %s",
+                            notify_err,
+                        )
+                if self.session_manager:
+                    _log_error_context(
+                        error=limit_msg,
+                        input_message_id=input_message_id,
+                        messages=last_error_messages,
+                        recoverable=False,
+                    )
+                    await self.session_manager.set_error(limit_msg)
+                await self._schedule_failover("codex", str(e))
+                return {
+                    "success": False,
+                    "error": limit_msg,
+                }
+
+            if exc_name == "GrokUsageLimitError":
+                limit_msg = f"Grok usage limit reached — {str(e)}"
+                _logger.info("[INVOKE] %s", limit_msg)
+                if notify_callback is not None:
+                    try:
+                        await notify_callback({
+                            "type": "error",
+                            "role": "system",
+                            "content": limit_msg,
+                        })
+                    except Exception as notify_err:
+                        _logger.warning(
+                            "[INVOKE] Failed to notify limit to TUI: %s",
+                            notify_err,
+                        )
+                if self.session_manager:
+                    _log_error_context(
+                        error=limit_msg,
+                        input_message_id=input_message_id,
+                        messages=last_error_messages,
+                        recoverable=False,
+                    )
+                    await self.session_manager.set_error(limit_msg)
+                await self._schedule_failover("grok", str(e))
+                return {
+                    "success": False,
+                    "error": limit_msg,
+                }
+
+            if is_fatal:
+                # Non-provider-specific fatal — CheckpointCorruptedError,
+                # ProviderAuthFatalError, AgentNotInitialisedError.
+                fatal_msg = f"{exc_name}: {str(e)}"
+                if notify_callback is not None:
+                    try:
+                        await notify_callback({
+                            "type": "error",
+                            "role": "system",
+                            "content": fatal_msg,
+                        })
+                    except Exception as notify_err:
+                        _logger.warning(
+                            "[INVOKE] Failed to notify fatal to TUI: %s",
+                            notify_err,
+                        )
+                if self.session_manager:
+                    _log_error_context(
+                        error=fatal_msg,
+                        input_message_id=input_message_id,
+                        messages=last_error_messages,
+                        recoverable=False,
+                    )
+                    await self.session_manager.set_error(fatal_msg)
+                return {
+                    "success": False,
+                    "error": fatal_msg,
+                }
+
+            # ---------- Recoverable path ----------
+            # Convert the exception into a SystemMessage so the model sees
+            # it on the next turn, transition to IDLE, notify the UI with
+            # type="system" (not "error" — the agent is fine), and persist
+            # a structured log entry.
+            recoverable_msg = (
+                f"Internal error during agent invocation "
+                f"({exc_name}: {str(e)}).  The agent runtime caught the "
+                f"exception and kept the conversation alive — please type "
+                f"'continue' or correct your request to proceed."
+            )
             if notify_callback is not None:
                 try:
                     await notify_callback({
-                        "type": "error",
+                        "type": "system",
                         "role": "system",
-                        "content": error_msg,
+                        "content": recoverable_msg,
                     })
                 except Exception as notify_err:
-                    print(f"[INVOKE] Warning: Failed to notify error to TUI: {notify_err}", file=sys.stderr)
+                    _logger.warning(
+                        "[INVOKE] Failed to notify recoverable error to TUI: %s",
+                        notify_err,
+                    )
 
-            # Set error status on exception
+            try:
+                await self._append_recoverable_error_to_history(
+                    exc_name=exc_name,
+                    exc_repr=str(e),
+                    input_message_id=input_message_id,
+                )
+            except Exception as hist_err:
+                # We must not raise from the catch-all itself — the policy
+                # is "no ERROR for anything we can recover from".  Just
+                # log and continue settling to IDLE.
+                _logger.warning(
+                    "[INVOKE] Failed to append recoverable error to history: %s",
+                    hist_err,
+                )
+
             if self.session_manager:
-                invocation_error = f"Agent invocation failed: {str(e)}"
                 _log_error_context(
-                    error=invocation_error,
+                    error=f"{exc_name}: {str(e)}",
                     input_message_id=input_message_id,
                     messages=last_error_messages,
+                    recoverable=True,
                 )
-                await self.session_manager.set_error(invocation_error)
+                await self.session_manager.set_status(AgentStatus.IDLE)
 
             return {
                 "success": False,
-                "error": f"Agent invocation failed: {str(e)}",
+                "recovered": True,
+                "error": recoverable_msg,
             }
 
         finally:
-            # Always reset execution state
-            self.is_running = False
-            self.current_worker_task = None
+            # Only the active owner may clear shared execution state. The
+            # identity check also protects focused callers that bypass the
+            # serialization wrapper in tests.
+            if self.current_worker_task is asyncio.current_task():
+                self.is_running = False
+                self.current_worker_task = None

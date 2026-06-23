@@ -134,6 +134,10 @@ class TestIntegrationToolCalls:
             return_value=[{"id": "call_1", "name": "add_numbers", "args": {"a": 15, "b": 27}}]
         )
         mock_proxy.resolve_call = Mock()
+        # wait_for_any_pending_call has no timeout — it parks
+        # event-driven. has_pending_calls is True
+        # from the start so the wait short-circuits.
+        mock_proxy.wait_for_any_pending_call = AsyncMock(return_value=None)
 
         # Create separate patches: one for ClaudeSDKClient, one for get_or_create_client
         with patch("claude_code_provider.client_manager.ClaudeSDKClient", return_value=mock_client):
@@ -400,95 +404,10 @@ class TestIntegrationMessageConversions:
         assert result.content == "Response"
 
 
-class TestIntegrationDivergentVisibleVsControlArgs:
-    """End-to-end against a REAL ProxyMCPServer (no mocked proxy).
-
-    Reproduces the production failure observed on a live agent (2026-05-26): the visible
-    message-stream ToolUseBlock and the actual MCP control-channel call are
-    the same logical call, but Claude streams slightly different argument
-    JSON in the assistant message than the finalized args delivered to the
-    MCP handler. With strict (tool_name, args) matching this dead-locked for
-    30s and surfaced as agent `error`. The fix waits for ANY handler
-    registration and then surfaces the authoritative control-channel call.
-    """
-
-    @pytest.mark.asyncio
-    async def test_divergent_args_surfaces_control_channel_call(self) -> None:
-        from claude_agent_sdk import ToolUseBlock
-
-        from claude_code_provider.custom_types import ToolMetadata
-        from claude_code_provider.proxy_mcp_server import ProxyMCPServer
-
-        tools_metadata: list[ToolMetadata] = [
-            {
-                "name": "read_file",
-                "description": "Read a file",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string"},
-                        "limit": {"type": "integer"},
-                    },
-                },
-            }
-        ]
-        # REAL proxy — its handler registers the authoritative pending call.
-        proxy = ProxyMCPServer(tools_metadata)
-        real_handler = proxy.tool_handlers[0].handler
-
-        model = ClaudeCodeChatModel(base_options=None)
-        model = model.bind_tools([read_file_tool])
-
-        mock_client = Mock()
-        mock_client.query = AsyncMock()
-
-        handler_task: dict[str, Any] = {}
-
-        async def mock_receive() -> Any:
-            # The SDK control channel runs the MCP handler in a SEPARATE task,
-            # concurrently with stream consumption. It invokes the handler with
-            # the FINALIZED args: limit=40 (different from the visible block).
-            handler_task["task"] = asyncio.create_task(
-                real_handler({"path": "/tmp/x.py", "limit": 40})
-            )
-            # Visible block carries the streamed (earlier) args: limit=30.
-            yield ClaudeAssistantMessage(
-                content=[
-                    ToolUseBlock(
-                        id="toolu_read",
-                        name="mcp__deepworker__read_file",
-                        input={"path": "/tmp/x.py", "limit": 30},
-                    )
-                ],
-                model="claude-sonnet-4-5-20250929",
-            )
-
-        mock_client.receive_response = mock_receive
-
-        with patch.object(
-            model.client_manager,
-            "get_or_create_client",
-            return_value=(mock_client, proxy),
-        ):
-            result = await asyncio.wait_for(
-                model.ainvoke(
-                    [HumanMessage(content="read the file")],
-                    config={"configurable": {"thread_id": "test-divergent-e2e"}},
-                ),
-                timeout=5.0,  # MUST NOT hit the 30s control-channel timeout.
-            )
-
-        # ainvoke must surface the AUTHORITATIVE control-channel call (limit=40),
-        # NOT the visible block's args (limit=30), and must NOT deadlock/error.
-        assert isinstance(result, AIMessage)
-        assert len(result.tool_calls) == 1
-        assert result.tool_calls[0]["name"] == "read_file"
-        assert result.tool_calls[0]["args"] == {"path": "/tmp/x.py", "limit": 40}
-
-        # Resolve the real handler so its task completes cleanly.
-        for call in proxy.get_pending_calls():
-            proxy.resolve_call(
-                call["id"], {"content": [{"type": "text", "text": "ok"}]}
-            )
-        await handler_task["task"]
+# NOTE: TestIntegrationDivergentVisibleVsControlArgs was REMOVED by the
+# unified tool_use_id change. The "visible args ≠ control args" defect cannot
+# affect identity once the tool_use_id is unified end-to-end — the SAME
+# id ties together the visible block and the control-channel handler.
+# See a related internal incident analysis (not included here) and
+# POLICIES.md §7.
 

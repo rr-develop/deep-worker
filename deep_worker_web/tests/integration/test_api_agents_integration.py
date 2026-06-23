@@ -12,6 +12,24 @@ from deep_worker_cli.process.registry import ProcessRegistry  # type: ignore[imp
 from tests.integration.agent_fixture import agent_fixture
 
 
+async def _warm_connection(service: AgentService, name: str) -> None:
+    """Establish the per-agent RPyC connection BEFORE issuing HTTP
+    requests.
+
+    Since the 2026-06-15 incident the HTTP handlers use the NON-BLOCKING
+    ``ensure_connecting`` gate: the very first request to an agent the
+    web has not connected to yet returns 503 ``connecting`` while a
+    single-flight background connect runs — handlers never block on
+    connect establishment, not even for a timeout. The real UI handles
+    this by retrying; these tests instead warm the connection up-front
+    via the sanctioned blocking lifecycle path (``connect_to_agent``),
+    which is exactly the "warm the connection with one sequential call
+    before issuing the batch" rule the service already prescribes.
+    """
+    ok = await service.connect_to_agent(name)
+    assert ok is True, f"failed to warm RPyC connection to {name}"
+
+
 @pytest.fixture
 def app() -> FastAPI:
     """Create FastAPI app for testing."""
@@ -85,6 +103,7 @@ class TestAgentsAPIWithRealAgent:
             registry = ProcessRegistry()
             service = AgentService(registry=registry)
             asyncio.run(service.initialize())
+            asyncio.run(_warm_connection(service, agent_info.name))
             app.state.agent_service = service
 
             transport = ASGITransport(app=app)
@@ -120,6 +139,7 @@ class TestAgentsAPIWithRealAgent:
             registry = ProcessRegistry()
             service = AgentService(registry=registry)
             asyncio.run(service.initialize())
+            asyncio.run(_warm_connection(service, agent_info.name))
             app.state.agent_service = service
 
             transport = ASGITransport(app=app)
@@ -149,6 +169,7 @@ class TestAgentsAPIWithRealAgent:
             registry = ProcessRegistry()
             service = AgentService(registry=registry)
             asyncio.run(service.initialize())
+            asyncio.run(_warm_connection(service, agent_info.name))
             app.state.agent_service = service
 
             transport = ASGITransport(app=app)
@@ -183,6 +204,7 @@ class TestAgentsAPIWithRealAgent:
             registry = ProcessRegistry()
             service = AgentService(registry=registry)
             asyncio.run(service.initialize())
+            asyncio.run(_warm_connection(service, agent_info.name))
             app.state.agent_service = service
 
             transport = ASGITransport(app=app)
@@ -276,15 +298,21 @@ class TestAgentsAPIWithRealAgent:
             registry = ProcessRegistry()
             service = AgentService(registry=registry)
             asyncio.run(service.initialize())
+            # Warm-up: open the ONE per-agent RPyC connection before
+            # fanning out. Since the HTTP handlers are now non-blocking
+            # (the 2026-06-15 incident), a cold HTTP request would return 503
+            # while the background connect runs; warming via the
+            # sanctioned blocking connect path establishes the single
+            # connection deterministically before the parallel batch.
+            asyncio.run(_warm_connection(service, agent_info.name))
             app.state.agent_service = service
 
             transport = ASGITransport(app=app)
 
             async def run_test() -> None:
                 async with AsyncClient(transport=transport, base_url="http://test") as client:
-                    # Warm-up: open the ONE per-agent RPyC connection
-                    # before fanning out. See docstring for the rule
-                    # this enforces.
+                    # Connection already warmed above; confirm the hot
+                    # path serves /status with 200 before fanning out.
                     warmup = await client.get(
                         f"/api/agents/{agent_info.name}/status"
                     )

@@ -32,9 +32,11 @@ creating a lossless structured log of summarized history.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 import warnings
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
 
@@ -147,6 +149,7 @@ class SummarizationMiddleware(BaseSummarizationMiddleware):
         trim_tokens_to_summarize: int | None = _DEFAULT_TRIM_TOKEN_LIMIT,
         history_path_prefix: str = "/conversation_history",
         truncate_args_settings: TruncateArgsSettings | None = None,
+        on_summarized: Callable[[str], None] | None = None,
         **deprecated_kwargs: Any,
     ) -> None:
         """Initialize summarization middleware with backend support.
@@ -203,6 +206,7 @@ class SummarizationMiddleware(BaseSummarizationMiddleware):
         )
         self._backend = backend
         self._history_path_prefix = history_path_prefix
+        self._on_summarized = on_summarized
 
         # Parse truncate_args_settings
         if truncate_args_settings is None:
@@ -669,6 +673,8 @@ A condensed summary follows:
             return None
         else:
             logger.debug("Offloaded %d messages to %s", len(filtered_messages), path)
+            if self._on_summarized:
+                self._on_summarized(path)
             return path
 
     async def _aoffload_to_backend(
@@ -746,6 +752,30 @@ A condensed summary follows:
             return None
         else:
             logger.debug("Offloaded %d messages to %s", len(filtered_messages), path)
+            if self._on_summarized:
+                # ⚠️ CRITICAL — DO NOT call ``self._on_summarized(path)``
+                # inline here. We are inside an ``async`` method
+                # (``_aoffload_to_backend``) running on the AGENT'S
+                # event-loop thread. The production callback is
+                # ``index_all_history_files`` — a FULLY SYNCHRONOUS LanceDB
+                # WRITE (vectors.lance) + (cold) embedding-model load.
+                #
+                # LanceDB bridges to its OWN background event loop via
+                # ``run_coroutine_threadsafe(...).result()`` (see
+                # ``lancedb/background_loop.py``). Run inline, that blocks
+                # THIS loop thread WHILE HOLDING THE GIL; LanceDB's
+                # background loop then can never acquire the GIL to finish
+                # → permanent GIL deadlock, the agent's loop stops ticking
+                # forever (status stuck "running", RPyC dead). This is the
+                # live mj1_init deadlock (2026-06-15).
+                #
+                # Offloading to a worker thread makes the blocking
+                # ``.result()`` wait there RELEASE the GIL, so LanceDB's
+                # loop runs and our loop keeps ticking. NEVER revert to an
+                # inline call. See
+                # docs/DESIGN_NO_LOOP_BLOCKING_TOOLS.md and
+                # tests/test_no_loop_blocking_summarization.py.
+                await asyncio.to_thread(self._on_summarized, path)
             return path
 
     @override

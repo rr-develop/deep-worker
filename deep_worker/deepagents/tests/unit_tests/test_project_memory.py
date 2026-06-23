@@ -4,6 +4,7 @@ Tests the project_memory tool, has_semantic_index utility, and
 ProjectMemoryMiddleware functionality.
 """
 
+import asyncio
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -93,7 +94,7 @@ def test_project_memory_tool_success() -> None:
         mock_search.return_value = [mock_result]
 
         # Call the tool
-        result = project_memory.func("authentication implementation", runtime=runtime, top_k=5)
+        result = asyncio.run(project_memory.coroutine("authentication implementation", runtime=runtime, top_k=5))
 
         # Verify search was called correctly
         mock_search.assert_called_once_with(
@@ -125,7 +126,7 @@ def test_project_memory_tool_index_not_found() -> None:
     ):
         mock_search.side_effect = IndexNotFoundError("Index not found")
 
-        result = project_memory.func("some query", runtime=runtime, top_k=5)
+        result = asyncio.run(project_memory.coroutine("some query", runtime=runtime, top_k=5))
 
         # Should return error message with "Error:" prefix
         assert "Error: Project memory not available." in result
@@ -146,7 +147,7 @@ def test_project_memory_tool_no_results() -> None:
     ):
         mock_search.return_value = []  # No results
 
-        result = project_memory.func("nonexistent feature", runtime=runtime, top_k=5)
+        result = asyncio.run(project_memory.coroutine("nonexistent feature", runtime=runtime, top_k=5))
 
         # Should return informative message
         assert "Project Memory: No results found for 'nonexistent feature'" in result
@@ -162,11 +163,11 @@ def test_project_memory_tool_invalid_top_k() -> None:
     )
 
     # Test top_k too small
-    result = project_memory.func("query", runtime=runtime, top_k=0)
+    result = asyncio.run(project_memory.coroutine("query", runtime=runtime, top_k=0))
     assert "Error: top_k must be between 1 and 20" in result
 
     # Test top_k too large
-    result = project_memory.func("query", runtime=runtime, top_k=21)
+    result = asyncio.run(project_memory.coroutine("query", runtime=runtime, top_k=21))
     assert "Error: top_k must be between 1 and 20" in result
 
 
@@ -195,7 +196,7 @@ def test_project_memory_tool_runtime_fallback() -> None:
         with patch("deepagents.tools.project_memory.Path.cwd") as mock_cwd:
             mock_cwd.return_value = Path("/fallback/dir")
 
-            result = project_memory.func("test query", runtime=runtime, top_k=3)
+            result = asyncio.run(project_memory.coroutine("test query", runtime=runtime, top_k=3))
 
             # Should use Path.cwd() as fallback
             mock_search.assert_called_once_with(

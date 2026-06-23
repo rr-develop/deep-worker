@@ -15,7 +15,7 @@ Deep-Worker-Web is a web-based user interface for managing and interacting with 
 ### Starting the Server
 
 ```bash
-cd deep_worker_web
+cd /path/to/<web-app-deployment>
 python3 run.py
 ```
 
@@ -95,6 +95,8 @@ After selecting an agent, you can:
    | **Final answers only** *(default)* | One assistant block per turn — the **last** text-bearing reply, i.e. the genuine final answer. |
    | **All assistant text** | Every text-bearing assistant reply within the turn, in chronological order. Useful when the agent narrates intermediate progress. |
    | **Full (with tool calls)** | Same as *All assistant text*, plus a compact one-line summary for every tool call (`→ tool_name(args)`, args truncated to 200 chars). |
+   | **System prompt (invariant)** | The agent's **invariant startup system prompt** — the provider-agnostic role/instruction text the agent was built with. This is NOT conversation history; it does not live in the checkpoint and is the same regardless of provider. Use it to verify what base instructions the agent is running with. |
+   | **Available tools** | The list of tools currently available to the agent (`- name: description`). This list **may depend on the active provider**, so the header shows the provider and tool count. Use it to confirm whether a given tool (e.g. `execute`, `web_search`) is currently bound. |
 
    You can also hit the endpoint directly:
 
@@ -102,6 +104,8 @@ After selecting an agent, you can:
    GET /api/agents/{name}/dialog-text                  # final (default)
    GET /api/agents/{name}/dialog-text?verbosity=text
    GET /api/agents/{name}/dialog-text?verbosity=full
+   GET /api/agents/{name}/dialog-text?verbosity=system_prompt
+   GET /api/agents/{name}/dialog-text?verbosity=tools
    ```
 
    The selected verbosity is remembered between page loads (stored in
@@ -178,7 +182,7 @@ The application has no authentication and provides direct access to agent capabi
 
 1. Verify agents are running:
    ```bash
-   cat /tmp/deep_worker_registry.json
+   cat <path to the process registry file>
    ```
 
 2. Check agent processes are alive:

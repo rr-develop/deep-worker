@@ -838,10 +838,10 @@ class Settings:
 
     @property
     def user_deepagents_dir(self) -> Path:
-        """Get the base user-level data directory.
+        """Get the base user-level .deepagents directory.
 
         Returns:
-            Path to the user-level data directory
+            Path to ~/.deepagents
         """
         return Path.home() / ".deepagents"
 
@@ -856,8 +856,8 @@ class Settings:
 
         Returns:
             Path to the agent data AGENTS.md file. For storage v3 this is
-            the AGENTS.md file under the agent's data directory; legacy v2
-            agents keep using the AGENTS.md file in the agent root directory.
+            ~/.deep_worker/{agent_name}/data/AGENTS.md; legacy v2 agents keep
+            using ~/.deepagents/{agent_name}/AGENTS.md.
         """
         from deep_worker_cli.storage_paths import deepagents_data_dir
         return deepagents_data_dir(agent_name, create=False) / "AGENTS.md"
@@ -895,8 +895,8 @@ class Settings:
 
         Returns:
             Path to the agent data directory. For storage v3 this is
-            the data subdirectory under the agent's data directory; legacy
-            v2 agents keep using the agent root directory.
+            ~/.deep_worker/{agent_name}/data; legacy v2 agents keep using
+            ~/.deepagents/{agent_name}.
 
         Raises:
             ValueError: If the agent name contains invalid characters.
@@ -918,8 +918,8 @@ class Settings:
 
         Returns:
             Path to the agent data directory. For storage v3 this is
-            the data subdirectory under the agent's data directory; legacy
-            v2 agents keep using the agent root directory.
+            ~/.deep_worker/{agent_name}/data; legacy v2 agents keep using
+            ~/.deepagents/{agent_name}.
 
         Raises:
             ValueError: If the agent name contains invalid characters.
@@ -954,7 +954,7 @@ class Settings:
             agent_name: Name of the agent
 
         Returns:
-            Path to the user-level skills directory for the agent
+            Path to ~/.deepagents/{agent_name}/skills/
         """
         return self.get_agent_dir(agent_name) / "skills"
 
@@ -965,7 +965,7 @@ class Settings:
             agent_name: Name of the agent
 
         Returns:
-            Path to the user-level skills directory for the agent
+            Path to ~/.deepagents/{agent_name}/skills/
         """
         from deep_worker_cli.storage_paths import deepagents_data_dir, ensure_private_dir
 
@@ -1003,7 +1003,7 @@ class Settings:
             agent_name: Name of the CLI agent (e.g., "deepagents")
 
         Returns:
-            Path to the user-level agents directory for the agent
+            Path to ~/.deepagents/{agent_name}/agents/
         """
         return self.get_agent_dir(agent_name) / "agents"
 
@@ -1393,6 +1393,10 @@ _PROVIDER_DEFAULT_MODELS: dict[str, tuple[str | None, str | None]] = {
     # CODEX_MODEL, we honour it; otherwise we pass nothing and the
     # CLI chooses. See DESIGN_CODEX_PROVIDER.md §15 Q2.
     "codex": ("CODEX_MODEL", None),
+    # Grok: do NOT pin a model version. Let the grok CLI pick its own
+    # default (which evolves with the CLI). If the user sets GROK_MODEL we
+    # honour it; otherwise we pass nothing. See DESIGN_GROK_PROVIDER.md §16.
+    "grok": ("GROK_MODEL", None),
 }
 
 
@@ -1545,11 +1549,11 @@ def create_model(
     # DO NOT CHANGE THE PROVIDER PRIORITY ORDER!
     # DO NOT REMOVE THE has_deepseek CHECK!
     #
-    # This code is used by the OLD main.py entry point (python3 -m deep_worker_cli.main)
-    # which MUST NOT be used for testing or production!
+    # This code is used by the OLD entry point main.py (python3 -m deep_worker_cli.main)
+    # which must NOT be used for testing or production!
     #
     # THE ONLY CORRECT way to launch:
-    # ✅ deep-worker [agent-name]  - the command installed by the package entry point
+    # ✅ deep-worker [agent-name]  - command installed on the user's PATH
     #
     # WRONG (DO NOT USE):
     # ❌ python3 -m deep_worker_cli.main
@@ -1610,7 +1614,7 @@ def create_model(
         # round-trip and the next call was rejected with:
         #   400 - "The `reasoning_content` in the thinking mode must be passed
         #          back to the API."
-        # → the agent crashed to ERROR (incident observed 2026-05-22). We use
+        # → the agent crashed to ERROR (observed live, 2026-05-22). We use
         # ``ReasoningChatDeepSeek`` (subclass of ``langchain_deepseek``'s
         # ``ChatDeepSeek``): ChatDeepSeek READS reasoning_content inbound but
         # its 1.0.1 ``_get_request_payload`` does NOT re-send it outbound, so
@@ -1700,7 +1704,7 @@ def create_model(
         # ============================================================================
         # CRITICAL: CLAUDE_CODE_PROVIDER MUST BE IMPORTED FROM SOURCE CODE!
         # ============================================================================
-        # Import claude_code_provider from the repository root (this project)
+        # Import claude_code_provider from the repository root
         # This is a local package that provides LangChain wrapper for Claude Code SDK
         # ============================================================================
         _repo_root = Path(__file__).parent.parent.parent.parent
@@ -1735,6 +1739,25 @@ def create_model(
             model=model_name,            # may be None — Codex picks default
             max_tokens=20_000,
             # sandbox_mode/approval_policy defaults match Q3 (always-skip-prompts)
+        )
+    elif provider == "grok":
+        # ============================================================================
+        # GROK provider — sibling of codex (see DESIGN_GROK_PROVIDER.md).
+        # ============================================================================
+        # Local source import, no API key (supergrok subscription cache via
+        # ~/.grok/auth.json). ``model_name`` may be None — in that case the
+        # provider does NOT pin a model and the grok CLI picks its own current
+        # default. Drives ``grok agent stdio`` over ACP.
+        # ============================================================================
+        _repo_root = Path(__file__).parent.parent.parent.parent
+        if str(_repo_root) not in sys.path:
+            sys.path.insert(0, str(_repo_root))
+
+        from grok_provider import GrokChatModel
+
+        model = GrokChatModel(
+            model=model_name,            # may be None — grok picks default
+            max_tokens=20_000,
         )
     else:
         # Should not reach here due to earlier validation

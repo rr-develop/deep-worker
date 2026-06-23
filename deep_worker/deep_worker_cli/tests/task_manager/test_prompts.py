@@ -148,6 +148,37 @@ REASONING: Cannot be completed"""
         assert status == 'unable'
         assert message == "Task cannot be completed due to identified constraints."
 
+    def test_parse_done_with_parenthesized_qualifier(self):
+        """Test parsing 'done' with parenthesized qualifier like 'done (escalated correctly)'."""
+        response = """STATUS: done (escalated correctly)
+REASONING: Task completed with escalation
+MESSAGE: NONE"""
+
+        status, message = parse_manager_response(response)
+
+        assert status == 'done'
+        assert message is None
+
+    def test_parse_in_progress_with_qualifier(self):
+        """Test parsing 'in_progress' with parenthesized qualifier."""
+        response = """STATUS: in_progress (needs more work)
+REASONING: Implementation incomplete
+MESSAGE: Please finish the remaining work"""
+
+        status, message = parse_manager_response(response)
+
+        assert status == 'in_progress'
+        assert message == "Please finish the remaining work"
+
+    def test_parse_bare_status_raises_valueerror(self):
+        """Test that bare STATUS: raises ValueError, not IndexError."""
+        response = """STATUS:
+REASONING: No status provided
+MESSAGE: NONE"""
+
+        with pytest.raises(ValueError, match="Empty STATUS value"):
+            parse_manager_response(response)
+
 
 class TestSystemPrompt:
     """Tests for TaskManager system prompt."""

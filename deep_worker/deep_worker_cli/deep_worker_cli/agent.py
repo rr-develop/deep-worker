@@ -187,6 +187,8 @@ of the form `<sender> -> <receiver> :> <text>`:
 - When you RECEIVE a user-role message whose content starts with
   `<someone> -> {assistant_id} :> <text>`, it was sent to you by
   another agent named `<someone>`; treat it as a peer request.
+  You MUST reply via ``send_message_to_agent`` unless
+  ``reply_back=False`` was specified.
 
 """
 
@@ -519,6 +521,11 @@ def _add_interrupt_on(
         "description": _format_restart_agent_description,
     }
 
+    restart_self_interrupt_config: InterruptOnConfig = {
+        "allowed_decisions": ["approve", "reject"],
+        "description": "Restart the current agent process to pick up fresh code.",
+    }
+
     result: dict[str, InterruptOnConfig] = {
         "execute": execute_interrupt_config,
         "write_file": write_file_interrupt_config,
@@ -527,6 +534,7 @@ def _add_interrupt_on(
         "fetch_url": fetch_url_interrupt_config,
         "task": task_interrupt_config,
         "restart_agent": restart_agent_interrupt_config,
+        "restart_self": restart_self_interrupt_config,
     }
 
     # Only gate send_message_to_agent when we are NOT explicitly told to
@@ -594,6 +602,103 @@ def _dedupe_tools_by_name_priority(
     return out
 
 
+# ---------------------------------------------------------------------------
+# History-index catch-up helpers
+# ---------------------------------------------------------------------------
+#
+# Why these live here (and not in semantic_search): the catch-up decision
+# is part of the agent's startup flow and must NOT pay the cost of importing
+# the embedding model on the cheap "no work to do" path. The semantic_search
+# functions (`index_all_history_files`, `history_index_exists`) are fine,
+# but a delta computation must stay zero-dependency.
+#
+# See ``docs/DESIGN_HISTORY_INDEX_CATCHUP_ON_START.md``.
+
+
+def _count_pending_history_lines(
+    summaries_dir: Path,
+    jsonl_files: list[Path],
+) -> int:
+    """Return total number of JSONL lines NOT YET indexed.
+
+    Cheap pre-check: reads ``.history_index/line_hashes.json`` (tiny
+    JSON, microseconds) and counts lines in each provided JSONL file.
+
+    Contract:
+
+    * If ``line_hashes.json`` is missing or unreadable: every line of
+      every provided file is treated as pending. Caller will run a
+      full index.
+    * Files referenced in ``line_hashes.json`` that no longer exist on
+      disk are silently ignored — they cannot contribute pending
+      lines.
+    * If a JSONL file shrank below its recorded count, the current
+      line count is reported as pending (NOT a negative number). The
+      downstream ``index_history_file`` already handles the
+      shrank-file case by re-indexing from scratch.
+    """
+    import json as _json  # noqa: PLC0415
+
+    if not jsonl_files:
+        return 0
+
+    hashes_path = summaries_dir / ".history_index" / "line_hashes.json"
+    try:
+        line_counts: dict[str, int] = _json.loads(
+            hashes_path.read_text(encoding="utf-8"),
+        )
+    except (FileNotFoundError, OSError, _json.JSONDecodeError):
+        line_counts = {}
+
+    pending = 0
+    for jsonl in jsonl_files:
+        try:
+            current = sum(1 for _ in jsonl.open(encoding="utf-8"))
+        except OSError:
+            continue
+        recorded = int(line_counts.get(str(jsonl), 0))
+        delta = current - recorded
+        if delta > 0:
+            pending += delta
+        elif current < recorded:
+            # File shrank → treat the whole current content as pending,
+            # so the caller re-indexes it. Never report negative.
+            pending += current
+    return pending
+
+
+def _should_catchup_history_index(
+    summaries_dir: Path,
+) -> tuple[bool, int]:
+    """Return ``(needs_catchup, pending_lines)`` for startup decision.
+
+    Used by ``create_cli_agent`` to decide whether to run
+    ``index_all_history_files`` on agent start. Returns ``(False, 0)``
+    when there's nothing to do (most restarts after the first one), so
+    the caller can skip both the embedding-model load and the progress
+    UI entirely.
+
+    Returns ``(True, N)`` when:
+
+    * The summaries dir contains ``*.jsonl`` files, AND
+    * Their combined line count exceeds what's recorded in
+      ``.history_index/line_hashes.json`` (or that file is missing).
+
+    Returns ``(False, 0)`` when:
+
+    * The summaries dir doesn't exist, OR
+    * There are no JSONL files, OR
+    * The index is fully up to date.
+    """
+    if not summaries_dir.exists() or not summaries_dir.is_dir():
+        return False, 0
+    jsonl_files = sorted(summaries_dir.glob("*.jsonl"))
+    if not jsonl_files:
+        return False, 0
+    pending = _count_pending_history_lines(summaries_dir, jsonl_files)
+    return (pending > 0), pending
+
+
 def create_cli_agent(
     model: str | BaseChatModel,
     assistant_id: str,
@@ -609,6 +714,9 @@ def create_cli_agent(
     enable_shell: bool = True,
     checkpointer: BaseCheckpointSaver | None = None,
     project_memory_dir: Path | None = None,
+    enable_history_memory: bool = False,
+    external_mcp_tools: Sequence[BaseTool] | None = None,
+    external_mcp_auto_approved_names: set[str] | None = None,
 ) -> tuple[Pregel, CompositeBackend]:
     """Create a CLI-configured agent with flexible options.
 
@@ -654,6 +762,11 @@ def create_cli_agent(
             If `None`, defaults to `Path.cwd()`. When a semantic index
             exists at `{project_memory_dir}/.vector_index/`, the
             `project_memory` tool becomes available for code search.
+        external_mcp_tools: Ready MCP adapter tools owned by the calling
+            `AgentProcess` lifecycle.
+        external_mcp_auto_approved_names: External MCP tool names that bypass
+            HITL even when global auto-approve is disabled. Global
+            `auto_approve=True` / `-sp` still bypasses all HITL.
 
     Returns:
         2-tuple of `(agent_graph, backend)`
@@ -692,7 +805,18 @@ def create_cli_agent(
             def __init__(self, *args: Any, **kwargs: Any) -> None:
                 self.tools = []  # No tools available in placeholder
 
-    tools = tools or []
+    tools = list(tools or [])
+
+    # External MCP tools (see docs/DESIGN_EXTERNAL_MCP_TOOLS.md). These tools
+    # are already started by the caller (``AgentProcess.start()``) through
+    # ``ExternalMCPClientPool.create(...)`` — we just add them to the
+    # shared ``tools`` list; from there they travel like ordinary BaseTools
+    # through SafeToolCallMiddleware / BoundedToolCallMiddleware / interrupt_on.
+    _external_mcp_names: set[str] = set()
+    if external_mcp_tools:
+        for t in external_mcp_tools:
+            tools.append(t)
+            _external_mcp_names.add(t.name)
 
     # CRITICAL: project_memory_dir is REQUIRED - no fallback!
     if project_memory_dir is None:
@@ -758,6 +882,27 @@ def create_cli_agent(
     )
     agent_middleware.append(SendMessageCompletionMiddleware())
 
+    # Inject cognitive hints for incoming inter-agent messages: guides the
+    # receiving agent to either reply via send_message_to_agent (reply_back=True)
+    # or respond directly to the user (reply_back=False).
+    # Must come AFTER DanglingToolCall & SendMessageCompletion, and BEFORE
+    # SummarizationMiddleware so the hint is visible before summarization.
+    from deep_worker_cli.middleware.inter_agent_reply import (
+        InterAgentReplyMiddleware,
+    )
+    agent_middleware.append(InterAgentReplyMiddleware(name=assistant_id))
+
+    # Unconditionally register history access tools (history_range,
+    # history_at, history_slice) for ALL agents. These tools let the agent
+    # read pre-summarization history directly from markdown section files
+    # regardless of the --history-memory flag.
+    from deep_worker_cli.middleware.history_access import (
+        HistoryAccessMiddleware,
+    )
+    agent_middleware.append(
+        HistoryAccessMiddleware(assistant_id=assistant_id)
+    )
+
     # claude-code only: resolve the inter-agent send Future at DELIVERY time
     # (not on the next round-trip), so the Claude CLI gets its tool_result
     # immediately and the proxy-MCP timeout bounds delivery — not the
@@ -768,9 +913,17 @@ def create_cli_agent(
     # Add memory middleware
     if enable_memory:
         memory_sources = [str(settings.get_user_agent_md_path(assistant_id))]
+        # CRITICAL: settings.get_project_agent_md_path() depends on the
+        # global settings.project_root which is derived from cwd at module
+        # import time.  After daemonize chdirs to "/" that resolution yields
+        # None, so the project AGENTS.md is silently skipped.  Fall back to
+        # the explicit --dir / working_dir value which is always correct.
         project_agent_md = settings.get_project_agent_md_path()
         if project_agent_md:
             memory_sources.append(str(project_agent_md))
+        project_md_from_wd = project_memory_dir / "AGENTS.md"
+        if project_md_from_wd.exists():
+            memory_sources.append(str(project_md_from_wd))
 
         agent_middleware.append(
             MemoryMiddleware(
@@ -824,6 +977,10 @@ def create_cli_agent(
         # Project memory middleware (semantic search if index exists)
         # CRITICAL: NO FALLBACK - project_memory_dir is guaranteed to be set!
         agent_middleware.append(ProjectMemoryMiddleware(working_dir=project_memory_dir))
+
+        # History memory middleware (semantic search over summarised history)
+        # NOTE: Created AFTER startup indexing below so that _has_index check
+        # returns the correct result.
     else:
         # ========== REMOTE SANDBOX MODE ==========
         backend = sandbox  # Remote sandbox (ModalBackend, etc.)
@@ -833,6 +990,9 @@ def create_cli_agent(
         # Project memory middleware (if working directory is specified)
         if project_memory_dir is not None:
             agent_middleware.append(ProjectMemoryMiddleware(working_dir=project_memory_dir))
+
+        # History memory middleware (if enabled)
+        # NOTE: Created AFTER startup indexing below.
 
     # Get or use custom system prompt
     if system_prompt is None:
@@ -847,19 +1007,26 @@ def create_cli_agent(
     if auto_approve:
         # No interrupts - all tools run automatically. Per-tool overrides
         # (like auto_approve_send_message) are implied and have no extra
-        # effect here.
+        # effect here. EXTERNAL MCP TOOLS ARE ALSO NOT INTERRUPTED under -sp
+        # (user rule 2026-06-23) — `interrupt_on={}` is what ensures this:
+        # absence of the key = no HITL.
         interrupt_on = {}
     else:
         # Full HITL for destructive operations, with optional per-tool
-        # carve-out for send_message_to_agent.
-        # `_add_interrupt_on` returns `dict[str, InterruptOnConfig]` — a
-        # narrower type than the `dict[str, bool | InterruptOnConfig]`
-        # variable annotation. `dict` is invariant in its value type, so a
-        # direct assignment fails ty. Cast widens the value type
-        # explicitly; the runtime dict itself is unchanged.
+        # carve-out for send_message_to_agent.  External MCP tools land
+        # here too (see DESIGN_EXTERNAL_MCP_TOOLS.md §3.6) — except
+        # those whose server is marked ``auto_approve: true``.
+        from deep_worker_cli.external_mcp.interrupt import (
+            build_interrupt_on_with_external,
+        )
         interrupt_on = cast(
             "dict[str, bool | InterruptOnConfig]",
-            _add_interrupt_on(auto_approve_send_message=auto_approve_send_message),
+            build_interrupt_on_with_external(
+                auto_approve=False,
+                auto_approve_send_message=auto_approve_send_message,
+                external_tool_names=_external_mcp_names,
+                external_auto_approved_names=external_mcp_auto_approved_names or set(),
+            ),
         )
 
     # Set up composite backend with routing
@@ -918,6 +1085,99 @@ def create_cli_agent(
     # docs/DESIGN_FIX_TOOL_NAME_PRIORITY_AND_DANGLING_TOOLCALLS.md (Fix A).
     tools = _dedupe_tools_by_name_priority(tools)
 
+    # Wire up history memory indexer as summarization callback
+    if enable_history_memory:
+        from semantic_search.history_indexer import index_all_history_files
+        _on_summarized = lambda path_str: index_all_history_files(summaries_dir)  # noqa: E731
+
+        # --- Start-up catch-up of existing history ---
+        #
+        # Run on EVERY agent start (not only when no index exists). The
+        # `_on_summarized` callback only fires during a live process;
+        # between two starts the JSONL can grow without anyone updating
+        # the index. So the next start must catch up.
+        #
+        # ``_should_catchup_history_index`` does a cheap line-count diff
+        # vs ``.history_index/line_hashes.json`` — microseconds — and
+        # returns ``(False, 0)`` when there's nothing to do, in which
+        # case we skip both the embedding-model load AND the progress UI.
+        # See ``docs/DESIGN_HISTORY_INDEX_CATCHUP_ON_START.md``.
+        from semantic_search.history_indexer import history_index_exists
+
+        summaries_path = Path(summaries_dir)
+        needs_catchup, _pending_lines = _should_catchup_history_index(summaries_path)
+
+        if needs_catchup:
+            from deep_worker_cli.config import console
+
+            jsonl_files = list(summaries_path.glob("*.jsonl"))
+            try:
+                file_count = len(jsonl_files)
+                if file_count >= 3:
+                    from rich.progress import (
+                        BarColumn,
+                        Progress,
+                        SpinnerColumn,
+                        TextColumn,
+                    )
+
+                    with Progress(
+                        SpinnerColumn(),
+                        TextColumn("[progress.description]{task.description}"),
+                        BarColumn(),
+                        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+                        console=console,
+                        transient=True,
+                    ) as progress:
+                        task = progress.add_task(
+                            "Indexing conversation history...", total=file_count
+                        )
+
+                        def _on_progress(filename: str) -> None:
+                            progress.update(
+                                task,
+                                description=f"Indexing {filename}...",
+                                advance=1,
+                            )
+
+                        index_all_history_files(
+                            summaries_dir=summaries_path,
+                            on_progress=_on_progress,
+                        )
+                else:
+                    console.print("[dim]Indexing conversation history...[/dim]")
+                    index_all_history_files(summaries_dir=summaries_path)
+            except Exception:
+                import logging
+
+                logging.getLogger(__name__).warning(
+                    "Failed to index conversation history. "
+                    "history_memory tool will not be available.",
+                    exc_info=True,
+                )
+
+        # Enable history memory middleware only if index exists
+        history_ready = history_index_exists(summaries_path)
+        from deep_worker_cli.middleware.history_memory import HistoryMemoryMiddleware
+
+        agent_middleware.append(
+            HistoryMemoryMiddleware(
+                assistant_id=assistant_id,
+                enabled=history_ready,
+            )
+        )
+    else:
+        _on_summarized = None
+
+    # Tool-dispatch safety net — MUST be the last entry in agent_middleware
+    # so it is the innermost ``awrap_tool_call`` wrapper.  Per the
+    # No-Agent-Error-State Policy (docs/POLICIES.md, §1) any exception
+    # raised by a tool must be converted into a ToolMessage(status="error")
+    # rather than propagating up to the agent invoke catch-all (which used
+    # to flip the whole agent into AgentStatus.ERROR).
+    from deep_worker_cli.middleware.safe_tool_call import SafeToolCallMiddleware
+    agent_middleware.append(SafeToolCallMiddleware())
+
     agent = create_deep_agent(
         model=model,
         system_prompt=system_prompt,
@@ -928,5 +1188,6 @@ def create_cli_agent(
         checkpointer=final_checkpointer,
         subagents=custom_subagents or None,
         summarization_history_prefix=str(summaries_dir),
+        summarization_on_summarized=_on_summarized,
     ).with_config(config)
     return agent, composite_backend
