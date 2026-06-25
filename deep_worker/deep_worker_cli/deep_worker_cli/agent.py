@@ -757,11 +757,13 @@ def create_cli_agent(
 
             If `None`, uses `InMemorySaver` (no persistence across
             CLI invocations).
-        project_memory_dir: Directory to check for semantic search index.
-
-            If `None`, defaults to `Path.cwd()`. When a semantic index
-            exists at `{project_memory_dir}/.vector_index/`, the
-            `project_memory` tool becomes available for code search.
+        project_memory_dir: REQUIRED working directory for the agent (project root).
+            Used for FilesystemBackend, skills, memory sources, semantic index
+            lookup under .vector_index/, and AGENTS.md. Caller (AgentProcess)
+            MUST pass explicit value (e.g. launch working_dir); None raises.
+        enable_history_memory: If True, enables HistoryMemoryMiddleware and
+            performs startup catch-up indexing so the history_memory tool
+            can search pre-summarization conversation history.
         external_mcp_tools: Ready MCP adapter tools owned by the calling
             `AgentProcess` lifecycle.
         external_mcp_auto_approved_names: External MCP tool names that bypass
@@ -774,6 +776,9 @@ def create_cli_agent(
             - `agent_graph`: Configured LangGraph Pregel instance ready
                 for execution
             - `composite_backend`: `CompositeBackend` for file operations
+
+    Raises:
+        ValueError: if project_memory_dir is None.
     """
     # Import deepagents here to avoid import errors when not needed
     from deepagents import create_deep_agent
@@ -809,9 +814,9 @@ def create_cli_agent(
 
     # External MCP tools (see docs/DESIGN_EXTERNAL_MCP_TOOLS.md). These tools
     # are already started by the caller (``AgentProcess.start()``) through
-    # ``ExternalMCPClientPool.create(...)`` — we just add them to the
-    # shared ``tools`` list; from there they travel like ordinary BaseTools
-    # through SafeToolCallMiddleware / BoundedToolCallMiddleware / interrupt_on.
+    # ``ExternalMCPClientPool.create(...)`` — we simply add them to the
+    # common ``tools`` list, after which they flow as regular BaseTools through
+    # SafeToolCallMiddleware / BoundedToolCallMiddleware / interrupt_on.
     _external_mcp_names: set[str] = set()
     if external_mcp_tools:
         for t in external_mcp_tools:
@@ -1007,8 +1012,8 @@ def create_cli_agent(
     if auto_approve:
         # No interrupts - all tools run automatically. Per-tool overrides
         # (like auto_approve_send_message) are implied and have no extra
-        # effect here. EXTERNAL MCP TOOLS ARE ALSO NOT INTERRUPTED under -sp
-        # (user rule 2026-06-23) — `interrupt_on={}` is what ensures this:
+        # effect here. EXTERNAL MCP TOOLS ARE ALSO NOT INTERRUPTED with -sp
+        # (user rule 2026-06-23) - `interrupt_on={}` ensures exactly this:
         # absence of the key = no HITL.
         interrupt_on = {}
     else:

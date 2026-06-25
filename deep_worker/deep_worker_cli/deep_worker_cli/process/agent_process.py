@@ -485,6 +485,11 @@ class AgentProcess:
         self.shutdown_event = asyncio.Event()
         self.started_at: datetime | None = None  # Set when agent starts
 
+        # A2A protocol server handle (None when disabled / unavailable). Set in
+        # start() just before _register() so a2a_port/a2a_url can be written
+        # atomically with the rest of the registration (RC-6).
+        self._a2a_handle: Any = None
+
         # Track how many messages we've broadcasted per thread
         # This prevents re-broadcasting old messages from LangGraph checkpointer
         # Similar to sent_count pattern in ClaudeCodeChatModel
@@ -1043,6 +1048,23 @@ class AgentProcess:
                     sys.stdout.flush()
                     _logger.info(msg)
 
+                # Drop-in env files in ~/.deepagents/env.d/*.env (each 0o600).
+                # Loaded AFTER the main .env so it stays authoritative — drop-ins
+                # only fill blanks. See DESIGN_EXTERNAL_MCP_TOOLS.md §7 and
+                # tests/unit_tests/process/test_env_d_loader.py.
+                from deep_worker_cli.process.env_loader import load_env_d
+
+                env_d_dir = PathLib.home() / ".deepagents" / "env.d"
+                applied = load_env_d(env_d_dir)
+                if applied:
+                    msg = (
+                        f"{_ts()} [AGENT_INIT] Loaded {len(applied)} variable(s) "
+                        f"from {env_d_dir}: {sorted(applied.keys())}\n"
+                    )
+                    sys.stdout.write(msg)
+                    sys.stdout.flush()
+                    _logger.info(msg)
+
                 # ================================================================
                 # CRITICAL: Add deepagents to sys.path BEFORE imports
                 # ================================================================
@@ -1166,6 +1188,24 @@ class AgentProcess:
                     restart_self_tool_factory(self.name),
                     make_send_message_to_agent_tool(self.name),
                 ]
+
+                # A2A outbound tools (a2a_*): only registered when A2A is
+                # enabled for this agent. Lets the LLM initiate A2A protocol
+                # calls to other A2A-compliant agents. Import/build failures
+                # are non-fatal (A2A is optional) — the agent keeps its other
+                # tools. See deepworker_a2a/docs/DESIGN_A2A_PROTOCOL_SUPPORT.md.
+                try:
+                    from deepworker_a2a.config import A2AConfig as _A2AConfig
+
+                    if _A2AConfig.from_env(self.name).enabled:
+                        from deepworker_a2a.tools import make_a2a_tools
+
+                        web_tools.extend(make_a2a_tools())
+                        _logger.info("Registered outbound a2a_* tools")
+                except Exception:  # noqa: BLE001 — A2A tools are optional
+                    _logger.info(
+                        "deepworker_a2a tools unavailable; skipping a2a_* tools"
+                    )
 
                 # Codex-specific: register the native-tool passthroughs.
                 # Codex CLI hard-codes a few native tools (apply_patch,
@@ -1316,6 +1356,18 @@ class AgentProcess:
                 _logger.info(traceback.format_exc())
                 # Agent remains None, fallback to echo mode
                 self.agent = None
+                # Per No-Agent-Error-State policy + user requirement: init failures
+                # (e.g. missing MCP env vars, bad config) are FATAL ("agent not initialised").
+                # Make the error VISIBLE and PERSISTENT in Web UI as ERROR status + error_message.
+                # It must not be hidden in logs only. The error banner will show prominently
+                # for the selected agent.
+                if self.session_manager:
+                    try:
+                        await self.session_manager.set_error(
+                            f"Agent initialization failed: {e}"
+                        )
+                    except Exception:
+                        pass  # best effort; don't block start continuation
 
             # Initialize TaskManager if enabled and agent is available
             # This is done OUTSIDE the agent creation try/except so that
@@ -1374,6 +1426,11 @@ class AgentProcess:
 
             # 6. Register in registry (ONLY after RPyC server is ready!)
             # This ensures clients can connect immediately after seeing the agent in registry
+            # 5.1 Start optional A2A protocol server BEFORE registering, so
+            # a2a_port/a2a_url are written atomically with registration (RC-6).
+            # Disabled by default; failure here is logged, never fatal (RC-7).
+            await self._maybe_start_a2a_server()
+
             msg = f"{_ts()} [AGENT_INIT] About to register in registry...\n"
             sys.stdout.write(msg)
             sys.stdout.flush()
@@ -1836,6 +1893,37 @@ class AgentProcess:
 
         print(f"Agent '{self.name}' stopped")
 
+    async def _maybe_start_a2a_server(self) -> None:
+        """Start the optional A2A protocol server (RC-6/RC-7).
+
+        Gated on ``A2AConfig.from_env(...).enabled``. A missing optional
+        ``deepworker_a2a`` package or ``a2a-sdk`` dependency, or any startup
+        error, is logged and swallowed — A2A must never crash the agent. On
+        success ``self._a2a_handle`` is set so ``_register`` can persist
+        ``a2a_port``/``a2a_url`` atomically with the rest of the registration.
+        """
+        try:
+            from deepworker_a2a.config import A2AConfig
+            from deepworker_a2a.server import maybe_start_a2a_server
+        except Exception:  # noqa: BLE001 — optional dependency / package
+            _logger.info("deepworker_a2a not importable; A2A disabled")
+            return
+
+        try:
+            config = A2AConfig.from_env(self.name)
+        except Exception:  # noqa: BLE001 — bad env config must not be fatal
+            _logger.exception("Invalid A2A config from env; A2A disabled")
+            return
+
+        if not config.enabled:
+            return
+
+        self._a2a_handle = await maybe_start_a2a_server(
+            self, config, agent_name=self.name
+        )
+        if self._a2a_handle is not None:
+            print(f"{_ts()} A2A server: {self._a2a_handle.url}")
+
     async def _register(self) -> None:
         """Register agent in ProcessRegistry."""
         if self.started_at is None:
@@ -1845,6 +1933,14 @@ class AgentProcess:
         if self.rpyc_port is None:
             raise RuntimeError("RPyC port must be configured - RPyC is required for agent communication")
 
+        # A2A endpoint (RC-6): written atomically with the rest of the
+        # registration so a peer never sees the agent without its A2A URL.
+        a2a_port: int | None = None
+        a2a_url: str | None = None
+        if self._a2a_handle is not None:
+            a2a_url = getattr(self._a2a_handle, "url", None)
+            a2a_port = getattr(self._a2a_handle, "port", None)
+
         process_info = AgentProcessInfo(
             name=self.name,
             pid=os.getpid(),
@@ -1852,6 +1948,8 @@ class AgentProcess:
             working_dir=str(self.config.working_dir),
             started_at=self.started_at,
             rpyc_port=self.rpyc_port,  # RPyC port (REQUIRED for communication)
+            a2a_port=a2a_port,
+            a2a_url=a2a_url,
         )
         self.registry.register(process_info)
 

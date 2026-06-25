@@ -73,6 +73,11 @@ class AgentProcessInfo:
     started_at: datetime
     rpyc_port: int  # RPyC server port (REQUIRED)
     last_activity: datetime | None = None
+    # Optional A2A (Agent2Agent) protocol endpoint, populated only when the
+    # agent runs its A2A server (deepworker_a2a). Backward-compatible: absent
+    # for agents without A2A enabled.
+    a2a_port: int | None = None
+    a2a_url: str | None = None
 
 
 @dataclass

@@ -1,14 +1,20 @@
-"""MCPToolAdapter — a wrapper over a single MCP tool entry.
+"""MCPToolAdapter — a wrapper over a single MCP tool record.
 
-Contract (see DESIGN_EXTERNAL_MCP_TOOLS.md §3.3):
+Contract (see DESIGN_EXTERNAL_MCP_TOOLS.md §3.3 and
+DESIGN_EXTERNAL_MCP_TOOL_NAME_MANGLING.md):
 
-* ``name`` = ``mcp__<server>__<tool>``  (the same prefix as our proxy)
-* ``description`` comes from the MCP ``tool.description``
-* ``_arun`` proxies to ``session.call_tool(tool_name, kwargs)``
-* Result: if the MCP returned a structured payload it is serialised to
-  a JSON string; plain text is passed through as-is.
+* ``name`` = **provider-safe** name (`.` and `/` replaced with `__`),
+  the final name by which ToolNode and all providers route.
+* ``canonical_name`` = the original MCP name ``<server>.<tool>`` (with dots/
+  slashes) — the source of truth for the UI and the MCP-wire call.
+* ``description`` is taken from MCP ``tool.description``.
+* ``_arun`` proxies into ``session.call_tool(tool_name, kwargs)`` —
+  with ``_bare_tool_name`` (the original bare name on the MCP-server side, without
+  the server prefix and without any mangling).
+* Result: if MCP returned a structure — it is serialized into a JSON string,
+  if plain text — returned as-is.
 
-This unit test does NOT bring up a real MCP — it only mocks ``ClientSession``.
+This unit test does NOT raise a real MCP — it only mocks ``ClientSession``.
 """
 from __future__ import annotations
 
@@ -27,7 +33,7 @@ from deep_worker_cli.external_mcp.adapter import MCPToolAdapter
 
 
 class _FakeSession:
-    """Mimics exactly the slice of mcp.ClientSession the adapter uses:
+    """Imitates exactly the slice of mcp.ClientSession the adapter uses:
     one ``call_tool(name, args)`` method returning an object with
     ``content`` and ``isError`` attributes."""
 
@@ -39,13 +45,14 @@ class _FakeSession:
     async def call_tool(self, name: str, args: dict) -> Any:
         self.calls.append((name, args))
         # The MCP SDK returns CallToolResult with .content: list[TextContent|...]
-        # and .isError. Mimic the minimal shape.
+        # and .isError. We imitate the minimal shape.
         text_block = SimpleNamespace(type="text", text=self.payload)
         return SimpleNamespace(content=[text_block], isError=self.is_error)
 
 
 @pytest.mark.asyncio
-async def test_adapter_name_carries_server_and_tool_prefix() -> None:
+async def test_adapter_name_is_mangled_canonical_preserved() -> None:
+    """``name`` is provider-safe (mangled), ``canonical_name`` is the original."""
     sess = _FakeSession("ok")
     a = MCPToolAdapter(
         session=sess,  # type: ignore[arg-type]
@@ -54,7 +61,26 @@ async def test_adapter_name_carries_server_and_tool_prefix() -> None:
         description="Create a GitHub issue",
         input_schema={"type": "object", "properties": {}},
     )
-    assert a.name == "mcp__github__create_issue"
+    # `.` in `<server>.<tool>` → `__` in the provider-safe name.
+    assert a.name == "github__create_issue"
+    assert a.canonical_name == "github.create_issue"
+
+
+@pytest.mark.asyncio
+async def test_adapter_name_mangled_for_dotted_tool_name() -> None:
+    """Real scenario from a chrome bridge: a tool with a dot in its name
+    (`browser.list_tabs`) → mangled `chrome__browser__list_tabs`,
+    canonical — `chrome.browser.list_tabs`."""
+    sess = _FakeSession("ok")
+    a = MCPToolAdapter(
+        session=sess,  # type: ignore[arg-type]
+        server_name="chrome",
+        tool_name="browser.list_tabs",
+        description="",
+        input_schema={"type": "object", "properties": {}},
+    )
+    assert a.name == "chrome__browser__list_tabs"
+    assert a.canonical_name == "chrome.browser.list_tabs"
 
 
 @pytest.mark.asyncio
@@ -68,6 +94,32 @@ async def test_adapter_description_propagated() -> None:
         input_schema={"type": "object", "properties": {}},
     )
     assert a.description == "Hello from MCP"
+
+
+@pytest.mark.asyncio
+async def test_adapter_uses_provided_mangler_for_name_only() -> None:
+    """When the caller passes a ``mangler``, the adapter registers its
+    canonical name in it and takes the name from there. The wire call always goes by the
+    bare tool_name (without the server prefix, without mangling)."""
+    from deep_worker_cli.external_mcp.mangler import MCPToolNameMangler
+
+    mangler = MCPToolNameMangler()
+    sess = _FakeSession("ok")
+    a = MCPToolAdapter(
+        session=sess,  # type: ignore[arg-type]
+        server_name="chrome",
+        tool_name="browser.status",
+        description="",
+        input_schema={"type": "object", "properties": {}},
+        mangler=mangler,
+    )
+    assert a.name == "chrome__browser__status"
+    assert a.canonical_name == "chrome.browser.status"
+    # The mangler really received the canonical.
+    assert mangler.to_canonical("chrome__browser__status") == "chrome.browser.status"
+    # The wire call goes by the bare tool_name, without the server prefix and without mangling.
+    await a._arun()
+    assert sess.calls == [("browser.status", {})]
 
 
 @pytest.mark.asyncio
@@ -89,7 +141,7 @@ async def test_adapter_arun_forwards_kwargs_to_call_tool() -> None:
     )
     out = await a._arun(title="hi", body="there")
     assert "done" in out
-    # The adapter must proxy under the bare tool_name exactly, without the prefix.
+    # The adapter must proxy EXACTLY under the bare tool_name, without the prefix.
     assert sess.calls == [("create_issue", {"title": "hi", "body": "there"})]
 
 
@@ -102,7 +154,7 @@ async def test_adapter_serialises_structured_payload() -> None:
         description="", input_schema={"type": "object", "properties": {}},
     )
     out = await a._arun()
-    # A structured payload must come through as a JSON string.
+    # A structured payload must come back as a JSON string.
     assert json.loads(out) == {"id": 42, "url": "https://x/42"}
 
 
@@ -114,7 +166,7 @@ async def test_adapter_is_error_surfaced_as_exception() -> None:
         server_name="x", tool_name="y",
         description="", input_schema={"type": "object", "properties": {}},
     )
-    # SafeToolCallMiddleware turns the RuntimeError into a ToolMessage(status="error").
+    # SafeToolCallMiddleware will turn RuntimeError into ToolMessage(status="error").
     with pytest.raises(RuntimeError):
         await a._arun()
 

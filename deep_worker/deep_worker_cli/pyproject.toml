@@ -165,6 +165,10 @@ extra-paths = [
     "../../claude_code_provider",
     "../../semantic_search",
     "../deepagents",
+    "..",  # exposes the deepworker_a2a package (optional A2A protocol package).
+           # agent_process.py imports it lazily and gracefully when A2A is
+           # enabled; ty must still resolve the import to type-check the
+           # integration code path.
     "../../../rpyc_async",
 ]
 

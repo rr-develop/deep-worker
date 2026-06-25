@@ -1735,12 +1735,21 @@ class AgentService:
 
         if verbosity == "system_prompt":
             try:
-                raw = await asyncio.wait_for(root.get_system_prompt(), timeout=30.0)
-            except asyncio.TimeoutError:
-                logger.error(f"Timeout getting system prompt for '{agent_name}'")
-                raise asyncio.TimeoutError(
-                    f"Agent '{agent_name}' did not respond within 30s"
-                )
+                # ⚠️ NON-BLOCKING RPyC — DO NOT REGRESS. ⚠️
+                # MUST be ``await async_(root.M)()``, NEVER ``await root.M()``.
+                # ``root`` is an RPyC netref; ``await root.get_system_prompt()``
+                # evaluates the call EAGERLY and INLINE on the event loop,
+                # dropping into ``AsyncResult.value -> wait() -> while …:
+                # conn.serve()`` which READS THE SOCKET on the loop thread and
+                # busy-spins at 100% CPU. Against a slow/stuck peer it NEVER
+                # returns → the whole web server deadlocks (regression
+                # 2026-06-23: a frozen web server whose restart then hung).
+                # ``async_(proxy)()`` issues ``asyncreq`` (no inline serve) and
+                # returns an AsyncResult whose ``__await__`` yields to the loop
+                # — cancel-aware, no arbitrary ``timeout=`` band-aid needed.
+                # See module header rule #5, POLICIES.md §1/§3/§7, and
+                # tests/integration/test_no_blocking_rpyc_in_handlers.py.
+                raw = await rpyc.async_(root.get_system_prompt)()
             except Exception as e:
                 if _is_missing_method_error(e):
                     # Stale agent (no RPyC method). The invariant system prompt
@@ -1766,12 +1775,15 @@ class AgentService:
 
         if verbosity == "tools":
             try:
-                raw = await asyncio.wait_for(root.get_tools(), timeout=30.0)
-            except asyncio.TimeoutError:
-                logger.error(f"Timeout getting tools for '{agent_name}'")
-                raise asyncio.TimeoutError(
-                    f"Agent '{agent_name}' did not respond within 30s"
-                )
+                # ⚠️ NON-BLOCKING RPyC — DO NOT REGRESS. ⚠️ See the identical
+                # banner on the ``get_system_prompt`` call above. NEVER write
+                # ``await root.get_tools()`` — it blocks the event loop in
+                # AsyncResult.value/serve (100% CPU deadlock vs a slow peer,
+                # regression 2026-06-23). The non-blocking await path is
+                # ``await async_(root.get_tools)()``. No ``timeout=`` band-aid:
+                # the async path yields to the loop and is cancel-aware. See
+                # test_no_blocking_rpyc_in_handlers.py.
+                raw = await rpyc.async_(root.get_tools)()
             except Exception as e:
                 if _is_missing_method_error(e):
                     return (

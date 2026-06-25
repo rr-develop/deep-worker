@@ -67,6 +67,20 @@ if deepagents_str in sys.path:
     sys.path.remove(deepagents_str)
 sys.path.insert(0, deepagents_str)
 
+# ============================================================================
+# CRITICAL: local deepworker_a2a package importable from THIS tree
+# ============================================================================
+# The A2A protocol package lives at the deep_worker package root, a sibling of
+# deep_worker_cli / deepagents. Production puts that root on PYTHONPATH via the
+# deep-worker launcher; mirror that here so `import deepworker_a2a` resolves to
+# the LOCAL repository package, never site-packages. It is named
+# `deepworker_a2a` (NOT `a2a`) so it never shadows the installed `a2a-sdk`.
+DEEP_WORKER_DIR = Path(__file__).parent.parent.parent  # the deep_worker package root
+deep_worker_dir_str = str(DEEP_WORKER_DIR)
+if deep_worker_dir_str in sys.path:
+    sys.path.remove(deep_worker_dir_str)
+sys.path.insert(0, deep_worker_dir_str)
+
 # Verify that we're using the correct deepagents
 try:
     import deepagents

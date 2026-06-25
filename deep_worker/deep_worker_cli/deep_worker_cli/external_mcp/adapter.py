@@ -1,12 +1,21 @@
-"""MCPToolAdapter — turns an MCP tool record into an ordinary LangChain BaseTool.
+"""MCPToolAdapter — wraps an MCP tool entry into an ordinary LangChain BaseTool.
 
-The adapter is the only place where we make the MCP call "by hand". Further
-down the graph the tool looks like any other ``BaseTool``: it is picked up by
-``SafeToolCallMiddleware`` (exceptions → ToolMessage(status='error')),
-``BoundedToolCallMiddleware`` (2-min wait → job-handle), and ordinary HITL
+The adapter is the single place where we perform the MCP call "by hand". From
+there on, within the graph the tool looks like any other ``BaseTool``: it is
+picked up by ``SafeToolCallMiddleware`` (exceptions → ToolMessage(status='error')),
+``BoundedToolCallMiddleware`` (2-min wait → job-handle), and the regular HITL
 ``interrupt_on``.
 
-See DESIGN_EXTERNAL_MCP_TOOLS.md §3.3.
+See DESIGN_EXTERNAL_MCP_TOOLS.md §3.3 and
+DESIGN_EXTERNAL_MCP_TOOL_NAME_MANGLING.md.
+
+Names:
+* ``name`` — provider-safe (``.``/``/`` → ``__``); ToolNode and each provider
+  (claude-code/codex/grok/deepseek/openai/gemini) route by it; satisfies
+  ``^[a-zA-Z0-9_-]+$``.
+* ``canonical_name`` — the original ``<server>.<tool>`` (for UI/introspection).
+* ``_bare_tool_name`` — the bare tool_name from MCP ``list_tools`` (no server
+  prefix, no mangling); this is exactly what ``session.call_tool(...)`` receives.
 """
 from __future__ import annotations
 
@@ -15,6 +24,8 @@ from typing import Any
 
 from langchain_core.tools import BaseTool
 from pydantic import BaseModel, ConfigDict, Field, create_model
+
+from deep_worker_cli.external_mcp.mangler import MCPToolNameMangler
 
 _JSON_TO_PY = {
     "string": str,
@@ -53,7 +64,7 @@ def _schema_to_pydantic(
         fields[prop_name] = (py_type, Field(default=default, description=description))
 
     model_name = f"MCPArgs_{server_name}_{tool_name}"
-    # ``extra='allow'`` — MCP servers may permit additional arguments.
+    # ``extra='allow'`` — MCP servers may also allow other arguments.
     model_cls = create_model(  # type: ignore[call-overload]
         model_name,
         __config__=ConfigDict(extra="allow", arbitrary_types_allowed=True),
@@ -94,14 +105,15 @@ def _flatten_call_result(result: Any) -> str:
 class MCPToolAdapter(BaseTool):
     """Wrapper around a single MCP tool as a LangChain BaseTool."""
 
-    # pydantic v2 on BaseTool — public fields
-    name: str
-    description: str
-    args_schema: type[BaseModel]
+    # pydantic v2 on BaseTool — public fields (defaults to satisfy strict override checks)  # noqa: E501
+    name: str = ""
+    description: str = ""
+    args_schema: type[BaseModel] | dict[str, Any] | None = None
 
-    # private: session + bare tool name
+    # private: session + bare tool name + canonical (for UI/wire)
     _session: Any = None
     _bare_tool_name: str = ""
+    _canonical_name: str = ""
 
     def __init__(
         self,
@@ -111,29 +123,45 @@ class MCPToolAdapter(BaseTool):
         tool_name: str,
         description: str,
         input_schema: dict[str, Any],
+        mangler: MCPToolNameMangler | None = None,
     ) -> None:
+        canonical = f"{server_name}.{tool_name}"
+        # If the caller passed a shared per-agent mangler, register the
+        # canonical name in it (collisions between different tools of one
+        # agent are caught there too). Otherwise create a local one so the
+        # adapter stays self-contained (stand-alone tests).
+        m = mangler if mangler is not None else MCPToolNameMangler()
+        mangled_name = m.add(canonical)
         args_model = _schema_to_pydantic(server_name, tool_name, input_schema or {})
         super().__init__(
-            name=f"mcp__{server_name}__{tool_name}",
-            description=description or f"MCP tool {server_name}.{tool_name}",
+            name=mangled_name,
+            description=description or f"MCP tool {canonical}",
             args_schema=args_model,
         )
-        # bypass pydantic-frozen-init for private fields
+        # bypass pydantic's frozen init for private fields
         object.__setattr__(self, "_session", session)
         object.__setattr__(self, "_bare_tool_name", tool_name)
+        object.__setattr__(self, "_canonical_name", canonical)
+
+    @property
+    def canonical_name(self) -> str:
+        """Canonical MCP name ``<server>.<tool>`` (with dots/slashes)
+        for the UI/catalog. Source of truth for display; ``name`` (mangled)
+        is used for routing inside the graph and by providers."""
+        return self._canonical_name
 
     def _run(self, *args: Any, **kwargs: Any) -> Any:  # pragma: no cover
-        # All calls from ToolNode go the async way (LangGraph will choose
-        # ainvoke for a tool with _arun). The sync path is kept only as a
-        # safety net.
+        # All calls from ToolNode go through the async path (LangGraph will
+        # pick ainvoke for a tool with _arun). The sync path is kept only as
+        # a safety net.
         raise NotImplementedError(
             "MCPToolAdapter is async-only; the graph should call _arun()."
         )
 
     async def _arun(self, *args: Any, **kwargs: Any) -> str:
-        # LangChain sometimes passes config as the first positional argument;
-        # we ignore it (validation already happened in args_schema, the rest
-        # is up to the MCP server).
+        # LangChain sometimes passes config as the first positional arg; we
+        # ignore it (validation already happened in args_schema, the rest is
+        # up to the MCP server).
         sess = self._session
         result = await sess.call_tool(self._bare_tool_name, kwargs)
         if getattr(result, "isError", False):

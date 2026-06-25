@@ -68,7 +68,7 @@ class ProcessRegistry:
                 # Dead process, will be replaced
 
             # Register new entry
-            registry[agent_info.name] = {
+            entry: dict[str, Any] = {
                 "pid": agent_info.pid,
                 "pid_file": str(agent_info.pid_file),
                 "working_dir": agent_info.working_dir,
@@ -76,6 +76,14 @@ class ProcessRegistry:
                 "last_activity": datetime.now().isoformat(),
                 "rpyc_port": agent_info.rpyc_port,  # RPyC port (REQUIRED)
             }
+            # Optional A2A endpoint fields — only persisted when present so the
+            # registry stays backward-compatible for non-A2A agents.
+            if agent_info.a2a_port is not None:
+                entry["a2a_port"] = agent_info.a2a_port
+            if agent_info.a2a_url is not None:
+                entry["a2a_url"] = agent_info.a2a_url
+
+            registry[agent_info.name] = entry
 
             self._save_registry(registry)
 
@@ -126,6 +134,8 @@ class ProcessRegistry:
                 if "last_activity" in entry
                 else None,
                 rpyc_port=entry.get("rpyc_port"),  # RPyC port (REQUIRED)
+                a2a_port=entry.get("a2a_port"),  # optional A2A endpoint
+                a2a_url=entry.get("a2a_url"),
             )
 
     def list_all(self) -> list[AgentProcessInfo]:
@@ -152,6 +162,8 @@ class ProcessRegistry:
                             if "last_activity" in entry
                             else None,
                             rpyc_port=entry.get("rpyc_port"),  # RPyC port (REQUIRED)
+                            a2a_port=entry.get("a2a_port"),  # optional A2A endpoint
+                            a2a_url=entry.get("a2a_url"),
                         )
                     )
                 else:

@@ -75,6 +75,24 @@
                         <span id="agent-model">unknown</span>
                     </div>
 
+                    <!-- Last Error Panel - placed prominently at top of agent view so it is
+                         immediately visible without scrolling when the agent is selected as current.
+                         Persistent (not a toast), red-styled, shows full init/config/runtime errors. -->
+                    <div id="last-error-panel" class="last-error-panel" style="display: none;">
+                        <div class="last-error-header">
+                            <h3>⚠️ Last Error</h3>
+                            <div class="last-error-actions">
+                                <button id="copy-error-btn" onclick="copyLastError(event)" class="btn btn-secondary btn-sm" title="Copy error">
+                                    📋 Copy
+                                </button>
+                                <button id="dismiss-error-btn" onclick="dismissLastError()" class="btn btn-secondary btn-sm" title="Dismiss error">
+                                    ✕ Dismiss
+                                </button>
+                            </div>
+                        </div>
+                        <pre id="last-error-content" class="error-content"></pre>
+                    </div>
+
                     <!-- Approval Panel (hidden by default) -->
                     <div id="approval-panel" class="approval-panel" style="display: none;">
                         <div class="approval-header">
@@ -100,23 +118,6 @@
                         <div id="last-response-content" class="response-content">
                             <em>No response yet</em>
                         </div>
-                    </div>
-
-                    <!-- Last Error Panel (separate from Last Response;
-                         persistent, copyable, manually dismissed) -->
-                    <div id="last-error-panel" class="last-error-panel" style="display: none;">
-                        <div class="last-error-header">
-                            <h3>⚠️ Last Error</h3>
-                            <div class="last-error-actions">
-                                <button id="copy-error-btn" onclick="copyLastError(event)" class="btn btn-secondary btn-sm" title="Copy error">
-                                    📋 Copy
-                                </button>
-                                <button id="dismiss-error-btn" onclick="dismissLastError()" class="btn btn-secondary btn-sm" title="Dismiss error">
-                                    ✕ Dismiss
-                                </button>
-                            </div>
-                        </div>
-                        <pre id="last-error-content" class="error-content"></pre>
                     </div>
 
                     <!-- Message Input -->

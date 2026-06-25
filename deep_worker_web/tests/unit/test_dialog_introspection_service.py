@@ -17,9 +17,12 @@ from tests.fixtures.mock_registry import MockProcessRegistry
 
 
 class _AwaitableValue:
-    """Wrap a value so ``root.method(...)`` returns an awaitable, matching
-    the RPyC async-netref call shape used in production
-    (``await root.get_history(...)``)."""
+    """Wrap a value so a call returns an awaitable, matching the RPyC
+    ``async_(netref_method)()`` -> AsyncResult shape used in production: the
+    non-blocking await path (``AsyncResult.__await__`` yields to the loop).
+    A bare blocking netref call (``root.method()``) is FORBIDDEN — see
+    ``test_no_blocking_rpyc_in_handlers.py`` and the banner in
+    ``agent_service.get_agent_dialog_formatted``."""
 
     def __init__(self, value: object) -> None:
         self._value = value
@@ -29,6 +32,28 @@ class _AwaitableValue:
             return self._value
 
         return _coro().__await__()
+
+
+@pytest.fixture(autouse=True)
+def _patch_rpyc_async(monkeypatch):  # noqa: ANN001, ANN201
+    """Model production faithfully: the service MUST reach the introspection
+    methods via ``rpyc.async_(root.M)()`` (the non-blocking await path), NOT a
+    bare ``await root.M()`` (which blocks the event loop in
+    AsyncResult.value/serve — regression 2026-06-23). Real ``rpyc.async_``
+    rejects non-netref fakes, so we stub it with the same CONTRACT: given a
+    bound method, calling the wrapper returns an awaitable yielding that
+    method's value. If the service ever regresses to a bare ``await
+    root.M()``, this stub is bypassed and the call is no longer awaitable →
+    the test fails, surfacing the blocking regression."""
+    import rpyc  # type: ignore[import-not-found]
+
+    def _fake_async(bound_method):  # noqa: ANN001, ANN202
+        def _invoke(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+            return _AwaitableValue(bound_method(*args, **kwargs))
+
+        return _invoke
+
+    monkeypatch.setattr(rpyc, "async_", _fake_async)
 
 
 class _FakeRoot:
@@ -41,11 +66,15 @@ class _FakeRoot:
         self.history_called = True
         return _AwaitableValue(json.dumps({"success": True, "history": []}))
 
+    # NOTE: these return the raw JSON string. In production they are netref
+    # methods reached via ``async_(root.M)()``; the autouse ``_patch_rpyc_async``
+    # fixture models that wrapper. They must NOT return an awaitable themselves
+    # (that would mask a bare-``await root.M()`` regression).
     def get_system_prompt(self):  # noqa: ANN201
-        return _AwaitableValue(json.dumps(self._sp))
+        return json.dumps(self._sp)
 
     def get_tools(self):  # noqa: ANN201
-        return _AwaitableValue(json.dumps(self._tools))
+        return json.dumps(self._tools)
 
 
 class _StaleRoot:

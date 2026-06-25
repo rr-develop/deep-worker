@@ -131,7 +131,12 @@ fi
 # Normal launch in THIS tree.
 # ---------------------------------------------------------------------------
 
-export PYTHONPATH="$SCRIPT_DIR:$PARENT_DIR/deepagents:${PYTHONPATH:-}"
+# $PARENT_DIR (the deep_worker package root) is added so `import deepworker_a2a`
+# resolves (the A2A protocol package lives under $PARENT_DIR, next to
+# deep_worker_cli and deepagents). It must NOT be named `a2a`: that top-level
+# name belongs to the installed `a2a-sdk` and a local `a2a/` here would shadow
+# & break it. See deepworker_a2a/docs/DESIGN_A2A_PROTOCOL_SUPPORT.md §5.1.
+export PYTHONPATH="$SCRIPT_DIR:$PARENT_DIR/deepagents:$PARENT_DIR:${PYTHONPATH:-}"
 export DEEP_WORKER_TREE_ROOT="${DEEP_WORKER_TREE_ROOT:-$THIS_TREE_ROOT}"
 
 cd "$SCRIPT_DIR" && DEEP_WORKER_ORIGINAL_CWD="$ORIGINAL_CWD" \

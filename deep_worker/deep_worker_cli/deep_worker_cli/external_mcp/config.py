@@ -1,26 +1,28 @@
 """External MCP config loader.
 
 Layered JSON config for external MCP servers: user → project →
-per-agent → CLI ad-hoc. A higher layer fully replaces an entry with
-the same name from a lower layer. See DESIGN_EXTERNAL_MCP_TOOLS.md §3.
+per-agent → CLI ad-hoc. A higher layer fully replaces a same-named
+entry from a lower one. See DESIGN_EXTERNAL_MCP_TOOLS.md §3.
 
-Deliberately NO global state and no side-effects on
-import — pure load/merge/validation.
+Deliberately NO global state, no side effects on import — pure
+loading/merging/validation.
 """
 from __future__ import annotations
 
 import json
 import os
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 
 class UnresolvedEnvError(ValueError):
     """Raised when ``${env:VAR}`` references a variable that is not set
     (and no ``:-fallback`` is provided). Loud-by-design — starting a
-    server with an empty token is worse than failing fast."""
+    server with an empty token is worse than failing fast.
+    """
 
 
 @dataclass(frozen=True)
@@ -103,7 +105,7 @@ def _parse_one(name: str, raw: dict[str, Any]) -> ServerSpec | None:
             type="http",
             url=_resolve_env_in_value(url),
             headers=_resolve_env_in_mapping(headers_in),
-            auto_approve=bool(raw.get("auto_approve", False)),
+            auto_approve=bool(raw.get("auto_approve")),
         )
 
     # stdio default
@@ -129,7 +131,7 @@ def _parse_one(name: str, raw: dict[str, Any]) -> ServerSpec | None:
         args=[_resolve_env_in_value(a) for a in args_in],
         env=_resolve_env_in_mapping(env_in),
         cwd=_resolve_env_in_value(cwd) if cwd else None,
-        auto_approve=bool(raw.get("auto_approve", False)),
+        auto_approve=bool(raw.get("auto_approve")),
     )
 
 

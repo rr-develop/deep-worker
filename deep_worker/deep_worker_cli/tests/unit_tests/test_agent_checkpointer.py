@@ -380,3 +380,59 @@ class TestPriorityLogic:
                     # Should use SQLite in normal production
                     call_kwargs = mock_create.call_args.kwargs
                     assert call_kwargs["checkpointer"] is not None
+
+
+class TestInitErrorVisibility:
+    """TDD tests for making init errors VISIBLE in UI (persistent ERROR + error_message).
+
+    Per user requirement + POLICIES.md: errors like missing MCP ${env:VAR} must
+    not be hidden in logs. They must set ERROR status, persist error_message,
+    so the prominent red banner shows at top of selected agent page without scroll.
+    """
+
+    @pytest.mark.asyncio
+    async def test_init_error_sets_error_status_and_message_for_ui(self, agent_config):
+        """Simulate startup init failure (e.g. UnresolvedEnvError from mcp.json).
+
+        Before the fix: only logged + self.agent=None, status stayed non-ERROR,
+        error_message not set → UI showed nothing (or "not initialized" on calls).
+        After: calls set_error → status=ERROR, error_message populated → UI banner visible.
+        """
+        process = AgentProcess(name="test-agent", config=agent_config)
+
+        # Force the MCP pool (or any init step) to raise a realistic init error
+        async def _raise_init_error():
+            from deep_worker_cli.external_mcp.config import UnresolvedEnvError
+            raise UnresolvedEnvError("environment variable 'MCP_ADMIN_TOKEN' referenced by mcp.json is not set")
+
+        with patch.object(process, "_start_external_mcp_pool", _raise_init_error):
+            with patch("deep_worker_cli.sessions.get_checkpointer"):
+                with patch("deep_worker_cli.agent.create_cli_agent") as mock_create:
+                    mock_create.return_value = (MagicMock(), MagicMock())
+                    # Run enough of start to hit the catch but stop before infinite await shutdown_event
+                    # We use a mock shutdown to let it proceed to RPyC but we don't care
+                    with patch.object(process, "shutdown_event", MagicMock(wait=AsyncMock())):
+                        with patch("deep_worker_cli.process.agent_process.ProcessRegistry"):
+                            # Patch RPyC start to avoid real server
+                            with patch.object(process, "_start_rpyc_server", AsyncMock()):
+                                with patch.object(process, "_register", AsyncMock()):
+                                    try:
+                                        # Run start in bg task, let it hit the error path
+                                        task = asyncio.create_task(process.start())
+                                        # Give it time to reach the init except + set_error
+                                        await asyncio.sleep(0.1)
+                                        # Cancel to stop the await shutdown
+                                        task.cancel()
+                                        try:
+                                            await task
+                                        except asyncio.CancelledError:
+                                            pass
+                                    except Exception:
+                                        pass  # expected in this simulated partial start
+
+        # Key assertions for visibility:
+        assert process.session_manager is not None
+        assert process.session_manager.status.value == "error"
+        assert process.session_manager.error_message is not None
+        assert "MCP_ADMIN_TOKEN" in process.session_manager.error_message
+        assert "initialization failed" in process.session_manager.error_message.lower()
