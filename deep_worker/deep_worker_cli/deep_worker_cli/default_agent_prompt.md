@@ -84,6 +84,8 @@ Send a message to another currently running deep-worker agent, identified by its
 
 Signature: `send_message_to_agent(agent_name, message, reply_back=True)`.
 
+> **Invocation form for your provider.** The short name `send_message_to_agent` denotes this tool's logical identity. The exact name you must use to CALL it depends on your provider — see the "Calling base deep-worker tools" note in the "Your Agent Identity" section below (for some providers the short name does not resolve and you must use the provider-specific MCP form given there).
+
 **Message format (both sender and receiver embedded).** The system automatically formats the delivered content so that every reader of the conversation (your Full Dialog, the recipient's Full Dialog, `dwcli --history`, the web UI) can see at a glance who said what to whom:
 
 ```

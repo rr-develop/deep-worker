@@ -49,10 +49,9 @@ def _build_service_with_agent(
 
 
 @pytest.mark.asyncio
-async def test_subscribe_sends_initial_snapshot() -> None:
+async def test_subscribe_sends_initial_snapshot(netref_subscriber) -> None:
     service, agent = _build_service_with_agent(status_value="running")
-    callback = MagicMock()
-    callback.on_message = AsyncMock()
+    callback = netref_subscriber(AsyncMock())
 
     ok = await service.exposed_subscribe_messages(callback)
     assert ok is True
@@ -78,14 +77,13 @@ async def test_subscribe_sends_initial_snapshot() -> None:
 
 
 @pytest.mark.asyncio
-async def test_snapshot_includes_task_manager_fields_when_configured() -> None:
+async def test_snapshot_includes_task_manager_fields_when_configured(netref_subscriber) -> None:
     import asyncio as _asyncio
 
     service, _agent = _build_service_with_agent(
         tm_present=True, tm_active=True, tm_disabled=False
     )
-    cb = MagicMock()
-    cb.on_message = AsyncMock()
+    cb = netref_subscriber(AsyncMock())
 
     await service.exposed_subscribe_messages(cb)
     await _asyncio.sleep(0.02)
@@ -97,13 +95,12 @@ async def test_snapshot_includes_task_manager_fields_when_configured() -> None:
 
 
 @pytest.mark.asyncio
-async def test_snapshot_omits_task_manager_fields_when_absent() -> None:
+async def test_snapshot_omits_task_manager_fields_when_absent(netref_subscriber) -> None:
     """No TM configured → TM keys absent entirely. Never invent data."""
     import asyncio as _asyncio
 
     service, _agent = _build_service_with_agent(tm_present=False)
-    cb = MagicMock()
-    cb.on_message = AsyncMock()
+    cb = netref_subscriber(AsyncMock())
 
     await service.exposed_subscribe_messages(cb)
     await _asyncio.sleep(0.02)

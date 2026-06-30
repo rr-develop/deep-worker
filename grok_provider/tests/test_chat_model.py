@@ -451,6 +451,17 @@ class TestToolContract:
         contract = cm._build_tool_contract(["edit_file"])
         assert "StrReplace -> `edit_file`" in contract
 
+    def test_contract_disambiguates_mcp_vs_native(self) -> None:
+        # §8 of DESIGN_MCP_PROXY_TOOL_NAME_PREFIX_AWARENESS.md: the contract
+        # must state these are MCP tools, NOT grok's native built-ins, and
+        # must still forbid hunting for the schema on disk.
+        contract = cm._build_tool_contract(["send_message_to_agent"])
+        assert "MCP tool" in contract
+        assert "NOT" in contract and "built-in" in contract
+        assert "mcps/" in contract  # disk-hunt prohibition preserved
+        # No misleading literal mcp__deepworker__ prefix advertised to grok.
+        assert "mcp__deepworker" not in contract
+
 
 class TestBuiltinToolCall:
     async def test_builtin_surfaced_and_future_registered(self, model) -> None:

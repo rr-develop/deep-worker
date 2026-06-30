@@ -126,6 +126,8 @@ class GrokClientState:
         self._evict_session(st.grok_session_id)
         st.grok_session_id = None
         st.sent_count = 0
+        st.forwarded_first_system_chars = 0
+        st.forwarded_extra_system_keys.clear()
         # pending_session_prompt_future / current_notif_queue are NOT cleared
         # here — that is the caller's concern (the in-flight turn, if any,
         # owns them). builtin_passthrough_futures likewise belongs to the

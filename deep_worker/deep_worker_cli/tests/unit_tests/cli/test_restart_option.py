@@ -191,7 +191,7 @@ class TestMergeRestartConfig:
 
 
 # ===========================================================================
-# Provider-switch regression tests (incident observed 2026-05-29)
+# Provider-switch regression tests (a related internal incident)
 #
 # `deep-worker --restart <agent> --provider deepseek` was silently restarting
 # with the PREVIOUS provider/model. Two root causes in merge_restart_config:
@@ -261,9 +261,13 @@ class TestProviderSwitchRegression:
              "deepseek", "deepseek-chat"),
             # model only: saved provider kept, explicit model wins.
             (["myagent", "--restart", "--model", "sonnet"], "claude-code", "sonnet"),
-            # same provider re-passed explicitly + no model: keep saved model
-            # (provider did NOT actually change, so nothing stale to drop).
-            (["myagent", "--restart", "--provider", "claude-code"], "claude-code", "opus"),
+            # same provider re-passed explicitly + no model: model resets to
+            # the provider's default. The operator rule (a related internal incident):
+            # any explicit provider declaration without --model means "use that
+            # provider's default", even when re-declaring the same provider —
+            # this is the only way to heal an already-poisoned same-provider
+            # config (saved provider matches the cross-provider stale model).
+            (["myagent", "--restart", "--provider", "claude-code"], "claude-code", None),
         ],
     )
     def test_override_matrix(self, saved_launch_config, argv, exp_provider, exp_model):
@@ -329,7 +333,7 @@ class TestStopAgent:
             name="myagent",
             pid=99999,
             pid_file=Path("/tmp/deep_worker_myagent.pid"),
-            working_dir="/path/to/test",
+            working_dir="/tmp/test",
             started_at=datetime.now(),
             rpyc_port=18861,
         )
@@ -354,7 +358,7 @@ class TestStopAgent:
         registry = MagicMock(spec=ProcessRegistry)
         registry.lookup.return_value = AgentProcessInfo(
             name="myagent", pid=99999, pid_file=Path("/tmp/x.pid"),
-            working_dir="/path/to/test", started_at=datetime.now(), rpyc_port=18861,
+            working_dir="/tmp/test", started_at=datetime.now(), rpyc_port=18861,
         )
 
         with patch("deep_worker_cli.process.agent_stop.os.kill"), \
@@ -374,7 +378,7 @@ class TestStopAgent:
         registry = MagicMock(spec=ProcessRegistry)
         registry.lookup.return_value = AgentProcessInfo(
             name="myagent", pid=99999, pid_file=Path("/tmp/x.pid"),
-            working_dir="/path/to/test", started_at=datetime.now(), rpyc_port=18861,
+            working_dir="/tmp/test", started_at=datetime.now(), rpyc_port=18861,
         )
 
         with pytest.raises(RuntimeError, match="actively running"):
@@ -405,7 +409,7 @@ class TestStopAgent:
         registry = MagicMock(spec=ProcessRegistry)
         registry.lookup.return_value = AgentProcessInfo(
             name="myagent", pid=99999, pid_file=Path("/tmp/x.pid"),
-            working_dir="/path/to/test", started_at=datetime.now(), rpyc_port=18861,
+            working_dir="/tmp/test", started_at=datetime.now(), rpyc_port=18861,
         )
 
         with patch("deep_worker_cli.process.agent_stop.os.kill"), \
@@ -424,7 +428,7 @@ class TestStopAgent:
         registry = MagicMock(spec=ProcessRegistry)
         registry.lookup.return_value = AgentProcessInfo(
             name="myagent", pid=99999, pid_file=Path("/tmp/x.pid"),
-            working_dir="/path/to/test", started_at=datetime.now(), rpyc_port=18861,
+            working_dir="/tmp/test", started_at=datetime.now(), rpyc_port=18861,
         )
 
         with patch("deep_worker_cli.process.agent_stop.os.kill"), \

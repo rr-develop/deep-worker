@@ -46,14 +46,14 @@ logger = logging.getLogger(__name__)
 _DELTA_VERSION = 2
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Channels we deliberately DO NOT persist (the 2026-05-30 incident).
+# Channels we deliberately DO NOT persist (incident 2026-05-30).
 # ═══════════════════════════════════════════════════════════════════════════
 # ``__pregel_tasks`` is a LangGraph-internal reserved channel of type
 # ``Topic[Send](accumulate=False)`` — its value is the list of ``Send``
 # operations for the CURRENT super-step, consumed within that step and never
 # carried over (see pregel/main.py:680 + pregel/_algo.py:888-890). It is also
 # unwritable from user code (``pregel/_write.py`` raises "Cannot write to the
-# reserved channel TASKS"). Persisting it gave a live agent a 1.6 GB threads.db
+# reserved channel TASKS"). Persisting it gave an agent a 1.6 GB threads.db
 # (92% of weight was a single full-replace copy of TASKS on every super-step;
 # fanning out to sub-agents made each Send object ≈ 500 KB). The pregel loop
 # treats TASKS as conditionally present on resume (``if TASKS in
@@ -160,6 +160,21 @@ CREATE TABLE IF NOT EXISTS writes (
     value BLOB,
     PRIMARY KEY (thread_id, checkpoint_ns, checkpoint_id, task_id, idx)
 );
+CREATE TABLE IF NOT EXISTS thread_metadata (
+    thread_id TEXT NOT NULL,
+    checkpoint_ns TEXT NOT NULL DEFAULT '',
+    agent_name TEXT,
+    updated_at TEXT,
+    message_count INTEGER DEFAULT 0,
+    checkpoint_count INTEGER DEFAULT 0,
+    PRIMARY KEY (thread_id, checkpoint_ns)
+);
+"""
+
+# Single-source DDL for the ``thread_metadata`` table, reused by the offline
+# thread-listing helpers (``sessions._ensure_thread_metadata``) so the schema
+# is never hand-duplicated.
+_CREATE_THREAD_METADATA_SQL = """
 CREATE TABLE IF NOT EXISTS thread_metadata (
     thread_id TEXT NOT NULL,
     checkpoint_ns TEXT NOT NULL DEFAULT '',
@@ -343,7 +358,7 @@ class DeltaSqliteCheckpointer(BaseCheckpointSaver):
         #   synchronous=NORMAL — safe with WAL; prevents fsync on every
         #                        transaction while guaranteeing crash safety
         #                        within the WAL protocol.
-        # See DESIGN_FIX_SQLITE_DB_CORRUPTION.md (#4114e536).
+        # See DESIGN_FIX_SQLITE_DB_CORRUPTION.md.
         pragmas = [
             "PRAGMA journal_mode=WAL",
             "PRAGMA synchronous=NORMAL",
@@ -766,7 +781,7 @@ class DeltaSqliteCheckpointer(BaseCheckpointSaver):
 
         # ``channel_versions`` / ``versions_seen`` are written wholesale on
         # every delta; strip ephemeral channels from them too so TASKS cannot
-        # leak back in through the version maps (the observed bloat path).
+        # leak back in through the version maps (the earlier bloat path).
         result: dict[str, Any] = {
             "v": _DELTA_VERSION,
             "id": checkpoint["id"],
@@ -868,12 +883,12 @@ class DeltaSqliteCheckpointer(BaseCheckpointSaver):
         task_path: str = "",
     ) -> None:
         # ──────────────────────────────────────────────────────────────────
-        # Incident (observed live) — the SECOND half of the ephemeral-channel
+        # Incident 2026-06-23 — the SECOND half of the ephemeral-channel
         # fix. The 2026-05-30 fix stripped ``__pregel_tasks`` from ``aput``
         # (delta payload + full snapshot + ``channel_versions`` +
         # ``versions_seen``) but left ``aput_writes`` untouched, so every
         # super-step kept inserting a full ``__pregel_tasks`` payload
-        # (0.5–4 MB / row) into the ``writes`` table. On a live agent that
+        # (0.5–4 MB / row) into the ``writes`` table. On one agent that
         # path accumulated 4 596 rows totalling 2.43 GB — 96 % of a
         # 2.84 GB threads.db. Worse, on cold start LangGraph's
         # ``aget_tuple`` merges these pending writes into the

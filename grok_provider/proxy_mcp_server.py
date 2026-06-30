@@ -67,7 +67,7 @@ class ProxyMCPServer:
     ``session/new`` includes an ``mcpServers`` entry of the form
     ``{"type":"http","name":<server_name>,"url":<url_async()>}`` — grok
     speaks the streamable-HTTP MCP transport. NOTHING is written to any
-    global grok config file (observed live lesson), so concurrent agents never
+    global grok config file (learned from a related internal incident), so concurrent agents never
     collide.
 
     Pending tool calls live in ``pending_calls`` — keyed by a stable
@@ -236,23 +236,49 @@ class ProxyMCPServer:
             with contextlib.suppress(ValueError):
                 self._pending_waiters.remove(waiter)
 
-    def resolve_call(self, call_id: str, result: MCPResult) -> None:
+    def resolve_call(
+        self,
+        call_id: str,
+        result: MCPResult,
+        *,
+        tool_name: str | None = None,
+    ) -> None:
         """Set the Future for ``call_id`` to ``result``. The awaiting MCP
         handler unblocks and returns the value to grok CLI. Idempotent /
         no-op for unknown ids. Also resolves a call that was PARKED as a job
         (its Future lives in ``self._jobs``) — the work completing late is
-        delivered the same way, and the job entry is dropped."""
+        delivered the same way, and the job entry is dropped.
+
+        When ``call_id`` is an ACP ``toolCallId`` (not the handler's synthetic
+        id), pass ``tool_name`` so we can fall back to the oldest matching
+        pending/job entry — grok serializes proxy tool calls one at a time."""
+        if self._resolve_call_id(call_id, result):
+            return
+        if tool_name is None:
+            return
+        for pid, info in list(self.pending_calls.items()):
+            if info["name"] == tool_name:
+                if self._resolve_call_id(pid, result):
+                    return
+        for jid, job in list(self._jobs.items()):
+            if job["tool_name"] == tool_name:
+                if self._resolve_call_id(jid, result):
+                    return
+
+    def _resolve_call_id(self, call_id: str, result: MCPResult) -> bool:
         info = self.pending_calls.get(call_id)
         if info is not None:
             fut = info["future"]
             if not fut.done():
                 fut.set_result(result)
-            return
+            return True
         job = self._jobs.pop(call_id, None)
         if job is not None:
             jfut = job["future"]
             if not jfut.done():
                 jfut.set_result(result)
+            return True
+        return False
 
     def _matching_pending_calls(
         self,
@@ -312,7 +338,7 @@ class ProxyMCPServer:
 
         ⚠️ A timeout is NEVER ``is_error=true`` — it informs and the agent
         continues / retries. ⚠️ DO NOT reintroduce a bare unbounded
-        ``await future`` (it hung edit_file forever, observed live 2026-06-16),
+        ``await future`` (it hung edit_file forever, a related internal incident),
         and DO NOT cancel the work on timeout (use ``shield``). See
         docs/POLICIES.md §7.1.
         """
@@ -430,7 +456,21 @@ class ProxyMCPServer:
         # (per-protocol scope dicts, async-callable typing differences)
         # and we don't add value pinning it strictly here.
         async def asgi_handler(scope: Any, receive: Any, send: Any) -> None:
-            await session_manager.handle_request(scope, receive, send)
+            try:
+                await session_manager.handle_request(scope, receive, send)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # Client disconnect / teardown must not wedge the agent loop.
+                if exc.__class__.__name__ in (
+                    "ClosedResourceError",
+                    "BrokenResourceError",
+                ):
+                    logger.debug(
+                        "ProxyMCPServer: client disconnected during request"
+                    )
+                    return
+                raise
 
         starlette_app = Starlette(
             routes=[Mount("/mcp", app=asgi_handler)],
@@ -525,11 +565,12 @@ class ProxyMCPServer:
         self._server_task = None
         self._uvicorn_server = None
 
-        # Exit the session manager context
-        if self._session_manager_cm is not None:
-            with contextlib.suppress(Exception):
-                await self._session_manager_cm.__aexit__(None, None, None)
-            self._session_manager_cm = None
+        # Drop the session-manager context without calling __aexit__ here.
+        # StreamableHTTPSessionManager.run() enters an anyio cancel scope in
+        # the uvicorn task; exiting it from this coroutine raises
+        # "Attempted to exit cancel scope in a different task" and can wedge
+        # in-flight MCP handlers (inter-agent grok turns, 2026-06-28).
+        self._session_manager_cm = None
 
         self._port = None
 

@@ -10,7 +10,7 @@ the agent's status push is wired through
 call leaks a task that holds an ``AsyncResult`` slot on the
 connection's ``_request_callbacks``. Long-running agents will
 eventually trip the inbound-backpressure quarantine on web
-(see the rpyc_async inbound-backpressure design notes).
+(see ``rpyc_async/docs/DESIGN_INBOUND_BACKPRESSURE.md``).
 
 Contract: ``_dispatch_status_event`` schedules each subscriber's
 ``on_message`` via ``fire_and_forget_async`` with a finite timeout,
@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -106,10 +107,12 @@ async def test_dispatch_status_event_delivers_to_healthy_subscriber() -> None:
 @pytest.mark.asyncio
 async def test_dispatch_status_event_logs_subscriber_failure(
     capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A subscriber raising inside ``on_message`` must be logged (the
-    legacy implementation prints to stderr; the new one may use a
-    logger — either is acceptable as long as the failure is visible)."""
+    legacy implementation prints to stderr; the new one routes the failure
+    through Python logging — either is acceptable as long as the failure is
+    visible)."""
     error_event = asyncio.Event()
 
     async def bad_on_message(_payload: str) -> None:
@@ -122,15 +125,20 @@ async def test_dispatch_status_event_logs_subscriber_failure(
     cb = _make_mock_netref(bad_on_message)
     agent._message_subscribers.add(cb)
 
-    # MUST NOT raise out of the caller (SessionManager.set_status).
-    await agent._dispatch_status_event({"type": "status_change"})
-    await asyncio.wait_for(error_event.wait(), timeout=1.0)
-    # Give the error_callback a chance to log.
-    for _ in range(5):
-        await asyncio.sleep(0.01)
+    with caplog.at_level(logging.DEBUG):
+        # MUST NOT raise out of the caller (SessionManager.set_status).
+        await agent._dispatch_status_event({"type": "status_change"})
+        await asyncio.wait_for(error_event.wait(), timeout=1.0)
+        # Give the error_callback a chance to log.
+        for _ in range(5):
+            await asyncio.sleep(0.01)
 
     captured = capsys.readouterr()
-    combined = captured.err + captured.out
+    combined = (
+        captured.err
+        + captured.out
+        + "\n".join(r.getMessage() for r in caplog.records)
+    )
     # Failure must surface somewhere visible (stderr print OR Python logging).
     # We accept either the legacy substring or any reasonable variant.
     assert any(
@@ -138,7 +146,7 @@ async def test_dispatch_status_event_logs_subscriber_failure(
         for marker in ("status push", "subscriber", "peer gone", "runtimeerror")
     ), (
         f"Expected the broken subscriber to be logged; "
-        f"stderr/stdout combined was: {combined!r}"
+        f"captured/logs combined was: {combined!r}"
     )
 
 
@@ -217,7 +225,7 @@ async def test_dead_subscriber_is_evicted_after_push_error() -> None:
     corpse.
 
     Root cause of the "stuck at idle during inter-agent
-    conversation" bug (2026-05-20): the web client died/restarted
+    conversation" bug (a related internal incident): the web client died/restarted
     without calling ``exposed_unsubscribe_messages``. The agent's
     ``on_disconnect`` deliberately does NOT clean up (it relies on a
     graceful unsubscribe that never came). The dead
@@ -251,7 +259,7 @@ async def test_dead_subscriber_is_evicted_after_push_error() -> None:
 
     assert dead not in agent._message_subscribers, (
         "a subscriber whose on_message failed must be evicted so the "
-        "agent stops pushing status to a dead peer (observed live, 2026-05-20)"
+        "agent stops pushing status to a dead peer (a related internal incident)"
     )
 
 

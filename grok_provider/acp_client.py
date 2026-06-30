@@ -241,6 +241,19 @@ class GrokAcpClient:
             self._session_ready[session_id] = loop.create_future()
         return reply
 
+    def release_session(self, session_id: str | None) -> None:
+        """Drop local ACP bookkeeping for ``session_id`` (best-effort).
+
+        Called when spinning a fresh grok session so stale prompt/sink
+        entries cannot block ``session/prompt`` on the replacement id."""
+        if session_id is None:
+            return
+        active = self._active_prompts.pop(session_id, None)
+        if active is not None and not active.done():
+            active.cancel()
+        self._sinks.pop(session_id, None)
+        self._session_ready.pop(session_id, None)
+
     async def session_cancel(self, session_id: str | None) -> None:
         if session_id is None:
             return
@@ -335,7 +348,7 @@ class GrokAcpClient:
             # ``_call`` — so without popping here every turn would leak one
             # stale entry (O(turns) growth). Popping on reply is safe for
             # both paths (a double-pop just returns None). Review fix
-            # observed live, 2026-06-17.
+            # (internal review).
             fut = self._pending_requests.pop(obj["id"], None)
             if fut is not None and not fut.done():
                 fut.set_result(obj)

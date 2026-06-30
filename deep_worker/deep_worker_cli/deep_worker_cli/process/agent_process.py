@@ -13,9 +13,10 @@ import traceback
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
+from collections.abc import Awaitable, Callable
 from typing import Any, cast
 
-# Timestamp helper for log messages (shared format with deep_worker_web)
+# Timestamp helper for log messages (shared format with the web service)
 _TS_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 def _ts() -> str:
@@ -53,7 +54,7 @@ def _get_git_commit_info(tree_root: str | None) -> tuple[str, str]:
 # ============================================================================
 # CRITICAL: RPYC_ASYNC MUST BE IMPORTED FROM SOURCE, NOT FROM PIP!
 # ============================================================================
-# Add rpyc_async to sys.path to use AsyncioServer from a local checkout
+# Add the local rpyc_async source tree to sys.path to use AsyncioServer.
 # This enables true bidirectional async communication (156x faster!)
 # DO NOT use 'pip install rpyc' - it will use classic RPyC 5.0 without AsyncioServer
 # ============================================================================
@@ -208,6 +209,57 @@ def _resolve_persisted_codex_display_model(agent_name: str) -> str | None:
         except OSError:
             continue
     return None
+
+
+def _make_resolved_model_handler(
+    *,
+    config: Any,
+    session_manager: Any,
+) -> Callable[..., Awaitable[None]]:
+    """Build the ``_on_resolved_model`` async callback used by codex/grok
+    providers and the startup display seed.
+
+    ``persist`` controls whether the resolved model is written back to
+    ``launch_config["model"]`` (durable execution config). For an agent launched
+    with ``config.model is None`` (unpinned), the resolved value is DISPLAY-ONLY
+    and must NOT be persisted — persisting it re-pins execution and defeats the
+    operator rule "no explicit --model ⇒ provider default". See
+    ``DESIGN_FIX_CROSS_PROVIDER_MODEL_POISON.md`` (internal incident
+    2026-06-29):
+    codex's session jsonl had recorded a foreign grok model name (because the
+    original broken ``-pp`` bug had fed codex that string), and the previous
+    handler persisted that back into ``launch_config["model"]`` on every restart.
+
+    - **Startup session-log seed**: ``persist=False`` (display only).
+    - **Live provider callback**: ``persist=True``, BUT only persists when the
+      agent was launched with an explicit model (``config.model is not None``).
+      Unpinned agents never silently pin from a session log.
+
+    Extracted from ``AgentProcess.start`` to be unit-testable
+    (``test_resolved_model_handler.py``).
+    """
+
+    async def _on_resolved_model(
+        model_name: str, *, persist: bool = True
+    ) -> None:
+        set_display_model = getattr(config, "set_dynamic_display_model", None)
+        if callable(set_display_model):
+            set_display_model(model_name)
+        if not persist:
+            return
+        if getattr(config, "model", None) is None:
+            # Agent launched unpinned — never re-pin execution config from a
+            # resolved value. Display already updated above.
+            return
+        if session_manager is None:
+            return
+        update_model = getattr(
+            session_manager, "update_launch_config_model", None
+        )
+        if callable(update_model):
+            await update_model(model_name)
+
+    return _on_resolved_model
 
 
 def _find_free_port(start_port: int = 0, max_attempts: int = 100) -> int:
@@ -471,8 +523,8 @@ class AgentProcess:
         # mode (§9 of DESIGN_FULL_DIALOG_FINAL_RESPONSE_PAIRS.md).
         self._invariant_system_prompt: str | None = None
 
-        # External MCP client pool — started in start(), stopped
-        # in stop(). See docs/DESIGN_EXTERNAL_MCP_TOOLS.md.
+        # External MCP client pool — started in start(), stopped in stop().
+        # See docs/DESIGN_EXTERNAL_MCP_TOOLS.md.
         self._external_mcp_pool: Any = None  # ExternalMCPClientPool | None
 
         # RPyC components
@@ -604,11 +656,11 @@ class AgentProcess:
            an auto-discard ``add_done_callback``, so a GC pass cannot
            silently drop a half-finished outbound RPC and pin its
            ``AsyncResult`` chain in ``Connection._request_callbacks``
-           (the 2026-05-08 and 2026-05-11 incidents).
+           (incidents 2026-05-08, 2026-05-11).
         3. *Timeout breaks the hang.* A subscriber whose ``on_message``
            never resolves used to accumulate one parked Task per
            ``set_status`` for the rest of the process's life
-           (observed live, 2026-05-19). With the timeout, each dispatched
+           (2026-05-19). With the timeout, each dispatched
            Task settles within ``DWCLI_STATUS_PUSH_TIMEOUT_SEC``
            (default 10 s) and releases its slot.
 
@@ -651,14 +703,14 @@ class AgentProcess:
                 # the dead MessageCallbackService netref lingers forever
                 # and EVERY status push goes only to the corpse (10 s
                 # timeout each), so the live UI never updates — the
-                # the "stuck at idle while actually working" bug
-                # (observed live, 2026-05-20). A live web re-subscribes on its next
+                # "stuck at idle while actually working" bug
+                # (2026-05-20). A live web re-subscribes on its next
                 # connect_to_agent, so eviction is safe.
                 #
                 # Evict by IDENTITY: ``set.discard(netref)`` would call
                 # ``netref.__hash__`` → a sync RPyC round-trip over the
                 # already-dead channel → EOFError, which on the invoke path
-                # escaped and forced the agent to ERROR (observed live, 2026-05-22).
+                # escaped and forced the agent to ERROR (2026-05-22).
                 # ``evict_subscriber_by_identity`` never crosses the wire.
                 from deep_worker_cli.rpyc_service.agent_service import (  # noqa: PLC0415
                     evict_subscriber_by_identity,
@@ -681,8 +733,8 @@ class AgentProcess:
                 # ``conn.async_request(HANDLE_CALLATTR, ...)`` — a single
                 # async message that never enters sync_request at all. The
                 # peer's _dispatch_request_async handles both sync and
-                # async on_message correctly (see §6.1 of a related
-                # design note). Fixes a related issue.
+                # async on_message correctly (see §6.1 of
+                # DESIGN_ASYNC_DISPATCH). Fixes issue #48.
                 from rpyc.core.netref import asyncreq as _asyncreq  # noqa: PLC0415
                 awaitable = _asyncreq(
                     subscriber,
@@ -803,11 +855,11 @@ class AgentProcess:
         WARNING: the agent keeps working and its status MUST NOT change. We
         only log it and broadcast a non-status warning event to the live
         subscribers (the quarantined channel itself won't receive it — it's
-        the spammer — but other live channels, e.g. deep_worker_web, will).
+        the spammer — but other live channels, e.g. the web UI, will).
 
         Quarantine (vs. closing the channel) is intentional: it stops the
-        spammer from immediately opening a fresh connection. See
-        the rpyc_async inbound-backpressure design notes.
+        spammer from immediately opening a fresh connection. See the
+        rpyc_async documentation on inbound backpressure.
         """
         connid = info.get("connid")
         peer = info.get("peer")
@@ -869,8 +921,7 @@ class AgentProcess:
                 _logger.info(f"[AGENT] quarantine-warning push to subscriber id={_sid} "
                     f"failed: {exc!r}")
                 # Evict by identity — never ``discard`` a netref (its
-                # __hash__ crosses the dead wire → EOFError (observed live,
-                # 2026-05-22).
+                # __hash__ crosses the dead wire → EOFError, 2026-05-22).
                 from deep_worker_cli.rpyc_service.agent_service import (  # noqa: PLC0415
                     evict_subscriber_by_identity,
                 )
@@ -878,7 +929,7 @@ class AgentProcess:
 
             try:
                 # Same fix as _dispatch_status_event: use asyncreq +
-                # HANDLE_CALLATTR to avoid sync_request guard (a related issue).
+                # HANDLE_CALLATTR to avoid sync_request guard (issue #48).
                 from rpyc.core.netref import asyncreq as _asyncreq  # noqa: PLC0415
                 awaitable = _asyncreq(
                     subscriber,
@@ -919,7 +970,8 @@ class AgentProcess:
             self._agent_event_loop = asyncio.get_running_loop()
 
             # Emit a one-line startup diagnostic to the agent's stdout log
-            # (daemonized → ~/.deep_worker/logs/<name>.out.log).
+            # (daemonized → the agent's per-agent log file under the runtime
+            # data directory).
             # Includes git commit SHA and the full launch configuration so
             # every agent start produces a grep-able breadcrumb.
             lc = self.launch_config or {}
@@ -1073,12 +1125,11 @@ class AgentProcess:
                 # divergence.
                 #
                 # The path is derived from __file__ so the SAME line works
-                # for BOTH the production tree (/path/to/production) and
-                # the developer tree (/path/to/dev). Hard-coding
-                # the prod path here used to defeat the --dev launcher
-                # dispatch: even after the bash launcher correctly re-execs
-                # into the dev tree, this insertion would prepend the prod
-                # ``deepagents`` and shadow the dev one. See
+                # for BOTH the production tree and the developer tree.
+                # Hard-coding the prod path here used to defeat the --dev
+                # launcher dispatch: even after the bash launcher correctly
+                # re-execs into the dev tree, this insertion would prepend
+                # the prod ``deepagents`` and shadow the dev one. See
                 # docs/DESIGN_DEV_FLAG.md.
                 #
                 # __file__ here =
@@ -1125,8 +1176,8 @@ class AgentProcess:
 
                 # Expose the model on ``self`` so any post-init helper
                 # that needs it (e.g. provider failover, codex display-
-                # model resolution) can reach it. After the 2026-06-13 (#2)
-                # incident, the MCP-tools-ready barrier that
+                # model resolution) can reach it. After incident
+                # 2026-06-13 (#2), the MCP-tools-ready barrier that
                 # used to live here was replaced by a deterministic
                 # prewarm of ClientManager — see
                 # ``_extract_final_tool_metadata`` and
@@ -1138,37 +1189,26 @@ class AgentProcess:
                     model, "set_resolved_model_callback", None
                 )
                 if callable(set_resolved_model_callback):
-                    async def _on_resolved_model(model_name: str) -> None:
-                        set_display_model = getattr(
-                            self.config, "set_dynamic_display_model", None
-                        )
-                        if callable(set_display_model):
-                            set_display_model(model_name)
-                        if self.session_manager is not None:
-                            update_model = getattr(
-                                self.session_manager,
-                                "update_launch_config_model",
-                                None,
-                            )
-                            if callable(update_model):
-                                await update_model(model_name)
-
+                    _on_resolved_model = _make_resolved_model_handler(
+                        config=self.config,
+                        session_manager=self.session_manager,
+                    )
                     set_resolved_model_callback(_on_resolved_model)
                     if self.config.provider == "codex" and self.config.model is None:
                         persisted_model = _resolve_persisted_codex_display_model(self.name)
                         if persisted_model:
-                            await _on_resolved_model(persisted_model)
+                            await _on_resolved_model(persisted_model, persist=False)
                     elif self.config.provider == "grok" and self.config.model is None:
                         # Seed the TUI display with the modelId from grok's
                         # own per-session log (~/.grok/sessions/...). Without
                         # this seed the user sees "unknown" until the first
                         # session/prompt response arrives, because the hot
                         # path only updates the display from the response
-                        # _meta.modelId. See an incident observed
-                        # live on 2026-06-18.
+                        # _meta.modelId. See a related internal incident
+                        # analysis from 2026-06-18 (not included here).
                         persisted_model = _resolve_persisted_grok_display_model(self.name)
                         if persisted_model:
-                            await _on_resolved_model(persisted_model)
+                            await _on_resolved_model(persisted_model, persist=False)
 
                 restart_tool_factory = getattr(cli_tools, "make_restart_agent_tool")
                 restart_self_tool_factory = getattr(cli_tools, "make_restart_self_tool")
@@ -1193,7 +1233,7 @@ class AgentProcess:
                 # enabled for this agent. Lets the LLM initiate A2A protocol
                 # calls to other A2A-compliant agents. Import/build failures
                 # are non-fatal (A2A is optional) — the agent keeps its other
-                # tools. See deepworker_a2a/docs/DESIGN_A2A_PROTOCOL_SUPPORT.md.
+                # tools. See the A2A protocol design documentation.
                 try:
                     from deepworker_a2a.config import A2AConfig as _A2AConfig
 
@@ -1267,12 +1307,12 @@ class AgentProcess:
                     self._checkpointer_ctx = get_checkpointer(agent_name=self.name)
                     checkpointer = await self._checkpointer_ctx.__aenter__()
 
-                # Bring up the external MCP servers (see
-                # docs/DESIGN_EXTERNAL_MCP_TOOLS.md) BEFORE create_cli_agent,
-                # so their tools enter the graph from the very start and land in
-                # _extract_final_tool_metadata (then Full Dialog
-                # verbosity=tools shows them, and the provider prewarm
-                # sees the correct final set).
+                # Start the external MCP servers (see
+                # docs/DESIGN_EXTERNAL_MCP_TOOLS.md) BEFORE create_cli_agent
+                # so their tools enter the graph from the very start and land
+                # in _extract_final_tool_metadata (so Full Dialog
+                # verbosity=tools shows them, and the provider prewarm sees
+                # the correct final set).
                 self._external_mcp_pool = await self._start_external_mcp_pool()
 
                 # Create the agent with auto-approve for testing
@@ -1301,8 +1341,8 @@ class AgentProcess:
                 )
 
                 # Capture the INVARIANT (startup) system prompt so the
-                # Full Dialog "system_prompt" introspection mode (§9 of
-                # deep_worker_web/docs/DESIGN_FULL_DIALOG_FINAL_RESPONSE_PAIRS.md)
+                # Full Dialog "system_prompt" introspection mode (§9 of the
+                # Full Dialog design document)
                 # reports EXACTLY what the agent was built with. We pass no
                 # ``system_prompt`` override above, so ``create_cli_agent``
                 # resolves it via ``get_system_prompt`` with these same args —
@@ -1313,6 +1353,7 @@ class AgentProcess:
                         assistant_id=self.name,
                         sandbox_type=None,
                         project_memory_dir=Path(self.config.working_dir),
+                        provider=getattr(self.config, "provider", None),
                     )
                 except Exception:  # noqa: BLE001 — never block start()
                     self._invariant_system_prompt = None
@@ -1320,7 +1361,7 @@ class AgentProcess:
                 # ════════════════════════════════════════════════════════
                 # PREWARM ClientManager with the FINAL tool inventory.
                 # ════════════════════════════════════════════════════════
-                # The 2026-06-13 (#2) incident root-cause fix. The compiled
+                # Incident 2026-06-13 (#2) root-cause fix. The compiled
                 # agent already knows its final tool set (LangGraph's
                 # ToolNode.tools_by_name) — read it synchronously and
                 # seed ClientManager.clients[self.name] with a
@@ -1561,7 +1602,7 @@ class AgentProcess:
         Earlier code (now deleted) used ``_wait_for_mcp_tools_ready``
         — a 30s polling barrier on ``model.tools_metadata`` that
         returned True on the FIRST non-empty set. That was the EXACT
-        failure mode of the 2026-06-13 (#2) incident: the first non-empty
+        failure mode of incident 2026-06-13 (#2): the first non-empty
         ``tools_metadata`` came from ``_bind_tools_for_middleware``
         with the original caller-supplied 7 ``web_tools``, NOT the
         final 23 tools. The barrier released early and the cached
@@ -1646,12 +1687,12 @@ class AgentProcess:
         FINAL tool inventory before any ``ainvoke`` can run.
 
         ════════════════════════════════════════════════════════════════
-        ⚠ WHY THIS EXISTS — THE 2026-06-13 (#2) INCIDENT ROOT CAUSE FIX.
+        ⚠ WHY THIS EXISTS — INCIDENT 2026-06-13 (#2) ROOT CAUSE FIX.
         ════════════════════════════════════════════════════════════════
         ``ClientManager`` caches one ``(ClaudeSDKClient, ProxyMCPServer)``
         pair per ``thread_id``. The cached ``ProxyMCPServer`` is built
         from whatever ``tools_metadata`` was passed on the FIRST
-        ``get_or_create_client`` call. After the 2026-06-13 (#2) incident
+        ``get_or_create_client`` call. After incident-2026-06-13 (#2)
         we also rotate-on-mismatch (see ``ClientManager``), but the
         ROOT prevention is to make sure the first call lands with the
         right inventory.
@@ -1668,7 +1709,7 @@ class AgentProcess:
         residual mistake.
 
         ⚠ DO NOT replace this with a polling barrier. The whole point
-        is determinism. See the 2026-06-13 (#2) incident post-mortem.
+        is determinism. See incident 2026-06-13 (#2) post-mortem.
         """
         if not tools_metadata:
             # Nothing to prewarm — likely a tool-less agent or extraction
@@ -1676,8 +1717,8 @@ class AgentProcess:
             # it normally.
             return
         # ════════════════════════════════════════════════════════════════
-        # ⚠ PREWARM MUST NOT OPEN THE CLAUDE CLI SESSION — THE
-        # 2026-06-15 INCIDENT (an agent forgot its history after restart).
+        # ⚠ PREWARM MUST NOT OPEN THE CLAUDE CLI SESSION — INCIDENT
+        # 2026-06-15 (an agent lost its history after restart).
         # ════════════════════════════════════════════════════════════════
         # Previously this called ``get_or_create_client(...)``, which
         # actually spawned the Claude CLI subprocess with
@@ -1689,7 +1730,7 @@ class AgentProcess:
         #
         # ``prepare_proxy_only`` does the prewarm half that we actually
         # need (deterministic ``ProxyMCPServer`` with the FINAL tool
-        # inventory — the 2026-06-13 #2 incident) WITHOUT opening the CLI
+        # inventory — incident 2026-06-13 #2) WITHOUT opening the CLI
         # session. The first real ``ainvoke`` computes
         # ``resume_session_id`` and the subsequent
         # ``get_or_create_client(...)`` adopts our reserved proxy and
@@ -1737,7 +1778,7 @@ class AgentProcess:
         helper has been REMOVED — it returned True on the first non-
         empty ``tools_metadata``, which was the 7-tool ``web_tools``
         subset on restart, not the full 23-tool middleware-augmented
-        inventory. See the 2026-06-13 (#2) incident. DO NOT reintroduce
+        inventory. See incident 2026-06-13 (#2). DO NOT reintroduce
         polling here; if the ordering ever breaks again, fix the
         prewarm in ``start()``, not this entry point.
 
@@ -1841,8 +1882,8 @@ class AgentProcess:
             finally:
                 self._checkpointer_ctx = None
 
-        # External MCP pool — properly shut down stdio clients and child
-        # processes. See docs/DESIGN_EXTERNAL_MCP_TOOLS.md §3.4.
+        # External MCP pool — properly shut down the stdio clients and
+        # child processes. See docs/DESIGN_EXTERNAL_MCP_TOOLS.md §3.4.
         if self._external_mcp_pool is not None:
             try:
                 await self._external_mcp_pool.stop()
@@ -1871,6 +1912,15 @@ class AgentProcess:
                 await self.rpyc_server.close()  # AsyncioServer.close() is async
             except Exception as e:
                 print(f"[RPyC] Error stopping AsyncioServer: {e}")
+
+        # 2.1 Stop A2A server (if running)
+        if self._a2a_handle is not None:
+            try:
+                await self._a2a_handle.shutdown()
+            except Exception as e:  # noqa: BLE001 — best-effort shutdown
+                print(f"[A2A] Error stopping A2A server: {e}")
+            finally:
+                self._a2a_handle = None
 
         # 3. Persist state
         if self.session_manager:
@@ -1952,6 +2002,27 @@ class AgentProcess:
             a2a_url=a2a_url,
         )
         self.registry.register(process_info)
+
+    def cancel_current_worker_task(self) -> bool:
+        """Interrupt the currently-running agent turn, if any (RC-1).
+
+        Thin, in-process wrapper around the same mechanism used by
+        ``AgentService.exposed_interrupt_agent`` (``is_running`` +
+        ``current_worker_task.cancel()``) — but with NO RPyC/netref involved,
+        so the A2A executor's ``cancel()`` can call it directly on the local
+        event loop.
+
+        Returns:
+            True if there was an active, not-yet-finished turn that we asked to
+            cancel; False if no turn was running (nothing to interrupt).
+        """
+        if not getattr(self, "is_running", False):
+            return False
+        task = getattr(self, "current_worker_task", None)
+        if task is None or task.done():
+            return False
+        task.cancel()
+        return True
 
     async def _unregister(self) -> None:
         """Unregister agent from ProcessRegistry."""
@@ -2148,7 +2219,7 @@ class AgentProcess:
                 # NO TIMEOUT - connection can live for days/weeks
                 # Surface inbound-quarantine as a non-blocking WARNING (log +
                 # broadcast to live subscribers). Does NOT change agent status
-                # — the agent keeps working (observed live, 2026-05-22).
+                # — the agent keeps working (observed live 2026-05-22).
                 "on_inbound_quarantine": self._on_inbound_quarantine,
             }
         )
@@ -2227,8 +2298,8 @@ class AgentProcess:
         #   logger.info(f"... Successfully got state: {state}")
         #   logger.info(f"... Agent is initialized: {self.agent}")
         # That grew the agent log to 5.2 GB at ~46 KB/s and spiked RssAnon per
-        # call (observed live, 2026-05-23; first seen 2026-05-08, see a
-        # related internal incident analysis (not included here)). Keep ONLY
+        # call (2026-05-23; first seen 2026-05-08, see a related internal
+        # incident analysis; not included here). Keep ONLY
         # bounded breadcrumbs (sizes/counts, never content), and at DEBUG so a
         # polled hot path is silent by default. NEVER interpolate ``state``,
         # ``self.agent``, ``config``, or any message into a log record.
@@ -2335,8 +2406,8 @@ class AgentProcess:
     async def _handle_get_system_prompt(self) -> dict[str, Any]:
         """Return the INVARIANT (startup) system prompt the agent was built with.
 
-        Mode #4 of the Full Dialog verbosity combo (§9 of
-        deep_worker_web/docs/DESIGN_FULL_DIALOG_FINAL_RESPONSE_PAIRS.md).
+        Mode #4 of the Full Dialog verbosity combo (§9 of the Full Dialog
+        design document).
 
         The invariant prompt is the provider-AGNOSTIC role/instruction text
         passed to ``create_deep_agent(system_prompt=...)``. It is captured at
@@ -2362,6 +2433,9 @@ class AgentProcess:
                     assistant_id=self.name,
                     sandbox_type=None,
                     project_memory_dir=project_memory_dir,
+                    provider=getattr(
+                        getattr(self, "config", None), "provider", None
+                    ),
                 )
             except Exception as e:  # noqa: BLE001
                 return {"success": False, "error": f"system prompt unavailable: {e}"}
@@ -2584,8 +2658,8 @@ class AgentProcess:
                     # Write the restart-notice BEFORE spawning so the new
                     # process consumes it on startup and
                     # ``_auto_continue_after_restart`` CONTINUES the pending
-                    # task instead of going idle (the 2026-06-17 incident,
-                    # a live agent). Same notice format as ``restart_self``.
+                    # task instead of going idle (incident 2026-06-17).
+                    # Same notice format as ``restart_self``.
                     try:
                         from deep_worker_cli.tools import write_restart_notice  # noqa: PLC0415
                         write_restart_notice(
@@ -2688,8 +2762,17 @@ class AgentProcess:
         connection: Any = None,
         notify_callback: Any = None,
         approval_callback: Any = None,
+        thread_id_override: str | None = None,
     ) -> dict[str, Any]:
-        """Serialize complete top-level turns for this agent thread."""
+        """Serialize complete top-level turns for this agent thread.
+
+        ``thread_id_override`` (optional): when provided, this string is used as
+        the LangGraph checkpointer ``thread_id`` instead of the default
+        ``self.name``. Used by the A2A executor to isolate each A2A
+        ``context_id`` into its own conversation history (see the A2A
+        design documentation §4.1). ``None`` (default) preserves the existing
+        behaviour exactly, so all current callers are unaffected.
+        """
         lock = getattr(self, "_invoke_lock", None)
         if lock is None:
             # Some focused tests construct AgentProcess via __new__. Production
@@ -2702,6 +2785,7 @@ class AgentProcess:
                 connection=connection,
                 notify_callback=notify_callback,
                 approval_callback=approval_callback,
+                thread_id_override=thread_id_override,
             )
 
     async def _handle_invoke_owned(
@@ -2710,6 +2794,7 @@ class AgentProcess:
         connection: Any = None,
         notify_callback: Any = None,
         approval_callback: Any = None,
+        thread_id_override: str | None = None,
     ) -> dict[str, Any]:
         """Handle one invocation while holding the per-agent turn gate.
 
@@ -2729,6 +2814,7 @@ class AgentProcess:
         """
         message = command.get("message")
         stream = command.get("stream", True)  # Default to streaming to match deepagents
+        inter_agent_delivery = bool(command.get("inter_agent_delivery", False))
         reply_back = command.get("reply_back", True)  # For inter-agent messaging
         input_message_id: str | None = None
         last_error_messages: list[Any] = []
@@ -2771,10 +2857,16 @@ class AgentProcess:
                 def _next_user_message(content: str) -> HumanMessage:
                     nonlocal input_message_id
                     input_message_id = f"user-{uuid.uuid4().hex}"
+                    extra_kwargs: dict[str, Any] = {}
+                    if inter_agent_delivery:
+                        extra_kwargs = {
+                            "inter_agent_delivery": True,
+                            "reply_back": reply_back,
+                        }
                     return HumanMessage(
                         content=content,
                         id=input_message_id,
-                        additional_kwargs={"reply_back": reply_back},
+                        additional_kwargs=extra_kwargs,
                     )
 
                 def _build_invoke_messages(content: str) -> list:
@@ -2802,9 +2894,13 @@ class AgentProcess:
                 # Create status tracking callback
                 status_callback = StatusTrackingCallback(session_manager=self.session_manager)
 
-                # Configure thread_id for checkpointer (use agent name as thread_id)
+                # Configure thread_id for checkpointer. Defaults to the agent
+                # name (one shared history); an A2A turn passes
+                # thread_id_override to isolate its context_id into a separate
+                # conversation history (A2A design documentation §4.1).
+                _thread_id = thread_id_override or self.name
                 config: RunnableConfig = {
-                    "configurable": {"thread_id": self.name},
+                    "configurable": {"thread_id": _thread_id},
                     "callbacks": [status_callback],
                     "metadata": {
                         "assistant_id": self.name,
@@ -3191,7 +3287,7 @@ class AgentProcess:
                         else:
                             # Terminal failure: settle status so the agent
                             # is not left dangling at RUNNING forever (the
-                            # "forever working" bug, observed live 2026-05-20).
+                            # 2026-05-20 "forever working" bug).
                             # No-Agent-Error-State Policy: an empty model
                             # response is recoverable — append a hint and
                             # settle to IDLE so the user can just type
@@ -3363,7 +3459,7 @@ class AgentProcess:
                             # CRITICAL: Must check role in ('assistant', 'ai') to avoid treating tool results as final response!
                             # LangGraph uses 'ai' for AIMessage.type, while dicts may use 'assistant'
                             # NOTE: do NOT require ``not has_tool_calls`` — the agent may produce text
-                            # thinking alongside tool calls (a related issue). The text IS a response; tool
+                            # thinking alongside tool calls (issue #51). The text IS a response; tool
                             # calls without interrupt are handled below (break + continue to the
                             # no-final-content check which sets final_content and returns success).
                             if content and role in ('assistant', 'ai'):
@@ -3468,7 +3564,7 @@ class AgentProcess:
 
                         if not final_content:
                             # Check if the last message had tool calls — the agent DID produce
-                            # a response (tool requests) but no text content (a related issue).
+                            # a response (tool requests) but no text content (issue #51).
                             _has_unhandled_tool_calls = False
                             _tool_call_count = 0
                             if last_error_messages:
@@ -3485,7 +3581,7 @@ class AgentProcess:
 
                             if _has_unhandled_tool_calls:
                                 # The agent produced tool calls but no text — more accurate than
-                                # "did not produce a response" (a related issue).
+                                # "did not produce a response" (issue #51).
                                 _err = f"Agent produced {_tool_call_count} tool call(s) but no text response"
                             else:
                                 _err = "Agent did not produce a response"

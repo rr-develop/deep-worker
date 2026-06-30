@@ -154,17 +154,155 @@ async def _table_exists(conn: aiosqlite.Connection, table: str) -> bool:
         return await cursor.fetchone() is not None
 
 
+async def _ensure_thread_metadata(conn: aiosqlite.Connection) -> None:
+    """Guarantee ``thread_metadata`` exists and covers every checkpoint thread.
+
+    The thread-listing hot path reads the small pre-aggregated
+    ``thread_metadata`` table instead of full-scanning the BLOB-heavy
+    ``checkpoints`` table. Live agents maintain ``thread_metadata`` on every
+    ``aput`` (see ``DeltaSqliteCheckpointer``). For databases that predate the
+    table — or that have it but miss some threads — we backfill the gap ONCE,
+    in place, so the listing path never has to scan ``checkpoints``.
+
+    The work is gated: when the table already covers all checkpoint threads
+    (the common case) nothing is written and the DB stays effectively
+    read-only. On a locked / read-only database we degrade best-effort: skip
+    the backfill and let the caller read whatever ``thread_metadata`` already
+    holds (mirrors the existing corrupt-file ``OperationalError`` posture).
+    """
+    # Import the DDL from its single source of truth.
+    from deep_worker_cli.delta_checkpointer import _CREATE_THREAD_METADATA_SQL
+
+    try:
+        has_table = await _table_exists(conn, "thread_metadata")
+        has_checkpoints = await _table_exists(conn, "checkpoints")
+
+        if not has_table:
+            await conn.execute(_CREATE_THREAD_METADATA_SQL)
+
+        if not has_checkpoints:
+            # Nothing to backfill from; ensure commit of a possible CREATE.
+            await conn.commit()
+            return
+
+        # Cheap existence probe: is there any checkpoint thread NOT yet in
+        # thread_metadata? Only then do we pay for a backfill.
+        gap_probe = """
+            SELECT 1
+            FROM checkpoints c
+            LEFT JOIN thread_metadata m
+                ON c.thread_id = m.thread_id
+               AND c.checkpoint_ns = m.checkpoint_ns
+            WHERE m.thread_id IS NULL
+            LIMIT 1
+        """
+        async with conn.execute(gap_probe) as cursor:
+            has_gap = await cursor.fetchone() is not None
+
+        if not has_gap:
+            if not has_table:
+                await conn.commit()
+            return
+
+        # Backfill only the missing (thread_id, checkpoint_ns) rows. We never
+        # clobber accurate live-maintained rows: INSERT OR IGNORE leaves
+        # existing primary keys untouched. message_count is left 0 here (no
+        # BLOB deserialization during listing); --with-counts resolves legacy
+        # rows with a bounded per-thread read, and the live checkpointer
+        # corrects the column on the next aput.
+        backfill = """
+            INSERT OR IGNORE INTO thread_metadata
+                (thread_id, checkpoint_ns, agent_name, updated_at,
+                 message_count, checkpoint_count)
+            SELECT thread_id,
+                   checkpoint_ns,
+                   json_extract(metadata, '$.agent_name'),
+                   MAX(json_extract(metadata, '$.updated_at')),
+                   0,
+                   COUNT(*)
+            FROM checkpoints
+            GROUP BY thread_id, checkpoint_ns
+        """
+        await conn.execute(backfill)
+        await conn.commit()
+    except aiosqlite.OperationalError:
+        # Locked / read-only DB — degrade to best-effort: read whatever the
+        # table already contains. Never fall through to a checkpoints scan.
+        return
+
+
+async def _list_threads_from_metadata(
+    conn: aiosqlite.Connection,
+    agent_name: str | None,
+) -> list[dict]:
+    """Read one DB's thread list from ``thread_metadata`` (no checkpoints scan).
+
+    Aggregates across ``checkpoint_ns`` so a thread spanning multiple
+    namespaces collapses to a single row, matching the legacy
+    ``GROUP BY thread_id`` semantics:
+
+    * ``agent_name`` — ``MAX`` (constant per thread → safe selector).
+    * ``updated_at`` — ``MAX`` (newest ISO timestamp).
+    * ``message_count`` — ``SUM`` (total messages across namespaces).
+
+    Caller must have run ``_ensure_thread_metadata(conn)`` first. Returns dicts
+    with ``thread_id``, ``agent_name``, ``updated_at``, ``message_count``.
+
+    Returns:
+        List of per-thread dicts (unsorted; caller applies dedup/sort/limit).
+    """
+    if not await _table_exists(conn, "thread_metadata"):
+        return []
+
+    if agent_name is not None:
+        query = """
+            SELECT thread_id,
+                   MAX(agent_name)    AS agent_name,
+                   MAX(updated_at)    AS updated_at,
+                   SUM(message_count) AS message_count
+            FROM thread_metadata
+            WHERE agent_name = ?
+            GROUP BY thread_id
+        """
+        params: tuple = (agent_name,)
+    else:
+        query = """
+            SELECT thread_id,
+                   MAX(agent_name)    AS agent_name,
+                   MAX(updated_at)    AS updated_at,
+                   SUM(message_count) AS message_count
+            FROM thread_metadata
+            GROUP BY thread_id
+        """
+        params = ()
+
+    async with conn.execute(query, params) as cursor:
+        rows = await cursor.fetchall()
+
+    return [
+        {
+            "thread_id": r[0],
+            "agent_name": r[1],
+            "updated_at": r[2],
+            "message_count": r[3] if r[3] is not None else 0,
+        }
+        for r in rows
+    ]
+
+
 async def list_threads(
     agent_name: str | None = None,
     limit: int = 20,
     include_message_count: bool = False,
 ) -> list[dict]:
-    """List threads from checkpoints table.
+    """List threads from the pre-aggregated ``thread_metadata`` table.
 
-    Iterates across every ``sessions_*.db`` file in the agent data directory
+    Iterates across every ``sessions_*.db`` file in ``~/.deepagents``
     plus the legacy global ``sessions.db`` and merges results, so offline
     threads of all agents are visible (not only those in the legacy
-    global DB).
+    global DB). Reads the small ``thread_metadata`` index (backfilling it
+    once for legacy DBs) instead of scanning the BLOB-heavy ``checkpoints``
+    table — see ``_read_db_thread_list``.
 
     Args:
         agent_name: Optional filter by agent name.  When provided, only
@@ -194,67 +332,72 @@ async def list_threads(
 
     for db_path in db_paths:
         try:
-            async with aiosqlite.connect(str(db_path), timeout=30.0) as conn:
-                if not await _table_exists(conn, "checkpoints"):
-                    continue
-
-                if agent_name:
-                    query = """
-                        SELECT thread_id,
-                               json_extract(metadata, '$.agent_name') as agent_name,
-                               MAX(json_extract(metadata, '$.updated_at')) as updated_at
-                        FROM checkpoints
-                        WHERE json_extract(metadata, '$.agent_name') = ?
-                        GROUP BY thread_id
-                    """
-                    params: tuple = (agent_name,)
-                else:
-                    query = """
-                        SELECT thread_id,
-                               json_extract(metadata, '$.agent_name') as agent_name,
-                               MAX(json_extract(metadata, '$.updated_at')) as updated_at
-                        FROM checkpoints
-                        GROUP BY thread_id
-                    """
-                    params = ()
-
-                async with conn.execute(query, params) as cursor:
-                    rows = await cursor.fetchall()
-
-                file_threads: list[dict] = []
-                for r in rows:
-                    tid = r[0]
-                    if tid in seen_thread_ids:
-                        # Same thread_id may appear in both per-agent and
-                        # legacy global DB right after migration — keep the
-                        # first (per-agent, sorted first).
-                        continue
-                    file_threads.append(
-                        {
-                            "thread_id": tid,
-                            "agent_name": r[1],
-                            "updated_at": r[2],
-                        }
-                    )
-                    seen_thread_ids.add(tid)
-
-                if include_message_count and file_threads:
-                    serde = JsonPlusSerializer()
-                    for thread in file_threads:
-                        thread["message_count"] = (
-                            await _count_messages_from_checkpoint(
-                                conn, thread["thread_id"], serde
-                            )
-                        )
-
-                threads.extend(file_threads)
+            file_threads = await _read_db_thread_list(
+                db_path, agent_name, include_message_count, seen_thread_ids
+            )
         except aiosqlite.OperationalError:
             # Skip corrupt / locked files — best-effort listing.
             continue
+        threads.extend(file_threads)
 
     # Sort by updated_at DESC (newest first), then apply limit.
     threads.sort(key=lambda t: t.get("updated_at") or "", reverse=True)
     return threads[:limit]
+
+
+async def _read_db_thread_list(
+    db_path: Path,
+    agent_name: str | None,
+    include_message_count: bool,
+    seen_thread_ids: set[str],
+) -> list[dict]:
+    """Read one DB file's thread list via the ``thread_metadata`` fast path.
+
+    Opens ``db_path``, ensures ``thread_metadata`` is present/complete
+    (backfilling once if needed), then reads the pre-aggregated rows — never
+    scanning the BLOB-heavy ``checkpoints`` table on the listing path.
+
+    ``seen_thread_ids`` is mutated in place to dedup threads that appear in
+    more than one DB file (per-agent + legacy global right after migration).
+
+    Returns:
+        New (not-yet-seen) thread dicts from this file.
+    """
+    async with aiosqlite.connect(str(db_path), timeout=30.0) as conn:
+        # Nothing to list if neither table exists.
+        if not await _table_exists(conn, "checkpoints") and not await _table_exists(
+            conn, "thread_metadata"
+        ):
+            return []
+
+        await _ensure_thread_metadata(conn)
+
+        rows = await _list_threads_from_metadata(conn, agent_name)
+
+        file_threads: list[dict] = []
+        for row in rows:
+            tid = row["thread_id"]
+            if tid in seen_thread_ids:
+                continue
+            file_threads.append(row)
+            seen_thread_ids.add(tid)
+
+        if include_message_count:
+            serde = JsonPlusSerializer()
+            for thread in file_threads:
+                # Live rows already carry the count in the column. Only legacy
+                # backfilled rows (count 0) need a bounded per-thread read.
+                if thread.get("message_count"):
+                    continue
+                thread["message_count"] = await _count_messages_from_checkpoint(
+                    conn, thread["thread_id"], serde
+                )
+        else:
+            # Match the documented contract: no message_count key in fast mode.
+            for thread in file_threads:
+                thread.pop("message_count", None)
+
+        return file_threads
 
 
 async def list_all_threads(
@@ -298,59 +441,12 @@ async def list_all_threads(
 
     for db_path in db_paths:
         try:
-            async with aiosqlite.connect(str(db_path), timeout=30.0) as conn:
-                if not await _table_exists(conn, "checkpoints"):
-                    continue
-
-                if agent_name:
-                    query = """
-                        SELECT thread_id,
-                               json_extract(metadata, '$.agent_name') as agent_name,
-                               MAX(json_extract(metadata, '$.updated_at')) as updated_at
-                        FROM checkpoints
-                        WHERE json_extract(metadata, '$.agent_name') = ?
-                        GROUP BY thread_id
-                    """
-                    params: tuple = (agent_name,)
-                else:
-                    query = """
-                        SELECT thread_id,
-                               json_extract(metadata, '$.agent_name') as agent_name,
-                               MAX(json_extract(metadata, '$.updated_at')) as updated_at
-                        FROM checkpoints
-                        GROUP BY thread_id
-                    """
-                    params = ()
-
-                async with conn.execute(query, params) as cursor:
-                    rows = await cursor.fetchall()
-
-                file_threads: list[dict] = []
-                for r in rows:
-                    tid = r[0]
-                    if tid in seen:
-                        continue
-                    file_threads.append(
-                        {
-                            "thread_id": tid,
-                            "agent_name": r[1],
-                            "updated_at": r[2],
-                        }
-                    )
-                    seen.add(tid)
-
-                if include_message_count and file_threads:
-                    serde = JsonPlusSerializer()
-                    for thread in file_threads:
-                        thread["message_count"] = (
-                            await _count_messages_from_checkpoint(
-                                conn, thread["thread_id"], serde
-                            )
-                        )
-
-                threads.extend(file_threads)
+            file_threads = await _read_db_thread_list(
+                db_path, agent_name, include_message_count, seen
+            )
         except aiosqlite.OperationalError:
             continue
+        threads.extend(file_threads)
 
     # Sort threads in Python (allows complex sort logic)
     if sort_by == "thread_id":
@@ -523,6 +619,10 @@ async def delete_thread(thread_id: str) -> bool:
         deleted = cursor.rowcount > 0
         if await _table_exists(conn, "writes"):
             await conn.execute("DELETE FROM writes WHERE thread_id = ?", (thread_id,))
+        if await _table_exists(conn, "thread_metadata"):
+            await conn.execute(
+                "DELETE FROM thread_metadata WHERE thread_id = ?", (thread_id,)
+            )
         await conn.commit()
         return deleted
 
@@ -776,6 +876,16 @@ async def clean_agent_history_db_only(
                         thread_ids,
                     )
                     writes_deleted += cursor.rowcount or 0
+                # Keep the pre-aggregated thread index in sync with the
+                # checkpoints we just removed, so offline listing does not
+                # report ghost threads.
+                if await _table_exists(conn, "thread_metadata") and thread_ids:
+                    placeholders = ",".join("?" * len(thread_ids))
+                    await conn.execute(
+                        f"DELETE FROM thread_metadata "
+                        f"WHERE thread_id IN ({placeholders})",
+                        thread_ids,
+                    )
                 await conn.commit()
         except aiosqlite.OperationalError:
             pass
@@ -793,13 +903,13 @@ async def clean_agent_history(
     This removes:
     - All checkpoints/threads from sessions.db for this agent
     - All writes from sessions.db for this agent's threads
-    - Agent data directory (under the user's home)
-    - Agent log files (under the user's home)
+    - Agent data directory (~/.deep_worker/{agent_name}/)
+    - Agent log files (~/.deep_worker/logs/{agent_name}.*)
 
     This does NOT remove:
-    - User configuration (AGENTS.md under the agent's data directory)
-    - User skills (under the agent's data directory)
-    - User subagents (under the agent's data directory)
+    - User configuration (~/.deepagents/{agent_name}/AGENTS.md)
+    - User skills (~/.deepagents/{agent_name}/skills/)
+    - User subagents (~/.deepagents/{agent_name}/agents/)
 
     Args:
         agent_name: Name of the agent to clean
@@ -902,6 +1012,16 @@ async def clean_agent_history(
                     cursor = await conn.execute(query, thread_ids)
                     writes_deleted += cursor.rowcount or 0
 
+                # Keep the pre-aggregated thread index in sync so offline
+                # listing does not report ghost threads after a clean.
+                if await _table_exists(conn, "thread_metadata") and thread_ids:
+                    placeholders = ",".join("?" * len(thread_ids))
+                    await conn.execute(
+                        f"DELETE FROM thread_metadata "
+                        f"WHERE thread_id IN ({placeholders})",
+                        thread_ids,
+                    )
+
                 await conn.commit()
         except aiosqlite.OperationalError:
             pass
@@ -933,7 +1053,7 @@ async def clean_agent_history(
             f"  [dim]- Removed {log_files_removed} log file(s)[/dim]"
         )
     console.print(
-        f"  [dim]- Preserved user config under the agent's data directory[/dim]"
+        f"  [dim]- Preserved user config: ~/.deepagents/{agent_name}/[/dim]"
     )
 
 
@@ -1091,6 +1211,13 @@ async def remove_thread(
                     (thread_id,)
                 )
 
+            # Keep the pre-aggregated thread index consistent.
+            if await _table_exists(conn, "thread_metadata"):
+                await conn.execute(
+                    "DELETE FROM thread_metadata WHERE thread_id = ?",
+                    (thread_id,)
+                )
+
             await conn.commit()
 
             return {
@@ -1174,7 +1301,7 @@ async def get_thread_history(
                 "error": (
                     f"Thread '{thread_id}' not found: no session database "
                     f"exists (looked for sessions_<agent>.db and "
-                    f"legacy sessions.db under the agent data directory)."
+                    f"legacy sessions.db under ~/.deepagents)."
                 ),
             }
         db_path = str(resolved)
@@ -1244,7 +1371,7 @@ async def remove_threads_before(
     """Remove all threads older than the specified date.
 
     When ``db_path`` is not provided, the operation is applied to every
-    per-agent ``sessions_<name>.db`` file in the agent data directory **and** the
+    per-agent ``sessions_<name>.db`` file in ``~/.deepagents`` **and** the
     legacy global ``sessions.db``.  Counts are summed across all files.
 
     Args:
@@ -1345,6 +1472,16 @@ async def remove_threads_before(
                     except aiosqlite.OperationalError:
                         pass
 
+                # Keep the pre-aggregated thread index consistent.
+                try:
+                    await conn.execute(
+                        f"DELETE FROM thread_metadata "
+                        f"WHERE thread_id IN ({placeholders})",
+                        thread_ids,
+                    )
+                except aiosqlite.OperationalError:
+                    pass
+
                 await conn.commit()
         except Exception as e:  # noqa: BLE001
             any_error = f"Error removing threads from '{current_db}': {str(e)}"
@@ -1387,8 +1524,7 @@ async def import_history(
     This is the injection point for ``--import-claude``
     (DESIGN_IMPORT_CLAUDE_SESSION.md §4): the parsed Claude transcript becomes
     the agent's conversation history (its *memory*). The messages land in
-    the per-agent session database (``sessions_<agent>.db``) so
-    ``deep-worker --history <agent>``
+    ``~/.deepagents/sessions_<agent>.db`` so ``deep-worker --history <agent>``
     shows them and the agent sees them on its first turn — independent of which
     provider the agent later runs under.
 

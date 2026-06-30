@@ -51,6 +51,10 @@ from deep_worker_cli.config import (
 )
 from deep_worker_cli.integrations.sandbox_factory import get_default_working_dir
 from deep_worker_cli.local_context import LocalContextMiddleware
+from deep_worker_cli.prompts.proxy_tool_hints import (
+    provider_tool_invocation_note,
+    proxy_tool_form,
+)
 from deep_worker_cli.middleware.dangling_tool_calls import (
     DanglingToolCallMiddleware,
 )
@@ -143,6 +147,7 @@ def get_system_prompt(
     assistant_id: str,
     sandbox_type: str | None = None,
     project_memory_dir: Path | None = None,
+    provider: str | None = None,
 ) -> str:
     """Get the base system prompt for the agent.
 
@@ -160,6 +165,12 @@ def get_system_prompt(
 
             CRITICAL: This MUST be the same directory passed to backend!
             If None, Path.cwd() is used (DANGEROUS after daemonization!).
+        provider: Active model provider ("claude-code", "codex", "grok", …).
+
+            Drives the provider-specific MCP-proxy tool-invocation note and
+            the parametrized invocation examples in the agent-identity
+            section. If None, falls back to ``settings.model_provider``.
+            See docs/DESIGN_MCP_PROXY_TOOL_NAME_PREFIX_AWARENESS.md.
 
     Returns:
         The system prompt string (base instructions + environment context)
@@ -168,29 +179,50 @@ def get_system_prompt(
     base_instructions = get_default_coding_instructions()
     agent_dir_path = f"~/.deepagents/{assistant_id}"
 
+    # Resolve the active provider (explicit arg wins; else global settings).
+    # Drives the provider-specific MCP-proxy invocation form for base tools
+    # (see docs/DESIGN_MCP_PROXY_TOOL_NAME_PREFIX_AWARENESS.md).
+    effective_provider = provider if provider is not None else settings.model_provider
+    # Provider-correct call name for send_message_to_agent (the tool the
+    # identity section instructs the model to use). For claude-code/codex
+    # this is the mcp__deepworker[_<pid>]__ form; for grok / no-proxy
+    # providers it stays the bare name.
+    send_msg_form = proxy_tool_form(effective_provider, "send_message_to_agent")
+    # The provider-specific note explaining how to invoke base tools (empty
+    # for providers without an MCP-proxy).
+    provider_tool_note = provider_tool_invocation_note(effective_provider)
+    provider_tool_note_block = (
+        provider_tool_note + "\n\n" if provider_tool_note else ""
+    )
+
     # Build agent identity section — tells the LLM its OWN registry name.
     # This is critical for inter-agent messaging: the agent must know
     # which name appears as the "<sender>" half of an outgoing
     # "<sender> -> <receiver> :> <msg>" marker (always this agent's
     # own name) and which name it should look for on the receiver side
     # of incoming messages from peers.
+    #
+    # RC-A: the send_message_to_agent example below uses the PROVIDER-CORRECT
+    # call form (``send_msg_form``) instead of a hard-coded bare name, so a
+    # claude-code/codex agent never sees the unresolvable short name as the
+    # invocation example.
     agent_identity_section = f"""### Your Agent Identity
 
 Your agent name is `{assistant_id}`. This is the name by which other
 agents and the process registry refer to you. In inter-agent messages
 of the form `<sender> -> <receiver> :> <text>`:
 
-- When YOU send a message via `send_message_to_agent(<peer>, <text>)`,
+- When YOU send a message via `{send_msg_form}(<peer>, <text>)`,
   the delivered content is automatically formatted as
   `{assistant_id} -> <peer> :> <text>` — your name appears as the
   sender, so you do NOT need to write it yourself.
 - When you RECEIVE a user-role message whose content starts with
   `<someone> -> {assistant_id} :> <text>`, it was sent to you by
   another agent named `<someone>`; treat it as a peer request.
-  You MUST reply via ``send_message_to_agent`` unless
+  You MUST reply via `{send_msg_form}` unless
   ``reply_back=False`` was specified.
 
-"""
+{provider_tool_note_block}"""
 
     # Build model identity section
     model_identity_section = ""
@@ -699,6 +731,24 @@ def _should_catchup_history_index(
     return (pending > 0), pending
 
 
+def _provider_of_model(model: "str | BaseChatModel") -> str | None:
+    """Best-effort detection of the active provider from a model object.
+
+    Used to drive the provider-specific MCP-proxy tool-invocation forms in
+    the system prompt and InterAgentReplyMiddleware. Detection is by class
+    name so we don't hard-import every optional provider package. Returns
+    None when the provider can't be determined (callers then fall back to
+    ``settings.model_provider`` / bare names).
+    """
+    cls = type(model).__name__
+    mapping = {
+        "ClaudeCodeChatModel": "claude-code",
+        "CodexChatModel": "codex",
+        "GrokChatModel": "grok",
+    }
+    return mapping.get(cls)
+
+
 def create_cli_agent(
     model: str | BaseChatModel,
     assistant_id: str,
@@ -813,9 +863,9 @@ def create_cli_agent(
     tools = list(tools or [])
 
     # External MCP tools (see docs/DESIGN_EXTERNAL_MCP_TOOLS.md). These tools
-    # are already started by the caller (``AgentProcess.start()``) through
-    # ``ExternalMCPClientPool.create(...)`` — we simply add them to the
-    # common ``tools`` list, after which they flow as regular BaseTools through
+    # are already brought up by the caller (``AgentProcess.start()``) via
+    # ``ExternalMCPClientPool.create(...)`` — we simply append them to the
+    # common ``tools`` list, after which they travel as regular BaseTools through
     # SafeToolCallMiddleware / BoundedToolCallMiddleware / interrupt_on.
     _external_mcp_names: set[str] = set()
     if external_mcp_tools:
@@ -865,6 +915,12 @@ def create_cli_agent(
             subagent["model"] = subagent_meta["model"]
         custom_subagents.append(subagent)
 
+    # Detect the active provider from the model object (drives the
+    # provider-specific MCP-proxy tool-invocation forms in the prompt and
+    # in InterAgentReplyMiddleware). Falls back to settings / bare names
+    # inside the helpers when None.
+    active_provider = _provider_of_model(model)
+
     # Build middleware stack based on enabled features
     agent_middleware = []
 
@@ -895,7 +951,21 @@ def create_cli_agent(
     from deep_worker_cli.middleware.inter_agent_reply import (
         InterAgentReplyMiddleware,
     )
-    agent_middleware.append(InterAgentReplyMiddleware(name=assistant_id))
+    # Provider-correct reply-channel form for send_message_to_agent, so the
+    # injected reply hint names a tool the CLI can actually resolve
+    # (claude-code/codex MCP prefix; grok bare name + "MCP tool, don't search
+    # disk" clarification). See
+    # docs/DESIGN_MCP_PROXY_TOOL_NAME_PREFIX_AWARENESS.md.
+    agent_middleware.append(
+        InterAgentReplyMiddleware(
+            name=assistant_id,
+            reply_tool_form=proxy_tool_form(
+                active_provider, "send_message_to_agent"
+            ),
+            grok_mcp_note=(active_provider == "grok"),
+            grok_receive_completion=(active_provider == "grok"),
+        )
+    )
 
     # Unconditionally register history access tools (history_range,
     # history_at, history_slice) for ALL agents. These tools let the agent
@@ -912,7 +982,7 @@ def create_cli_agent(
     # (not on the next round-trip), so the Claude CLI gets its tool_result
     # immediately and the proxy-MCP timeout bounds delivery — not the
     # recipient's work. Provider-agnostic stack stays untouched.
-    # See deep_worker_web/docs/DESIGN_SUBSCRIPTION_AND_DELIVERY_FIX.md (Bug 2).
+    # See the related design note on subscription and delivery (Bug 2).
     _maybe_add_delivery_resolve_middleware(agent_middleware, model)
 
     # Add memory middleware
@@ -1005,6 +1075,7 @@ def create_cli_agent(
             assistant_id=assistant_id,
             sandbox_type=sandbox_type,
             project_memory_dir=project_memory_dir,
+            provider=active_provider,
         )
 
     # Configure interrupt_on based on auto_approve / auto_approve_send_message
@@ -1012,9 +1083,9 @@ def create_cli_agent(
     if auto_approve:
         # No interrupts - all tools run automatically. Per-tool overrides
         # (like auto_approve_send_message) are implied and have no extra
-        # effect here. EXTERNAL MCP TOOLS ARE ALSO NOT INTERRUPTED with -sp
-        # (user rule 2026-06-23) - `interrupt_on={}` ensures exactly this:
-        # absence of the key = no HITL.
+        # effect here. External MCP tools are also NOT interrupted with -sp
+        # (user rule 2026-06-23) — `interrupt_on={}` is exactly what
+        # ensures this: absence of the key = no HITL.
         interrupt_on = {}
     else:
         # Full HITL for destructive operations, with optional per-tool

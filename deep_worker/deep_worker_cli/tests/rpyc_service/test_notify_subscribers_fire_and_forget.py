@@ -1,6 +1,6 @@
 """``_notify_subscribers`` must not block on a hung subscriber.
 
-Production incident (observed 2026-05-19): the agent received user
+Production incident (a related internal incident): the agent received user
 messages over RPyC, called ``_handle_invoke`` → ``_notify_subscribers``
 → ``await subscriber.on_message(payload_str)`` — and the web-side
 ``MessageCallbackService.on_message`` never returned. The agent
@@ -38,12 +38,43 @@ import pytest
 from deep_worker_cli.rpyc_service.agent_service import AgentService
 
 
-def _make_service_with_subscriber(on_message):
-    """Build a minimal ``AgentService`` with a single subscriber."""
-    service = AgentService()
-    agent = MagicMock()
+class _FakeConn:
+    """Minimal stand-in for a netref's ``____conn__`` (see
+    ``tests/rpyc_service/conftest.py`` for the rationale). Production's
+    ``asyncreq(subscriber, 8, "on_message", args, ())`` resolves to
+    ``conn.async_request(8, subscriber, "on_message", args, ())``."""
+
+    def __init__(self, on_message):
+        self._on_message = on_message
+
+    def async_request(self, handler, _proxy, name, args, kwargs):
+        if handler == 8 and name == "on_message":
+            return self._on_message(*args, **(dict(kwargs) if kwargs else {}))
+        raise NotImplementedError(
+            f"unexpected async_request handler={handler!r} name={name!r}"
+        )
+
+
+def _make_netref_subscriber(on_message):
+    """Build a MagicMock that behaves like an rpyc_async netref: a real
+    ``____conn__`` in ``__dict__`` so ``object.__getattribute__`` finds
+    it, delegating ``on_message`` calls to ``on_message``."""
     subscriber = MagicMock()
     subscriber.on_message = on_message
+    object.__setattr__(subscriber, "____conn__", _FakeConn(on_message))
+    return subscriber
+
+
+def _make_service_with_subscriber(on_message):
+    """Build a minimal ``AgentService`` with a single subscriber.
+
+    The subscriber is an rpyc_async-style netref (real ``____conn__``)
+    so production's ``asyncreq(subscriber, 8, "on_message", ...)`` path
+    resolves to ``on_message``.
+    """
+    service = AgentService()
+    agent = MagicMock()
+    subscriber = _make_netref_subscriber(on_message)
     agent._message_subscribers = {subscriber}
     service._agent_process = agent
     return service, subscriber
@@ -88,8 +119,7 @@ async def test_notify_subscribers_returns_immediately_with_many_hung_subscribers
     agent = MagicMock()
     subs = []
     for _ in range(5):
-        s = MagicMock()
-        s.on_message = hung_on_message
+        s = _make_netref_subscriber(hung_on_message)
         subs.append(s)
     agent._message_subscribers = set(subs)
     service._agent_process = agent
@@ -181,7 +211,7 @@ async def test_notify_subscribers_dispatched_task_is_pinned_in_INFLIGHT() -> Non
     rpyc_async ``_INFLIGHT`` set so a stray GC pass can't kill it
     while ``on_message`` is mid-flight.
 
-    Regression guard for the 2026-05-08 / 2026-05-11 GC-race incidents:
+    Regression guard for the earlier GC-race incidents:
     a dispatched Task with only a weak ref dies silently and pins the
     AsyncResult chain in ``Connection._request_callbacks``.
     """
@@ -275,7 +305,7 @@ async def test_notify_subscribers_enforces_timeout_on_hung_subscriber() -> None:
 async def test_dead_message_subscriber_is_evicted() -> None:
     """A message subscriber whose ``on_message`` fails must be evicted
     from the agent's ``_message_subscribers`` set — same dead-peer
-    hazard as status pushes (incident observed 2026-05-20). on_disconnect does
+    hazard as status pushes (a related internal incident). on_disconnect does
     not clean up; without eviction the corpse soaks a 10 s timeout on
     every broadcast forever."""
     error_seen = asyncio.Event()

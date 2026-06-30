@@ -106,6 +106,15 @@ class ThreadState:
     # ``messages[sent_count:]`` is the delta to send next turn.
     sent_count: int = 0
 
+    # Chars of the FIRST SystemMessage already delivered to grok CLI (via the
+    # initial ``<system>`` block and/or prior ``System:>`` lines). Middleware
+    # appends to that message in-place; only the suffix is forwarded later.
+    forwarded_first_system_chars: int = 0
+
+    # ids (or synthetic keys) of additional runtime SystemMessages already
+    # forwarded as ``System:>`` lines (middleware may inject extra messages).
+    forwarded_extra_system_keys: set[str] = field(default_factory=set, repr=False)
+
     # The in-flight ``session/prompt`` response Future when we are mid-turn
     # (between an ainvoke that surfaced tool_calls and the next ainvoke that
     # resolves them). ``None`` when no turn is in progress. Used by the
@@ -120,6 +129,20 @@ class ThreadState:
     current_notif_queue: "asyncio.Queue[Any] | None" = field(
         default=None, repr=False
     )
+
+    # Set when a text-only turn called session/load with mcp_servers=[] so
+    # grok cannot invoke stale proxy tools; cleared on the next tool turn.
+    mcp_detached_for_text_only: bool = False
+
+    # True for the duration of one ``ainvoke`` tagged ``_grok_text_only_turn``.
+    # Used to drop spurious grok built-in / MCP tool_calls that would hang
+    # LangGraph when middleware stripped all tools (inter-agent reply_back=False).
+    text_only_turn_active: bool = False
+
+    # ACP toolCallId -> proxy MCP handler call_id. Grok surfaces CallMcpTool
+    # (or a bound tool by plain name) with its own toolCallId, but the proxy
+    # parks Futures under a synthetic id — resolve_call must use this map.
+    proxy_call_id_by_acp_id: dict[str, str] = field(default_factory=dict, repr=False)
 
     # toolCallId -> Future for grok built-in tool passthrough (channel B).
     # Lives on the per-thread state (NOT the shared client) so two agents

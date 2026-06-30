@@ -36,7 +36,20 @@ class HistorySearchResult:
     """Text of the retrieved message chunk."""
 
     score: float
-    """Cosine similarity score in [0, 1]."""
+    """Relevance score in ``(0, 1]`` — higher is more similar.
+
+    NOTE: this is NOT the raw cosine similarity. LanceDB ranks with the
+    ``L2`` metric (the default; no ``metric=`` is set) and llama-index maps
+    the L2 distance ``d`` to ``score = exp(-d)`` (see
+    ``llama_index.vector_stores.lancedb`` ``_to_llama_similarities``).
+
+    Because the embeddings are L2-normalized (``HuggingFaceEmbedding`` has
+    ``normalize=True`` by default), ranking by L2 is equivalent to ranking by
+    cosine, so the ORDER of results is the cosine order. The score NUMBER,
+    however, is ``exp(-d)`` with ``d in [0, 2]`` → score in ``[exp(-2), 1] ≈
+    [0.135, 1.0]``. It is a monotonic but non-linear transform of cosine
+    (``d^2 = 2 - 2*cos`` for unit vectors), never greater than 1.
+    """
 
     thread_id: str
     """Thread ID (stem of the JSONL filename)."""
@@ -78,6 +91,20 @@ def _ensure_embed_model(config: IndexConfig, embed_model: Any | None) -> Any:
 
     from llama_index.embeddings.huggingface import HuggingFaceEmbedding  # type: ignore[import-untyped]  # noqa: PLC0415
 
+    # ``normalize`` defaults to True in HuggingFaceEmbedding, so the produced
+    # vectors are L2-normalized (norm == 1.0). That is what makes the L2-based
+    # LanceDB ranking equivalent to cosine ranking (see ``HistorySearchResult
+    # .score``).
+    #
+    # KNOWN LIMITATION: the e5 family (``intfloat/multilingual-e5-*``) was
+    # trained with mandatory input prefixes — ``"query: "`` for queries and
+    # ``"passage: "`` for indexed text (``passage`` is the standard
+    # information-retrieval term for an indexed text fragment; it is fixed by
+    # the model authors, not a free-form label). We currently embed raw text
+    # WITHOUT these prefixes here and in ``history_indexer``. Search still
+    # works and scores are sensible, but adding the prefixes would better match
+    # the model's training distribution. Changing it requires a full re-index,
+    # so it is deliberately out of scope of this docs pass.
     model = HuggingFaceEmbedding(
         model_name=config.embedding_model,
         model_kwargs={"local_files_only": True},

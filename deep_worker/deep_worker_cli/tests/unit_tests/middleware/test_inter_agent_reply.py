@@ -9,14 +9,19 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
-from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from deep_worker_cli.middleware.inter_agent_reply import (
     INTER_AGENT_PATTERN,
     InterAgentReplyMiddleware,
     _find_system_message,
+    _is_delivered_inter_agent_message,
     _is_inter_agent_message,
 )
+
+
+def _ia_kwargs(**extra: Any) -> dict[str, Any]:
+    return {"inter_agent_delivery": True, **extra}
 
 
 # ===========================================================================
@@ -124,7 +129,7 @@ class TestInterAgentReplyMiddlewareDetection:
             HumanMessage(
                 content="alpha -> beta :> please compute 2+2",
                 id="msg-1",
-                additional_kwargs={"reply_back": True},
+                additional_kwargs=_ia_kwargs(reply_back=True),
             ),
         ]
         result = mw.before_model({"messages": msgs})
@@ -141,7 +146,7 @@ class TestInterAgentReplyMiddlewareDetection:
         # preserved on purpose — an unconditional "you MUST reply" used to
         # trigger Claude's prompt-injection defenses and produce a
         # plain-text "I'm waiting" filler instead of a tool call
-        # (a related internal incident analysis (not included here)).
+        # (a related internal incident analysis, not included here).
         assert "send_message_to_agent" in sys_msg.content
         assert "alpha" in sys_msg.content
         # Conditional trigger preserved.
@@ -158,7 +163,7 @@ class TestInterAgentReplyMiddlewareDetection:
             HumanMessage(
                 content="alpha -> beta :> tell the user hello",
                 id="msg-2",
-                additional_kwargs={"reply_back": False},
+                additional_kwargs=_ia_kwargs(reply_back=False),
             ),
         ]
         result = mw.before_model({"messages": msgs})
@@ -169,7 +174,7 @@ class TestInterAgentReplyMiddlewareDetection:
         # than back to the peer; it must NOT carry the reply-via-tool
         # phrasing of the reply_back=True branch.
         assert "reply_back=False" in sys_msg.content
-        assert "to the user" in sys_msg.content
+        assert "for the user" in sys_msg.content
         assert "If you need to send" not in sys_msg.content
         assert "IF you need to send" not in sys_msg.content
         assert "CRITICAL SYSTEM REQUIREMENT" not in sys_msg.content
@@ -183,7 +188,7 @@ class TestInterAgentReplyMiddlewareDetection:
         incoming = HumanMessage(
             content="alpha -> beta :> hello",
             id="msg-3",
-            additional_kwargs={"reply_back": True},
+            additional_kwargs=_ia_kwargs(reply_back=True),
         )
         msgs = [SystemMessage(content="You are a bot."), incoming]
 
@@ -199,6 +204,21 @@ class TestInterAgentReplyMiddlewareDetection:
         result2 = mw.before_model({"messages": msgs})
         assert result2 is None
 
+    def test_passthrough_when_format_quoted_without_delivery_flag(self) -> None:
+        """User/bootstrap text quoting the format must not trigger hints."""
+        mw = InterAgentReplyMiddleware(name="beta")
+        msgs = [
+            SystemMessage(content="You are a helpful assistant."),
+            HumanMessage(
+                content=(
+                    "When you see '<sender> -> beta :> ...' call the tool."
+                ),
+                id="msg-4",
+            ),
+        ]
+        result = mw.before_model({"messages": msgs})
+        assert result is None
+
     def test_default_reply_back_when_not_in_additional_kwargs(self) -> None:
         """reply_back defaults to True when additional_kwargs lacks it."""
         mw = InterAgentReplyMiddleware(name="beta")
@@ -206,7 +226,8 @@ class TestInterAgentReplyMiddlewareDetection:
             SystemMessage(content="You are a helpful assistant."),
             HumanMessage(
                 content="alpha -> beta :> hello",
-                id="msg-4",
+                id="msg-4b",
+                additional_kwargs=_ia_kwargs(),
             ),
         ]
         result = mw.before_model({"messages": msgs})
@@ -226,7 +247,7 @@ class TestInterAgentReplyMiddlewareDetection:
             HumanMessage(
                 content="alpha -> beta :> hello",
                 id="msg-5",
-                additional_kwargs={"reply_back": True},
+                additional_kwargs=_ia_kwargs(reply_back=True),
             ),
         ]
         result = mw.before_model({"messages": msgs})
@@ -234,12 +255,58 @@ class TestInterAgentReplyMiddlewareDetection:
         new_msgs = result.get("messages", [])
         assert len(new_msgs) == 2
         assert isinstance(new_msgs[0], SystemMessage), (
-            f"First message should be a new SystemMessage, got {type(new_msgs[0])}"
+            f"First message should be the new SystemMessage, got {type(new_msgs[0])}"
         )
+        assert isinstance(new_msgs[1], HumanMessage)
         assert "send_message_to_agent" in new_msgs[0].content
         assert "IF you need to send" in new_msgs[0].content
         assert "you MUST use" in new_msgs[0].content
         assert "CRITICAL SYSTEM REQUIREMENT" in new_msgs[0].content
+
+    def test_grok_receive_completion_jumps_to_end(self) -> None:
+        mw = InterAgentReplyMiddleware(
+            name="beta",
+            grok_receive_completion=True,
+        )
+        msgs = [
+            HumanMessage(
+                content="alpha -> beta :> MARK_GRK_42K",
+                id="msg-grok-rcv",
+                additional_kwargs=_ia_kwargs(reply_back=False),
+            ),
+        ]
+        result = mw.before_model({"messages": msgs})
+        assert result is not None
+        assert result.get("jump_to") == "end"
+        ai = result["messages"][0]
+        assert isinstance(ai, AIMessage)
+        assert "MARK_GRK_42K" in ai.content
+        assert "alpha" in ai.content
+
+    def test_grok_annotates_human_message_when_no_system(self) -> None:
+        """grok agents lack a state SystemMessage; hint must ride on the
+        inter-agent HumanMessage so delta-only prompts see it."""
+        mw = InterAgentReplyMiddleware(
+            name="beta",
+            grok_mcp_note=True,
+            grok_receive_completion=False,
+        )
+        msgs = [
+            HumanMessage(
+                content="alpha -> beta :> MARK_GRK_42K",
+                id="msg-grok",
+                additional_kwargs=_ia_kwargs(reply_back=False),
+            ),
+        ]
+        result = mw.before_model({"messages": msgs})
+        assert result is not None
+        new_msgs = result.get("messages", [])
+        assert len(new_msgs) == 1
+        assert isinstance(new_msgs[0], HumanMessage)
+        assert new_msgs[0].id == "msg-grok"
+        assert "reply_back=False" in new_msgs[0].content
+        assert "Do NOT call send_message_to_agent" in new_msgs[0].content
+        assert "alpha -> beta :> MARK_GRK_42K" in new_msgs[0].content
 
     def test_handles_message_without_id(self) -> None:
         """Messages without an 'id' should still trigger hint injection
@@ -249,7 +316,7 @@ class TestInterAgentReplyMiddlewareDetection:
             SystemMessage(content="You are a bot."),
             HumanMessage(
                 content="alpha -> beta :> hello",
-                additional_kwargs={"reply_back": True},
+                additional_kwargs=_ia_kwargs(reply_back=True),
             ),
         ]
         # First call: should inject
@@ -277,3 +344,61 @@ class TestInterAgentReplyMiddlewareContract:
     def test_requires_name_constructor_argument(self) -> None:
         mw = InterAgentReplyMiddleware(name="test-agent")
         assert mw._name == "test-agent"
+
+
+class TestInterAgentReplyMiddlewareProviderForm:
+    """The reply-channel tool form in the injected hint must be
+    provider-dependent (RC-A/RC-B of
+    docs/DESIGN_MCP_PROXY_TOOL_NAME_PREFIX_AWARENESS.md).
+
+    Default stays the bare ``send_message_to_agent`` for backward
+    compatibility (covered by the existing tests above).
+    """
+
+    def _inject(self, mw: InterAgentReplyMiddleware) -> str:
+        msgs = [
+            SystemMessage(content="You are a bot."),
+            HumanMessage(
+                content="alpha -> beta :> hello",
+                id="m-form",
+                additional_kwargs=_ia_kwargs(reply_back=True),
+            ),
+        ]
+        result = mw.before_model({"messages": msgs})
+        assert result is not None
+        return result["messages"][0].content
+
+    def test_default_form_is_bare_name(self) -> None:
+        mw = InterAgentReplyMiddleware(name="beta")
+        content = self._inject(mw)
+        assert "send_message_to_agent" in content
+        assert "mcp__deepworker__" not in content
+
+    def test_claude_code_form_is_prefixed(self) -> None:
+        mw = InterAgentReplyMiddleware(
+            name="beta",
+            reply_tool_form="mcp__deepworker__send_message_to_agent",
+        )
+        content = self._inject(mw)
+        assert "mcp__deepworker__send_message_to_agent" in content
+
+    def test_codex_form_is_pid_prefixed(self) -> None:
+        mw = InterAgentReplyMiddleware(
+            name="beta",
+            reply_tool_form="mcp__deepworker_777__send_message_to_agent",
+        )
+        content = self._inject(mw)
+        assert "mcp__deepworker_777__send_message_to_agent" in content
+
+    def test_grok_hint_carries_mcp_tool_disk_warning(self) -> None:
+        # For grok the form stays the bare name but the hint must carry the
+        # "as MCP tool, do not search disk" warning.
+        mw = InterAgentReplyMiddleware(
+            name="beta",
+            reply_tool_form="send_message_to_agent",
+            grok_mcp_note=True,
+        )
+        content = self._inject(mw)
+        lowered = content.lower()
+        assert "mcp" in lowered
+        assert "disk" in lowered

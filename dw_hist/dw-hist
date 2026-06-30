@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# dw-hist launcher — adds repo modules to PYTHONPATH and execs python.
+#
+# Follows the same pattern as `dwcli` / `deep-worker`: lives in the repo tree,
+# tree-local imports via PYTHONPATH, no pip install required.
+#
+# Install (per-user) — symlink into ~/.local/bin to make `dw-hist` global:
+#   ln -sf <repo>/dw_hist/dw-hist ~/.local/bin/dw-hist
+# (<repo> = this repository's checkout path)
+#
+# See docs/DESIGN_DW_HIST_INITIAL.md for the design.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+REPO_ROOT="$(dirname "$SCRIPT_DIR")"
+
+export PYTHONPATH="$SCRIPT_DIR:$REPO_ROOT/deep_worker/deep_worker_cli:$REPO_ROOT/semantic_search:${PYTHONPATH:-}"
+
+exec python3 -m dw_hist.cli "$@"

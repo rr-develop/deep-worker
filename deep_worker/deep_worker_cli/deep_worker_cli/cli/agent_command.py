@@ -149,7 +149,7 @@ def _explicit_cli_flags(argv: list[str] | None = None) -> set[str]:
     default": the parser default for ``--provider`` is ``"deepseek"``, so a
     user who runs ``--restart a --provider deepseek`` produces a value that
     equals the default and would be mistaken for "flag not passed" — the
-    saved provider would silently win (an incident observed live, 2026-05-29).
+    saved provider would silently win (a related internal incident).
 
     To detect presence reliably we re-parse ``argv`` with a throwaway parser
     whose options default to ``argparse.SUPPRESS``. With SUPPRESS, a dest only
@@ -181,7 +181,7 @@ def _explicit_cli_flags(argv: list[str] | None = None) -> set[str]:
                           action="store_true", default=argparse.SUPPRESS)
     detector.add_argument("--dev", dest="dev_tree",
                           action="store_true", default=argparse.SUPPRESS)
-    detector.add_argument("--preferred-provider", dest="preferred_provider",
+    detector.add_argument("-pp", "--preferred-provider", dest="preferred_provider",
                           default=argparse.SUPPRESS)
     detector.add_argument("--no-update-preferred", dest="no_update_preferred",
                           action="store_true", default=argparse.SUPPRESS)
@@ -227,7 +227,7 @@ def merge_restart_config(
     default" alone is unsafe for ``--provider``, whose default is a real
     provider name (``"deepseek"``): an explicit ``--provider deepseek`` would
     otherwise be indistinguishable from "not passed" and silently dropped
-    (an incident observed live, 2026-05-29).
+    (a related internal incident).
 
     When the provider is overridden but ``--model`` is NOT explicitly given,
     the saved model is NOT inherited (it belongs to the OLD provider and would
@@ -259,7 +259,7 @@ def merge_restart_config(
     effective.provider = saved.get("provider", _PARSER_DEFAULTS["provider"])
     effective.model = saved.get("model", _PARSER_DEFAULTS["model"])
     # Heal legacy poison: older builds persisted an unspecified model as
-    # the literal "unknown" (observed live). Treat that
+    # the literal "unknown" (a related internal incident). Treat that
     # as "no model specified" so the provider default kicks back in on
     # restart instead of forwarding the bad string to the API.
     if effective.model == "unknown":
@@ -291,11 +291,10 @@ def merge_restart_config(
     model_explicit = _is_override("model", args.model, _PARSER_DEFAULTS["model"])
     if model_explicit:
         effective.model = args.model
-    elif provider_overridden and effective.provider != saved.get("provider"):
-        # Provider changed but no --model given: do NOT carry the old
-        # provider's model forward. Reset so build_launch_config() resolves
-        # the new provider's default (an incident observed live, 2026-05-29).
-        effective.model = None
+    # NOTE: the explicit-provider-declaration model reset used to live here and
+    # in the pp-block below, each guarded by ``effective.provider != saved``.
+    # Both are superseded by a single consolidated gate placed AFTER the pp-block
+    # finalizes ``effective.provider`` — see ``provider_decl_unpinned`` below.
     if _is_override("dir", args.dir, _PARSER_DEFAULTS["dir"]):
         effective.dir = args.dir
     if _is_override("skip_permissions", args.skip_permissions,
@@ -359,6 +358,34 @@ def merge_restart_config(
         effective.preferred_provider = args.preferred_provider
         effective.provider = args.preferred_provider
 
+    # ------------------------------------------------------------------
+    # Consolidated model reset (operator rule; a related internal incident)
+    # ------------------------------------------------------------------
+    # When the operator explicitly declares a provider (via ``-pp`` OR
+    # ``--provider``) but gives no ``--model``, the saved model is taken to be
+    # stale and MUST be reset to None so ``build_launch_config()`` resolves the
+    # declared provider's own default. The old code only fired this reset when
+    # the provider STRING changed (``effective.provider != saved.provider``),
+    # which left an already-poisoned same-provider state (``-pp codex`` over
+    # saved codex + cross-provider model) untouched. The categorical operator
+    # rule — "no explicit --model ⇒ provider default" — supersedes that gate,
+    # and same-provider re-declaration is the only way an operator can heal
+    # a poisoned config without supplying a specific model.
+    # ``--no-update-preferred`` is the internal failover/restore-on-idle path;
+    # the operator did not type this provider switch — TaskManager did — and
+    # the whole point of failover return is to RESTORE the operator's saved
+    # ``preferred_model``. So we exclude that case from the consolidated reset
+    # gate: only an OPERATOR-driven explicit provider declaration is treated
+    # as "use that provider's default".
+    no_update_preferred = bool(getattr(args, "no_update_preferred", False))
+    provider_decl_unpinned = (
+        (pp_explicit or provider_overridden)
+        and not model_explicit
+        and not no_update_preferred
+    )
+    if provider_decl_unpinned:
+        effective.model = None
+
     # --no-update-preferred: keep preferred_provider intact even when
     # provider is overridden. Used by automatic failover so that a
     # temporary provider switch does not overwrite the operator's
@@ -372,7 +399,23 @@ def merge_restart_config(
     # preferred_model: operator's model on preferred_provider (for restore-on-idle).
     saved_pp = effective.preferred_provider
     saved_provider = saved.get("provider", _PARSER_DEFAULTS["provider"])
-    if saved.get("preferred_model"):
+    # When ``-pp`` moved the preferred provider to a new one, any saved
+    # preferred_model belonged to the OLD preferred provider and is stale —
+    # do not carry it over (a related internal incident). The new preferred provider
+    # resolves its own default unless an explicit --model was given.
+    pp_switched = pp_explicit and args.preferred_provider != saved.get(
+        "preferred_provider", saved_provider
+    )
+    if provider_decl_unpinned:
+        # RC-1 (internal review): on ANY explicit provider declaration without
+        # --model, preferred_model must track the (None) reset of model.
+        # Otherwise a stale ``preferred_model`` survives same-provider ``-pp``
+        # and would re-pin the foreign model later via the restore-on-idle /
+        # failover path. ``effective.model`` was just reset to None above.
+        effective.preferred_model = effective.model
+    elif pp_switched and not model_explicit:
+        effective.preferred_model = effective.model
+    elif saved.get("preferred_model"):
         effective.preferred_model = saved.get("preferred_model")
     elif saved_pp and saved_provider == saved_pp and saved.get("model"):
         effective.preferred_model = saved.get("model")
@@ -410,7 +453,7 @@ def build_launch_config(args: argparse.Namespace) -> dict:
         # None — the codex CLI then picks its own current default. Do
         # NOT coerce to "unknown": that string would be read back on
         # restart and forwarded to CodexChatModel, which the API
-        # rejects with HTTP 400 (observed live).
+        # rejects with HTTP 400 (a related internal incident).
         model = get_default_model_name(args.provider)
 
     working_dir = args.dir
@@ -432,14 +475,14 @@ def build_launch_config(args: argparse.Namespace) -> dict:
     # reconstructs the spawn on the PROD tree (``_spawn_subprocess`` keys off
     # ``dev_tree``), where a dev-only provider like ``grok`` is unknown to the
     # argparse ``--provider`` choices → the agent dies at startup and never
-    # comes back (observed live). Deriving dev_tree from the
+    # comes back (a related internal incident). Deriving dev_tree from the
     # real code tree keeps the persisted flag consistent with reality, so the
     # flag never lies about which tree must be used on restart. The canonical
     # dev tree path mirrors the bash launcher's DEV_TREE (override honored for
     # tests).
     _dev_tree_root = Path(
         os.environ.get(
-            "DEEP_WORKER_DEV_TREE_ROOT_OVERRIDE", f"{_repo_root}_dev"
+            "DEEP_WORKER_DEV_TREE_ROOT_OVERRIDE", "/path/to/dev_tree"
         )
     )
     _running_from_dev_tree = _repo_root.resolve() == _dev_tree_root.resolve()
@@ -810,9 +853,8 @@ def create_parser() -> argparse.ArgumentParser:
         action="store_true",
         dest="dev_tree",
         help=(
-            "Run the agent using the development codebase "
-            "instead of the production codebase. The flag is normally "
-            "consumed by the "
+            "Run the agent using the development codebase instead of the "
+            "production codebase. The flag is normally consumed by the "
             "bash launcher (deep-worker) BEFORE Python starts; it is also "
             "declared here so argparse does not reject it inside the dev "
             "tree after the re-exec, and so it can be persisted to "
@@ -862,6 +904,7 @@ def create_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
+        "-pp",
         "--preferred-provider",
         default=None,
         dest="preferred_provider",
@@ -963,7 +1006,7 @@ def create_parser() -> argparse.ArgumentParser:
         help=(
             "Remove conversation data older than DATE (ISO 8601 or relative "
             "like 30d, 1y). Prunes checkpoint threads AND offloaded summary "
-            "sections under each agent's local summaries directory across ALL "
+            "sections under ~/.deep_worker/<agent>/summaries/ across ALL "
             "agents in the current $HOME (destructive and global — NEVER "
             "run in ad-hoc integration tests without an isolated HOME). "
             "If DATE resolves to a future timestamp, the command refuses "
@@ -985,7 +1028,7 @@ def create_parser() -> argparse.ArgumentParser:
         dest="list_summaries",
         help=(
             "List offloaded conversation-history files from "
-            "each agent's local summaries directory. Use --agent NAME to filter, "
+            "~/.deep_worker/<agent>/summaries/. Use --agent NAME to filter, "
             "--format json for machine-readable output."
         ),
     )
@@ -1065,7 +1108,7 @@ def create_parser() -> argparse.ArgumentParser:
         default=[],
         help=(
             "Path to an additional MCP config file (same JSON shape as "
-            "the default agent MCP config). Repeatable; later files override earlier."
+            "~/.deepagents/mcp.json). Repeatable; later files override earlier."
         ),
     )
     parser.add_argument(
@@ -1086,7 +1129,7 @@ def create_parser() -> argparse.ArgumentParser:
 #
 # An earlier version seeded ``claude_session_state.json`` with the imported
 # transcript's uuid so the claude-code provider would RESUME that real file.
-# That broke tool availability (observed live): the imported transcript is
+# That broke tool availability (a related internal incident): the imported transcript is
 # an ORDINARY ``claude`` session created OUTSIDE deep_worker. Resuming it makes
 # the CLI restore THAT session's tool/permission configuration, which has no
 # ``mcp__deepworker__*`` tools. deep_worker only sets ``disallowed_tools`` (it
@@ -1232,7 +1275,7 @@ async def run_agent(args: argparse.Namespace) -> int:
         # of truth, build_launch_config(). The previous hand-rolled inline
         # dict here was MISSING ``dev_tree`` and ``preferred_provider`` — the
         # same wart the fork path already avoided (see line ~593). A missing
-        # ``dev_tree`` is exactly what left a test agent un-restartable from the
+        # ``dev_tree`` is exactly what left an agent un-restartable from the
         # web UI on 2026-06-18: the metadata never recorded that the agent
         # ran on the dev tree, so ``_spawn_subprocess`` rebuilt the launch on
         # the prod tree where the ``grok`` provider is unknown to argparse.
@@ -1300,7 +1343,7 @@ def _detach_from_session_scope(agent_name: str | None = None) -> None:
     because cgroup membership was inherited across ``fork`` and
     ``setsid`` does not touch it.
 
-    Production incident this guards against: 2026-05-08, an agent
+    Production incident this guards against: an agent
     died at the moment systemd deactivated the SSH
     session-scope of the bash that originally launched it, even
     though ``loginctl enable-linger`` was set on the user. ``linger``
@@ -1460,8 +1503,7 @@ def daemonize(name: str, log_dir: Path | None = None) -> None:
 
     Args:
         name: Agent name for log files
-        log_dir: Directory for log files (default: the user data
-        directory's ``logs/`` subdirectory)
+        log_dir: Directory for log files (default: ~/.deep_worker/logs)
     """
     # Set up log directory
     if log_dir is None:
@@ -1539,7 +1581,8 @@ def daemonize(name: str, log_dir: Path | None = None) -> None:
     # RotatingLogWriter that enforces a hard 512MB-active + 1-backup cap, so the
     # on-disk total per stream NEVER exceeds 1 GiB — enforced in-process, with no
     # logrotate/cron needed. Captures print, logging, AND C-level writes to fd
-    # 1/2 alike. See log_rotation.py and a related internal incident analysis.
+    # 1/2 alike. See log_rotation.py and a related internal incident analysis
+    # (not included here).
     stdout_write_fd, _stdout_log_thread = start_pipe_writer(str(stdout_log))
     stderr_write_fd, _stderr_log_thread = start_pipe_writer(str(stderr_log))
 
@@ -1700,7 +1743,7 @@ async def remove_before_command(
     """Handle --remove-before command.
 
     Prunes BOTH checkpoint threads in per-agent SQLite DBs AND offloaded
-    summary sections under each agent's local summaries directory across
+    summary sections under ``~/.deep_worker/<agent>/summaries/`` across
     ALL agents in the current ``$HOME``.
 
     Safety guard (DESIGN_REMOVE_BEFORE_FUTURE_CUTOFF_GUARD.md): when the
@@ -1755,8 +1798,8 @@ async def remove_before_command(
         )
         console.print(
             "  A future cutoff matches every existing thread and would "
-            "delete ALL data under the agent data directories and "
-            "per-agent summaries."
+            "delete ALL data under ~/.deepagents/ and "
+            "~/.deep_worker/*/summaries/."
         )
         console.print(
             "  If you truly intend this, re-run with [bold]--force[/bold]."
@@ -1814,8 +1857,7 @@ async def remove_before_command(
 async def list_summaries_command(agent_name: str | None, fmt: str) -> int:
     """Handle --list-summaries command.
 
-    Walks each agent's local summaries directory (``*.md`` files) and
-    prints one row per
+    Walks ``~/.deep_worker/<agent>/summaries/*.md`` and prints one row per
     offloaded thread. Offline, read-only, no RPyC, no running-agent
     dependency.
 
@@ -1876,7 +1918,7 @@ async def list_summaries_command(agent_name: str | None, fmt: str) -> int:
             f"{latest:<26.26} {size_h:>8}"
         )
     console.print("=" * 78)
-    console.print("[dim]Files live under each agent's local summaries directory.[/dim]")
+    console.print("[dim]Files live under ~/.deep_worker/<agent>/summaries/.[/dim]")
     return 0
 
 
@@ -2268,7 +2310,7 @@ def main() -> int:
     daemonize(args.name)
 
     # --- Post-daemonize (grandchild only) -------------------------------
-    # Output goes to the agent's log directory (<name>.{out,err}.log) from here on.
+    # Output goes to ~/.deep_worker/logs/<name>.{out,err}.log from here on.
 
     if args.clean:
         # Database cleanup is the slow part (can wait up to 30s on SQLite

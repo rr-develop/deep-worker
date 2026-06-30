@@ -133,6 +133,28 @@ class TestCallToolParkingFuture:
         # Should not raise; no Future exists.
         srv.resolve_call("does_not_exist", {"content": []})
 
+    async def test_resolve_call_fallback_by_tool_name(
+        self, metadata: list[ToolMetadata]
+    ) -> None:
+        """ACP toolCallId differs from handler call_id — match by tool name."""
+        srv = ProxyMCPServer(metadata, long_running_wait_seconds=5.0)
+        task = asyncio.create_task(
+            srv.call_tool_for_test("read_file", {"path": "/tmp/x"})
+        )
+        await asyncio.sleep(0)
+        pending = srv.get_pending_calls()
+        assert len(pending) == 1
+        handler_id = pending[0]["id"]
+
+        srv.resolve_call(
+            "acp-tool-call-id-99",
+            {"content": [{"type": "text", "text": "ok"}]},
+            tool_name="read_file",
+        )
+        result = await task
+        assert result[0]["text"] == "ok"
+        assert handler_id != "acp-tool-call-id-99"
+
     async def test_wait_for_pending_calls_returns_existing_call(
         self, metadata: list[ToolMetadata]
     ) -> None:

@@ -113,9 +113,9 @@ def _cleanup_agent_files(agent_info: AgentFixtureInfo) -> None:
     Two locations:
 
     1. ``/tmp/deep_worker_<agent_name>.pid`` — the PID lockfile.
-    2. the agent's per-agent data directory — the ``SessionManager.data_dir``
+    2. ``~/.deep_worker/<agent_name>/`` — the ``SessionManager.data_dir``
        default (see ``AgentProcess.__init__``:
-       ``self.data_dir = data_dir or <agent-data-dir> / name``).
+       ``self.data_dir = data_dir or (Path.home() / Path("~/.deep_worker").name / name)``).
        Holds ``session_metadata.json`` and conversation summaries.
        Used to be left on disk by every passed test, accumulating
        hundreds of stale directories per machine over time.
@@ -196,19 +196,22 @@ def _agent_process_entry_point(
     # ============================================================================
     # CRITICAL: Ensure local deepagents code is used instead of system package
     # ============================================================================
-    # We should ALWAYS use code from the LOCAL repository (not
+    # This host should ALWAYS use code from the LOCAL repository (not
     # system-installed packages). We detect the repository root from the
     # agent_fixture.py path: going up 4 dirs from
     #   .../<tree>/deep_worker/deep_worker_cli/tests/integration_ai/
-    # gives us the tree root.
+    # gives us the tree root of this repository checkout.
     # ============================================================================
     _fixture_path = Path(__file__).resolve()
     _tree_root = str(_fixture_path.parents[3])
+    _repo_root = str(_fixture_path.parents[4])
     repo_base = Path(_tree_root) / "deep_worker"
     deep_worker_cli_path = str(repo_base / "deep_worker_cli")
     deepagents_path = str(repo_base / "deepagents")
 
     # Insert at beginning to override system packages
+    if _repo_root not in sys.path:
+        sys.path.insert(0, _repo_root)
     if deep_worker_cli_path not in sys.path:
         sys.path.insert(0, deep_worker_cli_path)
     if deepagents_path not in sys.path:

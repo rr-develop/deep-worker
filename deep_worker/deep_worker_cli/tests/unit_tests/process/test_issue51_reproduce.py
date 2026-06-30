@@ -45,6 +45,8 @@ async def test_tool_calls_without_content_gets_accurate_error():
 
     fake_graph = MagicMock()
     fake_graph.ainvoke = AsyncMock(return_value={"messages": [ai_with_tools]})
+    fake_graph.aupdate_state = AsyncMock()
+    fake_graph.aget_state = AsyncMock()
     agent.agent = fake_graph
 
     result = await agent._handle_invoke(
@@ -58,7 +60,11 @@ async def test_tool_calls_without_content_gets_accurate_error():
     assert "tool call" in result["error"].lower(), (
         f"Error should mention unhandled tool calls, got: {result['error']}"
     )
-    assert agent.session_manager.status == AgentStatus.ERROR
+    # No-Agent-Error-State Policy (2026-06-24): a recoverable empty-response
+    # turn settles to IDLE (not ERROR) and appends a SystemMessage so the
+    # next user message proceeds. The invariant is "not left RUNNING".
+    assert agent.session_manager.status != AgentStatus.RUNNING
+    assert agent.session_manager.status == AgentStatus.IDLE
 
 
 @pytest.mark.asyncio
@@ -106,6 +112,8 @@ async def test_truly_empty_response_still_produces_error():
 
     fake_graph = MagicMock()
     fake_graph.ainvoke = AsyncMock(return_value={"messages": [empty_ai]})
+    fake_graph.aupdate_state = AsyncMock()
+    fake_graph.aget_state = AsyncMock()
     agent.agent = fake_graph
 
     result = await agent._handle_invoke(
@@ -117,7 +125,10 @@ async def test_truly_empty_response_still_produces_error():
 
     assert result["success"] is False
     assert "did not produce" in result["error"].lower()
-    assert agent.session_manager.status == AgentStatus.ERROR
+    # No-Agent-Error-State Policy (2026-06-24): recoverable empty response
+    # settles to IDLE, never left RUNNING.
+    assert agent.session_manager.status != AgentStatus.RUNNING
+    assert agent.session_manager.status == AgentStatus.IDLE
 
 
 if __name__ == "__main__":

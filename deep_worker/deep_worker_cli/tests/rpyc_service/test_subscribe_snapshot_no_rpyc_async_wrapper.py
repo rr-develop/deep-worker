@@ -56,7 +56,7 @@ def _build_service_with_agent() -> tuple[AgentService, MagicMock]:
 
 
 @pytest.mark.asyncio
-async def test_deliver_snapshot_does_not_wrap_with_rpyc_async() -> None:
+async def test_deliver_snapshot_does_not_wrap_with_rpyc_async(netref_subscriber) -> None:
     """The snapshot push must call ``await callback.on_message(payload)``
     directly — NOT through ``rpyc.async_(callback.on_message)(...)``.
 
@@ -66,8 +66,7 @@ async def test_deliver_snapshot_does_not_wrap_with_rpyc_async() -> None:
     peer's async handler as an un-awaited coroutine.
     """
     service, _ = _build_service_with_agent()
-    cb = MagicMock()
-    cb.on_message = AsyncMock()
+    cb = netref_subscriber(AsyncMock())
 
     # Patch ``rpyc.async_`` in the module under test. If the
     # implementation still wraps, this patch is invoked and we fail.
@@ -92,7 +91,7 @@ async def test_deliver_snapshot_does_not_wrap_with_rpyc_async() -> None:
 
 
 @pytest.mark.asyncio
-async def test_deliver_snapshot_awaits_async_netref_coroutine() -> None:
+async def test_deliver_snapshot_awaits_async_netref_coroutine(netref_subscriber) -> None:
     """Simulate a real rpyc_async netref: ``callback.on_message(x)`` is
     itself an async operation that must be ``await``-ed by the code
     under test. If the fix forgets the ``await`` (e.g. by using a
@@ -108,11 +107,9 @@ async def test_deliver_snapshot_awaits_async_netref_coroutine() -> None:
         await asyncio.sleep(0)
         delivered.append(payload)
 
-    cb = MagicMock()
-    # ``MagicMock.on_message = on_message`` assigns the real coroutine
-    # function; calling ``cb.on_message(x)`` returns a coroutine we
-    # expect the implementation to await.
-    cb.on_message = on_message
+    # The netref's ``____conn__.async_request`` returns the coroutine
+    # produced by ``on_message`` so the implementation can await it.
+    cb = netref_subscriber(on_message)
 
     await service.exposed_subscribe_messages(cb)
     await asyncio.sleep(0.02)

@@ -85,7 +85,20 @@ class SearchResult:
     """Absolute path to the source file."""
 
     score: float
-    """Cosine similarity score in [0, 1]."""
+    """Relevance score in ``(0, 1]`` — higher is more similar.
+
+    NOTE: this is NOT the raw cosine similarity. LanceDB ranks with the
+    ``L2`` metric (the default; no ``metric=`` is set) and llama-index maps
+    the L2 distance ``d`` to ``score = exp(-d)`` (see
+    ``llama_index.vector_stores.lancedb`` ``_to_llama_similarities``).
+
+    Because the embeddings are L2-normalized (``HuggingFaceEmbedding`` has
+    ``normalize=True`` by default), ranking by L2 is equivalent to ranking by
+    cosine, so the ORDER of results is the cosine order. The score NUMBER,
+    however, is ``exp(-d)`` with ``d in [0, 2]`` → score in ``[exp(-2), 1] ≈
+    [0.135, 1.0]``. It is a monotonic but non-linear transform of cosine
+    (``d^2 = 2 - 2*cos`` for unit vectors), never greater than 1.
+    """
 
     content: str
     """Text of the retrieved chunk."""

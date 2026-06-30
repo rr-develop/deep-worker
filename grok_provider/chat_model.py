@@ -85,31 +85,41 @@ def _build_tool_contract(tool_names: list[str]) -> str:
     """Build the <system>-block tool guidance for the tools ACTUALLY bound
     this turn.
 
-    grok 0.2.54 exposes deep-worker MCP tools to the model under their BARE
-    names (e.g. ``get_magic_word``, ``execute``) — there is no
-    ``mcp__deepworker_*__`` prefix in what the model sees. The previous static
-    contract claimed such a prefix AND listed equivalents (Shell->execute, …)
-    regardless of whether those tools were bound. When the user bound a tool
-    whose name didn't match the advertised prefix/list (e.g. a plain
-    ``get_magic_word``), grok failed to recognise it as "one of the contract
-    tools" and went introspecting the on-disk MCP schema cache
-    (Glob/Grep/Read over ``~/.grok/.../mcps/.../tools/*.json``) instead of just
-    calling it — burning turns and never converging.
+    grok 0.2.54 does NOT expose a string ``mcp__deepworker_*__`` prefix to the
+    model: the model calls a deep-worker tool by its plain name and the grok
+    CLI itself routes the call to our MCP server
+    (``deep_worker_proxy_<pid>``) via its ``CallMcpTool`` built-in. IMPORTANT:
+    this does NOT make them grok's NATIVE built-ins (Shell/Read/Write/…) — the
+    deep-worker tools are MCP tools, reachable only through that MCP channel.
+    (See a related internal incident analysis (not included here) and
+    docs/DESIGN_MCP_PROXY_TOOL_NAME_PREFIX_AWARENESS.md §3.3/§8.)
+
+    The previous static contract claimed a literal prefix AND listed
+    equivalents (Shell->execute, …) regardless of whether those tools were
+    bound. When the user bound a tool whose name didn't match the advertised
+    prefix/list (e.g. a plain ``get_magic_word``), grok failed to recognise it
+    as "one of the contract tools" and went introspecting the on-disk MCP
+    schema cache (Glob/Grep/Read over ``~/.grok/.../mcps/.../tools/*.json``)
+    instead of just calling it — burning turns and never converging.
 
     The contract is now DYNAMIC and TRUTHFUL: it names exactly the bound
-    deep-worker tools, tells grok they are directly callable by those names,
-    and explicitly forbids hunting for their schema on disk. Returns an empty
+    deep-worker tools, tells grok they are MCP tools callable directly by name
+    (CLI routes them to our MCP server — they are NOT native built-ins), and
+    explicitly forbids hunting for their schema on disk. Returns an empty
     string when no deep-worker tools are bound (nothing to advertise)."""
     if not tool_names:
         return ""
     bound = set(tool_names)
     lines = [
         "Deep-worker tool contract:",
-        "- You have these deep-worker tools available THIS TURN, callable "
-        "directly by name (no prefix): " + ", ".join(f"`{n}`" for n in tool_names) + ".",
-        "- Call them directly by name. Do NOT search the filesystem for their "
-        "schema or definition (do not Glob/Grep/Read the `mcps/` directory) — "
-        "you already have everything needed to call them.",
+        "- You have these deep-worker MCP tools available THIS TURN, callable "
+        "directly by name: " + ", ".join(f"`{n}`" for n in tool_names) + ".",
+        "- These are deep-worker MCP tools, NOT your native built-ins "
+        "(Shell/Read/Write/Edit/Glob/Grep/WebSearch/Task). Call them directly "
+        "by name — the CLI routes the call to the deep-worker MCP server "
+        "automatically. Do NOT search the filesystem for their schema or "
+        "definition (do not Glob/Grep/Read the `mcps/` directory) — you "
+        "already have everything needed to call them.",
     ]
     equiv = [
         (b, d) for (b, d) in _BUILTIN_EQUIVALENTS if d in bound
@@ -281,6 +291,19 @@ class GrokChatModel(BaseChatModel):
         self._tools_metadata = tools_metadata
         return self
 
+    def bind(self, **kwargs: Any) -> Any:
+        """Text-only turn: LangGraph calls ``bind()`` without ``bind_tools``.
+
+        When middleware strips all tools (e.g. ``InterAgentReplyMiddleware``
+        on a ``reply_back=False`` inter-agent delivery), the agent factory
+        binds with ``request.model.bind(**settings)`` — leaving
+        ``_tools_metadata`` from the original ``bind_tools`` intact.  That
+        would still register the proxy MCP server with grok and invite
+        spurious tool calls / hung turns.  Tag this binding so ``ainvoke``
+        omits MCP for exactly one call.
+        """
+        return super().bind(_grok_text_only_turn=True, **kwargs)
+
     @staticmethod
     def _extract_tool_schema(tool: BaseTool) -> dict[str, Any]:
         schema: dict[str, Any] = {}
@@ -410,8 +433,14 @@ class GrokChatModel(BaseChatModel):
         # 3. Per-thread state.
         state = self._client_state.get_or_create(agent_thread_id)
 
-        # 4. Summarization detection — drop grok session, keep agent_thread_id.
-        if state.sent_count > len(messages):
+        # 4. LangGraph factory prepends ``request.system_message`` ahead of
+        # checkpoint messages. ``sent_count`` tracks STATE messages only.
+        state_messages = messages
+        if messages and isinstance(messages[0], SystemMessage):
+            state_messages = messages[1:]
+
+        # 4b. Summarization detection — drop grok session, keep agent_thread_id.
+        if state.sent_count > len(state_messages):
             # Cancel any live mid-turn pump first (fix #2 2026-06-18): the
             # turn it was draining belongs to a now-dropped session; leaving
             # it racing on a dead queue would leak the task and could resolve
@@ -421,22 +450,46 @@ class GrokChatModel(BaseChatModel):
             self._client_state.record_summarization(agent_thread_id)
             state = self._client_state.get_or_create(agent_thread_id)
 
-        # 5. System prompt (plain text — middleware may wrap it in blocks).
+        # 5. System prompt (plain text — factory-prepended SystemMessage).
         system_prompt: str | None = None
-        for msg in messages:
-            if isinstance(msg, SystemMessage):
-                system_prompt = _flatten_message_content_to_text(msg.content)
-                break
+        if messages and isinstance(messages[0], SystemMessage):
+            system_prompt = _flatten_message_content_to_text(messages[0].content)
 
-        # 6. Lazy start of proxy MCP + ACP client.
-        await self._ensure_proxy_started()
+        text_only_turn = bool(kwargs.pop("_grok_text_only_turn", False))
+        state.text_only_turn_active = text_only_turn
+
+        # 6. Lazy start of proxy MCP + ACP client. Text-only turns use a
+        # fresh grok session without MCP — skip touching the proxy listener so
+        # in-flight HTTP handlers cannot wedge the agent event loop.
+        if not text_only_turn:
+            await self._ensure_proxy_started()
         await self._ensure_acp_started()
 
-        # 7. Tail delta only.
-        new_messages = messages[state.sent_count :]
+        # 7. Tail delta only (state messages — not the prepended system).
+        new_messages = state_messages[state.sent_count :]
         user_text_parts: list[str] = []
         tool_resolved = False
         saw_builtin_resume = False
+
+        # 7b. LangGraph may append ToolMessage / echo AIMessage after a
+        # mid-turn tool_call return without another ainvoke (e.g.
+        # SendMessageCompletion).  sent_count then lags behind state.
+        # On a fresh turn (no in-flight session/prompt) send only the trailing
+        # HumanMessage delta so grok is not re-fed stale tool rows.
+        if (
+            not tool_resolved
+            and not saw_builtin_resume
+            and state.pending_session_prompt_future is None
+            and state.sent_count < len(state_messages)
+        ):
+            tail_human_idx: int | None = None
+            for i in range(len(state_messages) - 1, state.sent_count - 1, -1):
+                if isinstance(state_messages[i], HumanMessage):
+                    tail_human_idx = i
+                    break
+            if tail_human_idx is not None and tail_human_idx >= state.sent_count:
+                new_messages = state_messages[tail_human_idx:]
+
         for msg in new_messages:
             if isinstance(msg, ToolMessage):
                 is_builtin = bool(
@@ -447,9 +500,13 @@ class GrokChatModel(BaseChatModel):
                 if is_builtin:
                     saw_builtin_resume = True
                 else:
+                    proxy_call_id = state.proxy_call_id_by_acp_id.pop(
+                        msg.tool_call_id, msg.tool_call_id
+                    )
                     self._proxy_mcp.resolve_call(
-                        msg.tool_call_id,
+                        proxy_call_id,
                         {"content": _build_mcp_content(msg.content)},
+                        tool_name=msg.name,
                     )
                     tool_resolved = True
             elif isinstance(msg, HumanMessage):
@@ -458,10 +515,22 @@ class GrokChatModel(BaseChatModel):
                     if isinstance(msg.content, str)
                     else str(msg.content)
                 )
-            # AIMessage / SystemMessage — already in grok session / delivered.
+            # AIMessage — already in grok session. SystemMessage routing is
+            # handled in step 11 via ``_collect_runtime_system_chunks`` (see
+            # claude-code ``System:>`` forwarding).
+
+        # 7c. Text-only reply turns spin a fresh grok session (step 10b) with
+        # no prior CLI history — include every HumanMessage from state so the
+        # model sees the original user ask AND the inter-agent delivery.
+        if text_only_turn:
+            user_text_parts = [
+                m.content if isinstance(m.content, str) else str(m.content)
+                for m in state_messages
+                if isinstance(m, HumanMessage)
+            ]
 
         # 8. Persist sent_count BEFORE awaiting response (mirror codex).
-        state.sent_count = len(messages)
+        state.sent_count = len(state_messages)
         self._client_state.persist(agent_thread_id)
 
         # 9. Mid-turn resume vs new turn. A built-in-only resume MUST take
@@ -491,7 +560,7 @@ class GrokChatModel(BaseChatModel):
         # server; grok's built-ins still flow through the channel-B
         # passthrough.
         mcp_servers: list[dict[str, Any]] = []
-        if self._tools_metadata:
+        if self._tools_metadata and not text_only_turn:
             proxy_url = await self._proxy_mcp.url_async()
             mcp_servers = [
                 {
@@ -563,7 +632,7 @@ class GrokChatModel(BaseChatModel):
                 # the post-turn state); we only rebuild the prompt text here.
                 user_text_parts = [
                     m.content if isinstance(m.content, str) else str(m.content)
-                    for m in messages
+                    for m in state_messages
                     if isinstance(m, HumanMessage)
                 ]
             state.session_live_in_process = True
@@ -576,15 +645,87 @@ class GrokChatModel(BaseChatModel):
             # (c) Session already live in this process.
             is_first_prompt_in_session = False
 
-        # 11. Build prompt blocks — first prompt prepends the <system> block.
-        user_text = "\n\n".join(user_text_parts) if user_text_parts else ""
-        if is_first_prompt_in_session and system_prompt:
-            tool_contract = _build_tool_contract(
-                [tool["name"] for tool in self._tools_metadata]
+        # 10b. Text-only turns on a LIVE session: cancel any in-flight prompt
+        # and detach proxy MCP via ``session/load`` with ``mcp_servers=[]``.
+        if (
+            text_only_turn
+            and state.session_live_in_process
+            and state.grok_session_id is not None
+        ):
+            with contextlib.suppress(Exception):
+                await self._acp_client.session_cancel(state.grok_session_id)
+            if self._tools_metadata and not state.mcp_detached_for_text_only:
+                await self._acp_client.session_load(
+                    state.grok_session_id,
+                    cwd=self._working_dir or ".",
+                    mcp_servers=[],
+                )
+                if hasattr(self._acp_client, "wait_session_ready"):
+                    await self._acp_client.wait_session_ready(
+                        state.grok_session_id
+                    )
+                with contextlib.suppress(Exception):
+                    await self._acp_client.session_cancel(
+                        state.grok_session_id
+                    )
+                state.mcp_detached_for_text_only = True
+        elif (
+            not text_only_turn
+            and self._tools_metadata
+            and state.mcp_detached_for_text_only
+            and state.session_live_in_process
+            and state.grok_session_id is not None
+        ):
+            proxy_url = await self._proxy_mcp.url_async()
+            await self._acp_client.session_load(
+                state.grok_session_id,
+                cwd=self._working_dir or ".",
+                mcp_servers=[
+                    {
+                        "type": "http",
+                        "name": self._proxy_mcp.server_name,
+                        "url": proxy_url,
+                        "headers": [],
+                    }
+                ],
             )
-            system_parts = [system_prompt]
-            if tool_contract:
-                system_parts.append(tool_contract)
+            if hasattr(self._acp_client, "wait_session_ready"):
+                await self._acp_client.wait_session_ready(state.grok_session_id)
+            state.mcp_detached_for_text_only = False
+
+        # 11. Build prompt blocks — first prompt prepends the <system> block.
+        # Runtime SystemMessages (middleware cognitive hints) are forwarded as
+        # ``System:>`` lines prepended to the user text on later turns, or as
+        # suffix deltas when middleware appends to the first SystemMessage.
+        runtime_chunks, new_first_chars, new_extra_keys = (
+            _collect_runtime_system_chunks(
+                messages,
+                new_messages,
+                is_first_prompt_in_session=is_first_prompt_in_session,
+                forwarded_first_system_chars=state.forwarded_first_system_chars,
+                forwarded_extra_system_keys=state.forwarded_extra_system_keys,
+            )
+        )
+        state.forwarded_first_system_chars = new_first_chars
+        state.forwarded_extra_system_keys = new_extra_keys
+
+        user_text = "\n\n".join(user_text_parts) if user_text_parts else ""
+        if runtime_chunks:
+            user_text = (
+                "\n\n".join(runtime_chunks + [user_text])
+                if user_text
+                else "\n\n".join(runtime_chunks)
+            )
+        if is_first_prompt_in_session and system_prompt:
+            system_parts: list[str] = []
+            if system_prompt:
+                system_parts.append(system_prompt)
+            if self._tools_metadata:
+                tool_contract = _build_tool_contract(
+                    [tool["name"] for tool in self._tools_metadata]
+                )
+                if tool_contract:
+                    system_parts.append(tool_contract)
             text = (
                 f"<system>\n{'\n\n'.join(system_parts)}\n</system>\n\n"
                 f"{user_text}"
@@ -600,7 +741,10 @@ class GrokChatModel(BaseChatModel):
             prompt=blocks,
             notification_sink=state.current_notif_queue,
         )
-        return await self._consume_turn(state, agent_thread_id)
+        try:
+            return await self._consume_turn(state, agent_thread_id)
+        finally:
+            state.text_only_turn_active = False
 
     async def _consume_turn(self, state: Any, agent_thread_id: str) -> AIMessage:
         """Consume session/update notifications until either pending
@@ -644,6 +788,22 @@ class GrokChatModel(BaseChatModel):
             # is still in flight, hand them back to LangGraph before reading
             # more notifications — the model needs to run them next.
             if pending_tool_calls:
+                if state.text_only_turn_active:
+                    logger.warning(
+                        "grok text-only turn surfaced tool_calls %r — "
+                        "dropping to avoid hung ToolNode",
+                        [tc.get("name") for tc in pending_tool_calls],
+                    )
+                    with contextlib.suppress(Exception):
+                        await self._acp_client.session_cancel(
+                            state.grok_session_id
+                        )
+                    state.pending_session_prompt_future = None
+                    cleared_normally = True
+                    return AIMessage(content="".join(final_text_parts))
+                await self._correlate_proxy_tool_calls(
+                    state, pending_tool_calls
+                )
                 cleared_normally = True
                 return AIMessage(
                     content="".join(final_text_parts),
@@ -699,11 +859,22 @@ class GrokChatModel(BaseChatModel):
                 )
 
                 if pending_tool_calls:
+                    if state.text_only_turn_active:
+                        logger.warning(
+                            "grok text-only turn mid-stream tool_calls %r — "
+                            "dropping",
+                            [tc.get("name") for tc in pending_tool_calls],
+                        )
+                        pending_tool_calls.clear()
+                        continue
                     # Mid-turn pause: give LangGraph the tool_calls. KEEP the
                     # response future — the next ainvoke re-enters
                     # _consume_turn. Spawn the pump so the queue keeps being
                     # drained while ToolNode runs the passthrough body (fix
                     # #2 2026-06-18 — test_grok Shell hang).
+                    await self._correlate_proxy_tool_calls(
+                        state, pending_tool_calls
+                    )
                     cleared_normally = True
                     self._start_pump(state, agent_thread_id)
                     return AIMessage(
@@ -893,12 +1064,71 @@ class GrokChatModel(BaseChatModel):
     # ------------------------------------------------------------------
     # tool_call mapping
     # ------------------------------------------------------------------
+    def _bound_tool_names(self) -> set[str]:
+        return {t["name"] for t in self._tools_metadata}
+
+    def _proxy_tool_from_update(self, upd: dict) -> tuple[str, dict] | None:
+        """Return (name, args) when this update is a channel-A proxy tool."""
+        if self._proxy_mcp is None:
+            return None
+        title = upd.get("title")
+        raw_input = upd.get("rawInput") or {}
+        if acp_types.is_proxy_mcp_dispatch(upd, self._proxy_mcp.server_name):
+            return (
+                str(raw_input.get("toolName") or ""),
+                raw_input.get("arguments") or {},
+            )
+        if title in self._bound_tool_names():
+            return title, raw_input
+        return None
+
+    async def _correlate_proxy_tool_calls(
+        self, state: Any, tool_calls: list[dict]
+    ) -> None:
+        """Map ACP toolCallIds to proxy handler call_ids before LangGraph runs.
+
+        The MCP handler parks under a synthetic id; LangGraph later resolves
+        via ToolMessage.tool_call_id (the ACP id). Without this map,
+        resolve_call is a no-op and grok hangs until the job-handle timeout.
+        """
+        if self._proxy_mcp is None:
+            return
+        for tc in tool_calls:
+            tcid = tc.get("id")
+            name = tc.get("name")
+            args = tc.get("args") or {}
+            if not isinstance(tcid, str) or not tcid or not name:
+                continue
+            if tcid in state.proxy_call_id_by_acp_id:
+                continue
+            if name not in self._bound_tool_names():
+                continue
+            try:
+                # Match by tool name only — grok's ACP tool_call args and the
+                # MCP tools/call payload can differ (key order, coercion).
+                pending = await self._proxy_mcp.wait_for_pending_calls(
+                    tool_name=name,
+                    arguments=None,
+                    timeout=10.0,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "grok_provider: no pending MCP handler for %r "
+                    "(toolCallId=%s) within 10s",
+                    name,
+                    tcid,
+                )
+                continue
+            if pending:
+                state.proxy_call_id_by_acp_id[tcid] = pending[0]["id"]
+
     def _map_tool_call(self, state: Any, upd: dict) -> dict | None:
         """Map a grok ``tool_call`` update to a LangChain tool_call dict.
 
-        CASE A (proxy MCP dispatch via CallMcpTool): surface the INNER MCP
-        tool name + arguments. The proxy MCP handler is already parking on
-        the call; the ToolMessage will resolve it next ainvoke.
+        CASE A (proxy MCP): CallMcpTool dispatch OR grok calling a bound
+        deep-worker tool by plain name. Surface the inner/plain name + args.
+        ``_correlate_proxy_tool_calls`` maps ACP ids to handler ids before
+        LangGraph runs; ToolMessage resolution unblocks the MCP handler.
 
         CASE B (built-in): register a passthrough Future on the per-thread
         state keyed by toolCallId and surface the built-in name + rawInput.
@@ -909,13 +1139,16 @@ class GrokChatModel(BaseChatModel):
         title = upd.get("title")
         raw_input = upd.get("rawInput") or {}
 
-        if acp_types.is_proxy_mcp_dispatch(upd, self._proxy_mcp.server_name):
-            return {
-                "id": tcid,
-                "name": raw_input.get("toolName"),
-                "args": raw_input.get("arguments") or {},
-                "type": "tool_call",
-            }
+        proxy_tool = self._proxy_tool_from_update(upd)
+        if proxy_tool is not None:
+            name, args = proxy_tool
+            if name:
+                return {
+                    "id": tcid,
+                    "name": name,
+                    "args": args,
+                    "type": "tool_call",
+                }
 
         # Built-in (CASE B). Register the passthrough Future for the reader.
         if tcid not in state.builtin_passthrough_futures:
@@ -989,6 +1222,83 @@ def _flatten_message_content_to_text(content: Any) -> str:
         elif isinstance(item, dict) and item.get("type") == "text":
             parts.append(str(item.get("text", "")))
     return "\n\n".join(parts)
+
+
+_RUNTIME_SYSTEM_PREFIX = "System:> "
+
+
+def _collect_runtime_system_chunks(
+    messages: list[BaseMessage],
+    new_messages: list[BaseMessage],
+    *,
+    is_first_prompt_in_session: bool,
+    forwarded_first_system_chars: int,
+    forwarded_extra_system_keys: set[str],
+) -> tuple[list[str], int, set[str]]:
+    """Collect ``System:>`` lines for runtime system content not yet in grok.
+
+    grok accepts a ``<system>`` block only on the first ``session/prompt`` of
+    an ACP session. Later middleware cognitive hints (InterAgentReply,
+    ProjectMemory, …) MUST ride on the same user prompt as the HumanMessage
+    they refer to — mirroring ``claude_code_provider/chat_model.py`` lines
+    1078–1149 (see a related internal incident analysis, not included here).
+
+    Two paths:
+
+    1. **new_messages scan** — any SystemMessage in the send delta *after* the
+       conversation's first SystemMessage (agent default prompt) becomes a
+       ``System:>`` line. Covers InterAgentReply prepend and ProjectMemory
+       injections that arrive as separate SystemMessage objects.
+
+    2. **First-system append delta** — when middleware appends to the existing
+       first SystemMessage (InterAgentReply / ProjectMemory append path), only
+       the suffix since ``forwarded_first_system_chars`` is forwarded.
+
+    Returns ``(chunks, new_forwarded_first_system_chars,
+    new_forwarded_extra_system_keys)``.
+    """
+    chunks: list[str] = []
+    new_first_chars = forwarded_first_system_chars
+    new_extra_keys = set(forwarded_extra_system_keys)
+
+    # Path 1 — claude-code pre-pass on the send delta only.
+    first_system_seen_before = any(
+        isinstance(m, SystemMessage) for m in messages if m not in new_messages
+    )
+    first_system_consumed = first_system_seen_before
+    for msg in new_messages:
+        if isinstance(msg, SystemMessage):
+            if not first_system_consumed:
+                first_system_consumed = True
+            else:
+                text = _flatten_message_content_to_text(msg.content)
+                key = getattr(msg, "id", None) or f"extra:{id(msg)}:{text[:80]}"
+                if key not in new_extra_keys and text.strip():
+                    chunks.append(f"{_RUNTIME_SYSTEM_PREFIX}{text}")
+                    new_extra_keys.add(key)
+
+    # Path 2 — suffix appended to the first SystemMessage (not in new_messages).
+    first_sys_index: int | None = None
+    for i, msg in enumerate(messages):
+        if isinstance(msg, SystemMessage):
+            first_sys_index = i
+            break
+
+    if first_sys_index is not None:
+        first_text = _flatten_message_content_to_text(
+            messages[first_sys_index].content
+        )
+        if is_first_prompt_in_session:
+            new_first_chars = len(first_text)
+        elif len(first_text) > forwarded_first_system_chars:
+            delta = first_text[forwarded_first_system_chars:].strip()
+            if delta:
+                prefixed = f"{_RUNTIME_SYSTEM_PREFIX}{delta}"
+                if prefixed not in chunks:
+                    chunks.append(prefixed)
+            new_first_chars = len(first_text)
+
+    return chunks, new_first_chars, new_extra_keys
 
 
 def _render_completed_payload(upd: dict, status: str) -> dict[str, Any]:

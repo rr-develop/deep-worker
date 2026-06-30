@@ -29,6 +29,13 @@ class TestAgentServiceMetadata:
         mock_agent = Mock()
         mock_agent.started_at = datetime(2024, 1, 15, 10, 30, 0)
         mock_agent.rpyc_port = 18861
+        # `exposed_get_metadata` does ``getattr(self._agent_process,
+        # "session_manager", None)`` and then ``getattr(sm,
+        # "status_metadata", None)``. A bare ``Mock()`` auto-stubs
+        # both into ``Mock`` objects, which then bomb json.dumps.
+        # Pin them to ``None`` (the contract value when no session
+        # manager / no status metadata is present).
+        mock_agent.session_manager = None
 
         mock_config = Mock()
         mock_config.model = "deepseek-chat"
@@ -38,6 +45,10 @@ class TestAgentServiceMetadata:
         mock_config.resolved_model = "deepseek-chat"
         mock_config.provider = "deepseek"
         mock_config.working_dir = "/test/working/dir"
+        # ``dynamic_display_model`` is read via ``getattr(..., None)``;
+        # a bare Mock would otherwise auto-stub it as Mock and trip
+        # json.dumps (same root cause as session_manager above).
+        mock_config.dynamic_display_model = None
         mock_agent.config = mock_config
 
         service._agent_process = mock_agent
@@ -52,7 +63,7 @@ class TestAgentServiceMetadata:
 
         metadata = result["metadata"]
         assert metadata["directory"] == "/test/working/dir"
-        # pid is the current process PID, so we just check that it is present
+        # pid will be the current process PID, so we just check it exists
         assert "pid" in metadata
         assert isinstance(metadata["pid"], int)
         assert metadata["started"] == "2024-01-15T10:30:00"
@@ -80,6 +91,9 @@ class TestAgentServiceMetadata:
         mock_agent.started_at = datetime(2024, 1, 15, 10, 30, 0)
         mock_agent.rpyc_port = 18861
         mock_agent.config = None
+        # ``session_manager`` would otherwise auto-stub as Mock and
+        # leak into JSON via ``status_metadata`` field.
+        mock_agent.session_manager = None
 
         service._agent_process = mock_agent
 
@@ -103,12 +117,14 @@ class TestAgentServiceMetadataProvider:
         mock_agent = Mock()
         mock_agent.started_at = datetime(2024, 1, 15, 10, 30, 0)
         mock_agent.rpyc_port = 18861
+        mock_agent.session_manager = None  # avoid Mock auto-stub in JSON
 
         mock_config = Mock()
         mock_config.model = "deepseek-chat"
         mock_config.provider = "deepseek"
         mock_config.resolved_model = "deepseek-chat"
         mock_config.working_dir = "/test/dir"
+        mock_config.dynamic_display_model = None  # avoid Mock auto-stub
         mock_agent.config = mock_config
 
         service._agent_process = mock_agent
@@ -130,6 +146,7 @@ class TestAgentServiceMetadataProvider:
         mock_agent.started_at = datetime(2024, 1, 15, 10, 30, 0)
         mock_agent.rpyc_port = 18861
         mock_agent.config = None
+        mock_agent.session_manager = None  # avoid Mock auto-stub in JSON
 
         service._agent_process = mock_agent
 
@@ -148,6 +165,7 @@ class TestAgentServiceMetadataProvider:
         mock_agent = Mock()
         mock_agent.started_at = datetime(2024, 1, 15, 10, 30, 0)
         mock_agent.rpyc_port = 18861
+        mock_agent.session_manager = None  # avoid Mock auto-stub in JSON
 
         mock_config = Mock()
         mock_config.model = None
@@ -155,7 +173,6 @@ class TestAgentServiceMetadataProvider:
         mock_config.working_dir = "/test/dir"
         # resolved_model property should return "deepseek-chat"
         mock_config.resolved_model = "deepseek-chat"
-        mock_config.dynamic_display_model = None  # prevent Mock auto-stub
         mock_config.dynamic_display_model = None  # prevent Mock auto-stub
         mock_agent.config = mock_config
 

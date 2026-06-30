@@ -81,3 +81,58 @@ class TestAgentIdentityInPrompt:
         assert "->" in prompt and ":>" in prompt, (
             "Prompt must describe the '<sender> -> <receiver> :>' marker."
         )
+
+
+class TestProviderToolInvocationNoteInPrompt:
+    """get_system_prompt must embed a PROVIDER-DEPENDENT note teaching the
+    model the correct MCP-proxy invocation form for base tools.
+
+    See docs/DESIGN_MCP_PROXY_TOOL_NAME_PREFIX_AWARENESS.md (RC-A).
+    """
+
+    def test_claude_code_prompt_parametrizes_invocation_form(self) -> None:
+        prompt = get_system_prompt(
+            assistant_id="adam",
+            sandbox_type=None,
+            project_memory_dir=None,
+            provider="claude-code",
+        )
+        # The MCP form must appear, not just the bare name, so the model
+        # uses the resolvable invocation name.
+        assert "mcp__deepworker__send_message_to_agent" in prompt
+
+    def test_codex_prompt_contains_pid_prefixed_form(self) -> None:
+        import os
+
+        prompt = get_system_prompt(
+            assistant_id="adam",
+            sandbox_type=None,
+            project_memory_dir=None,
+            provider="codex",
+        )
+        assert f"mcp__deepworker_{os.getpid()}__send_message_to_agent" in prompt
+
+    def test_grok_prompt_has_mcp_tool_note_without_prefix(self) -> None:
+        prompt = get_system_prompt(
+            assistant_id="adam",
+            sandbox_type=None,
+            project_memory_dir=None,
+            provider="grok",
+        )
+        # grok: no string prefix advertised; instead a disambiguating note.
+        assert "mcp__deepworker__send_message_to_agent" not in prompt
+        lowered = prompt.lower()
+        assert "mcp" in lowered
+        # forbids disk schema hunting
+        assert "disk" in lowered or "mcps/" in prompt
+
+    def test_deepseek_prompt_has_no_provider_invocation_note(self) -> None:
+        prompt = get_system_prompt(
+            assistant_id="adam",
+            sandbox_type=None,
+            project_memory_dir=None,
+            provider="deepseek",
+        )
+        # No MCP-proxy prefix leaks into a native-tool provider prompt.
+        assert "mcp__deepworker__" not in prompt
+        assert "mcp__deepworker_" not in prompt

@@ -1,0 +1,11 @@
+{
+  "typeCheckingMode": "strict",
+  "include": [
+    "dw_hist"
+  ],
+  "extraPaths": [
+    "../deep_worker/deep_worker_cli",
+    "../semantic_search"
+  ],
+  "reportMissingImports": true
+}

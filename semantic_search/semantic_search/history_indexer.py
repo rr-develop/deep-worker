@@ -377,6 +377,13 @@ def index_history_file(
         # Lazy import — only when actually indexing
         from llama_index.embeddings.huggingface import HuggingFaceEmbedding  # type: ignore[import-untyped]  # noqa: PLC0415
 
+        # NOTE: ``normalize`` defaults to True → L2-normalized vectors, which
+        # is why the L2-based ranking is equivalent to cosine. KNOWN
+        # LIMITATION: e5 expects ``"query: "`` / ``"passage: "`` input
+        # prefixes; indexed text here is embedded WITHOUT the ``"passage: "``
+        # prefix (must stay consistent with the query side in
+        # ``history_retriever``). See ``_ensure_embed_model`` there for the
+        # full rationale. Adding prefixes requires a full re-index.
         embed_model = HuggingFaceEmbedding(
             model_name=config.embedding_model,
             model_kwargs={"local_files_only": True},

@@ -1,45 +1,44 @@
-# fix_service — working environment for fix agents (branch `fixes`)
+# fix_service — work environment for fix agents (branch `fixes`)
 
 This worktree (branch `fixes`) is intended **only** for **fixing** discovered
-problems/bugs in the worker agent code and the web server. Dedicated agents of
-the `fix_service` service work here. New functionality is NOT implemented here
-(the `dev` branch is used for that).
+issues/bugs in the deep-worker agent code and the project's web server.
+Dedicated agents of the `fix_service` service work here. New functionality is
+implemented NOT here (for that, use the `dev` branch).
 
-Each agent knows its role from its system prompt (by name). Below is the shared
-context, roles, and mandatory procedures/policies for this environment.
+Each agent knows its role from its system prompt (by name). Below is the
+shared context, roles, and mandatory procedures/policies for this environment.
 
 ## Roles
 
-- **fix_fixer** — the fix implementer. Receives a task to "fix GitHub issue
-  #N", follows the `add_feature` procedure (below), and commits to the `fixes`
+- **fix_fixer** — the fix executor. Receives a task "fix GitHub issue #N",
+  works through the `add_feature` procedure (below), commits to the `fixes`
   branch. One issue at a time.
-- **fix_detector** — the analyst of ambiguous log content. Determines whether
-  an agent message/log fragment is a real problem, assesses priority, and
-  checks against existing issues for deduplication. **Does not write fix code.**
+- **fix_detector** — an analyst of ambiguous log content. Decides whether an
+  agent message/log fragment is a real problem, assesses priority, and checks
+  against existing issues for deduplication. **Does not write fix code.**
 
 ## Issue completion protocol (for fix_fixer — MANDATORY)
 
 `fix_service` determines the outcome from the **trailer in the git commit
 message** on the `fixes` branch:
 
-- Successfully fixed → include this trailer in the commit:
+- Fixed successfully → specify the trailer in the commit:
   ```
   Fixes-Issue: #<N>
   ```
-- If you cannot fix it without violating architecture/policies OR changes to an
-  external dependency are required (for example an external rpyc source
-  checkout) → do NOT make the fix. Commit a note with the trailer and the
-  reason (this is an escalation to the user):
+- Cannot fix without violating architecture/policies OR changes to an external
+  dependency are required (e.g. rpyc_async) → do NOT fix. Commit a note with
+  the trailer and the reason (this escalates to the user):
   ```
   Escalate-Issue: #<N>
   ```
 
-Without one of these trailers, the service will consider the work incomplete.
+Without one of these trailers, the service considers the work unfinished.
 
 ## What counts as a "feature" (for fix_fixer)
 
-**Feature = fixing a specific issue.** Apply the full `add_feature` procedure to
-it (design if necessary, TDD implementation, review, commit).
+**A feature = the fix of a specific issue.** Apply the whole `add_feature`
+procedure to it (design if needed, TDD implementation, review, commit).
 
 ## Standard procedure
 
@@ -51,24 +50,24 @@ add_feature:
 
 design_feature(feature):
     Write a design for feature in an appropriate place in the project. If you
-    have open questions that require explicit approval from the user, ask the
-    user, providing them with the full link to the design document.
-    Then send it for review to a designated review agent (/send_to_review).
+    have open questions that require explicit agreement with the user, ask the
+    user, providing a full link to the design document. Then send it for
+    review to the review agent (/send_to_review).
 
 send_to_review(file_or_files, agent_name):
-    send file_or_files to agent agent_name for review using the inter-agent
-    communication tool. When you receive its response, make changes if
-    necessary. These changes must not violate the user's requirements, existing
+    send file_or_files to agent_name for review using the inter-agent
+    communication tool. When you receive the response, make changes if
+    necessary. These changes must not violate user requirements, existing
     policies, or change the application architecture without direct and
-    explicit approval from the user. If something had to be changed, send it
-    for a second review to the same agent until you reach agreement.
+    explicit agreement with the user. If something had to be changed, send it
+    for re-review to the same agent until you reach agreement.
 
 implement_design(file):
     implement the design described in file. Use the TDD approach.
     /do_unit_tests. /send_to_review the implementation code to the agent who
-    reviewed the design. If the review required changes, run /do_unit_tests
-    again. Write an integration test or tests that verify this functionality in
-    practice (no mocks!!!).
+    reviewed the design. If changes were made during the review, run
+    /do_unit_tests again. Write an integration test or tests that verify this
+    functionality in practice (without mocks!!!).
 
 do_unit_tests:
     Run the application's unit tests. If there are errors, determine whether
@@ -79,9 +78,9 @@ do_unit_tests:
     changes to the code, also report this to the user.
 
 do_commit:
-    commit your changes. Make sure the working directory is clean (or contains
+    commit your changes. Check that the working directory is clean (or contains
     only other people's changes). If the pre-commit hook reveals any problems,
-    fix them. Bypassing pre-commit hook checks is strictly forbidden.
+    fix them. Bypassing pre-commit hook checks is strictly prohibited.
 ```
 
 ## fix_detector: verdict format
@@ -95,21 +94,24 @@ Given a log fragment/agent message and a list of existing open issues
 Be conservative: a one-off transient record with no signs of a real problem →
 `is_issue: false`. Always check against existing issues (dedup).
 
-## Core policies (MUST NOT BE VIOLATED)
+## Core policies (VIOLATION IS PROHIBITED)
 
 - **Polling is strictly forbidden.** Everything must be event-driven.
 - Always prefer non-blocking approaches. **Do not add new threads** without
-  direct and explicit approval from the user.
-- Set correct access permissions for created files/folders. **No 777 or 666.**
-- **Changing the project architecture, contracts, or policies is forbidden**
-  without direct and explicit approval. If a fix requires it — escalate (see
-  above).
-- **Bypassing the pre-commit hook is forbidden** (`--no-verify` is not
+  direct and explicit user approval.
+- Set access permissions correctly for created files/folders. **No 777, 666.**
+- **It is forbidden to change the project's architecture, contracts, or
+  policies** without direct and explicit agreement. If a fix requires it —
+  escalate (see above).
+- **It is forbidden to bypass the pre-commit hook** (`--no-verify` is not
   allowed).
-- rpyc only from an external rpyc source checkout; no `pip install -e .` /
+- rpyc only from the external rpyc_async source tree; no `pip install -e .` /
   `.venv`; only source imports.
+- **The default branch is `dev`.** When the user asks to do or fix something
+  and did not explicitly specify a branch, work in the worktree of the `dev`
+  branch. Do not use `fixes`/`tasks`/`master` without explicit instruction.
 
 ## Review
 
-Send the fix design and code for review to a designated review agent via the
+Send the fix's design and code for review to the review agent via the
 inter-agent communication tool (`send_message_to_agent`, `reply_back=True`).

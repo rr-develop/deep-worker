@@ -25,7 +25,7 @@ from deep_worker_cli.rpyc_service.agent_service import AgentService
 
 
 @pytest.mark.asyncio
-async def test_notify_subscribers_sends_json_string() -> None:
+async def test_notify_subscribers_sends_json_string(netref_subscriber) -> None:
     received: list[object] = []
     received_event = asyncio.Event()
 
@@ -35,8 +35,7 @@ async def test_notify_subscribers_sends_json_string() -> None:
 
     service = AgentService()
     agent = MagicMock()
-    subscriber = MagicMock()
-    subscriber.on_message = on_message
+    subscriber = netref_subscriber(on_message)
     agent._message_subscribers = {subscriber}
     service._agent_process = agent
 
@@ -50,7 +49,7 @@ async def test_notify_subscribers_sends_json_string() -> None:
 
 
 @pytest.mark.asyncio
-async def test_notify_subscribers_handles_unserialisable_payload() -> None:
+async def test_notify_subscribers_handles_unserialisable_payload(netref_subscriber) -> None:
     """If someone accidentally passes a non-JSON-safe dict, we must
     still deliver a payload rather than drop the broadcast silently."""
     received: list[object] = []
@@ -62,8 +61,7 @@ async def test_notify_subscribers_handles_unserialisable_payload() -> None:
 
     service = AgentService()
     agent = MagicMock()
-    subscriber = MagicMock()
-    subscriber.on_message = on_message
+    subscriber = netref_subscriber(on_message)
     agent._message_subscribers = {subscriber}
     service._agent_process = agent
 
