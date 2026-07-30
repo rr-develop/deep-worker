@@ -35,9 +35,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-import warnings
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
+from string import Formatter
 from typing import TYPE_CHECKING, Any, cast
 
 from langchain.agents.middleware.summarization import (
@@ -51,7 +52,7 @@ from langchain.agents.middleware.summarization import (
 )
 from langchain.tools import ToolRuntime
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, RemoveMessage
-from langchain_core.messages.utils import count_tokens_approximately, trim_messages
+from langchain_core.messages.utils import count_tokens_approximately, get_buffer_string, trim_messages
 from langgraph.config import get_config
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from typing_extensions import TypedDict, override
@@ -69,6 +70,25 @@ if TYPE_CHECKING:
     from deepagents.backends.protocol import BACKEND_TYPES
 
 logger = logging.getLogger(__name__)
+
+
+class HistoryOffloadError(RuntimeError):
+    """Raised when the pre-summarization history offload cannot be persisted.
+
+    The summarization middleware evicts old messages from the active thread
+    and writes them to a JSONL history file BEFORE producing the summary
+    message. If that write fails (backend returns an error, exception during
+    write, permission denied, disk full, etc.), continuing summarization
+    would silently discard the history that is about to be dropped from the
+    active thread — a data-loss failure mode we explicitly forbid.
+
+    Fatal — the agent runtime's fatal-exception catch-all matches the
+    class name ``HistoryOffloadError`` in
+    :data:`deep_worker_cli.exceptions.FATAL_EXCEPTION_TYPES` and transitions
+    the agent into ``AgentStatus.ERROR`` with the error message.
+
+    See ``deep_worker/docs/DESIGN_FAIL_LOUD_SUMMARIZATION_OFFLOAD.md``.
+    """
 
 
 class TruncateArgsSettings(TypedDict, total=False):
@@ -93,6 +113,13 @@ class SummarizationDefaults(TypedDict):
     trigger: ContextSize
     keep: ContextSize
     truncate_args_settings: TruncateArgsSettings
+
+
+@dataclass(frozen=True, slots=True)
+class RequestedSummaryResult:
+    summarized: bool
+    replacement_messages: list[AnyMessage] | None
+    history_path: str | None
 
 
 def _compute_summarization_defaults(model: BaseChatModel) -> SummarizationDefaults:
@@ -367,16 +394,25 @@ class SummarizationMiddleware(BaseSummarizationMiddleware):
         logger.debug("No thread_id found, using generated session ID: %s", generated_id)
         return generated_id
 
-    def _get_history_path(self) -> str:
+    def _get_history_path(self, thread_id: str | None = None) -> str:
         """Generate path for storing conversation history.
 
         Returns a single file per thread that gets appended to over time.
 
+        Args:
+            thread_id: Explicit thread id to target. When ``None`` (the
+                default, used by ``before_model`` / ``abefore_model``), the
+                thread id is resolved from langgraph's ``get_config()``
+                contextvar via :meth:`_get_thread_id`. An explicit value is
+                passed by :meth:`apply_pseudo_summary`, which runs OUTSIDE a
+                graph run where the contextvar is unavailable (see
+                ``DESIGN_STARTUP_QUERY_OPTIONS.md`` §4.4 Blocker-1, option B).
+
         Returns:
             Path string like `'/conversation_history/{thread_id}.jsonl'`
         """
-        thread_id = self._get_thread_id()
-        return f"{self._history_path_prefix}/{thread_id}.jsonl"
+        tid = thread_id if thread_id is not None else self._get_thread_id()
+        return f"{self._history_path_prefix}/{tid}.jsonl"
 
     def _is_summary_message(self, msg: AnyMessage) -> bool:
         """Check if a message is a previous summarization message.
@@ -604,7 +640,8 @@ A condensed summary follows:
         self,
         backend: BackendProtocol,
         messages: list[AnyMessage],
-    ) -> str | None:
+        thread_id: str | None = None,
+    ) -> str:
         """Persist messages to backend before summarization.
 
         Appends evicted messages to a single JSONL file per thread. Each
@@ -616,11 +653,25 @@ A condensed summary follows:
         Args:
             backend: Backend to write to.
             messages: Messages being summarized.
+            thread_id: Explicit target thread id (additive, default ``None``).
+                When ``None`` the path is resolved via the langgraph config
+                contextvar (existing ``before_model`` behaviour). An explicit
+                value is forwarded by :meth:`apply_pseudo_summary` so the
+                offload lands in ``<agent>.jsonl`` outside a graph run
+                (``DESIGN_STARTUP_QUERY_OPTIONS.md`` §4.4 Blocker-1).
 
         Returns:
-            The file path where history was stored, or `None` if write failed.
+            The file path where history was stored.
+
+        Raises:
+            HistoryOffloadError: When the backend fails to persist the history
+                (returns ``None``, an error result, or raises). Fatal per the
+                No-Agent-Error-State Policy — the agent runtime catch-all
+                matches this class name in ``FATAL_EXCEPTION_TYPES`` and
+                transitions the agent to ``AgentStatus.ERROR``.
+                See ``DESIGN_FAIL_LOUD_SUMMARIZATION_OFFLOAD.md``.
         """
-        path = self._get_history_path()
+        path = self._get_history_path(thread_id)
 
         # Filter out previous summary messages to avoid redundant storage
         filtered_messages = self._filter_summary_messages(messages)
@@ -635,6 +686,8 @@ A condensed summary follows:
         # Read existing content (if any) and append
         # Note: We use download_files() instead of read() because read() returns
         # line-numbered content (for LLM consumption), but edit() expects raw content.
+        # A read failure here is NOT fatal — the file likely doesn't exist yet.
+        # Only the write path below is fail-loud.
         existing_content = ""
         try:
             responses = backend.download_files([path])
@@ -653,35 +706,36 @@ A condensed summary follows:
 
         try:
             result = backend.edit(path, existing_content, combined_content) if existing_content else backend.write(path, combined_content)
-            if result is None or result.error:
-                error_msg = result.error if result else "backend returned None"
-                logger.warning(
-                    "Failed to offload conversation history to %s (%d messages): %s",
-                    path,
-                    len(filtered_messages),
-                    error_msg,
-                )
-                return None
         except Exception as e:  # noqa: BLE001
-            logger.warning(
-                "Exception offloading conversation history to %s (%d messages): %s: %s",
-                path,
-                len(filtered_messages),
-                type(e).__name__,
-                e,
+            # Fail loud: raising HistoryOffloadError bubbles up through
+            # before_model into the runtime catch-all → AgentStatus.ERROR.
+            msg = (
+                f"Exception writing conversation history to {path} "
+                f"({len(filtered_messages)} messages): {type(e).__name__}: {e}"
             )
-            return None
-        else:
-            logger.debug("Offloaded %d messages to %s", len(filtered_messages), path)
-            if self._on_summarized:
-                self._on_summarized(path)
-            return path
+            logger.error(msg)
+            raise HistoryOffloadError(msg) from e
+
+        if result is None or result.error:
+            error_msg = result.error if result else "backend returned None"
+            msg = (
+                f"Backend failed to write conversation history to {path} "
+                f"({len(filtered_messages)} messages): {error_msg}"
+            )
+            logger.error(msg)
+            raise HistoryOffloadError(msg)
+
+        logger.debug("Offloaded %d messages to %s", len(filtered_messages), path)
+        if self._on_summarized:
+            self._on_summarized(path)
+        return path
 
     async def _aoffload_to_backend(
         self,
         backend: BackendProtocol,
         messages: list[AnyMessage],
-    ) -> str | None:
+        thread_id: str | None = None,
+    ) -> str:
         """Persist messages to backend before summarization (async).
 
         Appends evicted messages to a single JSONL file per thread. Each
@@ -693,11 +747,21 @@ A condensed summary follows:
         Args:
             backend: Backend to write to.
             messages: Messages being summarized.
+            thread_id: Explicit target thread id (additive, default ``None``).
+                Symmetric with sync :meth:`_offload_to_backend`. When ``None``
+                the path is resolved via the langgraph config contextvar;
+                :meth:`apply_pseudo_summary` forwards an explicit value so the
+                offload lands in ``<agent>.jsonl`` outside a graph run
+                (``DESIGN_STARTUP_QUERY_OPTIONS.md`` §4.4 Blocker-1).
 
         Returns:
-            The file path where history was stored, or `None` if write failed.
+            The file path where history was stored.
+
+        Raises:
+            HistoryOffloadError: When the backend fails to persist the history.
+                See sync :meth:`_offload_to_backend` for the rationale.
         """
-        path = self._get_history_path()
+        path = self._get_history_path(thread_id)
 
         # Filter out previous summary messages to avoid redundant storage
         filtered_messages = self._filter_summary_messages(messages)
@@ -712,6 +776,8 @@ A condensed summary follows:
         # Read existing content (if any) and append
         # Note: We use adownload_files() instead of aread() because read() returns
         # line-numbered content (for LLM consumption), but edit() expects raw content.
+        # A read failure here is NOT fatal — the file likely doesn't exist yet.
+        # Only the write path below is fail-loud.
         existing_content = ""
         try:
             responses = await backend.adownload_files([path])
@@ -732,51 +798,119 @@ A condensed summary follows:
             result = (
                 await backend.aedit(path, existing_content, combined_content) if existing_content else await backend.awrite(path, combined_content)
             )
-            if result is None or result.error:
-                error_msg = result.error if result else "backend returned None"
-                logger.warning(
-                    "Failed to offload conversation history to %s (%d messages): %s",
-                    path,
-                    len(filtered_messages),
-                    error_msg,
-                )
-                return None
         except Exception as e:  # noqa: BLE001
-            logger.warning(
-                "Exception offloading conversation history to %s (%d messages): %s: %s",
-                path,
-                len(filtered_messages),
-                type(e).__name__,
-                e,
+            msg = (
+                f"Exception writing conversation history to {path} "
+                f"({len(filtered_messages)} messages): {type(e).__name__}: {e}"
             )
-            return None
-        else:
-            logger.debug("Offloaded %d messages to %s", len(filtered_messages), path)
-            if self._on_summarized:
-                # ⚠️ CRITICAL — DO NOT call ``self._on_summarized(path)``
-                # inline here. We are inside an ``async`` method
-                # (``_aoffload_to_backend``) running on the AGENT'S
-                # event-loop thread. The production callback is
-                # ``index_all_history_files`` — a FULLY SYNCHRONOUS LanceDB
-                # WRITE (vectors.lance) + (cold) embedding-model load.
-                #
-                # LanceDB bridges to its OWN background event loop via
-                # ``run_coroutine_threadsafe(...).result()`` (see
-                # ``lancedb/background_loop.py``). Run inline, that blocks
-                # THIS loop thread WHILE HOLDING THE GIL; LanceDB's
-                # background loop then can never acquire the GIL to finish
-                # → permanent GIL deadlock, the agent's loop stops ticking
-                # forever (status stuck "running", RPyC dead). This is the
-                # live mj1_init deadlock (2026-06-15).
-                #
-                # Offloading to a worker thread makes the blocking
-                # ``.result()`` wait there RELEASE the GIL, so LanceDB's
-                # loop runs and our loop keeps ticking. NEVER revert to an
-                # inline call. See
-                # docs/DESIGN_NO_LOOP_BLOCKING_TOOLS.md and
-                # tests/test_no_loop_blocking_summarization.py.
-                await asyncio.to_thread(self._on_summarized, path)
-            return path
+            logger.error(msg)
+            raise HistoryOffloadError(msg) from e
+
+        if result is None or result.error:
+            error_msg = result.error if result else "backend returned None"
+            msg = (
+                f"Backend failed to write conversation history to {path} "
+                f"({len(filtered_messages)} messages): {error_msg}"
+            )
+            logger.error(msg)
+            raise HistoryOffloadError(msg)
+
+        logger.debug("Offloaded %d messages to %s", len(filtered_messages), path)
+        if self._on_summarized:
+            # ⚠️ CRITICAL — DO NOT call ``self._on_summarized(path)``
+            # inline here. We are inside an ``async`` method
+            # (``_aoffload_to_backend``) running on the AGENT'S
+            # event-loop thread. The production callback is
+            # ``index_all_history_files`` — a FULLY SYNCHRONOUS LanceDB
+            # WRITE (vectors.lance) + (cold) embedding-model load.
+            #
+            # LanceDB bridges to its OWN background event loop via
+            # ``run_coroutine_threadsafe(...).result()`` (see
+            # ``lancedb/background_loop.py``). Run inline, that blocks
+            # THIS loop thread WHILE HOLDING THE GIL; LanceDB's
+            # background loop then can never acquire the GIL to finish
+            # → permanent GIL deadlock, the agent's loop stops ticking
+            # forever (status stuck "running", RPyC dead). This is the
+            # live mj1_init deadlock (2026-06-15).
+            #
+            # Offloading to a worker thread makes the blocking
+            # ``.result()`` wait there RELEASE the GIL, so LanceDB's
+            # loop runs and our loop keeps ticking. NEVER revert to an
+            # inline call. See
+            # docs/DESIGN_NO_LOOP_BLOCKING_TOOLS.md and
+            # tests/test_no_loop_blocking_summarization.py.
+            await asyncio.to_thread(self._on_summarized, path)
+        return path
+
+    async def apply_pseudo_summary(
+        self,
+        thread_id: str,
+        summary_text: str,
+        current_messages: list[AnyMessage],
+    ) -> tuple[list[AnyMessage], str | None]:
+        """Evict ``current_messages`` to JSONL history and build the
+        replacement summary-shape message list for a startup pseudo-summary.
+
+        Pure producer: this method offloads the supplied messages and RETURNS
+        ``(new_messages, file_path)``. It does NOT write to any checkpointer
+        and does NOT emit ``RemoveMessage`` — the caller owns the state wipe
+        (see ``DESIGN_STARTUP_QUERY_OPTIONS.md`` §4.6, Blocker-2).
+
+        Delegates to the existing private helpers with one additive change:
+        ``_aoffload_to_backend`` is called with an explicit ``thread_id`` so
+        the JSONL lands in ``<agent>.jsonl`` even though this runs OUTSIDE a
+        graph run where langgraph's config contextvar is unavailable
+        (Blocker-1, option B). Serialization, append, fail-loud, and
+        summary-message building stay entirely inside those helpers.
+
+        Args:
+            thread_id: The thread whose JSONL file the offload appends to.
+                Callers pass the agent name (matching the real invoke's
+                checkpointer thread_id).
+            summary_text: Text for the summary-shape ``HumanMessage``.
+            current_messages: The active-context messages to evict.
+
+        Returns:
+            ``(new_messages, file_path)`` where ``new_messages`` is exactly
+            one summary-shape ``HumanMessage`` (``lc_source='summarization'``)
+            — with a JSONL reference line when an offload write occurred, and
+            without one when the (filtered) history was empty. ``file_path``
+            is the JSONL path when a write occurred, else ``None``.
+
+        Raises:
+            RuntimeError: When the middleware holds a factory backend rather
+                than a concrete ``BackendProtocol`` instance — a factory needs
+                a ``ToolRuntime`` unavailable outside a graph run (Gap-4).
+            HistoryOffloadError: When the backend fails to persist history —
+                same fail-loud contract as ``before_model`` / ``abefore_model``.
+        """
+        # Gap-4: backend must be a concrete instance; factory backends need a
+        # ToolRuntime that does not exist outside a graph run.
+        if not isinstance(self._backend, BackendProtocol):
+            msg = (
+                "apply_pseudo_summary requires SummarizationMiddleware to hold "
+                "a concrete backend instance; factory backends need a "
+                "ToolRuntime that is unavailable outside a graph run."
+            )
+            raise RuntimeError(msg)
+        backend = self._backend
+
+        # Empty-history invariant: filter previous summary messages first; if
+        # nothing remains, skip the offload entirely and build a summary-shape
+        # message WITHOUT a JSONL reference (no dangling file link).
+        filtered = self._filter_summary_messages(current_messages)
+        if not filtered:
+            return self._build_new_messages_with_path(summary_text, None), None
+
+        # Offload the SAME filtered list we emptiness-checked (NIT-1: "what we
+        # checked is what we write" — one filtration, no ambiguity).
+        # ``_aoffload_to_backend`` re-applies ``_filter_summary_messages``
+        # internally; on an already-filtered list that is an idempotent no-op.
+        file_path = await self._aoffload_to_backend(
+            backend, filtered, thread_id
+        )
+        new_messages = self._build_new_messages_with_path(summary_text, file_path)
+        return new_messages, file_path
 
     @override
     def before_model(
@@ -839,16 +973,15 @@ A condensed summary follows:
 
         messages_to_summarize, preserved_messages = self._partition_messages(truncated_messages, cutoff_index)
 
-        # Offload to backend first - abort summarization if this fails to prevent data loss
+        # Offload to backend FIRST — abort summarization if this fails to prevent data loss.
+        # ``_offload_to_backend`` now raises ``HistoryOffloadError`` on any failure; the raise
+        # propagates through this method into the agent runtime catch-all, which matches
+        # the class name in ``FATAL_EXCEPTION_TYPES`` and transitions the agent to
+        # ``AgentStatus.ERROR``. See ``DESIGN_FAIL_LOUD_SUMMARIZATION_OFFLOAD.md``.
         backend = self._get_backend(state, runtime)
         file_path = self._offload_to_backend(backend, messages_to_summarize)
-        if file_path is None:
-            warnings.warn(
-                "Offloading conversation history to backend failed during summarization.",
-                stacklevel=2,
-            )
 
-        # Generate summary
+        # Generate summary — only reached when the offload succeeded.
         summary = self._create_summary(messages_to_summarize)
 
         # Build summary message with file path reference
@@ -861,6 +994,179 @@ A condensed summary follows:
                 *preserved_messages,
             ]
         }
+
+    def _format_requested_summary_prompt(
+        self,
+        prompt: str,
+        messages: list[AnyMessage],
+    ) -> str:
+        fields = [
+            field_name
+            for _, field_name, _, _ in Formatter().parse(prompt)
+            if field_name is not None
+        ]
+        if any(field != "messages" for field in fields) or fields.count("messages") > 1:
+            raise ValueError(
+                "summary prompt may contain at most one {messages} field"
+            )
+        template = prompt if fields else f"{prompt}\n\n{{messages}}"
+        return template.format(messages=get_buffer_string(messages)).rstrip()
+
+    async def _acreate_summary_for_prompt(
+        self,
+        messages_to_summarize: list[AnyMessage],
+        summary_prompt: str | None,
+        thread_id: str | None,
+        *,
+        fail_loud: bool = False,
+    ) -> str:
+        if not messages_to_summarize:
+            return "No previous conversation history."
+        if summary_prompt is None:
+            trimmed_messages = self._trim_messages_for_summary(
+                messages_to_summarize
+            )
+            if not trimmed_messages:
+                return "Previous conversation was too long to summarize."
+            formatted_prompt = self.summary_prompt.format(
+                messages=get_buffer_string(trimmed_messages)
+            ).rstrip()
+            config: RunnableConfig = {
+                "metadata": {"lc_source": "summarization"},
+            }
+            if thread_id is not None:
+                config["configurable"] = {"thread_id": thread_id}
+            try:
+                response = await self.model.ainvoke(
+                    formatted_prompt, config=config
+                )
+                return response.text.strip()
+            except Exception as e:
+                if fail_loud:
+                    raise
+                return f"Error generating summary: {e!s}"
+        prompt_for_budget = (
+            summary_prompt
+            if "{messages}" in summary_prompt
+            else f"{summary_prompt}\n\n{{messages}}"
+        )
+        if self.trim_tokens_to_summarize is None:
+            trimmed_messages = messages_to_summarize
+        else:
+            prompt_tokens = self.token_counter(
+                [HumanMessage(content=prompt_for_budget)]
+            )
+            adjusted_limit = max(
+                1000,
+                self.trim_tokens_to_summarize - prompt_tokens,
+            )
+            trimmed_messages = cast(
+                "list[AnyMessage]",
+                trim_messages(
+                    messages_to_summarize,
+                    max_tokens=adjusted_limit,
+                    token_counter=self.token_counter,
+                    start_on="human",
+                    strategy="last",
+                    allow_partial=True,
+                    include_system=True,
+                ),
+            )
+        if not trimmed_messages:
+            return "Previous conversation was too long to summarize."
+        formatted_prompt = self._format_requested_summary_prompt(
+            summary_prompt,
+            trimmed_messages,
+        )
+        custom_config: RunnableConfig = {
+            "metadata": {"lc_source": "summarization"},
+        }
+        if thread_id is not None:
+            custom_config["configurable"] = {"thread_id": thread_id}
+        try:
+            response = await self.model.ainvoke(
+                formatted_prompt, config=custom_config
+            )
+            return response.text.strip()
+        except Exception as e:
+            if fail_loud:
+                raise
+            return f"Error generating summary: {e!s}"
+
+    async def _arun_compaction(
+        self,
+        messages: list[AnyMessage],
+        runtime: Runtime | None,
+        *,
+        force: bool,
+        summary_prompt: str | None = None,
+        backend: BackendProtocol | None = None,
+        thread_id: str | None = None,
+    ) -> RequestedSummaryResult:
+        self._ensure_message_ids(messages)
+        truncated_messages, args_were_truncated = self._truncate_args(messages)
+        total_tokens = self._cached_total_tokens(truncated_messages)
+        should_summarize = force or self._should_summarize(
+            truncated_messages,
+            total_tokens,
+        )
+        if not should_summarize:
+            replacement = truncated_messages if args_were_truncated else None
+            return RequestedSummaryResult(False, replacement, None)
+
+        cutoff_index = self._determine_cutoff_index(truncated_messages)
+        if cutoff_index <= 0:
+            replacement = truncated_messages if args_were_truncated else None
+            return RequestedSummaryResult(False, replacement, None)
+
+        messages_to_summarize, preserved_messages = self._partition_messages(
+            truncated_messages,
+            cutoff_index,
+        )
+        resolved_backend = backend
+        if resolved_backend is None:
+            if runtime is None:
+                raise RuntimeError(
+                    "requested summarization requires a concrete backend"
+                )
+            state = cast("AgentState[Any]", {"messages": messages})
+            resolved_backend = self._get_backend(state, runtime)
+        file_path = await self._aoffload_to_backend(
+            resolved_backend,
+            messages_to_summarize,
+            thread_id,
+        )
+        summary = await self._acreate_summary_for_prompt(
+            messages_to_summarize,
+            summary_prompt,
+            thread_id,
+            fail_loud=force,
+        )
+        new_messages = self._build_new_messages_with_path(summary, file_path)
+        return RequestedSummaryResult(
+            True,
+            [*new_messages, *preserved_messages],
+            file_path,
+        )
+
+    async def apply_requested_summary(
+        self,
+        thread_id: str,
+        current_messages: list[AnyMessage],
+        summary_prompt: str | None = None,
+    ) -> RequestedSummaryResult:
+        if not isinstance(self._backend, BackendProtocol):
+            raise RuntimeError(
+                "requested summarization requires a concrete backend"
+            )
+        return await self._arun_compaction(
+            current_messages,
+            None,
+            force=True,
+            summary_prompt=summary_prompt,
+            backend=self._backend,
+            thread_id=thread_id,
+        )
 
     @override
     async def abefore_model(
@@ -885,66 +1191,16 @@ A condensed summary follows:
         Returns:
             Updated state with truncated/summarized messages if processing was performed.
         """
-        messages = state["messages"]
-        self._ensure_message_ids(messages)
-
-        # Step 1: Truncate args if configured
-        truncated_messages, args_were_truncated = self._truncate_args(messages)
-
-        # Step 2: Check if summarization should happen.
-        # ``_cached_total_tokens`` memoizes the last-counted list by
-        # message-id signature so a repeat before_model call on the
-        # same history skips the O(messages × tokens) pass.
-        total_tokens = self._cached_total_tokens(truncated_messages)
-        should_summarize = self._should_summarize(truncated_messages, total_tokens)
-
-        # If only truncation happened (no summarization)
-        if args_were_truncated and not should_summarize:
-            return {
-                "messages": [
-                    RemoveMessage(id=REMOVE_ALL_MESSAGES),
-                    *truncated_messages,
-                ]
-            }
-
-        # If no truncation and no summarization
-        if not should_summarize:
+        result = await self._arun_compaction(
+            state["messages"],
+            runtime,
+            force=False,
+        )
+        if result.replacement_messages is None:
             return None
-
-        # Step 3: Perform summarization
-        cutoff_index = self._determine_cutoff_index(truncated_messages)
-        if cutoff_index <= 0:
-            # If truncation happened but we can't summarize, still return truncated messages
-            if args_were_truncated:
-                return {
-                    "messages": [
-                        RemoveMessage(id=REMOVE_ALL_MESSAGES),
-                        *truncated_messages,
-                    ]
-                }
-            return None
-
-        messages_to_summarize, preserved_messages = self._partition_messages(truncated_messages, cutoff_index)
-
-        # Offload to backend first - abort summarization if this fails to prevent data loss
-        backend = self._get_backend(state, runtime)
-        file_path = await self._aoffload_to_backend(backend, messages_to_summarize)
-        if file_path is None:
-            warnings.warn(
-                "Offloading conversation history to backend failed during summarization.",
-                stacklevel=2,
-            )
-
-        # Generate summary
-        summary = await self._acreate_summary(messages_to_summarize)
-
-        # Build summary message with file path reference
-        new_messages = self._build_new_messages_with_path(summary, file_path)
-
         return {
             "messages": [
                 RemoveMessage(id=REMOVE_ALL_MESSAGES),
-                *new_messages,
-                *preserved_messages,
+                *result.replacement_messages,
             ]
         }

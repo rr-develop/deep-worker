@@ -2,9 +2,9 @@
 
 Used by the cross-process integration tests in this directory to honour
 the project-wide rule that **rpyc_async MUST NEVER drive server+client
-in the same process** (see the ``AGENTS.md`` file in the user's agent
-data directory and ``docs/RPYC_NETREF_DEADLOCK_ANALYSIS.md`` for the
-deadlock that otherwise triggers on the first ``HANDLE_INSPECT``).
+in the same process** (see the agent instructions and
+``docs/RPYC_NETREF_DEADLOCK_ANALYSIS.md`` for the deadlock that
+otherwise triggers on the first ``HANDLE_INSPECT``).
 
 Lifecycle
 ---------
@@ -33,7 +33,7 @@ import sys
 from pathlib import Path
 
 # The local rpyc_async checkout must be on sys.path BEFORE importing rpyc.
-_RPYC_ASYNC = Path(__file__).resolve().parents[4] / "rpyc_async"
+_RPYC_ASYNC = Path("/path/to/rpyc_async")
 if str(_RPYC_ASYNC) not in sys.path:
     sys.path.insert(0, str(_RPYC_ASYNC))
 
@@ -54,7 +54,7 @@ async def _main() -> int:
 
     # Import lazily so the import path is short and any failure shows
     # up in the parent's captured stderr.
-    from rpyc.utils.async_server import AsyncioServer  # noqa: PLC0415
+    from rpyc_async.utils.async_server import AsyncioServer  # noqa: PLC0415
     from deep_worker_cli.rpyc_service.agent_service import (  # noqa: PLC0415
         AgentService,
     )

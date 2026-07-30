@@ -31,7 +31,14 @@ class TestResolvedModel:
             config = AgentConfig(working_dir=Path("/tmp"), model=None, provider="deepseek")
             assert config.resolved_model == "deepseek-custom"
 
-    def test_claude_code_default(self):
-        """Claude-code provider returns 'sonnet' as default."""
+    def test_claude_code_default(self, monkeypatch):
+        """Claude-code pins NO default — the claude CLI resolves its own.
+
+        Changed after a past incident: the hardcoded ``"sonnet"`` was
+        wrong. The real Claude Code default depends on account type, so
+        deep-worker must pass no ``--model`` and let the CLI decide — the
+        same contract codex and grok already have.
+        """
+        monkeypatch.delenv("CLAUDE_CODE_MODEL", raising=False)
         config = AgentConfig(working_dir=Path("/tmp"), model=None, provider="claude-code")
-        assert config.resolved_model == "sonnet"
+        assert config.resolved_model is None

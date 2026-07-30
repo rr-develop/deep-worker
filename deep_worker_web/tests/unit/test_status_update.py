@@ -44,7 +44,7 @@ async def _call_update_and_invoke_callback(
     agent_service._connections[agent_name] = MagicMock()
     agent_service._roots[agent_name] = mock_root
 
-    with patch("rpyc.utils.helpers.fire_and_forget_async") as mock_faf:
+    with patch("rpyc_async.utils.helpers.fire_and_forget_async") as mock_faf:
         await agent_service._update_agent_status(agent_name, mock_root)
 
         # fire_and_forget_async was called — extract the success callback
@@ -313,7 +313,7 @@ class TestFetchAgentMetadata:
         agent_service._connections["test-agent"] = MagicMock()
         agent_service._roots["test-agent"] = mock_root
 
-        with patch("rpyc.utils.helpers.fire_and_forget_async") as mock_faf:
+        with patch("rpyc_async.utils.helpers.fire_and_forget_async") as mock_faf:
             await agent_service._fetch_agent_metadata("test-agent", mock_root)
 
             kwargs = mock_faf.call_args
@@ -346,7 +346,7 @@ class TestFetchAgentMetadata:
         agent_service._connections["test-agent"] = MagicMock()
         agent_service._roots["test-agent"] = mock_root
 
-        with patch("rpyc.utils.helpers.fire_and_forget_async") as mock_faf:
+        with patch("rpyc_async.utils.helpers.fire_and_forget_async") as mock_faf:
             await agent_service._fetch_agent_metadata("test-agent", mock_root)
 
             kwargs = mock_faf.call_args

@@ -651,10 +651,14 @@ def _count_pending_history_lines(
     summaries_dir: Path,
     jsonl_files: list[Path],
 ) -> int:
-    """Return total number of JSONL lines NOT YET indexed.
+    """Return total number of JSONL records NOT YET indexed.
 
     Cheap pre-check: reads ``.history_index/line_hashes.json`` (tiny
-    JSON, microseconds) and counts lines in each provided JSONL file.
+    JSON, microseconds) and counts records in each provided JSONL file
+    via :func:`semantic_search.history_indexer.count_jsonl_lines` — the
+    SAME counter the indexer records with, so the two never desync (the
+    ``U+2028`` infinite-reindex bug). Counting is by physical ``\\n``
+    lines; no JSON parsing.
 
     Contract:
 
@@ -682,11 +686,17 @@ def _count_pending_history_lines(
     except (FileNotFoundError, OSError, _json.JSONDecodeError):
         line_counts = {}
 
+    # Single source of truth: count JSONL records the SAME way the indexer
+    # does (physical ``\n`` lines, NOT ``str.splitlines()``). Counting them
+    # differently here caused a permanent off-by-N for files whose record
+    # content embedded ``U+2028`` etc., which re-indexed the whole history on
+    # every start. See semantic_search.history_indexer.count_jsonl_lines.
+    from semantic_search.history_indexer import count_jsonl_lines  # noqa: PLC0415
+
     pending = 0
     for jsonl in jsonl_files:
-        try:
-            current = sum(1 for _ in jsonl.open(encoding="utf-8"))
-        except OSError:
+        current = count_jsonl_lines(jsonl)
+        if current == 0 and not jsonl.exists():
             continue
         recorded = int(line_counts.get(str(jsonl), 0))
         delta = current - recorded
@@ -863,9 +873,9 @@ def create_cli_agent(
     tools = list(tools or [])
 
     # External MCP tools (see docs/DESIGN_EXTERNAL_MCP_TOOLS.md). These tools
-    # are already brought up by the caller (``AgentProcess.start()``) via
+    # are already started by the caller (``AgentProcess.start()``) via
     # ``ExternalMCPClientPool.create(...)`` — we simply append them to the
-    # common ``tools`` list, after which they travel as regular BaseTools through
+    # common ``tools`` list; from there they flow as regular BaseTool through
     # SafeToolCallMiddleware / BoundedToolCallMiddleware / interrupt_on.
     _external_mcp_names: set[str] = set()
     if external_mcp_tools:
@@ -982,7 +992,7 @@ def create_cli_agent(
     # (not on the next round-trip), so the Claude CLI gets its tool_result
     # immediately and the proxy-MCP timeout bounds delivery — not the
     # recipient's work. Provider-agnostic stack stays untouched.
-    # See the related design note on subscription and delivery (Bug 2).
+    # See deep_worker_web/docs/DESIGN_SUBSCRIPTION_AND_DELIVERY_FIX.md (Bug 2).
     _maybe_add_delivery_resolve_middleware(agent_middleware, model)
 
     # Add memory middleware
@@ -1078,14 +1088,33 @@ def create_cli_agent(
             provider=active_provider,
         )
 
+    # Optional LSP navigation (see lsp/docs/DESIGN_LSP_MCP_INTEGRATION.md §4.4).
+    # Mixed in AFTER the pool tool names are known, and ONLY if the symbolic
+    # tools actually arrived: without LSP the prompt does not change by a
+    # single byte (optional, like the semantic index).
+    # We use the actual (already mangled) names — the agent calls exactly
+    # those.
+    #
+    # NB: deliberately OUTSIDE the ``if system_prompt is None`` branch — the
+    # fragment is also added to a prompt passed explicitly by the caller.
+    # Having a custom base prompt is no reason to hide the documentation on
+    # available capabilities from the agent (confirmed in code review).
+    # Behavior lock: tests/unit_tests/lsp/test_prompt_injection_point.py
+    if _external_mcp_names:
+        from deep_worker_cli.lsp.prompt import lsp_prompt_fragment  # noqa: PLC0415
+
+        _lsp_fragment = lsp_prompt_fragment(sorted(_external_mcp_names))
+        if _lsp_fragment:
+            system_prompt = f"{system_prompt}\n\n{_lsp_fragment}"
+
     # Configure interrupt_on based on auto_approve / auto_approve_send_message
     interrupt_on: dict[str, bool | InterruptOnConfig] | None = None
     if auto_approve:
         # No interrupts - all tools run automatically. Per-tool overrides
         # (like auto_approve_send_message) are implied and have no extra
-        # effect here. External MCP tools are also NOT interrupted with -sp
-        # (user rule 2026-06-23) — `interrupt_on={}` is exactly what
-        # ensures this: absence of the key = no HITL.
+        # effect here. EXTERNAL MCP TOOLS ARE NOT INTERRUPTED EITHER under -sp
+        # (user rule 2026-06-23) — `interrupt_on={}` is exactly what ensures
+        # this: absence of the key = no HITL.
         interrupt_on = {}
     else:
         # Full HITL for destructive operations, with optional per-tool

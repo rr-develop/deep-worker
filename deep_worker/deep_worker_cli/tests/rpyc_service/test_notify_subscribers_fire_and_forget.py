@@ -1,6 +1,6 @@
 """``_notify_subscribers`` must not block on a hung subscriber.
 
-Production incident (a related internal incident): the agent received user
+Production incident: the agent received user
 messages over RPyC, called ``_handle_invoke`` → ``_notify_subscribers``
 → ``await subscriber.on_message(payload_str)`` — and the web-side
 ``MessageCallbackService.on_message`` never returned. The agent
@@ -211,11 +211,11 @@ async def test_notify_subscribers_dispatched_task_is_pinned_in_INFLIGHT() -> Non
     rpyc_async ``_INFLIGHT`` set so a stray GC pass can't kill it
     while ``on_message`` is mid-flight.
 
-    Regression guard for the earlier GC-race incidents:
+    Regression guard for past GC-race incidents:
     a dispatched Task with only a weak ref dies silently and pins the
     AsyncResult chain in ``Connection._request_callbacks``.
     """
-    from rpyc.utils import helpers as h
+    from rpyc_async.utils import helpers as h
 
     sub_call_started = asyncio.Event()
     release_subscriber = asyncio.Event()
@@ -258,7 +258,7 @@ async def test_notify_subscribers_enforces_timeout_on_hung_subscriber() -> None:
     We don't assert on wall-clock — just that the task eventually
     completes (with a TimeoutError) rather than living forever.
     """
-    from rpyc.utils import helpers as h
+    from rpyc_async.utils import helpers as h
 
     hang_forever = asyncio.Event()
 
@@ -305,7 +305,7 @@ async def test_notify_subscribers_enforces_timeout_on_hung_subscriber() -> None:
 async def test_dead_message_subscriber_is_evicted() -> None:
     """A message subscriber whose ``on_message`` fails must be evicted
     from the agent's ``_message_subscribers`` set — same dead-peer
-    hazard as status pushes (a related internal incident). on_disconnect does
+    hazard as status pushes (observed in a past incident). on_disconnect does
     not clean up; without eviction the corpse soaks a 10 s timeout on
     every broadcast forever."""
     error_seen = asyncio.Event()

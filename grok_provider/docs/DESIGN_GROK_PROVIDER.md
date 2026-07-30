@@ -13,14 +13,14 @@ Taken directly from the codex design §0 — the same six invariants:
 
 1. **We do not change deep-worker contracts.** `config["configurable"]["thread_id"]`
    = the deep-worker agent name; never mutated. [§3, §4]
-2. **All messages — including every tool call and tool result — MUST go
-   through LangGraph** and end up in `result["messages"]`. [§5, §7]
+2. **All messages — including every tool call and tool result — must
+   pass through LangGraph** and end up in `result["messages"]`. [§5, §7]
 3. **Maximally lightweight.** One long-lived `grok agent stdio`
    process per agent (NOT per-turn). In-process HTTP MCP server. [§7]
 4. **History is read incrementally.** Tail-delta
    `messages[sent_count:]` per turn. No full rebuilds. [§6]
 5. **No polling, no blocking operations on the event loop.** Fully
-   event-driven via JSON-RPC notifications. [§7, §10]
+   event-driven through JSON-RPC notifications. [§7, §10]
 6. **No leaks.** All long-lived state is bounded. [§11]
 
 ---
@@ -28,7 +28,7 @@ Taken directly from the codex design §0 — the same six invariants:
 ## 1. Motivation
 
 The user wants to use **Grok** as an AI backend for deep-worker
-agents, via the **supergrok** subscription (no separate API key).
+agents, under the **supergrok** subscription (no separate API key).
 
 ```
 $ deep-worker my-agent --provider grok
@@ -37,17 +37,17 @@ $ deep-worker my-agent --provider grok
 Authentication — via the cached login `~/.grok/auth.json`. The binary
 `grok 0.2.54 (fee15ff8e) [stable]` is already installed on the host.
 
-Grok CLI implements **Agent Client Protocol (ACP) v1** via
-`grok agent stdio` — a standardized JSON-RPC 2.0 protocol from Zed
-Industries. Full spec:
+The Grok CLI implements **Agent Client Protocol (ACP) v1** through
+`grok agent stdio` — a standardised JSON-RPC 2.0 protocol from Zed
+Industries. Full specification:
 https://agentclientprotocol.com/protocol/v1/overview
 
 ---
 
-## 2. Background — the current provider registry
+## 2. Background — current provider registry
 
-Unchanged from `DESIGN_CODEX_PROVIDER.md` §2. The same 5 files need to
-be extended with the new provider:
+Unchanged from `DESIGN_CODEX_PROVIDER.md` §2. The same 5 files need to be
+extended with the new provider:
 
 | # | File | What is added |
 |---|---|---|
@@ -60,9 +60,9 @@ be extended with the new provider:
 | 4 | `runtime/availability_tracker.py:11` | `"grok": null` |
 | 5 | `runtime/provider_chain.py:4` | `["claude-code", "codex", "grok", "deepseek"]` |
 
-`process/agent_process.py` and `task_manager/task_manager.py` — no
-changes required (grok has no non-resettable native tools analogous to
-codex's `apply_patch`/`update_plan`). See §11A.2.
+`process/agent_process.py` and `task_manager/task_manager.py` — do NOT require
+edits (grok has no non-resettable native tools analogous to codex's
+`apply_patch`/`update_plan`). See §11A.2.
 
 ---
 
@@ -73,25 +73,25 @@ The same discipline as in the codex design:
 | Name | Owned by | Lifetime | Source |
 |---|---|---|---|
 | **`agent_thread_id`** | deep-worker (LangGraph) | the whole agent process; equals `self.name` | Hard-coded in `agent_process.py:915, 1016, 1143` |
-| **`grok_session_id`** | Grok agent process | Per-conversation; a UUID assigned by Grok in response to `session/new` | ACP protocol; persisted by Grok itself in `~/.grok/sessions/<encoded-cwd>/<sid>/...` |
+| **`grok_session_id`** | Grok agent process | Per-conversation; UUID assigned by Grok in the `session/new` response | ACP protocol; persisted by Grok itself in `~/.grok/sessions/<encoded-cwd>/<sid>/...` |
 | **`mcp_call_id`** | our in-process proxy MCP server | one tool call (≤ 120 s) | Constructed by the handler: `f"{tool_name}_{counter}_{id(args)}"` |
 
 **`agent_thread_id` IS NEVER MUTATED under any circumstances.** On
-summarization we drop `grok_session_id` (create a new `session/new`),
-but the deep-worker `thread_id` stays.
+summarization — we discard `grok_session_id` (create a new
+`session/new`), but the deep-worker `thread_id` remains.
 
 `session/update` notifications from Grok carry their own `messageId` and
-`toolCallId` — these are **Grok-internal identifiers and stay inside the
-provider**. Only the LangChain `AIMessage.tool_calls[*].id` leaves the
-provider (we generate them ourselves during mapping, or reuse Grok's
-`toolCallId` — discussed in §11A.2).
+`toolCallId` — these are **Grok-internal identifiers that stay inside the
+provider**. Only LangChain's `AIMessage.tool_calls[*].id` leave the provider
+(we generate them ourselves during mapping, or
+reuse Grok's `toolCallId` — discussed in §11A.2).
 
 ---
 
 ## 4. What the Grok CLI exposes via ACP (live-verified)
 
-Full data — in `RESEARCH_GROK_PROVIDER.md` §§ 2–10. Here — the
-architecturally important parts.
+Full data — in `RESEARCH_GROK_PROVIDER.md` §§ 2–10. Here — what is
+architecturally important.
 
 ### 4.1 Protocol handshake
 
@@ -124,7 +124,7 @@ architecturally important parts.
 }
 ```
 
-- `loadSession:true` — `session/load <sid>` supported (with replay).
+- `loadSession:true` — `session/load <sid>` is supported (with replay).
 - `sessionCapabilities` NOT declared → `session/resume` (without replay)
   NOT supported. Confirmed live: `Method not found`.
 - `mcpCapabilities.http:true` → we can pass the HTTP URL of our in-process MCP.
@@ -146,17 +146,16 @@ Returns `{_meta:{email, auth_mode:"Oidc", ...}}`. **No API key needed.**
 }
 ```
 
-**We do NOT write `~/.grok/config.toml`** (a policy analogous to codex
-§4.3.1 — a related internal incident analysis (not included here)). Each
-`session/new` carries its OWN mcpServers; nothing global remains between
-agents.
+**We do NOT write `~/.grok/config.toml`** (policy, analogous to codex
+§4.3.1 — a past config-pollution incident). Each `session/new` pulls
+its OWN mcpServers; nothing global remains between agents.
 
 ### 4.5 System prompt — inline `<system>` block
 
 `session/new` does NOT accept `systemPrompt`/`instructions`/
 `_meta.system_prompt_override` (live-verified — all three are ignored).
 
-**Working channel:** the first `session/prompt` content text =
+**Working channel:** first `session/prompt` content text =
 `<system>{ system prompt }</system>\n\n{ user query }`.
 
 See §10 for implementation details.
@@ -165,9 +164,9 @@ See §10 for implementation details.
 
 Grok has 12+ built-in tools (`Shell`, `Read`, `Write`, `Edit`, `MultiEdit`, `Glob`, `Grep`, `WebSearch`, `WebFetch`, `Task`, `Plan`, `CallMcpTool`, ...), which **run locally inside the grok process** and are not delegated to the client.
 
-**Established empirically (Q1 live-check 2026-06-17, see `RESOLUTION_Q1_DISALLOWED_TOOLS.md`):** in `agent stdio` mode they **cannot be disabled** by any CLI flag (`--disallowed-tools`, `--tools`, `--deny`, `--permission-mode`, `--sandbox` — all ignored), and grok does **not send** `session/request_permission` before executing them.
+**Established empirically (Q1 live-check 2026-06-17, see `RESOLUTION_Q1_DISALLOWED_TOOLS.md`):** in `agent stdio` mode they **cannot be disabled** by any CLI flag (`--disallowed-tools`, `--tools`, `--deny`, `--permission-mode`, `--sandbox` — all ignored), and grok **does not send** `session/request_permission` before executing them.
 
-**Design approach (after agreeing with the user on 2026-06-17):** do not try to block — **record everything fully in the LangGraph history** via the `tool_call`/`tool_call_update` notifications that ACP gives us with full arguments and result. Two equal tool-execution channels — deep-worker MCP (our single proxy MCP server) and grok built-ins (via `builtin_tool_passthrough.py`); both end up in `result["messages"]`. See §11A for details.
+**Design approach (after agreement with the user 2026-06-17):** do not try to block — **fully record them in the LangGraph history** via the `tool_call`/`tool_call_update` notifications that ACP gives us with full args and result. Two equal tool-execution channels — deep-worker MCP (our single proxy MCP server) and grok built-ins (via `builtin_tool_passthrough.py`); both end up in `result["messages"]`. See §11A for details.
 
 ---
 
@@ -178,14 +177,14 @@ Distilled lessons (unchanged from codex §5):
 - **L1.** `agent_thread_id` is mandatory and unique per caller (main agent,
   TaskManager, subagent). No fallback.
 - **L2.** We mirror only the tail delta `messages[sent_count:]`. Never
-  the full history. The `sent_count` cursor lives in a process-global singleton.
-- **L3.** On summarization (detected as `sent_count > len(messages)`) —
-  drop the underlying session, **do not touch `agent_thread_id`**.
+  the full history. `sent_count` cursor in a process-global singleton.
+- **L3.** On summarization (detect `sent_count > len(messages)`) —
+  discard the underlying session, **do not touch `agent_thread_id`**.
 - **L4.** Tools execute via LangGraph ToolNode, **never** in the MCP
-  handler. The handler parks an `asyncio.Future`; ToolNode runs the real
-  tool; the ToolMessage resolves the Future. This guarantees every
+  handler. The handler parks an `asyncio.Future`; ToolNode executes the
+  real tool; ToolMessage resolves the Future. Guarantees that every
   tool_call + tool_result ends up in `result["messages"]`.
-- **L5.** Shared state is a process-global singleton (LangGraph rebuilds
+- **L5.** Shared state — process-global singleton (LangGraph rebuilds
   model instances on pickling).
 
 ---
@@ -198,68 +197,68 @@ Distilled lessons (unchanged from codex §5):
   history in `session/prompt`. ❌ Violates §0.4 (incremental cache).
   ❌ Wastes prompt cache. **Rejected.**
 - **B. Stateful-light like codex.** Per-turn `grok exec` (if it existed)
-  with `session/load <uuid>` on each turn. ❌ Grok has no `grok exec` —
-  the ACP mode is only `grok agent stdio` (an interactive
+  with `session/load <uuid>` on each turn. ❌ Grok has no
+  `grok exec` — ACP mode is only `grok agent stdio` (interactive
   stream). And `session/load` does a full replay via notifications —
-  per-turn that would be expensive. **Rejected.**
+  per-turn that is expensive. **Rejected.**
 - **B+. Long-lived ACP client.** **One `grok agent stdio` subprocess
-  per agent, living for the whole deep-worker process lifetime.** Each
-  turn — one `session/prompt` request. This is the cleanest model for ACP.
+  per agent, lives the whole life of the deep-worker process.** On each turn —
+  one `session/prompt` request. This is the cleanest model for ACP.
 
   Per-agent state:
-  - `grok_proc`: `asyncio.subprocess.Process` — a long-lived process.
-  - `grok_session_id: str | None` — the UUID from `session/new`.
-  - `sent_count: int` — how many LangGraph messages have already been mirrored to Grok.
+  - `grok_proc`: `asyncio.subprocess.Process` — long-lived process.
+  - `grok_session_id: str | None` — UUID from `session/new`.
+  - `sent_count: int` — how many LangGraph messages are already mirrored to Grok.
   - `pending_requests: dict[int, Future]` — JSON-RPC reply waiters.
   - `pending_tool_calls: dict[str, Future]` — for parking tool_calls.
 
   Per-turn flow:
   - **Turn 1** (`grok_session_id is None`): `→ session/new {cwd, mcpServers}` →
     captures `sessionId`. Then `→ session/prompt {sessionId, prompt}`.
-  - **Turn N>1** (`grok_session_id` present): just
+  - **Turn N>1** (`grok_session_id` exists): simply
     `→ session/prompt {sessionId, prompt:messages[sent_count:]}`.
-  - **Summarization** (`sent_count > len(messages)`): a new `session/new`,
-    drop the old `sessionId`. **Do NOT touch `agent_thread_id`.**
+  - **Summarization** (`sent_count > len(messages)`): new `session/new`,
+    discard the old `sessionId`. **Do NOT touch `agent_thread_id`.**
 
-  `sent_count` is updated BEFORE awaiting the response (as in claude-code),
+  `sent_count` is updated BEFORE waiting for the response (as with claude-code),
   so a retry does not duplicate.
 
   **Persistence across restarts.** `(grok_session_id, sent_count)`
-  are written to disk in the agent's local state directory
-  (`grok_session_state.json`, mirroring `codex_session_state.json`).
+  are written to disk in `<state_dir>/<agent>/grok_session_state.json`
+  (mirroring `codex_session_state.json`).
 
-  **Filesystem permissions (POLICIES.md §4 compliance, per the
-  2026-06-17 review).** The file and its parent directory are
-  created with explicit permissions:
-  - the agent's local state directory — `0o700` (owner only).
-  - the agent's local `grok_session_state.json` — `0o600` (owner
+  **Filesystem permissions (POLICIES.md §4 compliance, review 2026-06-17
+  issue #5).** The file and its parent directory are created with
+  explicit permissions:
+  - `<state_dir>/<agent>/` — `0o700` (owner only).
+  - `<state_dir>/<agent>/grok_session_state.json` — `0o600` (owner
     read/write only).
 
-  Writing is atomic via temp-file + `os.replace`, with `os.chmod(tmp, 0o600)`
+  Writing is atomic via a temp file + `os.replace`, with `os.chmod(tmp, 0o600)`
   before the replace (mirroring `codex_provider/session_state.py`'s perm contract).
-  **No 777 / 666.** The explicit constraint is written into the spec; a
-  regression unit test (`test_session_state.py::test_perms`) checks the
-  stat-mode after `persist()`.
+  **No 777 / 666.** The explicit constraint is written into the spec; a regression
+  unit test (`test_session_state.py::test_perms`) checks the stat-mode
+  after `persist()`.
 
   On restart:
-  1. Start a new `grok agent stdio` subprocess.
+  1. Bring up a new `grok agent stdio` subprocess.
   2. If we have a `grok_session_id` — do `→ session/load <sid>`.
   3. Replay-notifications (arriving between request and response) —
-     **drop them** (the LangGraph state already knows them via the checkpointer).
+     **discard** (LangGraph state already knows them via the checkpointer).
   4. After the response — continue from the same `sent_count`.
 
-  If `session/load` errors (stale/missing) — fall back to a fresh
+  If `session/load` errors (stale/missing) — fallback to a fresh
   `session/new` + full history (like the codex resume fallback).
 
-**Adopted: B+.**
+**Accepted: B+.**
 
 ### 6.2 Why this satisfies all §0 constraints
 
 | Constraint | How B+ satisfies it |
 |---|---|
-| We don't change deep-worker contracts | `agent_thread_id` read-only; checkpointer thread untouched. |
-| All messages in the LangGraph history | We never bypass ToolNode; ToolMessages resolve the Future in the proxy MCP (§7). tool_call/tool_call_update → `AIMessage.tool_calls`. |
-| Lightweight, no extra processes | One long-lived subprocess (Grok itself is an external CLI binary). Proxy MCP — an in-process asyncio task. |
+| We do not change deep-worker contracts | `agent_thread_id` read-only; checkpointer thread untouched. |
+| All messages in the LangGraph history | Never bypass ToolNode; ToolMessages resolve Futures in proxy MCP (§7). tool_call/tool_call_update → `AIMessage.tool_calls`. |
+| Lightweight, no extra processes | One long-lived subprocess (Grok itself is an external CLI binary). Proxy MCP — in-process asyncio task. |
 | Incremental, no full rebuild | `sent_count` cursor; per-turn payload = `messages[sent_count:]`. |
 | No polling, no blocking | JSON-RPC stdout: `await readline()` (asyncio non-blocking; epoll). MCP handler: `await asyncio.wait_for(future, ...)`. |
 | No leaks | bounded state per agent_thread_id; one subprocess per agent_process; pending_tool_calls dropped on resolve. |
@@ -268,7 +267,7 @@ Distilled lessons (unchanged from codex §5):
 
 ## 7. Module layout
 
-Sibling of `codex_provider/`. The structure mirrors codex's:
+Sibling of `codex_provider/`. The structure mirrors the codex one:
 
 ```
 grok_provider/
@@ -301,14 +300,14 @@ grok_provider/
 **Comparison with codex_provider:**
 
 - ❌ No `exec_runner.py` (no per-turn subprocess).
-- ❌ No `event_pump.py` (the single JSON-RPC reader does everything).
-- ✅ `acp_client.py` added (lifecycle of the long-lived subprocess + JSON-RPC).
-- ✅ `acp_types.py` added (ACP events instead of codex JSONL).
+- ❌ No `event_pump.py` (a single JSON-RPC reader does everything).
+- ✅ Added `acp_client.py` (lifecycle of the long-lived subprocess + JSON-RPC).
+- ✅ Added `acp_types.py` (ACP events instead of codex JSONL).
 - ✅ `native_tools.py` → `builtin_tool_passthrough.py` — extended for the full set of grok built-ins (mandatory main channel, see §11A.4 and `RESOLUTION_Q1_DISALLOWED_TOOLS.md`).
 
 Total line count — estimated 2400–2900 (codex provider ~3000). Slightly less because there is no:
-- AGENTS.override.md write/cleanup machinery (~80 lines of exec_runner).
-- per-feature `--disable` flag mapping (~150 lines of config builder).
+- AGENTS.override.md write/cleanup machinery (~80 lines in exec_runner).
+- per-feature `--disable` flag mapping (~150 lines in the config builder).
 - event_pump (~250 lines; our reader_task does everything).
 
 But an extended `builtin_tool_passthrough.py` is added (~250 LOC vs codex's ~200) and `acp_client.py` for the long-lived subprocess (~250 LOC).
@@ -334,7 +333,7 @@ class GrokChatModel(BaseChatModel):
     _disallowed_builtins: tuple[str, ...] = PrivateAttr(default=DEFAULT_DISALLOWED_BUILTINS)
     _proxy_started: bool = PrivateAttr(default=False)
 
-    # Pydantic JSON-schema overrides — same surgery as codex (for the checkpointer pickle).
+    # Pydantic JSON-schema overrides — same surgery as codex (for checkpointer pickle).
     @classmethod
     def __get_pydantic_json_schema__(cls, core_schema, handler): ...
     def model_dump(self, **kwargs): ...
@@ -370,8 +369,8 @@ class GrokChatModel(BaseChatModel):
         raise NotImplementedError("GrokChatModel supports async only. Use ainvoke().")
 ```
 
-The interface is identical to `ClaudeCodeChatModel`/`CodexChatModel` so the
-factory branch in `config.py` is a clean copy with renamed classes.
+The interface is identical to `ClaudeCodeChatModel`/`CodexChatModel` so the factory
+branch in `config.py` is a clean-copy with class renames.
 
 ---
 
@@ -408,11 +407,11 @@ factory branch in `config.py` is a clean copy with renamed classes.
 
 ### 9.2 `GrokAcpClient` lifecycle
 
-**One instance per agent process** (a process-global singleton, like the codex
+**One instance per agent process** (process-global singleton, as with the codex
 proxy MCP). All `agent_thread_id`s (main + TaskManager + subagents)
 SHARE one subprocess, but each has its own `grok_session_id` (via
-separate `session/new`). Grok can handle several active sessions at
-once — that is the ACP design.
+separate `session/new`). Grok fully supports several active sessions
+simultaneously — that is the ACP design.
 
 **`async def start()`:**
 - `proc = await asyncio.create_subprocess_exec("grok", "agent", "stdio",
@@ -423,18 +422,18 @@ once — that is the ACP design.
   }, "clientInfo":{"name":"deep-worker","version":...}})`
 - `await self._call("authenticate", {"methodId":"cached_token"})`
 
-**`async def _read_loop()`** — the single stdout reader:
+**`async def _read_loop()`** — the single reader of stdout:
 - `line = await self.proc.stdout.readline()`
 - `obj = json.loads(line)`
 - If `id in obj` AND (`result in obj or error in obj`) → reply to our
   request: `self.pending_requests[obj["id"]].set_result(obj)`.
-- If `id in obj` AND `method in obj` → a request FROM grok to us (fs/*,
-  terminal/*, session/request_permission). Route via
+- If `id in obj` AND `method in obj` → request FROM grok to us (fs/*,
+  terminal/*, session/request_permission). Routed through
   `_handle_agent_request()` (see §9.3).
-- If only `method in obj` → a notification. Route via
+- If only `method in obj` → notification. Routed through
   `_handle_notification()` (see §9.4).
 
-**`async def _call(method, params)`** — JSON-RPC request with a response wait:
+**`async def _call(method, params)`** — JSON-RPC request with response wait:
 - `next_id += 1; rid = next_id`
 - `fut = asyncio.get_event_loop().create_future()`
 - `self.pending_requests[rid] = fut`
@@ -445,11 +444,12 @@ once — that is the ACP design.
 
 **`async def session_prompt(session_id, prompt_blocks, notification_sink)`**
 — the main entry point for `ainvoke`:
-- Registers a `notification_sink` (asyncio.Queue) to receive
+- Registers the `notification_sink` (asyncio.Queue) to receive
   `session/update` notifications for this sessionId.
-- Calls `_call("session/prompt", {sessionId, prompt})`.
-- When notifications with a matching `sessionId` arrive — pushes them into the queue.
-- When the response arrives — closes the queue, returns the stopReason.
+- Does `_call("session/prompt", {sessionId, prompt})`.
+- When notifications with a matching `sessionId` arrive — pushes to the queue.
+- When the response arrives — closes the queue, returns stopReason.
+
 **`async def aclose()`:**
 - Cancel `reader_task`.
 - Cancel all pending_requests/pending_tool_calls futures.
@@ -457,7 +457,7 @@ once — that is the ACP design.
 
 ### 9.3 Agent → Client requests (we handle them)
 
-Per the ACP spec, the agent can send us JSON-RPC requests:
+According to the ACP spec, the agent can send us JSON-RPC requests:
 
 | Method | What we do |
 |---|---|
@@ -467,22 +467,22 @@ Per the ACP spec, the agent can send us JSON-RPC requests:
 | `terminal/*` | `error -32601` (we declared `terminal:false`) |
 
 If grok suddenly decides to call `fs/*` despite the `false` capability —
-we return `-32601`; grok MUST fail its built-in tool gracefully and
-move on. The live test did not confirm this (`fs=false` → grok did
+we return `-32601`; grok MUST gracefully fail its built-in tool and
+move on. Live-test did not confirm this (`fs=false` → grok did
 Read locally), but the protection is needed.
 
 ### 9.4 Notifications (`session/update`)
 
-Routed into the notification_sink for the active sessionId.
-We recognize the following `sessionUpdate` types:
+Routed to the notification_sink for the active sessionId.
+We recognise the following `sessionUpdate` types:
 
 | Type | Action in ainvoke |
 |---|---|
 | `user_message_chunk` | ignore (this is an echo of our prompt) |
-| `agent_thought_chunk` | ignored by default; optionally stored in `additional_kwargs["reasoning"]` |
+| `agent_thought_chunk` | ignore by default; optionally save in `additional_kwargs["reasoning"]` |
 | `agent_message_chunk` | accumulate into `final_text` |
-| `tool_call` | **CASE A** (kind=mcp): we were waiting for this call via the proxy MCP — ignore (resolution via handler/Future). **CASE B** (built-in tool — Shell/Read/etc.): see §11A.2 |
-| `tool_call_update` | same; on `status="completed"` with content we resolve the pending future for CASE B |
+| `tool_call` | **CASE A** (kind=mcp): we were waiting for this call via proxy MCP — ignore (resolution through handler/Future). **CASE B** (built-in tool — Shell/Read/etc.): see §11A.2 |
+| `tool_call_update` | same; on `status="completed"` with content resolve the pending future for CASE B |
 | `plan` | converted to AIMessage.tool_calls with name="update_plan" (similar to codex update_plan handling) |
 | `usage_update` | broadcast via resolved_model_callback or metadata; does not go into the LangGraph history |
 | `available_commands_update` | ignore (grok's slash commands) |
@@ -495,7 +495,7 @@ session/prompt_complete, announcements/update) — **fully ignored.**
 
 **Established empirically (Q1 live-check 2026-06-17, see `RESOLUTION_Q1_DISALLOWED_TOOLS.md`):** grok 0.2.54 in `agent stdio` mode **never sends `session/request_permission`** for its built-in tools. It executes them locally without asking. This path is effectively dead in the current CLI version.
 
-**Strategy — defense-in-depth for possible future grok CLI changes:** we implement the classifier but do not rely on it for correctness. The user confirmed on 2026-06-17 that HITL is not critical (agents run with auto-approve).
+**Strategy — defense-in-depth in case of future grok CLI changes:** we implement a classifier, but do not rely on it for correctness. The user confirmed 2026-06-17 that HITL is not critical (agents work with auto-approve).
 
 ```python
 def _classify_permission_request(req: dict) -> str:
@@ -526,7 +526,7 @@ def _classify_permission_request(req: dict) -> str:
     return "allow"
 ```
 
-If HITL is needed for destructive built-ins in the future, the `DESTRUCTIVE_BUILTINS` constant and the `deny` branch are already there — just return `"deny"` for the required set. For now — auto-allow everything.
+If HITL is ever needed for destructive built-ins, the `DESTRUCTIVE_BUILTINS` constant and the `deny` branch are already ready — just return `"deny"` for the required set. For now — auto-allow everything.
 
 ---
 
@@ -771,10 +771,10 @@ async def _consume_turn(self, state, agent_thread_id) -> AIMessage:
 ```
 
 Key principles:
-- **Mid-turn detection** (step 9) — after a ToolMessage from LangGraph,
-  grok is still waiting for an answer to its tools/call; we do NOT create
-  a new session/prompt but keep consuming notifications from the current one.
-- **One session/prompt = many tool_call ↔ ToolMessage rounds**, until
+- **Mid-turn detection** (step 9) — after a ToolMessage from LangGraph
+  grok is still waiting for the reply to its tools/call; we do NOT create a new
+  session/prompt, but continue consuming notifications from the current one.
+- **One session/prompt = many rounds of tool_call ↔ ToolMessage**, until
   grok itself exits with `stopReason="end_turn"`.
 
 ### 10.1 Non-blocking invariants
@@ -782,9 +782,9 @@ Key principles:
 | Invariant | How we satisfy it |
 |---|---|
 | No polling | `await readline()` (epoll). `await notif_q.get()`. `asyncio.wait(...)`. |
-| No CPU steady-state | Between turns one subprocess is in state=waiting for stdin; the HTTP MCP listener is idle on epoll. |
+| No CPU steady-state | Between turns one subprocess in a wait-stdin state; HTTP MCP listener idle on epoll. |
 | Event-driven end-to-end | One stdout reader; async JSON-RPC communication; Future resolution for tool calls. |
-| Repeated client polls don't trigger heavy work | The provider is called by LangGraph only when there is new input. |
+| Repeated client polls don't trigger heavy work | The provider is invoked by LangGraph only when there is new input. |
 
 ---
 
@@ -792,10 +792,10 @@ Key principles:
 
 ### 11.1 Why MCP
 
-The grok agent process is a separate OS process. It cannot call functions
-in our address space directly. ACP dictates: tools = MCP servers
-passed via `session/new mcpServers`. HTTP transport is what we
-need (in-process loopback).
+The Grok agent process is a separate OS process. It cannot call functions
+in our address space directly. ACP dictates: tools = MCP servers,
+passed via `session/new mcpServers`. HTTP transport is what
+we need (in-process loopback).
 
 ### 11.2 In-agent-process HTTP MCP server
 
@@ -803,16 +803,16 @@ Identical to codex's `proxy_mcp_server.py`:
 - `mcp.server.streamable_http` on `127.0.0.1:<random-free-port>`.
 - `pending_calls: dict[call_id, {future, name, args}]`.
 - `_jobs: dict[call_id, ...]` — job-handle for long-running tools.
-- The handler parks an `asyncio.Future` and waits `await asyncio.wait_for(
+- The handler parks an `asyncio.Future`, waits `await asyncio.wait_for(
     asyncio.shield(fut), timeout=wait_seconds)` (default 120s).
-- On timeout — job-handle policy (see POLICIES.md §7.1), a non-error
+- On timeout — job-handle policy (see POLICIES.md §7.1), non-error
   `in_progress` notice with job_id.
 - `resolve_call(call_id, content)` is called from `GrokChatModel.ainvoke`
   when a ToolMessage arrives.
 
 ### 11.3 Job-handle policy
 
-Identical to codex — I do not repeat the details; I refer to
+Identical to codex — I do NOT repeat the details; I refer to
 `codex_provider/proxy_mcp_server.py` as the reference implementation.
 
 ---
@@ -820,20 +820,20 @@ Identical to codex — I do not repeat the details; I refer to
 ## 11A. Built-in tools and system prompt — detailed plan
 
 (The section is numbered `11A` to avoid colliding with §7 (module layout)
-— see the 2026-06-17 review. Logically it belongs to the tool-execution
-topic and comes right after §11.)
+— see the 2026-06-17 review. Logically it belongs to the tool
+execution topic and follows right after §11.)
 
 ### 11A.1 Threat model — final (after Q1 live-check 2026-06-17)
 
 **Established empirically on grok 0.2.54 (see `RESOLUTION_Q1_DISALLOWED_TOOLS.md`):**
 
-In `grok agent stdio` mode **all CLI flags that control tool availability are silently ignored** (`--disallowed-tools`, `--tools`, `--deny`, `--allow`, `--permission-mode`, `--sandbox`). Grok always gives the model the full set of built-ins and **executes them locally without `session/request_permission`**.
+In `grok agent stdio` mode **all CLI flags controlling tool availability are silently ignored** (`--disallowed-tools`, `--tools`, `--deny`, `--allow`, `--permission-mode`, `--sandbox`). Grok always gives the model the full set of built-ins and **executes them locally without `session/request_permission`**.
 
-**CONCLUSION:** preventing destructive built-ins at the protocol level is **impossible** in the current CLI version. This is ACP by design — the client (us) sees the calls via `session/update` but cannot block them.
+**CONCLUSION:** prevention of destructive built-ins at the protocol level is **impossible** in the current CLI version. This is by-design ACP — the client (us) sees the calls via `session/update`, but cannot block them.
 
-**But this is OK for deep-worker:** agents almost always run with auto-approve (the user confirmed on 2026-06-17), HITL is not critical. What is critical — **the full recording of all grok actions in the LangGraph history** (broadcast, checkpointer, TaskManager, CLI).
+**But this is OK for deep-worker:** agents almost always work with auto-approve (the user confirmed 2026-06-17), HITL is not critical. What IS critical — **full recording of all grok actions in the LangGraph history** (broadcast, checkpointer, TaskManager, dwcli).
 
-The live test confirmed that ACP gives us **everything needed** for full recording:
+Live-test confirmed that ACP gives us **everything needed** for full recording:
 
 | Data | Where in the ACP payload |
 |---|---|
@@ -844,19 +844,19 @@ The live test confirmed that ACP gives us **everything needed** for full recordi
 | Final result text | the final `tool_call_update status=completed` |
 | Metadata (exit_code, cwd, duration_ms, log path) | `rawOutput` in the final update |
 
-That is enough to reconstruct **exactly the same `AIMessage(tool_calls=[...])` + `ToolMessage(content)` pair** that LangGraph produces via ToolNode for deep-worker MCP tools.
+That is enough to reconstruct **exactly the same pair of `AIMessage(tool_calls=[...])` + `ToolMessage(content)`** that LangGraph produces via ToolNode for deep-worker MCP tools.
 
-### 11A.2 Two-channel tool-execution architecture
+### 11A.2 Two-channel tool execution architecture
 
-The final model — **two equal channels**, both land in the LangGraph history:
+The final model — **two equal channels**, both end up in the LangGraph history:
 
-**Channel A: deep-worker MCP tools (`execute`, `read_file`, `write_file`, `edit_file`, `glob`, `grep`, `web_search_delegation_tool`, `fetch_url`, `send_message_to_agent`, `task`, project_memory, etc.)** — executed through our proxy MCP server (§11). Full cycle: grok calls over HTTP MCP → the handler parks a Future → AIMessage(tool_calls) in LangGraph → ToolNode runs the real tool → the ToolMessage resolves the Future → grok continues. **This is the main channel.** All basic operations (file I/O, shell, web, inter-agent communication) go through here.
+**Channel A: deep-worker MCP tools (`execute`, `read_file`, `write_file`, `edit_file`, `glob`, `grep`, `web_search_delegation_tool`, `fetch_url`, `send_message_to_agent`, `task`, project_memory, etc.)** — executed through our proxy MCP server (§11). Full cycle: grok calls via HTTP MCP → handler parks a Future → AIMessage(tool_calls) in LangGraph → ToolNode executes the real tool → ToolMessage resolves the Future → grok continues. **This is the main channel.** All basic operations (file I/O, shell, web, inter-agent communication) go through it.
 
-**Channel B: grok built-in tools (`Shell`, `Read`, `Write`, `Edit`, `Glob`, `Grep`, `WebSearch`, `Task`, `Plan`, and any future ones)** — executed by grok locally. We **observe and record them post-factum** via `builtin_tool_passthrough.py`. **This is the observability/history channel.** It never blocks grok; the tool is already executed by the time we receive `status=completed`.
+**Channel B: grok built-in tools (`Shell`, `Read`, `Write`, `Edit`, `Glob`, `Grep`, `WebSearch`, `Task`, `Plan`, and any future ones)** — executed by grok locally. We **observe and record them post-factum** via `builtin_tool_passthrough.py`. **This is the observability/history channel.** Never blocks grok; the tool has already executed by the time we receive `status=completed`.
 
-Channel B exists for two reasons:
-1. **History.** Otherwise grok's actions ("it edited foo.py") would not land in `result["messages"]` → not visible to the CLI/web UI/TaskManager.
-2. **Grok-specific tools with no equivalent** (like `Plan` — a TodoWrite analog, or future grok-only ones). These tools have **no** alternative via channel A, and the user explicitly asked to support them.
+Channel B is needed for two reasons:
+1. **History.** Otherwise grok's actions ("it edited foo.py") would not end up in `result["messages"]` → dwcli/web UI/TaskManager would not see them.
+2. **Grok-specific tools without equivalents** (like `Plan` — the TodoWrite analog, or future grok-only ones). These tools have **no** alternative via channel A, and the user explicitly asked to support them.
 
 ### 11A.3 System prompt — guidance (NOT enforcement)
 
@@ -871,10 +871,10 @@ Channel B exists for two reasons:
 {user_query}
 ```
 
-`DEEP_WORKER_TOOL_CONTRACT` — **guidance, not security**. The goal is to steer the model to use our MCP tools (channel A) when an equivalent exists, so that:
-- we get our retry logic, unified timeouts, jobs-handle policy;
-- our project extensions are used (`project_memory`, `send_message_to_agent`, `task` middleware);
-- logging is unified (deep-worker access logs vs grok local terminal logs).
+`DEEP_WORKER_TOOL_CONTRACT` — **guidance, not security**. The goal is to steer the model to use our MCP tools (channel A) when an equivalent exists, so that we:
+- get our retry logic, unified timeouts, jobs-handle policy;
+- use our project extensions (`project_memory`, `send_message_to_agent`, `task` middleware);
+- have unified logging (deep-worker access logs vs grok local terminal logs).
 
 Contract text:
 ```
@@ -896,17 +896,17 @@ Deep-worker tool contract:
   not a hard restriction.
 ```
 
-If the model ignores it — this does **not break correctness**, because channel B still records the action in the history. The user will just see `name="Shell"` instead of `name="execute"` in the Full Dialog. Semantically equivalent for most tasks.
+If the model ignores it — this does **not break correctness**, because channel B still records the action in the history. The user simply sees `name="Shell"` instead of `name="execute"` in the Full Dialog. Semantically equivalent for most tasks.
 
-### 11A.4 Built-in tool passthrough — the critical module (`builtin_tool_passthrough.py`)
+### 11A.4 Built-in tool passthrough — critical module (`builtin_tool_passthrough.py`)
 
-**UPGRADED IN STATUS:** from "optional safety net" (old revision) to **"mandatory main channel for built-ins"**.
+**PROMOTED IN STATUS:** from "optional safety net" (old revision) to **"mandatory main channel for built-ins"**.
 
-Architecture (mirrors codex's `native_tools.py`, extended for the full set of grok built-ins):
+Architecture (mirror of codex's `native_tools.py`, extended for the full set of grok built-ins):
 
 ```python
 # Grok built-ins known at design time. The list is NOT fixed —
-# any unknown name that appears in a tool_call is automatically surfaced
+# any unknown name arriving in a tool_call is automatically surfaced
 # via the _GenericBuiltinPassthrough fallback (see below).
 KNOWN_GROK_BUILTINS: tuple[str, ...] = (
     "Shell",          # bash exec; rawInput={command, description}
@@ -1037,7 +1037,7 @@ def _on_session_update(self, params: dict) -> None:
             return
 ```
 
-**`_render_completed_payload`** for `Shell` additionally extracts `rawOutput.exit_code`, `current_dir`, `total_bytes`, `output_file` (path to the log file with the full output) — and writes them into `ToolMessage.additional_kwargs["grok_meta"]` for later inspection via the Full Dialog / CLI.
+**`_render_completed_payload`** for `Shell` additionally pulls out `rawOutput.exit_code`, `current_dir`, `total_bytes`, `output_file` (path to the log file with the full output) — records them in `ToolMessage.additional_kwargs["grok_meta"]` for later inspection via Full Dialog / dwcli.
 
 ### 11A.5 Cleanup and leak analysis for channel B
 
@@ -1047,23 +1047,23 @@ def _on_session_update(self, params: dict) -> None:
 sharing one grok CLI process never collide on a `toolCallId`.
 
 `state.builtin_passthrough_futures: dict[str, asyncio.Future[dict]]`:
-- **Entry created** on `tool_call` (step CASE B above).
-- **Entry removed** on `tool_call_update status in {completed, failed, cancelled}` — Future resolved + popped.
-- **Failsafe:** in the `_consume_turn` finally (a fix from the review) and in `aclose()`, any still-unresolved Future is cancelled. This handles the case where a grok session ends with an unclosed built-in (theoretically possible on `session/cancel`).
-- **Bounded:** max O(N concurrent tool_calls in one turn) ≈ single digits. In practice grok serializes built-ins.
+- **Entry is created** on `tool_call` (step CASE B above).
+- **Entry is removed** on `tool_call_update status in {completed, failed, cancelled}` — Future resolved + popped.
+- **Failsafe:** in the `_consume_turn` finally (change from review #3) and in `aclose()` any still-unresolved Future is cancelled. This handles the case where a grok session ends with a still-open built-in (theoretically possible on `session/cancel`).
+- **Bounded:** max O(N concurrent tool_calls in one turn) ≈ a handful. In practice grok serializes built-ins.
 
 ### 11A.6 Test plan for channel B (TDD)
 
 Units:
-- `test_builtin_passthrough.py::test_shell_round_trip` — mock ACP events, verify the Tool returns text and metadata.
-- `test_builtin_passthrough.py::test_streaming_partial_buffered` — several in_progress events are joined.
+- `test_builtin_passthrough.py::test_shell_round_trip` — mock ACP events, verify that the Tool returns text and metadata.
+- `test_builtin_passthrough.py::test_streaming_partial_buffered` — several in_progress events are stitched together.
 - `test_builtin_passthrough.py::test_unknown_tool_via_generic` — unknown name → `_GenericBuiltinPassthrough`, WARNING log.
 - `test_builtin_passthrough.py::test_call_mcp_tool_routes_to_channel_A` — CallMcpTool does NOT create a passthrough Future.
 - `test_builtin_passthrough.py::test_failed_status_returns_error` — `is_error=True` in the result.
 - `test_builtin_passthrough.py::test_cancel_clears_pending_futures` — aclose() cancels unresolved ones.
 
 Integration (live grok):
-- `test_integration.py::test_builtin_shell_recorded_in_history` — real grok, a prompt asking it to run a shell command, verify that state["messages"] contains the pair AIMessage(tool_calls=[{name:"Shell"}]) + ToolMessage with the real stdout.
+- `test_integration.py::test_builtin_shell_recorded_in_history` — real grok, a prompt asking to run shell, verify that `state["messages"]` contains the pair AIMessage(tool_calls=[{name:"Shell"}]) + ToolMessage with the real stdout.
 
 
 
@@ -1103,18 +1103,18 @@ Deep-worker tool contract:
    - `reader_task: asyncio.Task` (one)
    - `pending_requests: dict` (ephemeral; entries dropped on response)
    - `pending_tool_calls: dict` (ephemeral)
-2. **`GrokClientState` singleton** — a process-global dict
+2. **`GrokClientState` singleton** — process-global dict
    `agent_thread_id → _ThreadState`. Each `_ThreadState`: 3 scalars
    (grok_session_id, sent_count, pending_session_prompt_future?) +
    `current_notif_queue: asyncio.Queue` +
    `builtin_passthrough_futures: dict[str, asyncio.Future]`. Bounded by
-   the number of `agent_thread_id`s in the process. It additionally keeps a
+   the number of `agent_thread_id`s in the process. Additionally holds the
    reverse index `_session_index: dict[str, str]`
    (`grok_session_id → agent_thread_id`), populated right after
    `session_new` (§10 step 10) and cleared on teardown / summarization
-   reset (L3 — together with `grok_session_id`). The
-   `thread_for_session(session_id) -> _ThreadState | None` method uses the
-   reader_task to route `session/update` to the right
+   reset (L3 — together with `grok_session_id`). The method
+   `thread_for_session(session_id) -> _ThreadState | None` lets the
+   reader_task route `session/update` to the right
    `_ThreadState`.
 3. **`ProxyMCPServer` HTTP listener** — one per agent process.
 
@@ -1122,16 +1122,16 @@ Deep-worker tool contract:
 
 - One `session/prompt` JSON-RPC request with a response future.
 - Notification queue entries (drained as soon as consume_turn reads them).
-- One `Future` in `pending_tool_calls` per tool call (dropped on resolve).
+- One `Future` in `pending_tool_calls` per tool call (drop on resolve).
 
 ### Cross-reference past incidents
 
 | Incident | Class | Applicability to grok |
 |---|---|---|
-| a related internal incident analysis (not included here) | rpyc | N/A |
-| a related internal incident analysis (not included here) | exception on a long-lived obj | Risk: a `session/prompt` error persists on `state`. Mitigation: `state.pending_session_prompt_future = None` in finally. |
-| a related internal incident analysis (not included here) | rpyc AsyncResult | N/A; the asyncio.Future is local, dropped on completion. |
-| **NEW: analogous to a prior config-pollution incident** | global config pollution | Applicable if we wrote to `~/.grok/config.toml`. **We do NOT** — mcpServers are per session/new. |
+| dispatch-task leak | rpyc | N/A |
+| traceback retention | exception on a long-lived obj | Risk: a `session/prompt` error persists on `state`. Mitigation: `state.pending_session_prompt_future = None` in finally. |
+| AsyncResult leak | rpyc AsyncResult | N/A; asyncio.Future is local, dropped on completion. |
+| **NEW: global config pollution analog** | global config pollution | Applicable if we wrote to `~/.grok/config.toml`. **We do NOT write** — mcpServers per session/new. |
 | **NEW: subprocess pin** | long-lived subprocess | Applicable. Mitigation: `aclose()` cancels reader_task → proc.stdin.close() → proc.wait(); timeout → terminate → kill. |
 
 ---
@@ -1141,23 +1141,23 @@ Deep-worker tool contract:
 | # | Codex/Claude-code rule | Grok restatement |
 |---|---|---|
 | L1 | thread_id mandatory, unique per caller | Same. Each agent_thread_id (main, :tm, :sub_*) gets own (grok_session_id, sent_count) slot. **agent_thread_id never mutated.** |
-| L2 | Mirror only `messages[sent_count:]` | Same — grok server-side history via the persistent session; we send only the delta in `session/prompt`. |
-| L3 | Rotate session on summarization | Drop `grok_session_id`. The next ainvoke does a fresh `session/new`. **Do NOT touch `agent_thread_id`.** |
-| L4 | Tools execute via ToolNode, never in MCP handler | Same. The proxy MCP handler parks a Future; ToolNode runs the real tool; the ToolMessage in ainvoke → resolve_call. |
+| L2 | Mirror only `messages[sent_count:]` | Same — grok server-side history via persistent session; we send only the delta in `session/prompt`. |
+| L3 | Rotate session on summarization | Drop `grok_session_id`. The next ainvoke does a fresh `session/new`. **agent_thread_id NOT TOUCHED.** |
+| L4 | Tools execute via ToolNode, never in MCP handler | Same. The proxy MCP handler parks a Future; ToolNode executes the real tool; ToolMessage in ainvoke → resolve_call. |
 | L5 | Shared state is process-global singleton | Same. `GrokClientState` singleton; `GrokAcpClient` singleton; `ProxyMCPServer` singleton. |
 
 ---
 
 ## 14. Provider failover integration
 
-The CLI's `runtime/provider_chain.py`:
+`deep_worker_cli/runtime/provider_chain.py`:
 ```python
 PROVIDER_FAILOVER_CHAIN: list[str] = ["claude-code", "codex", "grok", "deepseek"]
 ```
 
-(Order: claude-code → codex → grok → deepseek, descending by quality/cost.)
+(Order: claude-code → codex → grok → deepseek, by decreasing quality/cost.)
 
-The CLI's `runtime/availability_tracker.py`:
+`deep_worker_cli/runtime/availability_tracker.py`:
 ```python
 {
   "claude-code": {...},
@@ -1167,10 +1167,45 @@ The CLI's `runtime/availability_tracker.py`:
 }
 ```
 
-Marker for usage-limit detection (mirror codex/claude-code). **TBD at
-implementation time** — we need to catch a live error event from grok
-with exhausted usage; the format is not yet known (see `_handle_invoke`
-in `agent_process.py:2117-2356`).
+### 14.1 Account-level exhaustion detection (RESOLVED)
+
+The marker for usage-limit detection lives in `grok_provider/limit_errors.py`
+(`_USAGE_LIMIT_MARKERS`). "Account-level exhaustion" covers TWO shapes,
+both meaning "this account cannot serve the request, retry will not help —
+failover now":
+
+  * **Subscription / rate caps** — `usage limit`, `rate limit`,
+    `quota exceeded`, `subscription limit`, `hit your … limit`.
+  * **Billing / payment (HTTP 402)** — the xAI API answers `Payment Required`
+    when the account has run out of credit. Markers: `payment required`, `\b402\b`,
+    `insufficient credit/credits/balance/funds`, `out of credits`,
+    `credit balance is too low`, `billing`.
+
+Transient errors (5xx, timeout, connection reset) are **deliberately NOT matched** —
+they are retryable and must not burn a failover step.
+
+On a match, `GrokUsageLimitError` is raised; `agent_process._handle_invoke`
+catches it by class name (`exc_name == "GrokUsageLimitError"`) → ERROR status
++ notify + `_schedule_failover("grok", …)` → deepseek.
+
+### 14.2 Error-reply on the terminal session/prompt path (past incident)
+
+There are TWO paths for getting a JSON-RPC reply, and previously only one checked the error:
+
+  * `_call()` (handshake / session/new / session/load) — checked `"error"` and
+    raised an exception.
+  * `session/prompt` — resolves its future with the RAW reply (`_dispatch` →
+    `fut.set_result(obj)`) and **bypasses `_call` entirely**. The terminal
+    handling in `chat_model._finalize_response` took `response.get("result", {})`
+    → `{}` on an error-reply → `stopReason=None` → returned an empty
+    `AIMessage(content="")`. Result: HTTP 402 produced EMPTY messages in the history,
+    with no error and no failover.
+
+**Fix:** a single extractor `raise_for_error_reply(method, reply)` in
+`acp_client.py` — single source of truth. Called from `_call` AND from
+`_finalize_response` (before extracting `result`). Any error-reply now
+raises `GrokUsageLimitError` (limit/billing) or `GrokAcpClientError`
+(otherwise), instead of degrading into an empty message.
 
 ---
 
@@ -1194,58 +1229,57 @@ in `agent_process.py:2117-2356`).
 - Multi-turn memory (resume via session_id).
 - Tool call round-trip (via a real proxy MCP server with a real BaseTool).
 - Thread isolation (main + TaskManager in one process with different
-  agent_thread_id's).
-- Restart resilience (kill the grok subprocess, restart — session/load
+  agent_thread_ids).
+- Restart resilience (kill grok subprocess, restart — session/load
   works).
 
 ### 15.3 deep-worker e2e
 
-The history-integration e2e test module (test_deep_worker_history_integration.py) — starts a real
-`deep-worker --provider grok` agent with a tempfile prompt and verifies
-that `--history` shows tool_call + ToolMessage pairs. Mirror of
-codex_provider.
+The history-integration e2e test module (test_deep_worker_history_integration.py) — launches a real
+`deep-worker --provider grok` agent with a tempfile prompt, verifies
+that `--history` shows tool_call + ToolMessage pairs. Mirror
+of codex_provider.
 
 ---
 
 ## 16. Open issues (for review)
 
-1. **Q-F resolution (CLOSED 2026-06-17).** Live verification showed: all
-   CLI flags (`--disallowed-tools`, `--tools`, `--deny`, `--permission-mode`, `--sandbox`) are ignored in `agent stdio` mode, and `session/request_permission` does not arrive for built-ins. Decision agreed with the user (2026-06-17): do not block, but **fully record** into the LangGraph history via `builtin_tool_passthrough.py` (§11A.4). Passthrough was upgraded from "optional safety net" to "mandatory main channel for built-ins". See `RESOLUTION_Q1_DISALLOWED_TOOLS.md` for the full report.
+1. **Q-F resolution (CLOSED 2026-06-17).** Live verify showed: all CLI flags (`--disallowed-tools`, `--tools`, `--deny`, `--permission-mode`, `--sandbox`) are ignored in `agent stdio` mode, and `session/request_permission` for built-ins does not arrive. Decision in agreement with the user (2026-06-17): do not block, but **fully record** into the LangGraph history via `builtin_tool_passthrough.py` (§11A.4). Passthrough is promoted from "optional safety net" to "mandatory main channel for built-ins". See `RESOLUTION_Q1_DISALLOWED_TOOLS.md` for the full report.
 
 2. **Resolved-model reporting.** Codex has `resolve_model_from_session_log`
-   which reads the persisted `~/.codex/sessions/...jsonl` to learn which
-   model grok actually chose. The analog for grok:
+   which reads the persisted `~/.codex/sessions/...jsonl` to learn
+   which model grok actually chose. The analog for grok:
    `~/.grok/sessions/<encoded-cwd>/<sid>/...` contains `model_id`
    in `chat_history.jsonl` / `events.jsonl` and in `_meta.modelId` in the
    session/prompt response. **Use the response `_meta.modelId`** —
-   it is directly in our `session/prompt` response; no need to touch the disk.
+   it is directly in our `session/prompt` response, no need to touch the disk.
 
-3. **Usage limit detection format.** We do not know it yet. We need to wait
-   for a live incident (or trigger one artificially). Mitigation: defensive
-   exception handling in `_consume_turn`, classify by error-message content
-   by analogy with codex (see POLICIES §1.2).
+3. **Usage limit detection format.** Unknown for now. Need to wait for a
+   live incident (or trigger one artificially). Mitigation: defensive
+   exception handling in `_consume_turn`, classify by the content of the
+   error message analogously to codex (see POLICIES §1.2).
 
-4. **fs/* delegation alternative.** Today we declare `fs:false`
-   `terminal:false`. The alternative — `fs:true` + handlers that
-   delegate into the deep-worker filesystem layer. Advantage:
-   grok's `Read` falls under our HITL. Disadvantage: more code, and
-   the protocol implies fs/* read/write real files (not
-   the virtual deep-worker dotfiles). **Defer** — we start with
+4. **fs/* delegation alternative.** Currently we declare `fs:false`
+   `terminal:false`. Alternative — `fs:true` + handlers that
+   delegate to deep-worker's filesystem layer. Advantage:
+   grok's `Read` falls under our HITL. Disadvantage: more code, and the
+   protocol implies fs/* reads/writes real files (not
+   virtual deep-worker dotfiles). **Defer** — we start with
    `false` and see how it behaves on a real task.
 
-5. **`additionalDirectories` capability.** Grok did not declare it. If
-   it declares it later — we can extend the session/new parameters.
+5. **`additionalDirectories` capability.** Grok did not declare it. If it
+   declares it later — we can extend the session/new parameters.
    **Defer** — no use case right now.
 
 ---
 
 ## 17. Estimated work
 
-- Design (this document): ✅ ready.
+- Design (this document): ✅ done.
 - Implementation: ~2200–2700 lines (see §7).
 - Unit tests: ~80–100 tests.
 - Integration tests: ~5 live tests + 1 deep-worker e2e.
-- Touch points in the CLI: 5 files (see §2), targeted edits.
+- Touch points in `deep_worker_cli`: 5 files (see §2), point edits.
 - Failover wiring: 2 files (§14).
 
 **Time:** 1–2 days of dedicated focus.
@@ -1254,8 +1288,7 @@ codex_provider.
 
 ## 18. Review
 
-The design is sent for review via `send_message_to_agent`, following the
-`add_feature` procedure in the project's `AGENTS.md`.
+The design goes through review per the `add_feature` procedure in
+`AGENTS.md` at the repo root.
 
-After agreement with the reviewer and the user — we move to
-TDD implementation (`/implement_design`).
+After review sign-off — we move to TDD implementation.

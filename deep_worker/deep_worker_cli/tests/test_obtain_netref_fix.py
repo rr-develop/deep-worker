@@ -113,11 +113,11 @@ async def test_obtain_helper_still_exported():
     import sys
     from pathlib import Path
 
-    _rpyc_async_path = Path("rpyc_async")
+    _rpyc_async_path = Path("/path/to/rpyc_async")
     if _rpyc_async_path.exists() and str(_rpyc_async_path) not in sys.path:
         sys.path.insert(0, str(_rpyc_async_path))
 
-    from rpyc.utils.classic import obtain
+    from rpyc_async.utils.classic import obtain
 
     test_dict = {"key": "value", "number": 42}
     result = obtain(test_dict)

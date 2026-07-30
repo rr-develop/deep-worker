@@ -22,11 +22,15 @@ from typing import Any, cast
 
 from llama_index.core import Document, Settings, StorageContext, VectorStoreIndex
 from llama_index.core.node_parser import SentenceSplitter
-from llama_index.core.schema import TextNode
+from llama_index.core.schema import MetadataMode, TextNode
 from llama_index.core.storage.docstore import SimpleDocumentStore
-from llama_index.core.utils import get_tokenizer  # type: ignore[import-untyped]
 from llama_index.vector_stores.lancedb import LanceDBVectorStore  # type: ignore[import-untyped]
 
+from ._tokenizer import (
+    TokenizeFn,
+    effective_max_tokens,
+    embed_model_tokenizer,
+)
 from .config import IndexConfig
 
 # ---------------------------------------------------------------------------
@@ -98,11 +102,48 @@ def _save_line_counts(path: Path, counts: dict[str, int]) -> None:
 # JSONL parsing and chunking
 # ---------------------------------------------------------------------------
 
+# In JSON Lines, records are separated ONLY by the newline character ``\n``.
+# We deliberately do NOT use ``str.splitlines()`` anywhere in this module:
+# ``splitlines()`` also breaks on ``\r``, ``\v``, ``\f``, ``\x1c``-``\x1e``,
+# ``U+0085``, ``U+2028`` (LINE SEPARATOR) and ``U+2029`` (PARAGRAPH SEPARATOR).
+# Those characters legitimately appear *inside* JSON string values, so
+# splitting on them shatters a single valid record into unparseable fragments
+# and undercounts records. Splitting on ``\n`` keeps each JSONL record intact
+# and makes the record count match a plain physical-line count — the single
+# source of truth shared with the startup catch-up check.
+JSONL_RECORD_SEPARATOR = "\n"
+
+
+def _iter_jsonl_lines(text: str) -> list[str]:
+    """Split raw JSONL text into records on ``\\n`` only (see note above)."""
+    return text.split(JSONL_RECORD_SEPARATOR)
+
+
+def count_jsonl_lines(file_path: Path) -> int:
+    """Return the number of JSONL records in *file_path*.
+
+    Single source of truth for "how many records does this file have" used by
+    BOTH the incremental indexer and the startup catch-up cheap-check. Counts
+    non-empty physical lines separated by ``\\n`` — no JSON parsing, so it is
+    cheap even for large files. A record whose content embeds ``U+2028`` etc.
+    still counts as exactly one record (unlike ``str.splitlines()``).
+
+    Returns 0 for a missing or unreadable file.
+    """
+    try:
+        text = file_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return 0
+    return sum(1 for line in _iter_jsonl_lines(text) if line.strip())
+
 
 def _read_jsonl_lines(file_path: Path) -> list[dict[str, Any]]:
-    """Read all lines from a JSONL file, returning parsed JSON objects.
+    """Read all records from a JSONL file, returning parsed JSON objects.
 
-    Skips empty lines and lines that fail to parse.
+    Records are separated by ``\\n`` only (NOT ``str.splitlines()`` — see the
+    module note on ``JSONL_RECORD_SEPARATOR``), so a value containing
+    ``U+2028``/``U+2029``/``\\r`` does not shatter its record. Skips empty
+    lines and lines that fail to parse.
     """
     results: list[dict[str, Any]] = []
     try:
@@ -110,7 +151,7 @@ def _read_jsonl_lines(file_path: Path) -> list[dict[str, Any]]:
     except OSError:
         return results
 
-    for line in text.splitlines():
+    for line in _iter_jsonl_lines(text):
         stripped = line.strip()
         if not stripped:
             continue
@@ -146,15 +187,33 @@ def _group_by_summarized_event(
 
 def _chunk_messages(
     groups: list[list[dict[str, Any]]],
-    max_tokens: int,
+    effective_max: int,
+    tokenize_fn: TokenizeFn,
+    *,
+    step: int = 1,
+    on_group_progress: Callable[[int, int], None] | None = None,
 ) -> list[tuple[str, dict[str, Any]]]:
-    """Merge adjacent message groups into chunks up to *max_tokens*.
+    """Merge adjacent message groups into chunks up to *effective_max*.
 
     Returns list of ``(combined_text, metadata)`` tuples.
     Metadata includes ``line_range`` (1-indexed), ``timestamp``,
     ``message_types``, and ``thread_id``.
+
+    *effective_max* and *tokenize_fn* MUST come from
+    :func:`semantic_search._tokenizer.embed_model_tokenizer` /
+    :func:`effective_max_tokens` so the chunker measures in the same units as
+    the embedder. See ``docs/DESIGN_FIX_TOKENIZER_MISMATCH.md``.
+
+    Phase 1 "Analyzing history…" progress: pass ``on_group_progress`` to be
+    called ``(done_groups, total_groups)`` as the (slow) chunking pass walks
+    the groups — this keeps the bar from sitting silent on large histories.
+    It fires ``(0, total)`` up front, every ``step`` groups, and a guaranteed
+    ``(total, total)`` at the end. Without the callback the chunking is
+    identical to before (backward compatible). See
+    ``docs/DESIGN_HISTORY_INDEX_ANALYZE_PHASE_PROGRESS.md``.
     """
-    tokenizer = get_tokenizer()  # type: ignore[no-untyped-call]
+    tokenizer = tokenize_fn
+    max_tokens = effective_max
     chunks: list[tuple[str, dict[str, Any]]] = []
     current_text_parts: list[str] = []
     current_metadata: dict[str, Any] | None = None
@@ -162,7 +221,26 @@ def _chunk_messages(
     # Track which original line numbers (1-indexed) this chunk spans
     line_offset = 0  # How many lines we've consumed so far (0-indexed)
 
-    for group in groups:
+    total_groups = len(groups)
+    tick_step = max(1, step)
+    _last_tick = -1  # last ``done`` value actually reported (dedup guard)
+
+    def _tick(done: int) -> None:
+        # Fire on the step boundary and always on the final group, so the bar
+        # reaches (total, total) regardless of ``step`` or ``continue`` paths.
+        # Never emit the same ``done`` twice (avoids a duplicate final tick).
+        nonlocal _last_tick
+        if on_group_progress is None:
+            return
+        if done == _last_tick:
+            return
+        if done % tick_step == 0 or done == total_groups:
+            _last_tick = done
+            on_group_progress(done, total_groups)
+
+    _tick(0)
+
+    for group_index, group in enumerate(groups, start=1):
         # Build text for this group
         group_text_parts: list[str] = []
         group_line_count = 0
@@ -213,6 +291,7 @@ def _chunk_messages(
 
         if not group_text_parts:
             line_offset += group_line_count
+            _tick(group_index)
             continue
 
         group_text = "\n".join(group_text_parts)
@@ -249,6 +328,7 @@ def _chunk_messages(
                 }
                 chunks.append((sub_text, chunk_meta))
             line_offset += group_line_count
+            _tick(group_index)
             continue
 
         # Case: adding this group would exceed max_tokens -> flush
@@ -284,11 +364,17 @@ def _chunk_messages(
         current_text_parts.append(group_text)
         current_tokens += group_tokens
         line_offset += group_line_count
+        _tick(group_index)
 
     # Flush remaining
     if current_text_parts:
         combined = "\n".join(current_text_parts)
         chunks.append((combined, current_metadata))  # type: ignore[arg-type]
+
+    # Guaranteed final tick so the "Analyzing…" bar always reaches (total,
+    # total), even if the last group hit a step boundary that didn't align or
+    # the groups list was empty. ``_tick`` dedups, so no double emit.
+    _tick(total_groups)
 
     return chunks
 
@@ -342,11 +428,105 @@ def _build_index(
     )
 
 
+def _resolve_embed_and_tokenizer(
+    embed_model: Any | None, config: IndexConfig
+) -> tuple[Any, Any, int, int]:
+    """Resolve the embedding model + tokenizer and wire them into Settings.
+
+    Returns ``(embed_model, tokenize_fn, model_max_length,
+    special_tokens_reserve)``.
+    """
+    if embed_model is None:
+        # Lazy import — only when actually indexing
+        from llama_index.embeddings.huggingface import HuggingFaceEmbedding  # type: ignore[import-untyped]  # noqa: PLC0415
+
+        embed_model = HuggingFaceEmbedding(
+            model_name=config.embedding_model,
+            model_kwargs={"local_files_only": True},
+        )
+
+    Settings.embed_model = embed_model  # type: ignore[assignment]
+    Settings.llm = None  # type: ignore[assignment]
+    tokenize_fn, model_max_length, special_tokens_reserve = (
+        embed_model_tokenizer(embed_model)
+    )
+    Settings.tokenizer = tokenize_fn  # type: ignore[assignment]
+    return embed_model, tokenize_fn, model_max_length, special_tokens_reserve
+
+
+def _pending_chunks_for_file(
+    jsonl_path: Path,
+    index_dir: Path,
+    config: IndexConfig,
+    tokenize_fn: Any,
+    model_max_length: int,
+    special_tokens_reserve: int,
+    on_group_progress: Callable[[int, int], None] | None = None,
+) -> tuple[list[tuple[str, dict[str, Any]]], int, int]:
+    """Compute the chunks a file will contribute WITHOUT embedding them.
+
+    Returns ``(chunks, total_entries, lines_read)``.
+
+    ``on_group_progress`` (optional) is forwarded to :func:`_chunk_messages`
+    for the Phase 1 "Analyzing history…" bar — called ``(done, total)`` by
+    message group as the chunking pass runs.
+    """
+    line_counts = _load_line_counts(_line_hashes_path(index_dir))
+    last_line_count = line_counts.get(str(jsonl_path), 0)
+
+    if not jsonl_path.exists():
+        return [], 0, 0
+
+    current_line_count = count_jsonl_lines(jsonl_path)
+
+    lines_read = current_line_count - last_line_count
+    if lines_read <= 0:
+        # Nothing new (or the file shrank): equality is a no-op — do NOT
+        # re-index the whole file. ``count_jsonl_lines`` is the single source
+        # of truth shared with the startup catch-up check, so at equality
+        # ``lines_read == 0`` and we stop here.
+        return [], 0, lines_read
+
+    all_entries = _read_jsonl_lines(jsonl_path)
+    total_entries = len(all_entries)
+
+    # ``count_jsonl_lines`` and ``len(_read_jsonl_lines())`` agree for a file
+    # whose records are all valid JSON, so ``last_line_count`` is a correct
+    # index into ``all_entries``. Use ``>=`` so the incremental tail is taken
+    # whenever there is genuinely new content; fall back to a full pass only
+    # when the recorded count no longer fits the parsed records (e.g. the file
+    # shrank, was rewritten, or has unparseable lines skewing the parse).
+    if last_line_count > 0 and total_entries >= last_line_count:
+        entries = all_entries[last_line_count:]
+    else:
+        # last_line_count == 0, or parsed records fewer than recorded — handle
+        # gracefully by reconsidering the whole (already-bounded) file.
+        entries = all_entries
+
+    if not entries:
+        return [], total_entries, lines_read
+
+    effective_max = effective_max_tokens(
+        config, model_max_length, special_tokens_reserve
+    )
+    groups = _group_by_summarized_event(entries)
+    chunks = _chunk_messages(
+        groups,
+        effective_max=effective_max,
+        tokenize_fn=tokenize_fn,
+        step=max(1, config.analyze_progress_step),
+        on_group_progress=on_group_progress,
+    )
+    return chunks, total_entries, lines_read
+
+
 def index_history_file(
     jsonl_path: str | Path,
     summaries_dir: str | Path,
     config: IndexConfig | None = None,
     embed_model: Any | None = None,
+    on_message_progress: Callable[[int, int], None] | None = None,
+    on_analyze_progress: Callable[[int, int], None] | None = None,
 ) -> HistoryIndexStats:
     """Index a single JSONL history file.
 
@@ -359,6 +539,11 @@ def index_history_file(
             ``.history_index/``.
         config: Index configuration. Uses defaults if ``None``.
         embed_model: Override the embedding model (for testing).
+        on_message_progress: Phase 2 callback ``(done, total)`` by message —
+            the embedding/write bar.
+        on_analyze_progress: Phase 1 callback ``(done, total)`` by message
+            group — the "Analyzing history…" (chunking) bar, which runs BEFORE
+            any ``on_message_progress`` tick.
 
     Returns:
         :class:`HistoryIndexStats` with counts of processed lines/chunks.
@@ -372,76 +557,44 @@ def index_history_file(
 
     stats = HistoryIndexStats()
 
-    # Resolve embedding model
-    if embed_model is None:
-        # Lazy import — only when actually indexing
-        from llama_index.embeddings.huggingface import HuggingFaceEmbedding  # type: ignore[import-untyped]  # noqa: PLC0415
+    # Resolve embedding model + tokenizer (also wires Settings). e5 KNOWN
+    # LIMITATION: indexed text is embedded WITHOUT the ``"passage: "`` prefix
+    # (must match the query side in ``history_retriever``). See
+    # docs/DESIGN_FIX_TOKENIZER_MISMATCH.md.
+    embed_model, tokenize_fn, model_max_length, special_tokens_reserve = (
+        _resolve_embed_and_tokenizer(embed_model, config)
+    )
 
-        # NOTE: ``normalize`` defaults to True → L2-normalized vectors, which
-        # is why the L2-based ranking is equivalent to cosine. KNOWN
-        # LIMITATION: e5 expects ``"query: "`` / ``"passage: "`` input
-        # prefixes; indexed text here is embedded WITHOUT the ``"passage: "``
-        # prefix (must stay consistent with the query side in
-        # ``history_retriever``). See ``_ensure_embed_model`` there for the
-        # full rationale. Adding prefixes requires a full re-index.
-        embed_model = HuggingFaceEmbedding(
-            model_name=config.embedding_model,
-            model_kwargs={"local_files_only": True},
-        )
-
-    Settings.embed_model = embed_model  # type: ignore[assignment]
-    Settings.llm = None  # type: ignore[assignment]
-
-    # Load existing line counts
     line_counts = _load_line_counts(_line_hashes_path(index_dir))
-    last_line_count = line_counts.get(str(jsonl_path), 0)
 
-    # Read the file
-    if not jsonl_path.exists():
-        return stats
-
-    try:
-        current_line_count = sum(1 for _ in jsonl_path.open(encoding="utf-8"))
-    except OSError:
-        return stats
-
-    stats.lines_read = current_line_count - last_line_count
-    if stats.lines_read <= 0:
+    # Compute pending chunks (shared with the pre-count path). Per-chunk
+    # ceiling is min(config.child_chunk_size, model_max_length -
+    # special_tokens), measured by the embedder's own tokenizer.
+    chunks, total_entries, lines_read = _pending_chunks_for_file(
+        jsonl_path, index_dir, config,
+        tokenize_fn, model_max_length, special_tokens_reserve,
+        on_group_progress=on_analyze_progress,
+    )
+    stats.lines_read = lines_read
+    if lines_read <= 0:
         return stats  # No new lines
-
-    # Parse entries (read all - we need context for grouping)
-    all_entries = _read_jsonl_lines(jsonl_path)
-    total_entries = len(all_entries)
-
-    # If we've indexed this file before, only process new entries
-    if last_line_count > 0 and total_entries > last_line_count:
-        entries = all_entries[last_line_count:]
-    elif last_line_count == 0:
-        entries = all_entries
-    else:
-        # File shrank - re-index from scratch wouldn't happen via append-only
-        # but handle gracefully
-        entries = all_entries
-
-    if not entries:
-        return stats
-
-    # Group and chunk
-    groups = _group_by_summarized_event(entries)
-    chunks = _chunk_messages(groups, max_tokens=config.child_chunk_size)
 
     if not chunks:
         # Still update line count to avoid re-processing
-        line_counts[str(jsonl_path)] = total_entries
-        _save_line_counts(_line_hashes_path(index_dir), line_counts)
+        if total_entries:
+            line_counts[str(jsonl_path)] = total_entries
+            _save_line_counts(_line_hashes_path(index_dir), line_counts)
         return stats
 
     # Build documents for indexing
-    documents: list[Document] = []
+    # The chunks are ALREADY the final units (we chunked them ourselves in
+    # _chunk_messages), so build TextNodes directly — no extra SentenceSplitter
+    # pass, no per-document transformation. One node == one chunk.
+    nodes: list[TextNode] = []
     for chunk_text, meta in chunks:
-        doc = Document(
+        node = TextNode(
             text=chunk_text,
-            doc_id=f"{jsonl_path}:L{meta.get('line_range', '0-0')}",
+            id_=f"{jsonl_path}:L{meta.get('line_range', '0-0')}",
             metadata={
                 "file_path": meta.get("file_path") or str(jsonl_path),
                 "thread_id": meta.get("thread_id", "unknown"),
@@ -459,16 +612,61 @@ def index_history_file(
                 "file_path", "thread_id", "total_lines", "jsonl_file",
             ],
         )
-        documents.append(doc)
+        nodes.append(node)
         stats.chunks_indexed += 1
 
     # Load or create vector store and index
     vector_store, docstore = _load_or_create_storage(index_dir)
     index = _build_index(vector_store, docstore, embed_model)
 
-    # Insert new documents
-    for doc in documents:
-        index.insert(doc)
+    # ── Progress is measured in MESSAGES, not chunks ──────────────────────
+    # The denominator (number of new messages/lines) is known up front, so
+    # the bar can show X/N + %% + ETA immediately — unlike chunk counts,
+    # which are only known after the (slow) chunking pass. We map "how far
+    # we've embedded" back to messages via each chunk's line_range end.
+    #
+    # These two axes are INDEPENDENT:
+    #   * embedding is done in progress-sized slices so the bar advances
+    #     smoothly and ETA is meaningful;
+    #   * the LanceDB WRITE stays batched at config.index_batch_size (one
+    #     transaction per batch — the fast path), decoupled from progress.
+    total_messages = lines_read
+    embed_step = max(1, config.embed_progress_step)
+    write_batch_size = max(1, config.index_batch_size)
+
+    def _end_line(node: TextNode) -> int:
+        rng = str(node.metadata.get("line_range", "0-0"))
+        try:
+            return int(rng.split("-")[-1])
+        except (ValueError, IndexError):
+            return 0
+
+    if on_message_progress is not None:
+        on_message_progress(0, total_messages)
+
+    # Phase 1 — embed all nodes in progress-sized slices, ticking progress in
+    # messages after each slice. Nodes carry their embeddings forward so the
+    # write phase does NOT re-embed (insert_nodes skips nodes that already
+    # have .embedding set).
+    assert embed_model is not None  # resolved above
+    for start in range(0, len(nodes), embed_step):
+        sl = nodes[start:start + embed_step]
+        texts = [n.get_content(metadata_mode=MetadataMode.EMBED) for n in sl]
+        embeddings = embed_model.get_text_embedding_batch(texts, show_progress=False)
+        for n, emb in zip(sl, embeddings):
+            n.embedding = emb
+        if on_message_progress is not None:
+            covered = _end_line(sl[-1])
+            done_msgs = min(total_messages, max(0, covered))
+            on_message_progress(done_msgs, total_messages)
+
+    # Phase 2 — write to LanceDB in batches of write_batch_size (one
+    # transaction each). Embeddings are already set, so this is pure I/O.
+    for start in range(0, len(nodes), write_batch_size):
+        index.insert_nodes(nodes[start:start + write_batch_size])
+
+    if on_message_progress is not None:
+        on_message_progress(total_messages, total_messages)
 
     # Persist docstore
     persist_path = str(docstore_path(index_dir) / "docstore.json")  # type: ignore[arg-type]
@@ -487,6 +685,8 @@ def index_all_history_files(
     config: IndexConfig | None = None,
     embed_model: Any | None = None,
     on_progress: Callable[[str], None] | None = None,
+    on_message_progress: Callable[[int, int], None] | None = None,
+    on_analyze_progress: Callable[[int, int], None] | None = None,
 ) -> HistoryIndexStats:
     """Index all ``.jsonl`` files in *summaries_dir*.
 
@@ -498,6 +698,15 @@ def index_all_history_files(
         embed_model: Override the embedding model (for testing).
         on_progress: Optional callback invoked with the filename (stem)
             before each file is indexed.
+        on_message_progress: Optional callback invoked as ``(done, total)``
+            in MESSAGES (new jsonl lines), aggregated across ALL files.
+            ``total`` is known up front (a cheap line count — no chunking),
+            so the bar can show X/N + %% + ETA from the very first tick.
+        on_analyze_progress: Optional Phase 1 callback invoked as
+            ``(done, total)`` in message GROUPS for the CURRENT file — the
+            "Analyzing history…" (chunking) bar. Per-file (not aggregated),
+            since chunking is done file-by-file and precedes that file's
+            embedding phase.
 
     Returns:
         Aggregated :class:`HistoryIndexStats`.
@@ -508,22 +717,67 @@ def index_all_history_files(
     if not summaries_dir.exists():
         return total
 
-    for jsonl_file in sorted(summaries_dir.glob("*.jsonl")):
+    jsonl_files = sorted(summaries_dir.glob("*.jsonl"))
+
+    # Cheap up-front denominator: how many NEW messages (lines) each file
+    # contributes. Just a line count vs the previously-indexed count — no
+    # chunking, no embedding — so it is effectively instant even for huge
+    # files. Only computed when a message-progress consumer is attached.
+    index_dir = get_history_index_dir(summaries_dir)
+    grand_total_messages = 0
+    per_file_new_lines: dict[Path, int] = {}
+    if on_message_progress is not None:
+        line_counts = _load_line_counts(_line_hashes_path(index_dir))
+        for jsonl_file in jsonl_files:
+            current = count_jsonl_lines(jsonl_file)
+            new_lines = max(0, current - line_counts.get(str(jsonl_file), 0))
+            per_file_new_lines[jsonl_file] = new_lines
+            grand_total_messages += new_lines
+
+    def _make_file_msg_cb(
+        base: int,
+        sink: Callable[[int, int], None],
+    ) -> Callable[[int, int], None]:
+        """Bind a per-file (done, total) message callback to the global bar."""
+        def _cb(done: int, _file_total: int) -> None:
+            sink(base + done, grand_total_messages)
+        return _cb
+
+    if on_message_progress is not None:
+        on_message_progress(0, grand_total_messages)
+
+    done_so_far = 0
+
+    for jsonl_file in jsonl_files:
         if on_progress is not None:
             on_progress(jsonl_file.name)
+
+        file_msg_cb: Callable[[int, int], None] | None = (
+            _make_file_msg_cb(done_so_far, on_message_progress)
+            if on_message_progress is not None
+            else None
+        )
+
         try:
             file_stats = index_history_file(
                 jsonl_file,
                 summaries_dir,
                 config=config,
                 embed_model=embed_model,
+                on_message_progress=file_msg_cb,
+                on_analyze_progress=on_analyze_progress,
             )
             total.lines_read += file_stats.lines_read
             total.chunks_indexed += file_stats.chunks_indexed
             total.files_processed += file_stats.files_processed
             total.errors += file_stats.errors
+            done_so_far += per_file_new_lines.get(jsonl_file, file_stats.lines_read)
         except Exception:  # noqa: BLE001
             total.errors += 1
+            done_so_far += per_file_new_lines.get(jsonl_file, 0)
+
+    if on_message_progress is not None:
+        on_message_progress(grand_total_messages, grand_total_messages)
 
     return total
 

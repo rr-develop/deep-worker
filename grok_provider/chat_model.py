@@ -44,6 +44,7 @@ from langchain_core.tools import BaseTool
 from pydantic import ConfigDict, PrivateAttr
 
 from grok_provider import acp_types
+from grok_provider.arg_compat import normalize_tool_args
 from grok_provider.builtin_tool_passthrough import (
     GROK_BUILTIN_MARKER,
     GROK_META_KEY,
@@ -91,7 +92,7 @@ def _build_tool_contract(tool_names: list[str]) -> str:
     (``deep_worker_proxy_<pid>``) via its ``CallMcpTool`` built-in. IMPORTANT:
     this does NOT make them grok's NATIVE built-ins (Shell/Read/Write/…) — the
     deep-worker tools are MCP tools, reachable only through that MCP channel.
-    (See a related internal incident analysis (not included here) and
+    (See a related internal incident analysis, not included here, and
     docs/DESIGN_MCP_PROXY_TOOL_NAME_PREFIX_AWARENESS.md §3.3/§8.)
 
     The previous static contract claimed a literal prefix AND listed
@@ -726,8 +727,9 @@ class GrokChatModel(BaseChatModel):
                 )
                 if tool_contract:
                     system_parts.append(tool_contract)
+            system_text = "\n\n".join(system_parts)
             text = (
-                f"<system>\n{'\n\n'.join(system_parts)}\n</system>\n\n"
+                f"<system>\n{system_text}\n</system>\n\n"
                 f"{user_text}"
             )
         else:
@@ -938,8 +940,23 @@ class GrokChatModel(BaseChatModel):
     ) -> AIMessage:
         """Common terminal path: report modelId, raise on cancelled/refusal,
         return the assembled AIMessage. Shared between the natural turn-end
-        in ``_consume_turn`` and the pump-prefetched response path."""
-        result = response.get("result", {}) if isinstance(response, dict) else {}
+        in ``_consume_turn`` and the pump-prefetched response path.
+
+        ``session/prompt`` resolves its future with the RAW reply (see
+        ``acp_client._dispatch``) and bypasses ``_call``'s error check, so an
+        error reply reaches here as ``{"id", "error"}`` with no ``result``.
+        Detect it FIRST and raise (usage/billing cap -> failover to deepseek,
+        anything else -> hard error) instead of silently returning an empty
+        AIMessage. Incident 2026-07-03 (grok HTTP 402 "Payment Required")."""
+        from grok_provider.acp_client import (  # noqa: PLC0415
+            raise_for_error_reply,
+        )
+
+        if isinstance(response, dict):
+            raise_for_error_reply("session/prompt", response)
+            result = response.get("result", {})
+        else:
+            result = {}
         await self._maybe_report_model(result)
         stop_reason = result.get("stopReason")
         if stop_reason == "cancelled":
@@ -1143,6 +1160,11 @@ class GrokChatModel(BaseChatModel):
         if proxy_tool is not None:
             name, args = proxy_tool
             if name:
+                # Narrow Grok arg-compat: rewrite Cursor-style keys / coerce
+                # human-readable values into the shape our tool schemas expect.
+                # CASE A only — built-in passthrough (CASE B) is verbatim.
+                # See docs/DESIGN_FIX_TOOL_VALIDATION_ERROR_STATE_AND_GROK_ARG_COMPAT.md.
+                args = normalize_tool_args(name, args)
                 return {
                     "id": tcid,
                     "name": name,

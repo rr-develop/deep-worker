@@ -52,6 +52,7 @@
                                 <option value="tools">Available tools</option>
                             </select>
                             <button id="interrupt-btn" class="btn btn-warning btn-sm" title="Interrupt current agent invocation (process keeps running)">⏸ Interrupt</button>
+                            <button id="summarize-agent-btn" class="btn btn-secondary btn-sm" onclick="summarizeCurrentAgent()">Summarize context</button>
                             <button id="stop-agent-btn" class="btn btn-danger btn-sm" onclick="stopCurrentAgent()">⏹ Stop</button>
                             <button id="restart-agent-btn" class="btn btn-primary btn-sm" onclick="restartCurrentAgent()">🔄 Restart</button>
                             <button id="stop-taskmanager-btn" class="btn btn-danger btn-sm">⏹️ Stop TM</button>
@@ -73,6 +74,8 @@
                         <span id="agent-provider">unknown</span>
                         <span class="status-label">Model:</span>
                         <span id="agent-model">unknown</span>
+                        <span class="status-label">Uptime:</span>
+                        <span id="agent-uptime" data-started-at="">-</span>
                     </div>
 
                     <!-- Last Error Panel - placed prominently at top of agent view so it is

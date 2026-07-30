@@ -7,11 +7,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 # Add rpyc_async to path
-import rpyc
+sys.path.insert(0, str(Path("/path/to/rpyc_async")))
+
+import rpyc_async as rpyc
 
 from deep_worker_cli.cli.interactive import InteractiveApp
 from deep_worker_cli.process.registry import ProcessRegistry
 from deep_worker_cli.types import AgentProcessInfo
+
 
 class TestInteractiveMode:
     """Tests for interactive mode functionality."""
@@ -198,6 +201,7 @@ class TestInteractiveMode:
         # Clean up
         if os.path.exists(pagination_log):
             os.remove(pagination_log)
+
 
 class TestInteractiveCommand:
     """Tests for interactive command entry point."""

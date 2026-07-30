@@ -11,6 +11,12 @@ from pathlib import Path
 
 import pytest
 
+# Add rpyc_async to path
+_rpyc_async_path = Path("/path/to/rpyc_async")
+if str(_rpyc_async_path) not in sys.path:
+    sys.path.insert(0, str(_rpyc_async_path))
+
+
 @pytest.mark.asyncio
 async def test_start_rpyc_server_method_is_async():
     """Test that _start_rpyc_server() is async after migration."""
@@ -41,6 +47,7 @@ async def test_start_rpyc_server_method_is_async():
         "_start_rpyc_server should be async after migration to AsyncioServer"
     )
 
+
 @pytest.mark.asyncio
 async def test_agent_process_start_is_async():
     """Test that AgentProcess.start() is async (already was, should remain)."""
@@ -62,13 +69,15 @@ async def test_agent_process_start_is_async():
         agent.start
     ), "AgentProcess.start() should be async"
 
+
 @pytest.mark.asyncio
 async def test_asyncio_server_import_available():
     """Test that AsyncioServer can be imported from rpyc_async."""
-    from rpyc.utils.async_server import AsyncioServer
+    from rpyc_async.utils.async_server import AsyncioServer
 
     # AsyncioServer should be available after migration
     assert AsyncioServer is not None, "AsyncioServer should be importable"
+
 
 @pytest.mark.asyncio
 async def test_agent_service_methods_are_async():
@@ -107,6 +116,7 @@ async def test_agent_service_methods_are_async():
         len(non_async_methods) == 0
     ), f"All exposed methods should be async, but these are not: {non_async_methods}"
 
+
 def test_imports_asyncio_server_not_threaded_server():
     """Test that agent_process.py imports AsyncioServer, not ThreadedServer."""
     import importlib.util
@@ -124,6 +134,7 @@ def test_imports_asyncio_server_not_threaded_server():
     # After migration, should NOT import ThreadedServer
     # (or it should be commented out / removed)
     # For now, allow both during transition
+
 
 def test_rpyc_server_type_hint_updated():
     """Test that rpyc_server type hint is updated to AsyncioServer."""

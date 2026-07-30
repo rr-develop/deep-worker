@@ -823,7 +823,7 @@ dependencies = [
     { name = "pyyaml" },
     { name = "requests" },
     { name = "rich" },
-    { name = "rpyc" },
+    { name = "rpyc-async" },
     { name = "runloop-api-client" },
     { name = "tavily-python" },
     { name = "textual" },
@@ -874,7 +874,7 @@ requires-dist = [
     { name = "pyyaml", specifier = ">=6.0.0" },
     { name = "requests", specifier = ">=2.0.0,<3.0.0" },
     { name = "rich", specifier = ">=14.0.0,<15.0.0" },
-    { name = "rpyc", directory = "../../../rpyc_async" },
+    { name = "rpyc-async", directory = "../../../rpyc_async" },
     { name = "runloop-api-client", specifier = ">=0.69.0" },
     { name = "tavily-python", specifier = ">=0.7.21,<1.0.0" },
     { name = "textual", specifier = ">=6.0.0,<8.0.0" },
@@ -3809,7 +3809,7 @@ wheels = [
 ]
 
 [[package]]
-name = "rpyc"
+name = "rpyc-async"
 source = { directory = "../../../rpyc_async" }
 dependencies = [
     { name = "plumbum" },

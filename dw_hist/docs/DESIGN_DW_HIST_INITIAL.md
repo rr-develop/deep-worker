@@ -24,11 +24,9 @@ present). Agents need **not** be running.
 Output (text, default): one agent per line, with a stable sort, e.g.:
 
 ```
-agent_a
-agent_b
-agent_c
-agent_d
-agent_e
+agent1
+agent2
+agent3
 ...
 ```
 
@@ -39,7 +37,7 @@ for scripting.
 
 Run a semantic search over `<agent_name>`'s history. Equivalent to what
 `history_memory` tool returns from within the agent, **plus** the explicit
-similarity score per result (requested by user).
+similarity score per result.
 
 Default output mirrors `history_memory_tool`'s human-readable formatting and
 adds `score=` already present there. Options:
@@ -53,7 +51,7 @@ adds `score=` already present there. Options:
 The agent need not be running. Read-only operation against the on-disk
 LanceDB index.
 
-### 2.3 Error behaviour (finalized after internal review)
+### 2.3 Error behaviour
 
 | Exit | Trigger |
 |------|---------|
@@ -63,8 +61,8 @@ LanceDB index.
 | 4 | search runtime error (any other exception raised inside `search_history`). Stderr: `"Search error: <type>: <message>"` |
 
 Notes:
-- "unknown agent" check (RC-B): we look at the **agent root** `~/.deep_worker/<agent>/`, not at the `summaries/` subdir. An agent may legitimately exist without `summaries/` (never summarised) — that is exit 3 with the "no index" message, NOT exit 2 "unknown agent".
-- `--top-k` is validated against 1..20 (the same bounds `history_memory_tool` enforces) **before** any heavy import or search call (RC-C).
+- "unknown agent" check: we look at the **agent root** `~/.deep_worker/<agent>/`, not at the `summaries/` subdir. An agent may legitimately exist without `summaries/` (never summarised) — that is exit 3 with the "no index" message, NOT exit 2 "unknown agent".
+- `--top-k` is validated against 1..20 (the same bounds `history_memory_tool` enforces) **before** any heavy import or search call.
 
 ## 3. Storage layout we read
 
@@ -127,11 +125,14 @@ later if/when distribution is wanted; not in scope here.
 Documented in `dw_hist/README.md`:
 
 ```bash
-ln -sf <repo>/dw_hist/dw-hist ~/.local/bin/dw-hist
-# (<repo> = this repository's checkout path)
+ln -sf /path/to/production-tree/dw_hist/dw-hist ~/.local/bin/dw-hist
+# (production tree)
+# or
+ln -sf /path/to/dev-tree/dw_hist/dw-hist ~/.local/bin/dw-hist
+# (dev tree)
 ```
 
-Same convention `deep-worker` and `dwcli` already follow on this host.
+Same convention `deep-worker` and `dwcli` already follow.
 
 ### 4.2 Launcher contract
 
@@ -151,7 +152,7 @@ This guarantees `dw_hist`, `deep_worker_cli`, and `semantic_search` all
 resolve from the same tree as the launcher (production or dev), matching
 the `deep-worker` dispatcher's tree-locality property.
 
-The launcher file is committed with **mode 0755** (RC-D), matching the
+The launcher file is committed with **mode 0755**, matching the
 existing `dwcli` / `deep-worker` launchers and the project's permission
 policy (no 777/666).
 
@@ -176,7 +177,7 @@ Implementation: a single `argparse.ArgumentParser` where:
 - `agent_name` without `-q` → error.
 - `-q` without `agent_name` → error.
 
-### 5.1 Exception mapping in `search.py` (RC-E)
+### 5.1 Exception mapping in `search.py`
 
 ```python
 def run_search(agent_name, query, top_k) -> tuple[int, str]:
@@ -201,24 +202,56 @@ def run_search(agent_name, query, top_k) -> tuple[int, str]:
     return 0, format_results(results, ...)
 ```
 
-This split is what test_cli.py asserts (RC-A/B/C/E together).
+This split is what test_cli.py asserts.
 
-### 5.2 stdout isolation (RC-G)
+### 5.2 Third-party noise isolation
 
-`search_history` triggers llama_index, which prints a benign banner to
-**stdout** the first time the embedder/index is loaded
-(`"LLM is explicitly disabled. Using MockLLM."`, emitted by a bare `print()`
-in `llama_index/core/llms/utils.py` because semantic search sets
-`Settings.llm = None`). That library print is outside our code (external
-dependency — must not be patched), but it lands on dw-hist's stdout and would
-corrupt machine-readable output, breaking `--format json` for any downstream
-consumer.
+The first time the embedder/index is loaded the underlying stack
+(`transformers`, `huggingface_hub`, `tqdm`, `llama_index`) splashes a fair
+amount of noise on **both** streams. None of it is a real error — the model
+is already on disk and `semantic_search` already passes
+`local_files_only=True` — but on a CLI tool meant for operators the noise is
+useless and, for `--format json`, actively harmful (it corrupts the
+JSON document).
 
-Fix at the CLI boundary: the `search_func` call is wrapped in
-`contextlib.redirect_stdout(sys.stderr)`, so any stdout the search produces is
-diverted to stderr. dw-hist's own formatted result is printed *after* the call
-returns, on the now-clean stdout. Covered by
-`test_cli.py::test_search_isolates_stdout_noise_from_json`.
+Observed (real cold-cache run, 2026-06-30):
+
+```
+stderr:
+  Warning: You are sending unauthenticated requests to the HF Hub. ...
+  Loading weights: 100%|████| 199/199 [00:00<00:00, 2323.13it/s, ...]
+  BertModel LOAD REPORT from: intfloat/multilingual-e5-small
+  Key                     | Status     |  |
+  embeddings.position_ids | UNEXPECTED |  |
+stdout:
+  LLM is explicitly disabled. Using MockLLM.
+```
+
+Two-layer fix:
+
+1.  **Pre-import** — both the bash launcher and `cli.py` set a small
+    set of env vars BEFORE any import of the heavy stack:
+    `HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1`,
+    `HF_HUB_DISABLE_TELEMETRY=1`, `HF_HUB_DISABLE_PROGRESS_BARS=1`,
+    `HF_HUB_DISABLE_IMPLICIT_TOKEN=1`, `TRANSFORMERS_VERBOSITY=error`,
+    `TRANSFORMERS_NO_ADVISORY_WARNINGS=1`, `TOKENIZERS_PARALLELISM=false`,
+    `TQDM_DISABLE=1`. The model is already cached locally so offline is the
+    correct mode anyway.
+
+2.  **Around the search call** — even with the env vars, libraries may
+    still log to `stdout`/`stderr` (e.g. the bare `print()` in
+    `llama_index/core/llms/utils.py`). We open `/dev/null` and redirect both
+    streams around the `search_func` call only. dw-hist's own formatted
+    output is printed *after* the context manager closes, on the clean
+    streams.
+
+Operator opt-out: `--verbose` (`-v`). The launcher detects the flag and
+skips step (1); `cli.py` sets `DW_HIST_VERBOSE=1` and skips step (2). All
+third-party noise then surfaces normally — useful when debugging actual
+cold-cache or model-load issues.
+
+Covered by `test_cli.py::test_search_silences_both_streams_by_default` and
+`test_cli.py::test_search_verbose_lets_noise_through`.
 
 ## 6. Future extensions (out of scope here, but shape preserved)
 
@@ -252,14 +285,14 @@ No integration tests against a real LanceDB index — that path is exercised
 by `semantic_search`'s own test suite and would require a heavy embedding
 model in CI.
 
-### 7.1 RC-C top_k test cases
+### 7.1 top_k test cases
 
 `test_cli.py::test_top_k_zero_exits_2`, `::test_top_k_above_20_exits_2`,
 `::test_top_k_negative_exits_2`. Validation happens **before** any heavy
 import or call to `search_history` so a bogus `-k -1` doesn't pay the
 embedding cold-start cost just to fail.
 
-## 7.2 RC-F future refactor (NON-blocking for v1)
+## 7.2 Future refactor (NON-blocking for v1)
 
 The text formatter currently duplicates the per-result formatting block
 from `history_memory_tool._run_history_search` (the `--- Result N
@@ -273,7 +306,7 @@ fails loudly and we update both at once.
 
 ## 8. What this design does NOT do
 
-- Does not modify `deep-worker` argparse. (User explicit requirement.)
+- Does not modify `deep-worker` argparse. (Explicit requirement.)
 - Does not add anything to `pyproject.toml` of any existing package.
 - Does not introduce new runtime dependencies — only re-uses
   `semantic_search` (already on PYTHONPATH for the agent process).

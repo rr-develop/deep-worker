@@ -46,6 +46,12 @@ def test_fatal_exception_types_contains_expected_classes():
     assert "CheckpointCorruptedError" in FATAL_EXCEPTION_TYPES
     assert "ProviderAuthFatalError" in FATAL_EXCEPTION_TYPES
     assert "AgentNotInitialisedError" in FATAL_EXCEPTION_TYPES
+    # HistoryOffloadError is raised by SummarizationMiddleware when the
+    # pre-summarization history cannot be persisted. Continuing the
+    # summarization would silently discard the evicted history — that is
+    # exactly the silent-failure mode this classification prevents.
+    # See DESIGN_FAIL_LOUD_SUMMARIZATION_OFFLOAD.md.
+    assert "HistoryOffloadError" in FATAL_EXCEPTION_TYPES
 
 
 def test_is_fatal_exception_for_fatal_classes():

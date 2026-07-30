@@ -6,9 +6,30 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
-from llama_index.core.embeddings.mock_embed_model import MockEmbedding
 
 from semantic_search.indexer import IndexStats, index_repository
+
+
+@pytest.fixture(scope="module")
+def _real_embed_model() -> object:
+    """Real strictly-offline HuggingFaceEmbedding(intfloat/multilingual-e5-small).
+
+    Module-scoped so the model is loaded once and reused. ``MockEmbedding``
+    cannot be used here any more because the indexer now requires a real
+    XLM-R tokenizer (RC-1 forbids the silent fallback to tiktoken).
+    See docs/DESIGN_FIX_TOKENIZER_MISMATCH.md.
+    """
+    import os as _os
+
+    _os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    _os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+    _os.environ.setdefault("TQDM_DISABLE", "1")
+    from llama_index.embeddings.huggingface import HuggingFaceEmbedding  # type: ignore[import-untyped]
+
+    return HuggingFaceEmbedding(
+        model_name="intfloat/multilingual-e5-small",
+        model_kwargs={"local_files_only": True},
+    )
 
 
 class TestIndexStats:
@@ -51,11 +72,7 @@ class TestIndexRepositoryErrors:
 
 
 class TestIndexRepositoryWithMocks:
-    """Unit tests using mocks to avoid LlamaIndex/embedding overhead."""
-
-    def _make_mock_embedding(self) -> MockEmbedding:
-        """Create a lightweight mock embedding (real BaseEmbedding subclass)."""
-        return MockEmbedding(embed_dim=16)
+    """Unit tests mocking the vector store while using a real XLM-R tokenizer."""
 
     @patch("semantic_search.indexer.LanceDBVectorStore")
     @patch("semantic_search.indexer.VectorStoreIndex")
@@ -66,12 +83,13 @@ class TestIndexRepositoryWithMocks:
         mock_index_cls: MagicMock,
         mock_vs_cls: MagicMock,
         tmp_path: Path,
+        _real_embed_model: object,
     ) -> None:
         # Arrange: repo with one Python file
         (tmp_path / "main.py").write_text("def hello(): pass")
 
         # Act
-        index_repository(tmp_path, embedding_model=self._make_mock_embedding())
+        index_repository(tmp_path, embedding_model=_real_embed_model)
 
         # Assert: .vector_index directory was created
         assert (tmp_path / ".vector_index").is_dir()
@@ -85,13 +103,14 @@ class TestIndexRepositoryWithMocks:
         mock_index_cls: MagicMock,
         mock_vs_cls: MagicMock,
         tmp_path: Path,
+        _real_embed_model: object,
     ) -> None:
         # Arrange
         (tmp_path / "a.py").write_text("def a(): pass")
         (tmp_path / "b.py").write_text("def b(): pass")
 
         # Act
-        stats = index_repository(tmp_path, embedding_model=self._make_mock_embedding())
+        stats = index_repository(tmp_path, embedding_model=_real_embed_model)
 
         # Assert: 2 new files
         assert stats.added == 2
@@ -107,8 +126,9 @@ class TestIndexRepositoryWithMocks:
         mock_index_cls: MagicMock,
         mock_vs_cls: MagicMock,
         tmp_path: Path,
+        _real_embed_model: object,
     ) -> None:
-        stats = index_repository(tmp_path, embedding_model=self._make_mock_embedding())
+        stats = index_repository(tmp_path, embedding_model=_real_embed_model)
 
         assert stats.added == 0
         assert stats.updated == 0
@@ -124,6 +144,7 @@ class TestIndexRepositoryWithMocks:
         mock_index_cls: MagicMock,
         mock_vs_cls: MagicMock,
         tmp_path: Path,
+        _real_embed_model: object,
     ) -> None:
         # Arrange: pre-existing index dir with a sentinel file
         index_dir = tmp_path / ".vector_index"
@@ -134,7 +155,7 @@ class TestIndexRepositoryWithMocks:
         # Act
         index_repository(
             tmp_path,
-            embedding_model=self._make_mock_embedding(),
+            embedding_model=_real_embed_model,
             reset=True,
         )
 
@@ -150,8 +171,9 @@ class TestIndexRepositoryWithMocks:
         mock_index_cls: MagicMock,
         mock_vs_cls: MagicMock,
         tmp_path: Path,
+        _real_embed_model: object,
     ) -> None:
-        embed = self._make_mock_embedding()
+        embed = _real_embed_model
         (tmp_path / "main.py").write_text("def hello(): pass")
 
         # First run
@@ -173,8 +195,9 @@ class TestIndexRepositoryWithMocks:
         mock_index_cls: MagicMock,
         mock_vs_cls: MagicMock,
         tmp_path: Path,
+        _real_embed_model: object,
     ) -> None:
-        embed = self._make_mock_embedding()
+        embed = _real_embed_model
         f = tmp_path / "main.py"
         f.write_text("def hello(): pass")
 
@@ -196,8 +219,9 @@ class TestIndexRepositoryWithMocks:
         mock_index_cls: MagicMock,
         mock_vs_cls: MagicMock,
         tmp_path: Path,
+        _real_embed_model: object,
     ) -> None:
-        embed = self._make_mock_embedding()
+        embed = _real_embed_model
         f = tmp_path / "main.py"
         f.write_text("def hello(): pass")
 

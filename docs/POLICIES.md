@@ -91,14 +91,15 @@ Full design: `DESIGN_FULL_DIALOG_FINAL_RESPONSE_PAIRS.md` (web app docs) §"Syst
 * No silent `try / except: pass`, no silent `if not isinstance(x, T):
   continue`, no silent retry loops. Either succeed, or fail loudly
   with a message that names what the contract was and why it broke.
-  Past incidents that landed in production from silent skips:
-  a related internal incident analysis (not included here), and
-  another related internal incident analysis (not included here).
+  Past incidents that landed in production from silent skips: MCP
+  servers lost after a restart because bare functions were filtered
+  out, and double execution of tool calls (both analysed in related
+  internal incident analyses, not included here).
 * No "TTL caches" / "completed-id sets" / "FIFO eviction" introduced
   to mask a duplicate-execution symptom. Find the missing unique
-  identifier on the original path and use it. Past incidents:
-  a related internal incident analysis (not included here).
-  (the revert chain — 6 attempts on one site in 5 days).
+  identifier on the original path and use it. Past incident: the
+  tool-call double-execution root cause (the `8d0ae52` revert chain —
+  6 attempts on one site in 5 days).
 * No timeouts on infrastructure waits ("our `Future` waited too long
   → tell the LLM the tool failed"). If the wait represents real tool
   work, let it run; if it represents a deadlock in our own plumbing,
@@ -126,8 +127,8 @@ TTL, a dedup cache, a sleep, or a timeout, the reviewer MUST ask:
    wrong behaviour?** If there is none, the change buries information
    that the next debugger will need — reject.
 
-The full worked example of this policy in action is
-a related internal incident analysis (not included here):
+The full worked example of this policy in action is a related internal
+incident analysis (not included here) of the tool-call double execution:
 six attempted fixes in five days on one site, none of them addressed
 the root cause (two-worlds identity in `proxy_mcp_server.py`
 `call_id = f"{tool_name}_{counter}_{id(args)}"` vs Claude's
@@ -149,7 +150,7 @@ provider.
   move on.
 * **A bare, unbounded wait (`await future` with no timeout) is
   FORBIDDEN for any tool.** It is exactly what hung `edit_file` forever
-  (observed live, 2026-06-16).
+  (observed in a past incident).
 * **Opting out is EXPLICIT and must carry its own timeout.** A tool may
   decline the job-handle mechanism only by explicitly setting
   `long_running=False`, and that opt-out MUST provide its own `timeout`.
@@ -159,7 +160,7 @@ provider.
   `is_error=true`. The agent is told what happened (still running,
   job_id, actions) and simply continues / retries. (The old
   `is_error=true` "timeout" lie caused retries that duplicated side
-  effects — see the 2026-06-14 incident.)
+  effects — observed in a past incident.)
 
 Claiming this mechanism "works" while no tool actually engages it (e.g.
 `long_running` set on nothing, so the gate is always False) is **false
@@ -189,3 +190,82 @@ MCP tools run without HITL; otherwise they require approval by default unless
 the server explicitly declares `auto_approve: true`.
 
 Full design: [`../deep_worker/deep_worker_cli/docs/DESIGN_EXTERNAL_MCP_TOOLS.md`](../deep_worker/deep_worker_cli/docs/DESIGN_EXTERNAL_MCP_TOOLS.md).
+
+## 9. No silent API errors — every provider error is visible in the UI (HARD POLICY, 2026-07-04)
+
+> **A provider / model API error must NEVER be swallowed.** Every error
+> returned by any provider's API (claude-code, codex, grok, deepseek, or any
+> future provider) MUST be surfaced to the user in the UI. Producing an empty
+> assistant message, a benign "system: type continue" note, or a toast that
+> auto-dismisses after a few seconds *in place of* the actual API error is a
+> policy violation. This is provider-agnostic and admits no exceptions.
+
+Concrete requirements:
+
+* **Fatal API error** (account-terminal: usage/billing cap, revoked auth) →
+  the agent MUST transition to `AgentStatus.ERROR` with the real API error text
+  in `error_message`, which the web renders in the **persistent error panel**
+  (never auto-dismissed, copyable). Where a provider chain exists, the fatal
+  error additionally triggers failover to the next provider — but the error is
+  still recorded and shown; failover does not hide it.
+* **Recoverable API error** (transient/unexpected provider failure the runtime
+  can keep the conversation alive through) → the agent MAY stay `IDLE`, but the
+  real API error text MUST be surfaced as an **error** event (`type="error"`),
+  routed into the **persistent** UI surface — NOT a `type="system"` note and
+  NOT a self-dismissing toast. It must also be appended to the conversation
+  history so it is inspectable after the fact. A fleeting message that
+  disappears after a second is explicitly forbidden.
+* **The detector must read the whole error object.** Provider error replies are
+  frequently nested (e.g. grok JSON-RPC: the generic `error.message ==
+  "Internal error"` with the real `"402 Payment Required …"` buried in
+  `error.data.message`). Classification (fatal vs recoverable, usage-limit vs
+  generic) MUST examine every level of the error payload, not just the
+  outermost field. Matching only the top-level message is how the 402 →
+  deepseek failover silently broke (observed in a past incident).
+
+Root cause of the class of bug this outlaws: `grok_provider/acp_client.py`
+`raise_for_error_reply` read only `reply["error"]["message"]` (`"Internal
+error"`) and never `reply["error"]["data"]["message"]`, so a real HTTP 402
+was classified as a generic `GrokAcpClientError` (not `GrokUsageLimitError`),
+failover never fired, and the recoverable path disguised the API error as a
+`type="system"` "please type continue" note. Analysed in a related internal
+incident analysis (not included here).
+
+Anyone breaking these rules writes bad code. Reviewers must reject such diffs.
+
+## 10. Every fix and every task ships with honest integration tests (HARD POLICY, 2026-07-04)
+
+> **Completing any task or fixing any bug MUST be accompanied by honest
+> integration tests in every case where such testing is possible.** Unit tests
+> alone are insufficient and, when they stand in for integration coverage, are
+> "fake testing" — they can pass while the real end-to-end path is broken.
+
+Requirements:
+
+* **No mocks in integration tests** — the test must exercise the real objects
+  on the real path (real agent process, real RPyC, real graph, real provider
+  wiring). The ONLY mock permitted in an integration test is a **wait/clock
+  mock** whose sole purpose is to avoid spending real wall-clock time on a
+  timeout or sleep. Mocking away the very code under test, or the transport, or
+  the provider boundary, disqualifies the test as an integration test.
+* **Prefer test agents.** Integration tests run against real test agents
+  (spawned via the normal `deep-worker` lifecycle), not against hand-built
+  in-memory stand-ins.
+* **Reproduce the real payload shape.** When a bug was caused by a specific
+  real-world payload (e.g. a nested provider error reply), the integration test
+  MUST drive that exact payload shape through the real path — not a flattened /
+  idealised version. A prior grok 402 fix passed only because its
+  tests fed a *flat* `error.message` the real API never sends; the real nested
+  reply still broke in production. That is the failure mode this policy exists
+  to prevent.
+* **"Where possible" is narrow.** The only acceptable reason to omit an
+  integration test is a genuinely uncontrollable external precondition (e.g.
+  you cannot force a third-party account into a billing state on demand). In
+  that case you fault-inject the real *reply* at the real boundary (not by
+  mocking your own function) and you document in the test why the external
+  trigger could not be reproduced directly.
+
+Reporting a fix as "done and verified" on the strength of unit tests that never
+executed the real failing path is a false report. Reviewers must reject diffs
+whose only tests are mocked unit tests when an honest integration test was
+feasible.

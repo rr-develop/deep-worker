@@ -113,6 +113,31 @@ class IndexConfig:
     # See docs/SEMANTIC_SEARCH_DESIGN.md § Embeddings for alternatives.
     embedding_model: str = "intfloat/multilingual-e5-small"
 
+    # Number of nodes WRITTEN to the vector store per transaction.
+    # CRITICAL: nodes MUST be written in batches, never one-at-a-time —
+    # LanceDB creates a new data fragment + manifest version per add() call,
+    # so per-node inserts degrade to O(n) transactions (thousands of .txn
+    # files) and crawl at ~1 insert/sec on large histories. Batching cuts
+    # this to ceil(n / index_batch_size) transactions. This is the WRITE
+    # batch size and is INDEPENDENT of the progress step below. See
+    # docs/DESIGN_FIX_BATCHED_INDEX_INSERT.md.
+    index_batch_size: int = 1000
+
+    # How many nodes to embed per progress tick. This is the PROGRESS
+    # granularity ONLY — it has nothing to do with when batches are written
+    # to LanceDB (index_batch_size). Smaller → smoother bar / more accurate
+    # ETA, at the cost of slightly less-batched embedding calls. Embedding a
+    # slice is cheap; the write stays batched at index_batch_size.
+    embed_progress_step: int = 64
+
+    # How many message groups to chunk per "Analyzing history…" progress tick
+    # (Phase 1, before embedding). This is the PROGRESS granularity for the
+    # chunking pass ONLY — it keeps the long tokenization/chunking pass from
+    # sitting silent on large histories. Deliberately a SMALL step and
+    # INDEPENDENT of index_batch_size (the write batch). See
+    # docs/DESIGN_HISTORY_INDEX_ANALYZE_PHASE_PROGRESS.md.
+    analyze_progress_step: int = 32
+
 
 @dataclass(frozen=True)
 class RepoIndex:

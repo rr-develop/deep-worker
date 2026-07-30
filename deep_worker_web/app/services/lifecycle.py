@@ -54,7 +54,7 @@ def _read_status_file(agent_name: str) -> str:
     NEVER used to gate stop — just surfaced in event payloads so the UI
     can show which agents were "officially" idle vs running.
     """
-    path = Path("~/.deep_worker").expanduser() / agent_name / "session_metadata.json"
+    path = Path.home() / Path("~/.deep_worker").name / agent_name / "session_metadata.json"
     try:
         data = json.loads(path.read_text())
         return str(data.get("status", "unknown"))
@@ -508,7 +508,8 @@ class AgentLifecycleService:
             else:
                 # Tail the spawn error log for the UI.
                 log_path = (
-                    Path("~/.deep_worker").expanduser()
+                    Path.home()
+                    / Path("~/.deep_worker").name
                     / "logs"
                     / f"{agent_name}.spawn.log"
                 )
@@ -852,7 +853,7 @@ class AgentLifecycleService:
 
         # Fire-and-forget via rpyc.async_ — never await the round trip.
         try:
-            import rpyc  # type: ignore[import-not-found]
+            import rpyc_async as rpyc  # type: ignore[import-not-found]
         except Exception as exc:  # noqa: BLE001
             await _emit_rpc_failure(
                 "rpyc_import_failed", f"{type(exc).__name__}: {exc}"

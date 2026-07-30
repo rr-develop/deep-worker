@@ -21,8 +21,8 @@ class _AwaitableValue:
     ``async_(netref_method)()`` -> AsyncResult shape used in production: the
     non-blocking await path (``AsyncResult.__await__`` yields to the loop).
     A bare blocking netref call (``root.method()``) is FORBIDDEN — see
-    ``test_no_blocking_rpyc_in_handlers.py`` and the banner in
-    ``agent_service.get_agent_dialog_formatted``."""
+    ``tests/integration/test_no_blocking_rpyc_in_handlers.py`` and the banner
+    in ``agent_service.get_agent_dialog_formatted``."""
 
     def __init__(self, value: object) -> None:
         self._value = value
@@ -39,13 +39,13 @@ def _patch_rpyc_async(monkeypatch):  # noqa: ANN001, ANN201
     """Model production faithfully: the service MUST reach the introspection
     methods via ``rpyc.async_(root.M)()`` (the non-blocking await path), NOT a
     bare ``await root.M()`` (which blocks the event loop in
-    AsyncResult.value/serve — regression 2026-06-23). Real ``rpyc.async_``
+    AsyncResult.value/serve — a past regression). Real ``rpyc.async_``
     rejects non-netref fakes, so we stub it with the same CONTRACT: given a
     bound method, calling the wrapper returns an awaitable yielding that
     method's value. If the service ever regresses to a bare ``await
     root.M()``, this stub is bypassed and the call is no longer awaitable →
     the test fails, surfacing the blocking regression."""
-    import rpyc  # type: ignore[import-not-found]
+    import rpyc_async as rpyc  # type: ignore[import-not-found]
 
     def _fake_async(bound_method):  # noqa: ANN001, ANN202
         def _invoke(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202

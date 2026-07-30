@@ -5,124 +5,136 @@ import sys
 import subprocess
 import threading
 import time
-import signal
 import logging
+from pathlib import Path
 from typing import Any
 from fastapi import APIRouter, HTTPException
-import psutil
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-def do_restart() -> None:
-    """
-    Perform server restart.
+def _server_run_py() -> Path:
+    """Return the run.py for the currently running checkout."""
+    argv0 = Path(sys.argv[0]) if sys.argv else Path("run.py")
+    if argv0.name == "run.py" and argv0.is_absolute():
+        return argv0
+    return Path(__file__).resolve().parents[2] / "run.py"
 
-    Waits briefly to ensure HTTP response is sent, then starts new process
-    and immediately terminates current one.
+
+def _restart_helper_code() -> str:
+    """Python code for the detached one-shot restart helper."""
+    return r'''
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+old_pid = int(sys.argv[1])
+run_py = Path(sys.argv[2])
+deadline = time.monotonic() + 5.0
+while time.monotonic() < deadline:
+    try:
+        os.kill(old_pid, 0)
+    except OSError:
+        break
+    time.sleep(0.05)
+
+# The replacement server bootstraps its own sys.path (run.py
+# _bootstrap_sys_path), so it does not need a PYTHONPATH handed down. Keep
+# the inherited environment anyway: dropping it is what made a stale
+# PYTHONPATH-dependent startup fail invisibly.
+#
+# Startup output goes to a file, NOT DEVNULL. A restart that dies during
+# import (ModuleNotFoundError, bad port, ...) must leave a trace instead of
+# vanishing after the old process has already exited.
+startup_log = Path("/tmp/deep_worker_web/restart_startup.log")
+try:
+    startup_log.parent.mkdir(parents=True, exist_ok=True)
+    sink = open(startup_log, "ab", buffering=0)
+except OSError:
+    sink = None
+
+proc = subprocess.Popen(
+    [sys.executable, str(run_py)],
+    cwd=str(run_py.parent),
+    start_new_session=True,
+    stdin=subprocess.DEVNULL,
+    stdout=sink if sink is not None else subprocess.DEVNULL,
+    stderr=subprocess.STDOUT if sink is not None else subprocess.DEVNULL,
+)
+
+# If the replacement dies immediately, record it. Without this the restart
+# silently leaves no server at all.
+time.sleep(2.0)
+rc = proc.poll()
+if rc is not None and sink is not None:
+    sink.write(
+        f"FATAL: replacement server exited with code {rc} "
+        f"within 2s of restart\\n".encode()
+    )
+'''.strip()
+
+
+def do_restart() -> None:
+    """Perform server restart from a background thread.
+
+    The endpoint returns the HTTP response before this function exits the
+    process. Keep the short delay so the response can flush, then start a
+    detached helper. The helper waits for this process to disappear and only
+    then starts the replacement, avoiding the bind race on 127.0.0.1:7887/7888.
     """
     logger.info("=" * 60)
     logger.info("RESTART INITIATED")
-    logger.info(f"Current PID: {os.getpid()}")
-    logger.info(f"Parent PID: {os.getppid()}")
+    current_pid = os.getpid()
+    run_py = _server_run_py()
+    logger.info(f"Current PID: {current_pid}")
+    logger.info(f"Parent PID: {os.getppid()} (left untouched)")
+    logger.info(f"Restart run.py: {run_py}")
 
-    # Brief wait to ensure HTTP response is sent (0.1s is sufficient)
+    # This function runs in the endpoint's background thread. Preserve the
+    # response-send gap before os._exit(0); otherwise the client can see a
+    # dropped request even though the restart was scheduled.
     logger.debug("Sleeping 0.1s to ensure HTTP response is sent...")
     time.sleep(0.1)
     logger.debug("Sleep completed")
 
-    # Get the Python executable
-    python_exe = sys.executable
-
-    # Determine how the server was started
-    script_args = sys.argv.copy()
-
-    # Check if we were launched via run.py
-    if len(script_args) > 0:
-        first_arg = script_args[0]
-
-        # If run.py is in the path, use it
-        if 'run.py' in first_arg:
-            script_args = [python_exe, 'run.py']
-        # If running via uvicorn directly
-        elif first_arg.endswith('uvicorn') or 'uvicorn' in first_arg:
-            # Keep the original command
-            script_args = [python_exe] + script_args
-        else:
-            # Default to run.py
-            script_args = [python_exe, 'run.py']
-    else:
-        # Default to run.py
-        script_args = [python_exe, 'run.py']
-
-    # Get current working directory
-    cwd = os.getcwd()
-
-    logger.info(f"Starting new process: {' '.join(script_args)}")
-    logger.info(f"Working directory: {cwd}")
-
-    # Start new process
     try:
-        new_proc = subprocess.Popen(
-            script_args,
-            cwd=cwd,
+        helper = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                _restart_helper_code(),
+                str(current_pid),
+                str(run_py),
+            ],
+            cwd=str(run_py.parent),
             start_new_session=True,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
+            stderr=subprocess.DEVNULL,
         )
-        logger.info(f"New process started with PID: {new_proc.pid}")
+        logger.info(f"Restart helper started with PID: {helper.pid}")
     except Exception as e:
-        logger.error(f"ERROR starting new process: {e}", exc_info=True)
+        logger.error(f"ERROR starting restart helper: {e}", exc_info=True)
+        # Also record it next to the replacement server's startup output, so a
+        # failed restart is diagnosable from one place. This path does NOT
+        # reach os._exit(0) below, so the current server keeps serving.
+        try:
+            startup_log = Path("/tmp/deep_worker_web/restart_startup.log")
+            startup_log.parent.mkdir(parents=True, exist_ok=True)
+            with open(startup_log, "a", encoding="utf-8") as fh:
+                fh.write(
+                    f"FATAL: restart helper failed to spawn: {e!r}; "
+                    f"current server (pid {current_pid}) left running\n"
+                )
+        except OSError:
+            pass
         raise
 
-    logger.info("Preparing to terminate process tree...")
-
-    # Kill the PARENT process to free the port
-    try:
-        current_pid = os.getpid()
-        parent_pid = os.getppid()
-
-        logger.info(f"Current PID: {current_pid}, Parent PID: {parent_pid}")
-
-        # Check if we have a parent process
-        if parent_pid > 1:
-            logger.info(f"Killing parent process PID {parent_pid}")
-
-            # Try graceful shutdown first (SIGTERM)
-            try:
-                os.kill(parent_pid, signal.SIGTERM)
-                logger.info("Sent SIGTERM to parent, waiting 0.5s...")
-                time.sleep(0.5)
-            except OSError:
-                pass  # Process already dead
-
-            # Check if parent is still alive
-            try:
-                # os.kill(pid, 0) doesn't kill, just checks if process exists
-                os.kill(parent_pid, 0)
-                # Still alive, force kill with SIGKILL
-                logger.warning("Parent still alive after SIGTERM, sending SIGKILL")
-                os.kill(parent_pid, signal.SIGKILL)
-                time.sleep(0.2)
-            except OSError:
-                # Process is dead (as expected)
-                logger.info("Parent process terminated")
-
-            # If we're still alive, force exit
-            logger.info("Forcing current process exit")
-            os._exit(0)
-        else:
-            # No parent (shouldn't happen, but handle anyway)
-            logger.warning("No parent process found, killing self")
-            os.kill(current_pid, signal.SIGKILL)
-            os._exit(0)
-
-    except Exception as e:
-        logger.error(f"EXCEPTION during shutdown: {e}", exc_info=True)
-        # Exit anyway to complete restart (new process already started)
-        os._exit(0)
+    logger.info("Exiting current server process for restart")
+    os._exit(0)
 
 
 @router.post("/api/server/restart")

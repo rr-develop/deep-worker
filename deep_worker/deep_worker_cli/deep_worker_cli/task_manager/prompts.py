@@ -1,6 +1,10 @@
-"""TaskManager prompts - exact copies from ai_lib/processes/task_manager.py.
+"""TaskManager prompts - originally exact copies from ai_lib/processes/task_manager.py.
 
-CRITICAL: These prompts MUST be identical to ai_lib to ensure consistent behavior.
+CRITICAL: These prompts MUST stay identical to ai_lib to ensure consistent
+behavior, with one deliberate divergence: ``BLOCKED_ON_USER_RULE`` (see below)
+is injected into both evaluation prompts. Do NOT drop it when syncing with
+ai_lib - it fixes an infinite manager/subordinate "wait for the user" loop and
+is pinned by tests/task_manager/test_blocked_on_user_no_pingpong.py.
 """
 
 from pathlib import Path
@@ -25,6 +29,56 @@ references external facts that you cannot verify from context alone.
 Most evaluations do not need web access.
 
 IF THE USER ASKS NOT TO DO SOMETHING, FOR EXAMPLE, NOT TO CHANGE CODE, NOT TO RUN OR NOT TO STOP SCRIPTS, THEN TASK MANAGER HAS NO RIGHT TO REQUEST FROM ITS SUBORDINATE TO DO ANYTHING THAT CONTRADICTS THIS REQUIREMENT. THESE REQUIREMENTS APPLY EQUALLY TO TASK MANAGER ITSELF AND TO ITS SUBORDINATE."""
+
+
+# Anti-ping-pong rule, shared by the initial and the follow-up evaluation
+# prompts.
+#
+# Defect it fixes: when the subordinate reports "I am waiting for the user's
+# confirmation", the criteria above leave no fitting status. Waiting is not
+# 'done', and 'unable' demands proof of impossibility, so the model settles on
+# 'in_progress' and emits a MESSAGE — and every 'in_progress' MESSAGE becomes
+# another subordinate turn (see TaskManager.on_subordinate_response). The
+# subordinate then repeats "I am waiting for the user", and the exchange never
+# converges.
+#
+# The rule adds the missing branch. Staying silent is expressed with
+# 'unable' + "MESSAGE: NONE", which the existing machinery already treats as a
+# terminal, message-free outcome, so no parser or control-flow change is
+# needed.
+BLOCKED_ON_USER_RULE = """BLOCKED-ON-USER RULE (mandatory, overrides other criteria):
+
+If the subordinate's response states it is waiting for the user's
+decision, confirmation, approval, or missing input, you have exactly
+two permitted actions - never a third:
+
+(a) ANSWER INSTEAD OF THE USER - only if the question has one clear,
+    unambiguous answer that is already fully determined by the initial
+    user request, by explicit user instructions, or by project
+    policies. Then return STATUS: in_progress with MESSAGE containing
+    that answer as a direct instruction.
+
+(b) STAY SILENT - if the answer genuinely requires the user (a real
+    choice, a preference, missing facts, permission you cannot grant,
+    or anything that would change scope, architecture or policy).
+    Then return:
+        STATUS: unable
+        REASONING: subordinate is blocked awaiting user input: <what>
+        MESSAGE: NONE
+    This is a legitimate use of 'unable' and
+    does NOT require proof of impossibility.
+
+If unfinished work remains that does NOT require the user, treat as
+ordinary incomplete -> STATUS in_progress with a concrete next step
+(never a wait-for-user echo). A claim of waiting for the user is not a
+shield for work the subordinate could have finished on its own.
+
+STRICTLY FORBIDDEN: replying to a "waiting for the user" response with
+any variant of "wait for the user", "awaiting confirmation", "continue
+waiting", or a restatement of the same question. Such a message adds no
+new information and creates an infinite manager/subordinate loop.
+Repeating a correction that the subordinate has already answered with
+"I am waiting for the user" is itself proof that you must choose (b)."""
 
 
 def format_evaluation_prompt(
@@ -81,6 +135,8 @@ IMPORTANT:
 - The subordinate must provide convincing proof with specific technical reasons
 - Focus on the INITIAL request, not intermediate corrections
 - Be honest: partial completion means 'in_progress', not 'done'
+
+{BLOCKED_ON_USER_RULE}
 
 OUTPUT FORMAT (must be strictly followed):
 STATUS: <done|in_progress|unable>
@@ -145,6 +201,8 @@ def format_followup_prompt(last_response: str) -> str:
 
 Re-evaluate if the initial user request is now fully completed.
 Return your evaluation in the same format as before.
+
+{BLOCKED_ON_USER_RULE}
 
 IF THE USER ASKS NOT TO DO SOMETHING, FOR EXAMPLE, NOT TO CHANGE CODE, NOT TO RUN OR NOT TO STOP SCRIPTS, THEN TASK MANAGER HAS NO RIGHT TO REQUEST FROM ITS SUBORDINATE TO DO ANYTHING THAT CONTRADICTS THIS REQUIREMENT. THESE REQUIREMENTS APPLY EQUALLY TO TASK MANAGER ITSELF AND TO ITS SUBORDINATE."""
 

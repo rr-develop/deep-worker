@@ -17,16 +17,16 @@ from deep_worker_cli.process.registry import ProcessRegistry
 # ============================================================================
 # CRITICAL: RPYC MUST BE IMPORTED FROM SOURCE CODE, NOT FROM PIP!
 # ============================================================================
-# ALWAYS import rpyc from the rpyc_async source checkout when available.
+# ALWAYS import rpyc from a local rpyc_async source checkout.
 # This ensures we use rpyc_async with AsyncioServer support.
 # ============================================================================
-_rpyc_async_path = Path(__file__).resolve().parents[4].parent / "rpyc_async"
+_rpyc_async_path = Path("/path/to/rpyc_async")
 if _rpyc_async_path.exists() and str(_rpyc_async_path) not in sys.path:
     sys.path.insert(0, str(_rpyc_async_path))
 
-import rpyc
-from rpyc.core.async_connect import async_connect
-from rpyc.utils.classic import obtain
+import rpyc_async as rpyc
+from rpyc_async.core.async_connect import async_connect
+from rpyc_async.utils.classic import obtain
 
 if TYPE_CHECKING:
     from deep_worker_cli.basesession.protocol_types import SessionInfo
@@ -46,6 +46,12 @@ class AgentClient:
 
         await client.disconnect()
     """
+
+    # Bound for the ENTIRE connect (TCP sock_connect + eager RPyC
+    # HANDLE_GETROOT handshake). MUST cover the handshake, not just the TCP
+    # step — see the banner in ``connect()`` and
+    # test_agent_client_connect_bounded.py.
+    _CONNECT_TIMEOUT: float = 10.0
 
     def __init__(
         self,
@@ -96,28 +102,46 @@ class AgentClient:
             # Get event loop
             loop = asyncio.get_running_loop()
 
-            # FULLY ASYNC connection - NO blocking, NO threads!
-            # Uses asyncio.sock_connect() under the hood for non-blocking socket I/O
-            self._conn = await async_connect(
-                "127.0.0.1",
-                agent_info.rpyc_port,
-                config={"allow_public_attrs": True},
-                timeout=10.0,
-                loop=loop
+            # ⚠️ BOUND THE WHOLE CONNECT — DO NOT REGRESS. ⚠️
+            # ``async_connect``'s OWN ``timeout=`` kwarg wraps ONLY the
+            # ``sock_connect`` step. The eager ``HANDLE_GETROOT`` handshake
+            # inside async_connect (``await conn.async_request(HANDLE_GETROOT)``)
+            # is UNBOUNDED. Against a busy/deadlocked peer TCP connects fine but
+            # the handshake never gets answered → this ``connect()`` blocks
+            # forever. That is exactly what hung an agent's
+            # ``send_message_to_agent`` in a past incident: bounded only by the outer
+            # 120s tool timeout, the send parked as a background job and never
+            # returned ``{"success": true}``, so SendMessageCompletionMiddleware
+            # never ended the turn and the agent WRONGLY kept making tool calls
+            # after the send instead of going idle. Same family as a related
+            # internal incident analysis (not included here). The OUTER
+            # ``wait_for`` bounds the ENTIRE connect (TCP + eager handshake),
+            # mirroring the web AgentService.
+            # See tests/unit_tests/client/test_agent_client_connect_bounded.py.
+            self._conn = await asyncio.wait_for(
+                async_connect(
+                    "127.0.0.1",
+                    agent_info.rpyc_port,
+                    config={"allow_public_attrs": True},
+                    timeout=self._CONNECT_TIMEOUT,
+                    loop=loop,
+                ),
+                timeout=self._CONNECT_TIMEOUT,
             )
 
-            # NOTE: async_connect() already enables asyncio serving internally,
-            # so we don't need to call enable_asyncio_serving() again!
-
-            # CRITICAL: DO NOT access self._conn.root here!
-            # Accessing .root triggers RPC handshake which BLOCKS in async context.
-            # Instead, use lazy access via _ensure_root() (accessed on first use).
-            # self._root stays None until first RPC call.
+            # NOTE: async_connect() already enables asyncio serving internally
+            # AND eager-fetches ``conn._remote_root`` via the event-driven async
+            # handshake, so the first ``self._conn.root`` access is non-blocking
+            # (cached). ``_ensure_root`` therefore never triggers a blocking
+            # ``sync_request(HANDLE_GETROOT)`` on a healthy conn.
 
             self.connected = True
 
         except asyncio.TimeoutError as e:
-            raise IPCConnectionError(f"Connection timeout after 10s") from e
+            raise IPCConnectionError(
+                f"Connection to agent '{self.agent_name}' timed out after "
+                f"{self._CONNECT_TIMEOUT}s (TCP + RPyC root handshake)"
+            ) from e
         except Exception as e:
             raise IPCConnectionError(f"Failed to connect via RPyC: {e}") from e
 
@@ -178,7 +202,7 @@ class AgentClient:
             command_type = command.get("command")
 
             # Import RPyC consts for low-level protocol handlers
-            from rpyc.core import consts
+            from rpyc_async.core import consts
 
             # Map commands to RPyC service methods using low-level HANDLE_ASYNC_CALLATTR
             # This bypasses Python's attribute access (which creates intermediate netrefs)
@@ -201,15 +225,32 @@ class AgentClient:
                 response = json.loads(response_json_str)
                 return response
 
+            elif command_type == "summarize":
+                prompt = command.get("prompt")
+                async_result = self._conn.async_request(
+                    consts.HANDLE_ASYNC_CALLATTR,
+                    self._root,
+                    "exposed_summarize",
+                    (prompt,),
+                    (),
+                )
+                response_json_str = await async_result
+                return json.loads(response_json_str)
+
             elif command_type == "invoke":
                 message = command.get("message", "")
                 stream = command.get("stream", False)
+                # Optional startup-query send-through (§4.5). When present,
+                # forwarded positionally to exposed_invoke_agent(message,
+                # stream, sum_query, query).
+                sum_query = command.get("sum_query")
+                query = command.get("query")
                 # Use low-level async_request with HANDLE_ASYNC_CALLATTR
                 async_result = self._conn.async_request(
                     consts.HANDLE_ASYNC_CALLATTR,
                     self._root,
                     "exposed_invoke_agent",  # method name (with exposed_ prefix!)
-                    (message, stream),       # args tuple
+                    (message, stream, sum_query, query),  # args tuple
                     ()                       # kwargs list (empty)
                 )
                 response_json_str = await async_result
@@ -263,6 +304,18 @@ class AgentClient:
                     consts.HANDLE_ASYNC_CALLATTR,
                     self._root,
                     "exposed_get_metadata",
+                    (),
+                    (),
+                )
+                response_json_str = await async_result
+                response = json.loads(response_json_str)
+                return response
+
+            elif command_type == "reindex_history":
+                async_result = self._conn.async_request(
+                    consts.HANDLE_ASYNC_CALLATTR,
+                    self._root,
+                    "exposed_reindex_history",
                     (),
                     (),
                 )
@@ -382,6 +435,12 @@ class AgentClient:
             return None
         meta = response.get("metadata")
         return meta if isinstance(meta, dict) else None
+
+    async def reindex_history(self) -> dict[str, Any]:
+        response = await self._send_command({"command": "reindex_history"})
+        if not isinstance(response, dict):
+            return {"success": False, "error": "Invalid reindex_history response"}
+        return response
 
     async def get_task_manager_info(self) -> dict[str, Any] | None:
         """Return TaskManager state from the agent, or ``None`` on error.

@@ -177,6 +177,25 @@ class TestPassThrough:
         ]
         assert _invoke(self.mw, msgs) is None
 
+    def test_parked_in_progress_send_does_not_end_turn(self) -> None:
+        """Incident 2026-07-01: when the sender's connect hung, the
+        ``send_message_to_agent`` tool was PARKED as a 120s background job and
+        its ToolMessage was the ``in_progress`` job-handle notice — NOT a
+        ``{"success": true}`` payload. This middleware must NOT end the turn on
+        that (Gate 4 = success only), which is precisely why the agent kept
+        making tool calls after the send. The REAL fix is bounding the connect
+        (see test_agent_client_connect_bounded.py); this asserts the middleware
+        contract that a non-success/parked result never triggers turn-end."""
+        parked_notice = (
+            "Tool 'send_message_to_agent' is still running after 120s. "
+            "status: in_progress. job_id: toolu_ABC. actions: "
+            'wait_for_job(job_id="toolu_ABC", timeout=<seconds>) or '
+            'kill_job(job_id="toolu_ABC").'
+        )
+        msgs = [_tool_msg(parked_notice)]
+        # Not JSON / no success field → gates fail → no turn-end.
+        assert _invoke(self.mw, msgs) is None
+
     def test_empty_delivered_content(self) -> None:
         msgs = [_tool_msg(json.dumps({"success": True, "delivered_content": ""}))]
         assert _invoke(self.mw, msgs) is None

@@ -32,9 +32,9 @@ from llama_index.core.node_parser import (
 )
 from llama_index.core.schema import NodeRelationship, RelatedNodeInfo, TextNode
 from llama_index.core.storage.docstore import SimpleDocumentStore
-from llama_index.core.utils import get_tokenizer  # type: ignore[import-untyped]
 from llama_index.vector_stores.lancedb import LanceDBVectorStore  # type: ignore[import-untyped]
 
+from ._tokenizer import TokenizeFn, effective_max_tokens, embed_model_tokenizer
 from .config import IndexConfig, RepoIndex
 from .scanner import compute_file_hash, get_language, scan_files
 
@@ -119,46 +119,59 @@ def _create_merged_node(batch: list[BaseNode], merged_text: str) -> BaseNode:  #
 
 def _merge_small_chunks(
     nodes: list[BaseNode],
-    max_tokens: int,
+    effective_max: int,
+    tokenize_fn: TokenizeFn,
     min_chars: int = 100,
 ) -> list[BaseNode]:  # type: ignore[misc]
-    """Merge small chunks and filter out files with single tiny chunk.
+    """Merge small chunks, enforce the embedder ceiling, drop micro-chunks.
 
     Algorithm:
-    1. Phase 1 - Merging: Iterate through nodes sequentially and accumulate
-       consecutive nodes into merged chunks (up to max_tokens)
-    2. Phase 2 - Filtering (applied to Phase 1 results):
-       - Single-chunk file < min_chars → skip entire file (return [])
-       - Multi-chunk file → discard chunks < min_chars that remain after merging
-         (if chunk < min_chars remains, it means it couldn't be merged)
+    1. **Phase 1 — Merging:** iterate nodes sequentially and accumulate them
+       into merged chunks up to *effective_max* tokens (measured by
+       *tokenize_fn*, which MUST be the embedder's own tokenizer — see
+       :func:`semantic_search._tokenizer.embed_model_tokenizer` and
+       ``docs/DESIGN_FIX_TOKENIZER_MISMATCH.md``).
+    2. **Phase 1.5 — Re-check (RC-3):** ``CodeSplitter`` measures with its
+       own tiktoken-backed counter, not with the embedder's tokenizer, so a
+       leaf may pass Phase 1 (its tiktoken-count is ≤ ``effective_max``) and
+       still be over the limit in XLM-R units. Any node whose
+       *tokenize_fn*-count exceeds *effective_max* after Phase 1 is split
+       with ``SentenceSplitter(chunk_size=effective_max, chunk_overlap=...)``
+       so the downstream embedder never sees a payload > ``model_max_length``.
+    3. **Phase 2 — Filtering:**
+       - Single-chunk file < *min_chars* → skip entire file (return ``[]``)
+       - Multi-chunk file → discard chunks < *min_chars* that remain after
+         merging (if such a chunk remains here, it couldn't be merged in
+         Phase 1 without overflowing the budget, so we drop it).
 
     Args:
         nodes: List of nodes from CodeSplitter or SentenceSplitter.
-        max_tokens: Maximum tokens per merged chunk (from config.child_chunk_size).
+        effective_max: Per-chunk ceiling in *tokenize_fn* units.
+        tokenize_fn: Embedder's own tokenizer (raw ids, no special tokens).
         min_chars: Minimum characters threshold (100 by default).
 
     Returns:
         List of merged nodes where chunks are merged as much as possible.
-        Small chunks (< min_chars) that couldn't be merged are discarded in multi-chunk files.
-        Empty list if single-chunk file < min_chars (skip entire file).
+        Small chunks (< min_chars) that couldn't be merged are discarded in
+        multi-chunk files. Empty list if single-chunk file < min_chars (skip
+        entire file).
     """
     if not nodes:
         return []
 
-    tokenizer = get_tokenizer()  # type: ignore[no-untyped-call]
     merged_nodes: list[BaseNode] = []
     current_batch: list[BaseNode] = []
     current_text = ""
     current_tokens = 0
 
-    # Phase 1: Merge chunks up to max_tokens
+    # Phase 1: Merge chunks up to effective_max
     for node in nodes:
         node_text = node.get_content()
-        node_tokens = len(tokenizer(node_text))  # type: ignore[no-untyped-call]
+        node_tokens = len(tokenize_fn(node_text))
 
         # Case 1: Node is already too big → keep as is, don't merge
-        if node_tokens > max_tokens:
-            # Flush current batch first
+        # (Phase 1.5 below will split it with the embedder's tokenizer.)
+        if node_tokens > effective_max:
             if current_batch:
                 merged_nodes.append(_create_merged_node(current_batch, current_text))
                 current_batch = []
@@ -168,8 +181,8 @@ def _merge_small_chunks(
             merged_nodes.append(node)
             continue
 
-        # Case 2: Adding node would exceed max_tokens → flush batch
-        if current_tokens + node_tokens > max_tokens and current_batch:
+        # Case 2: Adding node would exceed effective_max → flush batch
+        if current_tokens + node_tokens > effective_max and current_batch:
             merged_nodes.append(_create_merged_node(current_batch, current_text))
             current_batch = [node]
             current_text = node_text
@@ -187,6 +200,39 @@ def _merge_small_chunks(
     if current_batch:
         merged_nodes.append(_create_merged_node(current_batch, current_text))
 
+    # Phase 1.5: Re-check every merged node against the embedder's tokenizer.
+    # Any node still over effective_max (because Phase 1 measured a leaf with
+    # a foreign tokenizer) is split by SentenceSplitter using effective_max
+    # in the embedder's own units, guaranteeing the hard invariant
+    # "no stored chunk exceeds model_max_length - special_tokens".
+    re_checked: list[BaseNode] = []
+    overlap = min(20, max(1, effective_max // 8))
+    for node in merged_nodes:
+        if len(tokenize_fn(node.get_content())) <= effective_max:
+            re_checked.append(node)
+            continue
+        splitter = SentenceSplitter(
+            chunk_size=effective_max,
+            chunk_overlap=overlap,
+        )
+        doc = Document(text=node.get_content(), metadata=node.metadata)
+        sub_nodes = splitter.get_nodes_from_documents([doc])
+        # Defensive: if SentenceSplitter (which measures with Settings.tokenizer
+        # — not necessarily the embedder's) still emits a >effective_max
+        # sub-node, drop it down by a hard character truncation as last resort.
+        # This must never happen in practice; the assertion is a tripwire.
+        for sn in sub_nodes:
+            if len(tokenize_fn(sn.get_content())) <= effective_max:
+                re_checked.append(sn)
+            else:  # pragma: no cover - tripwire
+                raise RuntimeError(
+                    "Phase 1.5 invariant violated: SentenceSplitter produced "
+                    f"a sub-node of {len(tokenize_fn(sn.get_content()))} tokens "
+                    f"(effective_max={effective_max}). This should not happen "
+                    "— check Settings.tokenizer alignment."
+                )
+    merged_nodes = re_checked
+
     # Phase 2: Filter small chunks based on file context
     if len(merged_nodes) == 1:
         # Single chunk for entire file
@@ -197,9 +243,9 @@ def _merge_small_chunks(
         # File has single chunk >= min_chars → keep it
         return merged_nodes
     else:
-        # Multiple chunks → filter out those < min_chars that remain after merging
-        # If a chunk < min_chars remains here, it means it COULDN'T be merged in Phase 1
-        # (merging would have exceeded max_tokens), so we discard it
+        # Multiple chunks → filter out those < min_chars that remain after
+        # merging. If such a chunk remains here, it COULDN'T be merged in
+        # Phase 1 (merging would have exceeded effective_max), so we discard.
         filtered = [n for n in merged_nodes if len(n.get_content()) >= min_chars]
         return filtered
 
@@ -231,12 +277,17 @@ def _load_document(file_path: Path, repo_path: Path) -> Document:
 def _split_document(
     doc: Document,
     config: IndexConfig,
+    effective_max: int,
+    tokenize_fn: TokenizeFn,
 ) -> list[BaseNode]:
     """Split a document into leaf nodes using the appropriate splitter.
 
     Code files use CodeSplitter (tree-sitter) with token-based chunking and
     smart merging to eliminate micro-chunks. Everything else falls back to
-    SentenceSplitter.
+    SentenceSplitter. In both cases the chunk-size cap is *effective_max*
+    (= ``min(config.child_chunk_size, model_max_length - special_tokens)``),
+    measured by *tokenize_fn* (the embedder's own tokenizer). See
+    ``docs/DESIGN_FIX_TOKENIZER_MISMATCH.md``.
     """
     language: str | None = doc.metadata.get("language")
 
@@ -247,25 +298,24 @@ def _split_document(
                 chunk_lines=999999,  # Don't limit by lines, use tokens instead
                 chunk_lines_overlap=config.chunk_lines_overlap,
                 max_chars=config.max_chars,  # Fallback for char mode
-                count_mode="token",  # Use token-based chunking
-                max_tokens=config.child_chunk_size,  # Read from config (default 1024)
+                count_mode="token",  # CodeSplitter measures in its own units
+                max_tokens=effective_max,  # advisory ceiling; Phase 1.5 enforces
             )
             nodes = splitter.get_nodes_from_documents([doc])
             if nodes:
-                # Apply smart merging to combine small chunks
+                # Apply smart merging + Phase-1.5 re-check (embedder's tok).
                 nodes = _merge_small_chunks(
                     nodes,
-                    max_tokens=config.child_chunk_size,
+                    effective_max=effective_max,
+                    tokenize_fn=tokenize_fn,
                     min_chars=100,
                 )
                 return nodes
         except Exception:  # noqa: BLE001
             pass  # Fall through to sentence splitter
 
-    # SentenceSplitter already produces chunks of size child_chunk_size (1024 tokens)
-    # No merging needed - it handles size internally
     return SentenceSplitter(
-        chunk_size=config.child_chunk_size,
+        chunk_size=effective_max,
         chunk_overlap=config.chunk_lines_overlap * 4,
     ).get_nodes_from_documents([doc])
 
@@ -308,13 +358,15 @@ def _make_hierarchy(
 def _process_document(
     doc: Document,
     config: IndexConfig,
+    effective_max: int,
+    tokenize_fn: TokenizeFn,
 ) -> tuple[list[BaseNode], list[BaseNode]]:
     """Return (all_nodes, leaf_nodes) for a document.
 
     *all_nodes* go into the docstore (needed for AutoMergingRetriever).
     *leaf_nodes* go into the vector store (for similarity search).
     """
-    leaf_nodes = _split_document(doc, config)
+    leaf_nodes = _split_document(doc, config, effective_max, tokenize_fn)
     all_nodes = _make_hierarchy(doc, leaf_nodes, config)
     return all_nodes, leaf_nodes
 
@@ -408,6 +460,24 @@ def index_repository(
     Settings.embed_model = embedding_model
     Settings.llm = None  # type: ignore[assignment]  # LlamaIndex accepts None at runtime
 
+    # Token accounting comes from the embedder itself; the chunkers (and
+    # SentenceSplitter inside Phase 1.5 of _merge_small_chunks) measure in
+    # the same units the embedder will encode in, so no chunk is silently
+    # truncated at embed time. See docs/DESIGN_FIX_TOKENIZER_MISMATCH.md.
+    tokenize_fn, model_max_length, special_tokens_reserve = (
+        embed_model_tokenizer(embedding_model)
+    )
+    effective_max = effective_max_tokens(
+        config, model_max_length, special_tokens_reserve
+    )
+    # Align Settings.tokenizer too — SentenceSplitter used inside Phase 1.5
+    # reads from it for its own size accounting. Set globally without restore,
+    # mirroring Settings.embed_model / Settings.llm above: the project's
+    # LlamaIndex usage treats Settings as process-global config. A subsequent
+    # index_repository / index_history_file call overwrites it with the same
+    # embedder-derived tokenizer, so there is no cross-run drift.
+    Settings.tokenizer = tokenize_fn  # type: ignore[assignment]
+
     # --- Storage setup ---
     # Load hashes before deciding LanceDB mode.
     # - Fresh index (no hashes yet) or reset → "overwrite" creates the table.
@@ -491,7 +561,9 @@ def index_repository(
 
     for file_path in files_to_add + files_to_update:
         doc = _load_document(file_path, repo_path)
-        all_nodes, leaf_nodes = _process_document(doc, config)
+        all_nodes, leaf_nodes = _process_document(
+            doc, config, effective_max, tokenize_fn
+        )
         all_nodes_to_store.extend(all_nodes)
         all_leaf_nodes_to_index.extend(leaf_nodes)
 

@@ -83,6 +83,11 @@ FATAL_EXCEPTION_TYPES: frozenset[str] = frozenset({
     "CheckpointCorruptedError",
     "ProviderAuthFatalError",
     "AgentNotInitialisedError",
+    # Raised by deepagents.middleware.summarization.SummarizationMiddleware
+    # when the pre-summarization history offload to backend fails.
+    # Continuing summarization would silently discard the evicted history.
+    # See DESIGN_FAIL_LOUD_SUMMARIZATION_OFFLOAD.md.
+    "HistoryOffloadError",
 })
 
 
@@ -142,6 +147,7 @@ FATAL_EXCEPTION_TYPES: frozenset[str] = frozenset({
     "CheckpointCorruptedError",
     "ProviderAuthFatalError",
     "AgentNotInitialisedError",
+    "HistoryOffloadError",
 })
 
 
@@ -201,6 +207,7 @@ FATAL_EXCEPTION_TYPES: frozenset[str] = frozenset({
     "CheckpointCorruptedError",
     "ProviderAuthFatalError",
     "AgentNotInitialisedError",
+    "HistoryOffloadError",
 })
 
 
@@ -212,3 +219,45 @@ def is_fatal_exception(exc: BaseException) -> bool:
     user can just type "continue".
     """
     return type(exc).__name__ in FATAL_EXCEPTION_TYPES
+
+
+# ---------------------------------------------------------------------------
+# No-Silent-API-Errors Policy (docs/POLICIES.md §9) — recoverable provider/API
+# error taxonomy.
+#
+# A provider's API can fail in a way the runtime CAN recover from (keep the
+# conversation alive, stay IDLE) — e.g. a non-terminal grok ACP error or a
+# codex protocol hiccup that is not a usage cap. Such an error is NOT fatal,
+# but it MUST still be surfaced to the user as a visible, PERSISTENT error in
+# the UI — never disguised as a benign "system: type continue" note and never
+# a self-dismissing toast. The recoverable path keys on this set to choose the
+# ``type="error"`` (persistent) notification instead of ``type="system"``.
+#
+# Matched by class name so the table stays provider-agnostic (codex agents
+# never import the grok module and vice versa). The account-terminal provider
+# errors (…UsageLimitError, ProviderAuthFatalError) are already fatal and
+# surface as ERROR via FATAL_EXCEPTION_TYPES; this set is only the recoverable
+# ones that would otherwise be swallowed.
+# ---------------------------------------------------------------------------
+
+PROVIDER_API_ERROR_TYPES: frozenset[str] = frozenset({
+    # grok ACP JSON-RPC error reply that is NOT an account-terminal cap
+    # (those are GrokUsageLimitError, already fatal). E.g. an upstream 5xx or
+    # a malformed session error the runtime recovers from.
+    "GrokAcpClientError",
+    "GrokConcurrentPromptError",
+    # codex exec protocol error that is not a usage cap.
+    "CodexProtocolError",
+})
+
+
+def is_provider_api_error(exc: BaseException) -> bool:
+    """Return True iff ``exc`` is a recoverable provider/API error that must be
+    surfaced to the user as a visible, persistent UI error (POLICIES.md §9).
+
+    Fatal provider errors (usage/billing caps, auth) are handled separately by
+    :func:`is_fatal_exception` and already surface as ``AgentStatus.ERROR``;
+    this predicate covers the *recoverable* API failures that would otherwise
+    be swallowed into a benign system note or a fleeting toast.
+    """
+    return type(exc).__name__ in PROVIDER_API_ERROR_TYPES

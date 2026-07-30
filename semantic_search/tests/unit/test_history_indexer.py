@@ -84,6 +84,16 @@ class TestGroupBySummarizedEvent:
         assert len(groups[0]) == 2
 
 
+def _fake_tokenize(text: str) -> list[int]:
+    """Fake tokenizer: one fake token per whitespace-separated word.
+
+    Deterministic substitute for the embedder's XLM-R tokenizer in unit
+    tests of ``_chunk_messages`` — the chunker only cares about the count
+    returned by ``tokenize_fn``. See ``docs/DESIGN_FIX_TOKENIZER_MISMATCH.md``.
+    """
+    return [hash(w) & 0xFFFF for w in text.split()]
+
+
 class TestChunkMessages:
     def test_single_group_within_limit(self) -> None:
         groups = [
@@ -95,14 +105,14 @@ class TestChunkMessages:
                 },
             ],
         ]
-        chunks = _chunk_messages(groups, max_tokens=100000)
+        chunks = _chunk_messages(groups, effective_max=100000, tokenize_fn=_fake_tokenize)
         assert len(chunks) == 1
         text, meta = chunks[0]
         assert "short message" in text
         assert meta["timestamp"] == "2026-01-01T00:00:00"
 
     def test_empty_groups_returns_empty(self) -> None:
-        assert _chunk_messages([], max_tokens=1000) == []
+        assert _chunk_messages([], effective_max=1000, tokenize_fn=_fake_tokenize) == []
 
     def test_skip_empty_content(self) -> None:
         groups = [
@@ -114,7 +124,7 @@ class TestChunkMessages:
                 },
             ],
         ]
-        chunks = _chunk_messages(groups, max_tokens=100000)
+        chunks = _chunk_messages(groups, effective_max=100000, tokenize_fn=_fake_tokenize)
         assert len(chunks) == 0
 
     def test_message_types_in_metadata(self) -> None:
@@ -124,7 +134,7 @@ class TestChunkMessages:
                 {"summarized_at": "ts1", "message_type": "ai", "message": {"data": {"content": "hello"}}},
             ],
         ]
-        chunks = _chunk_messages(groups, max_tokens=100000)
+        chunks = _chunk_messages(groups, effective_max=100000, tokenize_fn=_fake_tokenize)
         assert len(chunks) == 1
         text, meta = chunks[0]
         assert "User: hi" in text
@@ -139,7 +149,7 @@ class TestChunkMessages:
                 {"summarized_at": "ts1", "message_type": "ai", "message": {"data": {"content": "msg2"}}},
             ],
         ]
-        chunks = _chunk_messages(groups, max_tokens=100000)
+        chunks = _chunk_messages(groups, effective_max=100000, tokenize_fn=_fake_tokenize)
         assert len(chunks) == 1
         _, meta = chunks[0]
         assert "line_range" in meta
@@ -153,7 +163,7 @@ class TestChunkMessages:
                 {"summarized_at": "ts2", "message_type": "ai", "message": {"data": {"content": "second group"}}},
             ],
         ]
-        chunks = _chunk_messages(groups, max_tokens=100000)
+        chunks = _chunk_messages(groups, effective_max=100000, tokenize_fn=_fake_tokenize)
         assert len(chunks) >= 1
 
 
@@ -215,10 +225,34 @@ class TestHistoryIndexStats:
         assert "chunks_indexed=3" in r
 
 
+@pytest.fixture(scope="module")
+def _real_embed_model() -> object:
+    """Real strictly-offline HuggingFaceEmbedding(intfloat/multilingual-e5-small).
+
+    Module-scoped so the model is loaded once and reused across the three
+    on_progress tests; ``MockEmbedding`` cannot be used here any more because
+    the chunker now requires a real XLM-R tokenizer (RC-1 forbids the silent
+    fallback to tiktoken). See docs/DESIGN_FIX_TOKENIZER_MISMATCH.md.
+    """
+    import os as _os
+
+    _os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    _os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+    _os.environ.setdefault("TQDM_DISABLE", "1")
+    from llama_index.embeddings.huggingface import HuggingFaceEmbedding  # type: ignore[import-untyped]
+
+    return HuggingFaceEmbedding(
+        model_name="intfloat/multilingual-e5-small",
+        model_kwargs={"local_files_only": True},
+    )
+
+
 class TestIndexAllHistoryFilesOnProgress:
     """Tests for the on_progress callback in index_all_history_files."""
 
-    def test_on_progress_called_per_file(self, tmp_path: Path) -> None:
+    def test_on_progress_called_per_file(
+        self, tmp_path: Path, _real_embed_model: object
+    ) -> None:
         """Verify callback fires once per .jsonl file."""
         summaries_dir = tmp_path / "summaries"
         summaries_dir.mkdir(parents=True)
@@ -240,18 +274,19 @@ class TestIndexAllHistoryFilesOnProgress:
             calls.append(filename)
 
         from semantic_search.history_indexer import index_all_history_files
-        from llama_index.core.embeddings.mock_embed_model import MockEmbedding
 
         stats = index_all_history_files(
             summaries_dir=summaries_dir,
-            embed_model=MockEmbedding(embed_dim=384),
+            embed_model=_real_embed_model,
             on_progress=on_progress,
         )
 
         assert len(calls) == 3
         assert stats.files_processed == 3
 
-    def test_on_progress_filenames(self, tmp_path: Path) -> None:
+    def test_on_progress_filenames(
+        self, tmp_path: Path, _real_embed_model: object
+    ) -> None:
         """Verify callback receives correct stem/filename."""
         summaries_dir = tmp_path / "summaries"
         summaries_dir.mkdir(parents=True)
@@ -271,18 +306,19 @@ class TestIndexAllHistoryFilesOnProgress:
             calls.append(filename)
 
         from semantic_search.history_indexer import index_all_history_files
-        from llama_index.core.embeddings.mock_embed_model import MockEmbedding
 
         index_all_history_files(
             summaries_dir=summaries_dir,
-            embed_model=MockEmbedding(embed_dim=384),
+            embed_model=_real_embed_model,
             on_progress=on_progress,
         )
 
         assert len(calls) == 1
         assert "thread_alpha" in calls[0]
 
-    def test_on_progress_none_still_works(self, tmp_path: Path) -> None:
+    def test_on_progress_none_still_works(
+        self, tmp_path: Path, _real_embed_model: object
+    ) -> None:
         """Verify backward compat: on_progress=None works normally."""
         summaries_dir = tmp_path / "summaries"
         summaries_dir.mkdir(parents=True)
@@ -297,12 +333,237 @@ class TestIndexAllHistoryFilesOnProgress:
         )
 
         from semantic_search.history_indexer import index_all_history_files
-        from llama_index.core.embeddings.mock_embed_model import MockEmbedding
 
         # Should not raise
         stats = index_all_history_files(
             summaries_dir=summaries_dir,
-            embed_model=MockEmbedding(embed_dim=384),
+            embed_model=_real_embed_model,
             on_progress=None,
         )
         assert stats.files_processed >= 1
+
+
+class TestMessageProgress:
+    """Progress is reported in MESSAGES (jsonl lines), NOT chunks.
+
+    The denominator is a plain line count — known up front, so the bar shows
+    X/N + %% + ETA from the first tick (no "0/None", no "1/1"). The progress
+    granularity (embed_progress_step) is INDEPENDENT of the LanceDB write
+    batch size (index_batch_size).
+    """
+
+    def _write_lines(self, path: Path, n: int) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lines = []
+        for g in range(n):
+            body = (f"unique message content number {g} "
+                    + "lorem ipsum dolor sit amet " * 40).strip()
+            lines.append(json.dumps({
+                "summarized_at": f"ts-{g}",
+                "message_index": g,
+                "message_type": "human",
+                "message": {"data": {"content": body}},
+            }))
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    def test_total_is_message_count_known_from_first_tick(
+        self, tmp_path: Path, _real_embed_model: object
+    ) -> None:
+        from semantic_search.history_indexer import index_history_file
+        from semantic_search.config import IndexConfig
+
+        summaries_dir = tmp_path / "summaries"
+        fp = summaries_dir / "thread.jsonl"
+        N = 20
+        self._write_lines(fp, N)
+
+        calls: list[tuple[int, int]] = []
+
+        def on_message_progress(done: int, total: int) -> None:
+            calls.append((done, total))
+
+        cfg = IndexConfig(embed_progress_step=4)
+        stats = index_history_file(fp, summaries_dir, config=cfg,
+                                   embed_model=_real_embed_model,
+                                   on_message_progress=on_message_progress)
+
+        assert calls, "expected progress callbacks"
+        # total == number of NEW messages (lines), constant, known from the
+        # very first tick (never None, never the chunk count).
+        assert all(total == N for _, total in calls)
+        assert stats.lines_read == N
+        # done is monotonic non-decreasing and ends exactly at N.
+        dones = [d for d, _ in calls]
+        assert dones == sorted(dones)
+        assert dones[0] == 0            # first tick before any embedding
+        assert dones[-1] == N           # final tick == all messages
+        assert all(0 <= d <= N for d in dones)
+
+    def test_progress_step_independent_of_write_batch(
+        self, tmp_path: Path, _real_embed_model: object
+    ) -> None:
+        """Small progress step => many ticks; large write batch => few txns.
+
+        The two knobs are independent: a fine-grained progress bar must NOT
+        force many LanceDB transactions.
+        """
+        import math
+        from semantic_search.history_indexer import (
+            index_history_file, get_history_index_dir,
+        )
+        from semantic_search.config import IndexConfig
+
+        summaries_dir = tmp_path / "summaries"
+        fp = summaries_dir / "thread.jsonl"
+        self._write_lines(fp, 20)
+
+        calls: list[tuple[int, int]] = []
+
+        def on_message_progress(done: int, total: int) -> None:
+            calls.append((done, total))
+
+        # Fine progress (step=1) but a single big write batch (1000).
+        cfg = IndexConfig(embed_progress_step=1, index_batch_size=1000)
+        stats = index_history_file(fp, summaries_dir, config=cfg,
+                                   embed_model=_real_embed_model,
+                                   on_message_progress=on_message_progress)
+
+        # Many progress ticks (one per embed step over the chunks) ...
+        assert len(calls) >= 3
+        # ... but the WRITE stayed batched: one LanceDB transaction.
+        txn_dir = (get_history_index_dir(summaries_dir)
+                   / "lancedb" / "vectors.lance" / "_transactions")
+        n_txn = len(list(txn_dir.glob("*.txn"))) if txn_dir.exists() else 0
+        assert n_txn == math.ceil(stats.chunks_indexed / cfg.index_batch_size)
+        assert n_txn == 1
+
+    def test_none_callback_backward_compatible(
+        self, tmp_path: Path, _real_embed_model: object
+    ) -> None:
+        from semantic_search.history_indexer import index_history_file
+
+        summaries_dir = tmp_path / "summaries"
+        fp = summaries_dir / "thread.jsonl"
+        self._write_lines(fp, 5)
+        # Must not raise without the callback.
+        stats = index_history_file(fp, summaries_dir, embed_model=_real_embed_model)
+        assert stats.lines_read == 5
+        assert stats.chunks_indexed >= 1
+
+    def test_index_all_aggregates_messages_across_files(
+        self, tmp_path: Path, _real_embed_model: object
+    ) -> None:
+        from semantic_search.history_indexer import index_all_history_files
+
+        summaries_dir = tmp_path / "summaries"
+        self._write_lines(summaries_dir / "a.jsonl", 6)
+        self._write_lines(summaries_dir / "b.jsonl", 9)
+
+        calls: list[tuple[int, int]] = []
+
+        def on_message_progress(done: int, total: int) -> None:
+            calls.append((done, total))
+
+        stats = index_all_history_files(
+            summaries_dir=summaries_dir,
+            embed_model=_real_embed_model,
+            on_message_progress=on_message_progress,
+        )
+
+        assert stats.lines_read == 15
+        # Grand total (messages across all files) is constant and known up
+        # front; final done reaches it.
+        assert all(total == 15 for _, total in calls)
+        dones = [d for d, _ in calls]
+        assert dones == sorted(dones)
+        assert dones[0] == 0
+        assert dones[-1] == 15
+
+
+class TestBatchedWrite:
+    """Nodes MUST be written to LanceDB in batches, never one-at-a-time.
+
+    Per-node writes create one LanceDB transaction (data fragment + manifest
+    version) each — O(n) fsync-heavy writes that crawl on large histories.
+    These tests count the actual LanceDB transaction files.
+    """
+
+    def _write_n(self, path: Path, n: int) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lines = []
+        for g in range(n):
+            body = (f"unique message content number {g} "
+                    + "lorem ipsum dolor sit amet " * 40).strip()
+            lines.append(json.dumps({
+                "summarized_at": f"ts-{g}",
+                "message_index": g,
+                "message_type": "human",
+                "message": {"data": {"content": body}},
+            }))
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    def _txn_count(self, summaries_dir: Path) -> int:
+        from semantic_search.history_indexer import get_history_index_dir
+        txn_dir = (get_history_index_dir(summaries_dir)
+                   / "lancedb" / "vectors.lance" / "_transactions")
+        if not txn_dir.exists():
+            return 0
+        return len(list(txn_dir.glob("*.txn")))
+
+    def test_single_write_batch_one_transaction(
+        self, tmp_path: Path, _real_embed_model: object
+    ) -> None:
+        import math
+        from semantic_search.history_indexer import index_history_file
+        from semantic_search.config import IndexConfig
+
+        summaries_dir = tmp_path / "summaries"
+        fp = summaries_dir / "thread.jsonl"
+        self._write_n(fp, 20)
+
+        cfg = IndexConfig(index_batch_size=1000)
+        stats = index_history_file(fp, summaries_dir, config=cfg,
+                                   embed_model=_real_embed_model)
+
+        assert stats.chunks_indexed >= 5
+        expected = math.ceil(stats.chunks_indexed / cfg.index_batch_size)
+        assert expected == 1
+        assert self._txn_count(summaries_dir) == expected
+
+    def test_small_write_batch_bounds_transactions(
+        self, tmp_path: Path, _real_embed_model: object
+    ) -> None:
+        import math
+        from semantic_search.history_indexer import index_history_file
+        from semantic_search.config import IndexConfig
+
+        summaries_dir = tmp_path / "summaries"
+        fp = summaries_dir / "thread.jsonl"
+        self._write_n(fp, 20)
+
+        cfg = IndexConfig(index_batch_size=3)
+        stats = index_history_file(fp, summaries_dir, config=cfg,
+                                   embed_model=_real_embed_model)
+
+        assert stats.chunks_indexed >= 6
+        expected = math.ceil(stats.chunks_indexed / cfg.index_batch_size)
+        assert self._txn_count(summaries_dir) == expected
+        assert expected < stats.chunks_indexed
+
+    def test_all_nodes_indexed_and_searchable(
+        self, tmp_path: Path, _real_embed_model: object
+    ) -> None:
+        from semantic_search.history_indexer import (
+            index_history_file, history_index_exists,
+        )
+        from semantic_search.config import IndexConfig
+
+        summaries_dir = tmp_path / "summaries"
+        fp = summaries_dir / "thread.jsonl"
+        self._write_n(fp, 20)
+
+        cfg = IndexConfig(index_batch_size=4, embed_progress_step=4)
+        stats = index_history_file(fp, summaries_dir, config=cfg,
+                                   embed_model=_real_embed_model)
+        assert history_index_exists(summaries_dir)
+        assert stats.chunks_indexed >= 6

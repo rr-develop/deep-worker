@@ -152,6 +152,13 @@ class TestIndexConfig:
         assert 0.0 < config.simple_ratio_thresh < 1.0
         assert config.embedding_model != ""
 
+    def test_child_chunk_size_default_unchanged(self) -> None:
+        """Regression (DESIGN_FIX_TOKENIZER_MISMATCH.md): the fix must NOT
+        lower ``child_chunk_size`` — the embedder ceiling is applied at
+        ``effective_max_tokens`` time, leaving the config knob at 1024 so a
+        future larger-context embedder keeps the full budget."""
+        assert IndexConfig().child_chunk_size == 1024
+
     def test_is_frozen(self) -> None:
         config = IndexConfig()
         with pytest.raises((AttributeError, TypeError)):

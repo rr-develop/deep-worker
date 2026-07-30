@@ -27,8 +27,14 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+# Add rpyc_async to path
+_rpyc_async_path = Path("/path/to/rpyc_async")
+if str(_rpyc_async_path) not in sys.path:
+    sys.path.insert(0, str(_rpyc_async_path))
+
 if TYPE_CHECKING:
     from deep_worker_cli.process.agent_process import AgentProcess
+
 
 async def _start_agent_in_background(
     agent: "AgentProcess",
@@ -67,6 +73,7 @@ async def _start_agent_in_background(
             )
         await asyncio.sleep(poll_interval)
 
+
 async def _stop_agent(
     agent: "AgentProcess", start_task: asyncio.Task[None],
 ) -> None:
@@ -80,8 +87,10 @@ async def _stop_agent(
         with suppress_cancelled():
             await start_task
 
+
 from contextlib import contextmanager
 from typing import Iterator
+
 
 @contextmanager
 def suppress_cancelled() -> Iterator[None]:
@@ -91,6 +100,7 @@ def suppress_cancelled() -> Iterator[None]:
         pass
     except Exception:  # noqa: BLE001 — best-effort drain
         pass
+
 
 @pytest.mark.asyncio
 async def test_agent_process_starts_with_asyncio_server():
@@ -121,7 +131,7 @@ async def test_agent_process_starts_with_asyncio_server():
             assert agent.rpyc_port > 0, "RPyC port should be assigned"
 
             # Verify it's AsyncioServer
-            from rpyc.utils.async_server import AsyncioServer
+            from rpyc_async.utils.async_server import AsyncioServer
 
             assert isinstance(
                 agent.rpyc_server, AsyncioServer
@@ -129,6 +139,7 @@ async def test_agent_process_starts_with_asyncio_server():
 
         finally:
             await _stop_agent(agent, start_task)
+
 
 _REDUNDANT_SKIP_REASON = (
     "Same-process AgentProcess + async_connect topology is forbidden "
@@ -140,15 +151,18 @@ _REDUNDANT_SKIP_REASON = (
     "tests/integration_ai/test_agent_process_lifecycle.py."
 )
 
+
 @pytest.mark.skip(reason=_REDUNDANT_SKIP_REASON)
 @pytest.mark.asyncio
 async def test_client_can_connect_to_asyncio_server():
     """Replaced by cross-process test_agent_service_asyncio_e2e.py."""
 
+
 @pytest.mark.skip(reason=_REDUNDANT_SKIP_REASON)
 @pytest.mark.asyncio
 async def test_multiple_sequential_calls():
     """Replaced by cross-process test_agent_service_asyncio_e2e.py."""
+
 
 @pytest.mark.asyncio
 async def test_graceful_shutdown():

@@ -107,12 +107,16 @@ class AgentConfig:
         default (checking env vars first, then hardcoded fallback).
 
         Returns ``None`` when the provider has no default and the user
-        did not specify a model — this is the correct value for codex,
-        whose CLI picks its own current default when no ``--model`` is
-        passed (see ``config.py`` codex branch / DESIGN_CODEX_PROVIDER.md
-        §15 Q2). ``None`` MUST be preserved through to ``create_model``;
+        did not specify a model — this is the correct value for every
+        CLI-wrapper provider: **codex**, **grok** and (since 2026-07-28)
+        **claude-code**. Each wraps a CLI that resolves its own current
+        default when no ``--model`` is passed, and for claude-code that
+        default legitimately varies by account type, so pinning one here
+        would silently override the operator (see ``config.py``
+        ``_PROVIDER_DEFAULT_MODELS``).
+        ``None`` MUST be preserved through to ``create_model``;
         it must NOT be coerced to the literal ``"unknown"``, which the
-        Codex API rejects with HTTP 400 (observed live).
+        Codex API rejects with HTTP 400 (observed in a past incident).
         For display, use ``display_model`` instead.
         """
         if self.model:
@@ -121,10 +125,13 @@ class AgentConfig:
         return get_default_model_name(self.provider)
 
     def set_dynamic_display_model(self, model: str | None) -> None:
+        from deep_worker_cli.config import model_can_belong_to_provider
+
         if (
             isinstance(model, str)
             and model.strip()
             and model.strip().lower() != "unknown"
+            and model_can_belong_to_provider(self.provider, model)
         ):
             self._dynamic_display_model = model.strip()
 
@@ -138,8 +145,7 @@ class AgentConfig:
 
         Falls back to ``"unknown"`` when no concrete model can be
         resolved. NEVER feed this into ``create_model`` or persist it as
-        the launch_config model — that is what poisoned an agent
-        observed live. Use
+        the launch_config model — that is what caused a past incident. Use
         ``resolved_model`` (which may be ``None``) for the data path.
         """
         return self.dynamic_display_model or self.resolved_model or "unknown"

@@ -77,7 +77,7 @@ async def test_dispatch_status_event_does_not_wrap_with_rpyc_async() -> None:
     # Patch ``rpyc.async_`` at the source. If the implementation
     # reaches for it — either directly or via a lazy ``import rpyc``
     # inside the method — this call counter goes up and we fail.
-    import rpyc as rpyc_mod
+    import rpyc_async as rpyc_mod
 
     with patch.object(rpyc_mod, "async_") as async_wrapper:
         await agent._dispatch_status_event({"type": "status_change"})

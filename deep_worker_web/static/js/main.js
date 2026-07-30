@@ -145,7 +145,7 @@ function getStatusTextClass(status) {
 // (dead / not in the registry) rather than a transient failure against a live
 // agent. When true, the failed-op handler should remove the card — otherwise
 // a phantom card for an already-dead agent lingers and "Stop" appears to do
-// nothing (observed live, 2026-05-24). Backend signals this via a LookupError raised
+// nothing (observed in a past incident). Backend signals this via a LookupError raised
 // from request_stop ("Agent '<name>' not found"). We match on error_type AND
 // the message text so a backend wording/type tweak can't silently regress.
 // Pure function (no DOM/globals) so it is unit-testable in node.
@@ -178,6 +178,12 @@ function selectAgent(name) {
     document.getElementById('selected-agent-name').textContent = name;
     document.getElementById('agent-provider').textContent = agent.provider;
     document.getElementById('agent-model').textContent = agent.model;
+
+    // Per-agent uptime: push started_at into the DOM once, then start
+    // a single local clock-tick that re-renders every second. NO
+    // network — the value is already in memory.
+    setAgentUptimeStartedAt(agent.started_at);
+    startAgentUptimeTicker();
 
     // Update Stop TaskManager button state AND TM control row
     // visibility so the row appears immediately based on the info
@@ -303,7 +309,7 @@ async function sendMessage() {
     }
 }
 
-// Copy last response to clipboard (matches the web UI's copyLastResponse)
+// Copy last response to clipboard (matches the web UI copyLastResponse)
 async function copyLastResponse(event) {
     const content = document.getElementById('last-response-content');
     const text = content.textContent;
@@ -333,7 +339,7 @@ async function copyLastResponse(event) {
 // The error panel is SEPARATE from the Last Response panel. It is
 // persistent (never auto-dismissed), copyable, and shows the full
 // agent error text. It never overwrites the model's last response.
-// observed live, 2026-05-20: errors used to be a transient toast that
+// In a past incident, errors used to be a transient toast that
 // vanished and could not be copied.
 
 // Show (or update) the persistent error panel with the given text.
@@ -812,6 +818,7 @@ function labelForOp(op) {
         agent_spawn: 'Start',
         batch: 'Batch',
         task_manager_stop: 'Stop TaskManager',
+        agent_summarize: 'Summarize context',
     };
     return m[op] || op;
 }
@@ -834,6 +841,9 @@ function handleWebSocketMessage(data) {
             break;
         case 'agent_error':
             handleAgentError(data);
+            break;
+        case 'agent_summarized':
+            handleAgentSummarized(data);
             break;
         case 'history_response':
             handleHistoryResponse(data);
@@ -868,6 +878,9 @@ function handleWebSocketMessage(data) {
         case 'agent_discovered':
             handleAgentDiscovered(data);
             break;
+        case 'agent_started_at_changed':
+            handleAgentStartedAtChanged(data);
+            break;
         case 'agent_terminated':
             handleAgentTerminated(data);
             break;
@@ -881,7 +894,7 @@ function handleWebSocketMessage(data) {
             // A client RPyC channel to the agent was flooded and quarantined.
             // This is a WARNING ONLY — the agent keeps working and its status
             // is unchanged. Show a non-blocking warning; do NOT touch the
-            // agent's status badge or the error panel. observed live, 2026-05-22.
+            // agent's status badge or the error panel. Observed in a past incident.
             handleChannelQuarantined(data);
             break;
 
@@ -935,7 +948,7 @@ function handleWebSocketMessage(data) {
             finalizeRequest(data.request_id);
             // If a stop/restart failed because the agent is GONE (not found /
             // not running), the card is a phantom — remove it so the UI is
-            // consistent and "Stop" visibly resolves it (observed live, 2026-05-24).
+            // consistent and "Stop" visibly resolves it (observed in a past incident).
             if (
                 (data.type === 'agent_stop_failed' || data.type === 'agent_restart_failed') &&
                 data.agent_name &&
@@ -979,6 +992,24 @@ function handleAgentMessage(data) {
 
     // Only update if this is the selected agent (as per design decision Q2)
     if (agent_name !== selectedAgent) {
+        return;
+    }
+
+    // ========================================================================
+    // No-Silent-API-Errors Policy (POLICIES.md §9): a streamed error event
+    // (type === 'error') carries a real provider/API error. It MUST land in
+    // the PERSISTENT error panel (copyable, never auto-dismissed) — NOT the
+    // 5-second self-dismissing toast, and NOT silently ignored. This covers
+    // recoverable provider/API errors where the agent stays IDLE (so there is
+    // no status='error' snapshot to drive the panel), e.g. a non-terminal grok
+    // ACP error. Fatal errors already reach the panel via the status snapshot.
+    // ========================================================================
+    if (message && message.type === 'error') {
+        const errText = (typeof message.content === 'string' && message.content)
+            ? message.content
+            : 'Provider API error';
+        showLastError(errText);
+        // Do not fall through to Last-Response handling for an error event.
         return;
     }
 
@@ -1067,6 +1098,7 @@ function handleAgentError(data) {
         summary = `Connection to agent lost`;
     }
     showNotification(summary, 'error');
+    if (data.request_id) finalizeRequest(data.request_id);
 
     // For the selected agent, surface the FULL error text persistently
     // in the dedicated error panel — copyable, does not auto-dismiss,
@@ -1076,6 +1108,15 @@ function handleAgentError(data) {
         showLastError(fullText);
         // Intentionally NOT reloading last-response here: the error must
         // not replace the previous successful model response.
+    }
+}
+
+function handleAgentSummarized(data) {
+    finalizeRequest(data.request_id);
+    if (data.summarized) {
+        showNotification(`Context summarized for '${data.agent_name}'`, 'success');
+    } else {
+        showNotification(`No context could be compacted for '${data.agent_name}'`, 'info');
     }
 }
 
@@ -1245,9 +1286,32 @@ function updateTmControls(agent) {
 function handleAgentDiscovered(data) {
     const agent = data.agent;
     console.log('Agent discovered:', agent.name);
-    
+
     agents[agent.name] = agent;
     renderAgentList();
+
+    // Covers the ungraceful-restart path: reconcile briefly sees the
+    // agent as GONE, then rediscovers it with a fresh started_at.
+    // Push the new value into the uptime panel and reset the ticker.
+    if (agent.name === selectedAgent) {
+        setAgentUptimeStartedAt(agent.started_at);
+        startAgentUptimeTicker();
+    }
+}
+
+// Handle graceful restart of an already-known agent: only started_at
+// changed (pid may or may not change; that's a separate concern
+// handled by reconcile). Reset the uptime ticker for the panel.
+function handleAgentStartedAtChanged(data) {
+    const { agent_name, started_at } = data;
+    if (!agent_name || !started_at) return;
+    if (agents[agent_name]) {
+        agents[agent_name].started_at = started_at;
+    }
+    if (agent_name === selectedAgent) {
+        setAgentUptimeStartedAt(started_at);
+        startAgentUptimeTicker();
+    }
 }
 
 // Handle agent terminated
@@ -1271,6 +1335,10 @@ function handleAgentTerminated(data) {
         selectedAgent = null;
         document.getElementById('no-agent-selected').style.display = 'flex';
         document.getElementById('agent-selected').style.display = 'none';
+        // Stop the per-agent uptime ticker — nothing to tick against
+        // anymore. (Single-instance guarantee also enforced at
+        // startAgentUptimeTicker.)
+        stopAgentUptimeTicker();
     }
 
     renderAgentList();
@@ -1326,7 +1394,7 @@ function handleAgentInterruptResult(data) {
 // flooded and quarantined. The agent KEEPS WORKING and its status is
 // unchanged — so we show a non-blocking warning toast only, and deliberately
 // do NOT touch the agent's status badge or the "Last Error" panel.
-// observed live, 2026-05-22.
+// Observed in a past incident.
 function handleChannelQuarantined(data) {
     const { agent_name, peer, connid } = data;
     console.warn(
@@ -1449,6 +1517,80 @@ function updateUptimeDisplay(uptimeData) {
         uptimeEl.textContent = `Uptime: ${uptimeData.uptime_formatted}`;
     }
 }
+
+// ==============================================================================
+// AGENT UPTIME DISPLAY (per-agent, event-driven; NO polling)
+// ==============================================================================
+//
+// The agent's ``started_at`` is delivered event-driven:
+//   * initial GET /api/agents snapshot,
+//   * WS ``agent_discovered`` (new or ungracefully-restarted agent),
+//   * WS ``agent_started_at_changed`` (graceful restart of a known agent).
+//
+// The 1-second setInterval below is NOT a polling loop — it makes NO
+// network requests. It is a pure clock-tick that re-renders the already-
+// received ``started_at`` relative to ``Date.now()``. See
+// docs/DESIGN_AGENT_UPTIME_UI.md.
+
+let _agentUptimeTickerId = null;
+
+// Pure function — safely tested in node.
+function formatAgentUptime(startedAtIso, nowMs) {
+    if (!startedAtIso) return '-';
+    const startedMs = Date.parse(startedAtIso);
+    if (!Number.isFinite(startedMs)) return '-';
+    // Clamp negative delta (clock skew: started_at in the future).
+    let deltaSec = Math.max(0, Math.floor((nowMs - startedMs) / 1000));
+
+    const days = Math.floor(deltaSec / 86400);
+    deltaSec -= days * 86400;
+    const hours = Math.floor(deltaSec / 3600);
+    deltaSec -= hours * 3600;
+    const mins = Math.floor(deltaSec / 60);
+    const secs = deltaSec - mins * 60;
+
+    const pad = (n) => String(n).padStart(2, '0');
+
+    if (days > 0) return `${days}d ${pad(hours)}:${pad(mins)}:${pad(secs)}`;
+    if (hours > 0) return `${pad(hours)}:${pad(mins)}:${pad(secs)}`;
+    if (mins > 0) return `${pad(mins)}:${pad(secs)}`;
+    return `${secs}s`;
+}
+
+function refreshAgentUptimeDisplay() {
+    const el = document.getElementById('agent-uptime');
+    if (!el) return;
+    const startedAtIso = el.getAttribute('data-started-at') || '';
+    el.textContent = formatAgentUptime(startedAtIso, Date.now());
+}
+
+function startAgentUptimeTicker() {
+    // Single-instance guarantee — always stop the previous ticker before
+    // starting a new one. Prevents leaked intervals when the user quickly
+    // switches selectedAgent or after multiple ``agent_started_at_changed``
+    // events for the same panel.
+    stopAgentUptimeTicker();
+    refreshAgentUptimeDisplay();
+    _agentUptimeTickerId = setInterval(refreshAgentUptimeDisplay, 1000);
+}
+
+function stopAgentUptimeTicker() {
+    if (_agentUptimeTickerId !== null) {
+        clearInterval(_agentUptimeTickerId);
+        _agentUptimeTickerId = null;
+    }
+}
+
+function setAgentUptimeStartedAt(startedAtIso) {
+    const el = document.getElementById('agent-uptime');
+    if (!el) return;
+    el.setAttribute('data-started-at', startedAtIso || '');
+    refreshAgentUptimeDisplay();
+}
+
+// Note: node-test export is bundled with the trailing module.exports
+// block near the end of this file (a single exports object avoids
+// clobbering earlier assignments).
 
 // ==============================================================================
 // AGENT SELECTION & BATCH OPERATIONS
@@ -1589,6 +1731,26 @@ async function restartCurrentAgent() {
     }
 }
 
+async function summarizeCurrentAgent() {
+    if (!selectedAgent) return;
+    const btn = document.getElementById('summarize-agent-btn');
+    try {
+        const response = await fetch(`/api/agents/${selectedAgent}/summarize`, {
+            method: 'POST',
+        });
+        if (!response.ok) {
+            const err = await response.json().catch(() => ({}));
+            showNotification(`Summarization rejected: ${err.detail || response.status}`, 'error');
+            return;
+        }
+        const data = await response.json();
+        trackButton(data.request_id, btn, 'agent_summarize', selectedAgent, 'Summarizing…');
+        showNotification(`Summarization requested for '${selectedAgent}' (${data.request_id})`, 'info');
+    } catch (error) {
+        showNotification('Error requesting summarization: ' + error.message, 'error');
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Test hook (no-op in the browser). Lets node-based unit tests import pure
 // decision functions from this file without a DOM or a module bundler. The
@@ -1596,5 +1758,9 @@ async function restartCurrentAgent() {
 // browser, so this line is inert when the page loads main.js as a <script>.
 // ---------------------------------------------------------------------------
 if (typeof module !== 'undefined' && module.exports) {
-    module.exports = { stopFailureMeansAgentGone };
+    module.exports = {
+        stopFailureMeansAgentGone,
+        formatAgentUptime,
+        handleAgentSummarized,
+    };
 }

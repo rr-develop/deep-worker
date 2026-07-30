@@ -1,23 +1,30 @@
 """Integration tests for the full index + search pipeline.
 
-Uses MockEmbedding — no real model download required.
+Uses the real ``intfloat/multilingual-e5-small`` embedder, loaded strictly
+offline (the model is cached on the host). ``MockEmbedding`` can no longer be
+used here: the chunker requires the embedder's own XLM-R tokenizer and RC-1
+forbids a silent fallback to tiktoken. See
+``docs/DESIGN_FIX_TOKENIZER_MISMATCH.md``.
+
 Marked with pytest.mark.integration for optional selective running.
 """
 
 from __future__ import annotations
 
-import pytest
+import os
 import subprocess
 from pathlib import Path
+from typing import Any
 
-from llama_index.core.embeddings.mock_embed_model import MockEmbedding
+import pytest
 
-from semantic_search.exceptions import IndexNotFoundError
-from semantic_search.indexer import IndexStats, index_repository
-from semantic_search.retriever import SearchResult, search
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+os.environ.setdefault("TQDM_DISABLE", "1")
 
-
-EMBED_DIM = 32  # small dimension for tests
+from semantic_search.exceptions import IndexNotFoundError  # noqa: E402
+from semantic_search.indexer import IndexStats, index_repository  # noqa: E402
+from semantic_search.retriever import SearchResult, search  # noqa: E402
 
 
 def _init_git_repo(repo_path: Path) -> None:
@@ -39,9 +46,20 @@ def _init_git_repo(repo_path: Path) -> None:
     )
 
 
-@pytest.fixture
-def mock_embed() -> MockEmbedding:
-    return MockEmbedding(embed_dim=EMBED_DIM)
+@pytest.fixture(scope="module")
+def mock_embed() -> Any:
+    """Real strictly-offline HuggingFaceEmbedding(intfloat/multilingual-e5-small).
+
+    Named ``mock_embed`` for historical reasons (all call sites pass it as the
+    ``embedding_model`` argument); it is now a real embedder. Module-scoped so
+    the model is loaded once for the whole file.
+    """
+    from llama_index.embeddings.huggingface import HuggingFaceEmbedding  # type: ignore[import-untyped]
+
+    return HuggingFaceEmbedding(
+        model_name="intfloat/multilingual-e5-small",
+        model_kwargs={"local_files_only": True},
+    )
 
 
 @pytest.fixture
@@ -88,19 +106,19 @@ def mixed_repo(tmp_path: Path) -> Path:
 
 class TestIndexRepository:
     def test_creates_vector_index_directory(
-        self, python_repo: Path, mock_embed: MockEmbedding
+        self, python_repo: Path, mock_embed: Any
     ) -> None:
         index_repository(python_repo, embedding_model=mock_embed)
         assert (python_repo / ".vector_index").is_dir()
 
     def test_returns_index_stats(
-        self, python_repo: Path, mock_embed: MockEmbedding
+        self, python_repo: Path, mock_embed: Any
     ) -> None:
         stats = index_repository(python_repo, embedding_model=mock_embed)
         assert isinstance(stats, IndexStats)
 
     def test_indexes_all_files(
-        self, python_repo: Path, mock_embed: MockEmbedding
+        self, python_repo: Path, mock_embed: Any
     ) -> None:
         stats = index_repository(python_repo, embedding_model=mock_embed)
         # calculator.py, utils.py, README.md, pyproject.toml = 4 files
@@ -109,13 +127,13 @@ class TestIndexRepository:
         assert stats.deleted == 0
 
     def test_creates_nodes(
-        self, python_repo: Path, mock_embed: MockEmbedding
+        self, python_repo: Path, mock_embed: Any
     ) -> None:
         stats = index_repository(python_repo, embedding_model=mock_embed)
         assert stats.total_nodes > 0
 
     def test_incremental_skips_unchanged_files(
-        self, python_repo: Path, mock_embed: MockEmbedding
+        self, python_repo: Path, mock_embed: Any
     ) -> None:
         index_repository(python_repo, embedding_model=mock_embed)
 
@@ -126,7 +144,7 @@ class TestIndexRepository:
         assert stats2.updated == 0
 
     def test_incremental_detects_new_file(
-        self, python_repo: Path, mock_embed: MockEmbedding
+        self, python_repo: Path, mock_embed: Any
     ) -> None:
         index_repository(python_repo, embedding_model=mock_embed)
 
@@ -139,7 +157,7 @@ class TestIndexRepository:
         assert stats2.skipped == 4
 
     def test_incremental_detects_modified_file(
-        self, python_repo: Path, mock_embed: MockEmbedding
+        self, python_repo: Path, mock_embed: Any
     ) -> None:
         index_repository(python_repo, embedding_model=mock_embed)
 
@@ -153,7 +171,7 @@ class TestIndexRepository:
         assert stats2.skipped == 3
 
     def test_incremental_detects_deleted_file(
-        self, python_repo: Path, mock_embed: MockEmbedding
+        self, python_repo: Path, mock_embed: Any
     ) -> None:
         index_repository(python_repo, embedding_model=mock_embed)
 
@@ -166,7 +184,7 @@ class TestIndexRepository:
         assert stats2.skipped == 3
 
     def test_reset_reindexes_everything(
-        self, python_repo: Path, mock_embed: MockEmbedding
+        self, python_repo: Path, mock_embed: Any
     ) -> None:
         index_repository(python_repo, embedding_model=mock_embed)
 
@@ -177,7 +195,7 @@ class TestIndexRepository:
         assert stats2.skipped == 0
 
     def test_mixed_language_repo(
-        self, mixed_repo: Path, mock_embed: MockEmbedding
+        self, mixed_repo: Path, mock_embed: Any
     ) -> None:
         stats = index_repository(mixed_repo, embedding_model=mock_embed)
         # app.py, index.ts, Main.java, README.md = 4 files
@@ -186,13 +204,13 @@ class TestIndexRepository:
 
 class TestSearch:
     def test_raises_for_unindexed_repo(
-        self, tmp_path: Path, mock_embed: MockEmbedding
+        self, tmp_path: Path, mock_embed: Any
     ) -> None:
         with pytest.raises(IndexNotFoundError):
             search("hello", repo_path=tmp_path, embedding_model=mock_embed)
 
     def test_returns_list_of_search_results(
-        self, python_repo: Path, mock_embed: MockEmbedding
+        self, python_repo: Path, mock_embed: Any
     ) -> None:
         index_repository(python_repo, embedding_model=mock_embed)
 
@@ -202,7 +220,7 @@ class TestSearch:
         assert all(isinstance(r, SearchResult) for r in results)
 
     def test_results_have_required_fields(
-        self, python_repo: Path, mock_embed: MockEmbedding
+        self, python_repo: Path, mock_embed: Any
     ) -> None:
         index_repository(python_repo, embedding_model=mock_embed)
 
@@ -216,7 +234,7 @@ class TestSearch:
         assert r.node_type in ("leaf", "parent")
 
     def test_top_k_limits_results(
-        self, python_repo: Path, mock_embed: MockEmbedding
+        self, python_repo: Path, mock_embed: Any
     ) -> None:
         index_repository(python_repo, embedding_model=mock_embed)
 
@@ -227,7 +245,7 @@ class TestSearch:
         assert len(results_1) <= 1
 
     def test_results_sorted_by_score_descending(
-        self, python_repo: Path, mock_embed: MockEmbedding
+        self, python_repo: Path, mock_embed: Any
     ) -> None:
         index_repository(python_repo, embedding_model=mock_embed)
 
@@ -237,7 +255,7 @@ class TestSearch:
         assert scores == sorted(scores, reverse=True)
 
     def test_file_paths_are_absolute(
-        self, python_repo: Path, mock_embed: MockEmbedding
+        self, python_repo: Path, mock_embed: Any
     ) -> None:
         index_repository(python_repo, embedding_model=mock_embed)
 
@@ -247,7 +265,7 @@ class TestSearch:
             assert Path(r.file_path).is_absolute(), f"Not absolute: {r.file_path}"
 
     def test_language_metadata_preserved(
-        self, python_repo: Path, mock_embed: MockEmbedding
+        self, python_repo: Path, mock_embed: Any
     ) -> None:
         index_repository(python_repo, embedding_model=mock_embed)
 

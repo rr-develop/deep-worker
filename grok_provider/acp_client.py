@@ -45,6 +45,83 @@ class GrokConcurrentPromptError(GrokAcpClientError):
     """Raised before writing a second prompt for one active ACP session."""
 
 
+def raise_for_error_reply(method: str, reply: dict[str, Any]) -> None:
+    """Raise if ``reply`` is a JSON-RPC error reply; return silently otherwise.
+
+    Single source of truth for turning a grok error reply into the right
+    exception. Two callers rely on this:
+
+      * :meth:`GrokAcpClient._call` — the request/response path (handshake,
+        session/new, session/load …).
+      * ``chat_model._finalize_response`` — the ``session/prompt`` terminal
+        path, which resolves its future with the *raw* reply and bypasses
+        ``_call`` entirely. Before this helper existed, an error reply there
+        silently produced an empty ``AIMessage`` (no ``result``, no failover).
+        Incident 2026-07-03 (grok HTTP 402 "Payment Required").
+
+    Account-level exhaustion (usage cap OR billing/payment) is raised as
+    :class:`GrokUsageLimitError` so ``agent_process`` fails over to deepseek;
+    any other error reply becomes :class:`GrokAcpClientError`.
+
+    Classification reads the WHOLE error object, not just the outermost
+    ``message``. grok's real JSON-RPC error nests the account-terminal text one
+    level down: the top-level ``error.message`` is a generic ``"Internal
+    error"`` while the real ``"API error (status 402 Payment Required): …
+    usage balance exhausted"`` lives in ``error.data.message`` (with
+    ``error.data.http_status == 402``). Matching only the top-level field
+    misclassified a billing cap as a generic error — no failover, empty
+    AIMessages. Incident 2026-07-04 (nested 402, per POLICIES.md §9).
+    """
+    if "error" not in reply:
+        return
+    from grok_provider.limit_errors import (  # noqa: PLC0415
+        grok_usage_limit_error_from_text,
+    )
+
+    err_obj = reply["error"]
+    err_text = _flatten_error_text(err_obj)
+    limit_err = grok_usage_limit_error_from_text(err_text)
+    if limit_err is not None:
+        raise limit_err
+    raise GrokAcpClientError(f"{method} failed: {reply['error']}")
+
+
+def _flatten_error_text(err_obj: Any) -> str:
+    """Collect all human-readable text from a JSON-RPC ``error`` payload so
+    limit/billing detection sees every level, not just the outermost message.
+
+    grok nests the account-terminal detail in ``error.data.message`` /
+    ``error.data.http_status`` while the top-level ``message`` is a generic
+    ``"Internal error"``. We concatenate the outer ``message``, any nested
+    ``data.message``, and — because an ``http_status`` of 402 is itself
+    account-terminal regardless of wording — an explicit ``"HTTP <status>"``
+    token. Non-dict payloads (bare strings) are returned as-is.
+    """
+    if not isinstance(err_obj, dict):
+        return str(err_obj)
+    parts: list[str] = []
+    msg = err_obj.get("message")
+    if msg is not None:
+        parts.append(str(msg))
+    data = err_obj.get("data")
+    if isinstance(data, dict):
+        data_msg = data.get("message")
+        if data_msg is not None:
+            parts.append(str(data_msg))
+        http_status = data.get("http_status")
+        if http_status is not None:
+            # Surface the numeric status as a token the markers can match
+            # (e.g. ``\b402\b``) even when the nested message is opaque.
+            parts.append(f"HTTP {http_status}")
+    elif data is not None:
+        parts.append(str(data))
+    if not parts:
+        # No message/data at all — fall back to the whole object so a caller
+        # still gets *something* to match/log rather than an empty string.
+        return str(err_obj)
+    return " | ".join(parts)
+
+
 class GrokAcpClient:
     def __init__(
         self,
@@ -154,21 +231,7 @@ class GrokAcpClient:
             )
         finally:
             self._pending_requests.pop(rid, None)
-        if "error" in reply:
-            from grok_provider.limit_errors import (  # noqa: PLC0415
-                grok_usage_limit_error_from_text,
-            )
-
-            err_obj = reply["error"]
-            err_text = (
-                str(err_obj.get("message", err_obj))
-                if isinstance(err_obj, dict)
-                else str(err_obj)
-            )
-            limit_err = grok_usage_limit_error_from_text(err_text)
-            if limit_err is not None:
-                raise limit_err
-            raise GrokAcpClientError(f"{method} failed: {reply['error']}")
+        raise_for_error_reply(method, reply)
         return reply
 
     # -- high-level handshake ----------------------------------------------
@@ -255,6 +318,26 @@ class GrokAcpClient:
         self._session_ready.pop(session_id, None)
 
     async def session_cancel(self, session_id: str | None) -> None:
+        """Abandon the outstanding ``session/prompt`` for ``session_id``.
+
+        Writes a ``session/cancel`` message to grok's stdin AND releases the
+        local sticky guard state for ``session_id`` (``_active_prompts`` /
+        ``_sinks``). Both steps are required — see incident 2026-07-01 §9b:
+        the guard is only auto-released via the pending future's
+        ``done_callback``, which fires only when grok writes back a JSON-RPC
+        reply for the outstanding prompt. If grok never replies (crash,
+        wedge, session/load discarding the request, mid-turn
+        ``CancelledError``), the entry would stay forever and every later
+        ``session_prompt`` on the same session id would raise
+        ``GrokConcurrentPromptError`` synchronously, permanently poisoning
+        the agent thread.
+
+        ``_session_ready`` is intentionally NOT cleared here: the session
+        itself is still live in grok (cancel abandons the prompt, not the
+        session), so a subsequent ``session_prompt`` can reuse the same
+        readiness signal. Fresh-session cleanup lives in
+        :meth:`release_session`.
+        """
         if session_id is None:
             return
         with contextlib.suppress(Exception):
@@ -267,6 +350,17 @@ class GrokAcpClient:
             )
             if self._proc is not None and self._proc.stdin is not None:
                 await self._proc.stdin.drain()
+        # Release the sticky guard for THIS session (fix, incident 2026-07-01
+        # §9b/§10). Cancelling the future triggers ``release_prompt_owner``
+        # which pops both ``_active_prompts[session_id]`` and its ``_sinks``
+        # entry. We also drop the sink defensively in case the callback path
+        # is short-circuited (e.g. future already ``done``/``cancelled`` from
+        # a prior close race), so the caller sees a clean slot for the next
+        # ``session_prompt`` regardless.
+        active = self._active_prompts.get(session_id)
+        if active is not None and not active.done():
+            active.cancel()
+        self._sinks.pop(session_id, None)
 
     def session_prompt(
         self,
@@ -302,6 +396,16 @@ class GrokAcpClient:
                 self._active_prompts.pop(session_id, None)
             if self._sinks.get(session_id) is notification_sink:
                 self._sinks.pop(session_id, None)
+            # RC-1 (review, past incident 2026-07-01 §9b): also drop
+            # our JSON-RPC pending entry so cancelled prompts don't leak
+            # ``_pending_requests`` entries — one per hot-loop retry in the
+            # incident scenario. On a normal reply the reader (``_dispatch``)
+            # has already popped ``rid`` before resolving the future, so the
+            # identity check makes this a safe no-op there. On ``fut.cancel()``
+            # from ``session_cancel``, the reader path never ran and we clear
+            # it here. Identity gate defends against a future rid collision.
+            if self._pending_requests.get(rid) is done:
+                self._pending_requests.pop(rid, None)
 
         fut.add_done_callback(release_prompt_owner)
         try:
@@ -347,8 +451,8 @@ class GrokAcpClient:
             # ``session_prompt`` registers a pending request and bypasses
             # ``_call`` — so without popping here every turn would leak one
             # stale entry (O(turns) growth). Popping on reply is safe for
-            # both paths (a double-pop just returns None). Review fix
-            # (internal review).
+            # both paths (a double-pop just returns None). Review fix,
+            # 2026-06-17.
             fut = self._pending_requests.pop(obj["id"], None)
             if fut is not None and not fut.done():
                 fut.set_result(obj)

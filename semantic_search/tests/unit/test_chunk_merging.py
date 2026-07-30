@@ -11,6 +11,16 @@ from llama_index.core.schema import TextNode
 from semantic_search.indexer import _merge_small_chunks, _create_merged_node
 
 
+def _fake_tokenize(text: str) -> list[int]:
+    """Word-split fake tokenizer for chunker unit tests.
+
+    The chunker only needs ``len(tokenize_fn(text))``; one fake token per
+    whitespace-separated word is deterministic and avoids loading a real
+    embedder for boundary tests. See docs/DESIGN_FIX_TOKENIZER_MISMATCH.md.
+    """
+    return [hash(w) & 0xFFFF for w in text.split()]
+
+
 class TestCreateMergedNode:
     """Test _create_merged_node helper function."""
 
@@ -74,7 +84,7 @@ class TestMergeSmallChunks:
 
     def test_empty_list_returns_empty(self):
         """Empty input should return empty list."""
-        result = _merge_small_chunks([], max_tokens=1024, min_chars=100)
+        result = _merge_small_chunks([], effective_max=1024, tokenize_fn=_fake_tokenize, min_chars=100)
         assert result == []
 
     def test_single_large_chunk_unchanged(self):
@@ -84,7 +94,7 @@ class TestMergeSmallChunks:
             metadata={"file_path": "/test.py"},
         )
 
-        result = _merge_small_chunks([node], max_tokens=1024, min_chars=100)
+        result = _merge_small_chunks([node], effective_max=1024, tokenize_fn=_fake_tokenize, min_chars=100)
 
         assert len(result) == 1
         assert result[0] is node
@@ -96,7 +106,7 @@ class TestMergeSmallChunks:
             metadata={"file_path": "/test.py"},
         )
 
-        result = _merge_small_chunks([node], max_tokens=1024, min_chars=100)
+        result = _merge_small_chunks([node], effective_max=1024, tokenize_fn=_fake_tokenize, min_chars=100)
 
         assert result == []  # File skipped
 
@@ -109,7 +119,7 @@ class TestMergeSmallChunks:
             TextNode(text="fun test() { assertEquals(1, 1); return true; }", metadata={"file_path": "/test.py"}),
         ]
 
-        result = _merge_small_chunks(nodes, max_tokens=1024, min_chars=100)
+        result = _merge_small_chunks(nodes, effective_max=1024, tokenize_fn=_fake_tokenize, min_chars=100)
 
         # Should merge into 1 chunk
         assert len(result) == 1
@@ -132,7 +142,7 @@ class TestMergeSmallChunks:
             TextNode(text="}", metadata={"file_path": "/test.py"}),
         ]
 
-        result = _merge_small_chunks(nodes, max_tokens=1024, min_chars=100)
+        result = _merge_small_chunks(nodes, effective_max=1024, tokenize_fn=_fake_tokenize, min_chars=100)
 
         # Should have: merged(node1), node2 (large), merged(node3) if it's alone and small
         # Actually: node1 merges alone (becomes 1 char < 100, but it's NOT single file)
@@ -159,30 +169,39 @@ class TestMergeSmallChunks:
             TextNode(text="word " * 600, metadata={"file_path": "/test.py"}),  # ~600 tokens
         ]
 
-        result = _merge_small_chunks(nodes, max_tokens=1024, min_chars=100)
+        result = _merge_small_chunks(nodes, effective_max=1024, tokenize_fn=_fake_tokenize, min_chars=100)
 
         # Should create 2 chunks (600 + 600 > 1024)
         assert len(result) == 2
 
-    def test_small_chunk_discarded_if_cannot_merge(self):
-        """Small chunk that can't be merged (would exceed max_tokens) should be discarded."""
-        # Create chunks where the large ones are definitely > max_tokens
+    def test_small_chunk_discarded_when_neighbours_overflow_then_split(self):
+        """Small chunk between two over-ceiling leaves is dropped; the
+        over-ceiling leaves are themselves re-split by Phase 1.5 (RC-3)
+        with SentenceSplitter(chunk_size=effective_max). See
+        docs/DESIGN_FIX_TOKENIZER_MISMATCH.md §4.3.
+        """
         nodes = [
-            TextNode(text="word " * 1100, metadata={"file_path": "/test.py"}),  # ~1100 tokens > 1024
-            TextNode(text="}", metadata={"file_path": "/test.py"}),  # 1 char < 100
-            TextNode(text="word " * 1100, metadata={"file_path": "/test.py"}),  # ~1100 tokens > 1024
+            TextNode(text="word " * 1100, metadata={"file_path": "/test.py"}),
+            TextNode(text="}", metadata={"file_path": "/test.py"}),  # <100 chars
+            TextNode(text="word " * 1100, metadata={"file_path": "/test.py"}),
         ]
 
-        result = _merge_small_chunks(nodes, max_tokens=1024, min_chars=100)
+        result = _merge_small_chunks(
+            nodes, effective_max=1024, tokenize_fn=_fake_tokenize, min_chars=100
+        )
 
-        # Should have 2 chunks because:
-        # - node1 (1100 tokens) > max_tokens → keep as-is
-        # - node2 (1 token) → start new batch, but it's < 100 chars
-        # - node3 (1100 tokens) > max_tokens → flush node2 batch, keep node3 as-is
-        # Result: [node1, node3] (node2 discarded because < 100 chars in multi-chunk file)
-        assert len(result) == 2
-        # Verify the small chunk was filtered out
-        assert all(len(n.get_content()) >= 100 for n in result)
+        # Phase 1 keeps node1/node3 as-is (each > effective_max) and drops
+        # node2 (< min_chars in multi-chunk file). Phase 1.5 then splits
+        # node1 and node3 to ≤ effective_max each. Exact sub-count depends
+        # on SentenceSplitter's overlap; the invariant we DO care about is:
+        #   * every surviving chunk ≤ effective_max in tokenize_fn units,
+        #   * every surviving chunk ≥ min_chars,
+        #   * the tiny "}" chunk did NOT survive.
+        assert len(result) >= 2  # at least one sub-chunk per oversized leaf
+        for n in result:
+            assert len(_fake_tokenize(n.get_content())) <= 1024
+            assert len(n.get_content()) >= 100
+        assert all("}" not in n.get_content() or len(n.get_content()) > 1 for n in result)
 
     def test_metadata_preserved_through_merging(self):
         """Metadata should be preserved when merging nodes."""
@@ -198,7 +217,7 @@ class TestMergeSmallChunks:
             ),
         ]
 
-        result = _merge_small_chunks(nodes, max_tokens=1024, min_chars=100)
+        result = _merge_small_chunks(nodes, effective_max=1024, tokenize_fn=_fake_tokenize, min_chars=100)
 
         assert len(result) == 1
         merged = result[0]
@@ -216,7 +235,7 @@ class TestMergeSmallChunks:
             TextNode(text="line3 " * 20, metadata={"file_path": "/test.py"}),  # ~20 words
         ]
 
-        result = _merge_small_chunks(nodes, max_tokens=1024, min_chars=100)
+        result = _merge_small_chunks(nodes, effective_max=1024, tokenize_fn=_fake_tokenize, min_chars=100)
 
         assert len(result) == 1
         content = result[0].get_content()
@@ -240,7 +259,7 @@ class TestMergeSmallChunks:
             ),
         ]
 
-        result = _merge_small_chunks(nodes, max_tokens=1024, min_chars=100)
+        result = _merge_small_chunks(nodes, effective_max=1024, tokenize_fn=_fake_tokenize, min_chars=100)
 
         # All should merge into 1 chunk (total tokens << 1024)
         assert len(result) == 1

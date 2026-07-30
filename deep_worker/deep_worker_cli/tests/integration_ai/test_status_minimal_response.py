@@ -19,12 +19,12 @@ import pytest
 # ============================================================================
 # CRITICAL: RPYC MUST BE IMPORTED FROM SOURCE CODE
 # ============================================================================
-_rpyc_async_path = Path("rpyc_async")
+_rpyc_async_path = Path("/path/to/rpyc_async")
 if _rpyc_async_path.exists() and str(_rpyc_async_path) not in sys.path:
     sys.path.insert(0, str(_rpyc_async_path))
 
-import rpyc
-from rpyc.core.async_connect import async_connect
+import rpyc_async as rpyc
+from rpyc_async.core.async_connect import async_connect
 
 
 @pytest.fixture
@@ -187,7 +187,7 @@ async def test_status_functionality_still_works(test_agent):
     This verifies that removing unnecessary fields doesn't break:
     - Status detection (ready/working/error)
     - Status polling via dwcli --status
-    - Status used by the web client WebSocket
+    - Status used by the web UI WebSocket
     """
     agent_name = test_agent.agent_name
 
@@ -229,12 +229,12 @@ async def test_status_functionality_still_works(test_agent):
 
         print(f"✅ Direct RPyC status works correctly")
 
-        # Test 3: Verify the web client can still parse status
-        # (This would be tested by the web client's integration tests, but we can verify structure)
-        assert "status" in status_response, "The web client expects 'status' field"
+        # Test 3: Verify the web UI can still parse status
+        # (This would be tested by the web UI integration tests, but we can verify structure)
+        assert "status" in status_response, "The web UI expects 'status' field"
         assert isinstance(status_response["status"], str), "Status must be string"
 
-        print(f"✅ Status response compatible with the web client")
+        print(f"✅ Status response compatible with the web UI")
     finally:
         conn.disable_asyncio_serving()
         conn.close()

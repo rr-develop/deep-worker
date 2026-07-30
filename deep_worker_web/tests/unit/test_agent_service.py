@@ -130,7 +130,7 @@ class TestAgentServiceConnection:
     async def test_is_connected_returns_false_when_conn_closed(
         self, agent_service: AgentService
     ) -> None:
-        """Regression for the 2026-04-27 incident.
+        """Regression for the 2026-04-27 AsyncResult leak incident.
 
         ``is_connected`` previously checked only the local
         ``_connections`` dict. After the peer process died and rpyc
@@ -491,7 +491,7 @@ class TestAgentServiceSendMessageFireAndForget:
 
         # Patch fire_and_forget_async to capture the timeout argument
         from unittest.mock import patch
-        with patch("rpyc.utils.helpers.fire_and_forget_async") as mock_faf:
+        with patch("rpyc_async.utils.helpers.fire_and_forget_async") as mock_faf:
             await agent_service.send_message("test-agent-1", "hello")
 
             assert mock_faf.called
@@ -519,3 +519,86 @@ class TestAgentServiceSendMessageFireAndForget:
         # Should report the not-connected failure without blocking.
         assert result["success"] is False
         assert "not connected" in result["error"].lower()
+
+
+class TestAgentServiceSendMessageSumQuery:
+    """send_message forwards the optional ``sum_query`` to the RPyC
+    ``exposed_invoke_agent`` endpoint (offload→wipe→inject cycle for a
+    per-task fresh context). The endpoint already accepts ``sum_query`` on
+    the agent side; the web must pass it through."""
+
+    async def test_sum_query_forwarded_to_invoke_agent(
+        self, agent_service: AgentService
+    ) -> None:
+        await agent_service.initialize()
+
+        mock_root = AsyncMock()
+        mock_root.invoke_agent = AsyncMock(
+            return_value={"success": True, "response": "ok"}
+        )
+        mock_conn = MagicMock()
+        agent_service._roots["test-agent-1"] = mock_root
+        agent_service._connections["test-agent-1"] = mock_conn
+
+        result = await agent_service.send_message(
+            "test-agent-1", "hello", sum_query="prior context summary"
+        )
+        assert result["success"] is True
+
+        # The RPyC endpoint must receive the sum_query verbatim.
+        mock_root.invoke_agent.assert_called_once_with(
+            "hello", stream=False, sum_query="prior context summary"
+        )
+
+    async def test_sum_query_defaults_to_none(
+        self, agent_service: AgentService
+    ) -> None:
+        """Backward compatibility: callers that omit ``sum_query`` still
+        invoke the endpoint with ``sum_query=None`` (a plain send-through,
+        no offload/wipe on the agent side)."""
+        await agent_service.initialize()
+
+        mock_root = AsyncMock()
+        mock_root.invoke_agent = AsyncMock(
+            return_value={"success": True, "response": "ok"}
+        )
+        mock_conn = MagicMock()
+        agent_service._roots["test-agent-1"] = mock_root
+        agent_service._connections["test-agent-1"] = mock_conn
+
+        await agent_service.send_message("test-agent-1", "hello")
+
+        mock_root.invoke_agent.assert_called_once_with(
+            "hello", stream=False, sum_query=None
+        )
+
+    async def test_message_and_sum_query_both_reach_endpoint(
+        self, agent_service: AgentService
+    ) -> None:
+        """Bug 2026-07-04: the web client carries the actionable
+        request in ``message`` and the summary prefix in ``sum_query``. BOTH
+        must reach ``exposed_invoke_agent`` — the endpoint then runs the
+        sum_query and the message as two sequential turns. Previously
+        ``message`` was fine on the wire but the RPyC branch dropped it; the
+        web-side guarantee is simply that it is forwarded, never elided."""
+        await agent_service.initialize()
+
+        mock_root = AsyncMock()
+        mock_root.invoke_agent = AsyncMock(
+            return_value={"success": True, "response": "ok"}
+        )
+        mock_conn = MagicMock()
+        agent_service._roots["test-agent-1"] = mock_root
+        agent_service._connections["test-agent-1"] = mock_conn
+
+        await agent_service.send_message(
+            "test-agent-1",
+            "Draft a response to the recruiter id=XYZ",
+            sum_query="STABLE_PREFIX",
+        )
+
+        # message is the first positional arg; sum_query is a kwarg. Neither
+        # is dropped on the web side.
+        call = mock_root.invoke_agent.call_args
+        assert call.args[0] == "Draft a response to the recruiter id=XYZ"
+        assert call.kwargs["sum_query"] == "STABLE_PREFIX"

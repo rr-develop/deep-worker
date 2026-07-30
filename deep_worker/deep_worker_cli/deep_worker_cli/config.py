@@ -17,6 +17,9 @@ import dotenv
 from rich.console import Console
 
 from deep_worker_cli._version import __version__
+from deep_worker_cli.model_predicate import (
+    model_can_belong_to_provider as _leaf_model_can_belong_to_provider,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -856,8 +859,8 @@ class Settings:
 
         Returns:
             Path to the agent data AGENTS.md file. For storage v3 this is
-            ~/.deep_worker/{agent_name}/data/AGENTS.md; legacy v2 agents keep
-            using ~/.deepagents/{agent_name}/AGENTS.md.
+            the AGENTS.md in the per-agent data directory; legacy v2 agents
+            keep using ~/.deepagents/{agent_name}/AGENTS.md.
         """
         from deep_worker_cli.storage_paths import deepagents_data_dir
         return deepagents_data_dir(agent_name, create=False) / "AGENTS.md"
@@ -894,8 +897,8 @@ class Settings:
             agent_name: Name of the agent
 
         Returns:
-            Path to the agent data directory. For storage v3 this is
-            ~/.deep_worker/{agent_name}/data; legacy v2 agents keep using
+            Path to the agent data directory. For storage v3 this is the
+            per-agent data directory; legacy v2 agents keep using
             ~/.deepagents/{agent_name}.
 
         Raises:
@@ -917,8 +920,8 @@ class Settings:
             agent_name: Name of the agent
 
         Returns:
-            Path to the agent data directory. For storage v3 this is
-            ~/.deep_worker/{agent_name}/data; legacy v2 agents keep using
+            Path to the agent data directory. For storage v3 this is the
+            per-agent data directory; legacy v2 agents keep using
             ~/.deepagents/{agent_name}.
 
         Raises:
@@ -1379,6 +1382,17 @@ def _detect_provider(model_name: str) -> str | None:
     return None
 
 
+# The predicate itself lives in the dependency-free leaf module
+# ``deep_worker_cli.model_predicate`` so that the web frontend can import
+# it without pulling in langchain. It is re-exported here because this is the
+# import path every existing caller already uses (agent_command,
+# agent_service, agent_config). Do NOT reimplement it here: a hand-copied
+# duplicate in the web router is exactly what let the stale Claude Code
+# whitelist survive in two places and silently drop ``--model fable``
+# (see a related internal incident analysis (not included here)).
+model_can_belong_to_provider = _leaf_model_can_belong_to_provider
+
+
 # Provider → (env_var, hardcoded_default) mapping.
 # Single source of truth for default model names.
 _PROVIDER_DEFAULT_MODELS: dict[str, tuple[str | None, str | None]] = {
@@ -1387,7 +1401,18 @@ _PROVIDER_DEFAULT_MODELS: dict[str, tuple[str | None, str | None]] = {
     "anthropic": ("ANTHROPIC_MODEL", "claude-sonnet-4-5-20250929"),
     "google": ("GOOGLE_MODEL", "gemini-3-pro-preview"),
     "vertexai": ("VERTEX_AI_MODEL", "gemini-3-pro-preview"),
-    "claude-code": (None, "sonnet"),
+    # Claude Code: do NOT pin a model. The real default depends on the
+    # account type — Opus 5 for Anthropic API / Max / Team Premium /
+    # Enterprise PAYG / Bedrock / AWS / GCP, Sonnet 5 for Pro / Team
+    # Standard / Enterprise seats, Sonnet 4.5 on Microsoft Foundry (see
+    # code.claude.com/docs/en/model-config#default-model-setting).
+    # deep-worker cannot know which applies, so it passes no ``--model``
+    # and lets the claude CLI resolve its own default — the same contract
+    # codex and grok already use. The previous hardcoded ``"sonnet"``
+    # silently overrode a rejected ``--model fable`` (see a related internal
+    # incident analysis (not included here)). CLAUDE_CODE_MODEL pins it when
+    # the operator wants.
+    "claude-code": ("CLAUDE_CODE_MODEL", None),
     # Codex: do NOT pin a model version. Let Codex CLI pick its own
     # default (which evolves with the CLI). If the user sets
     # CODEX_MODEL, we honour it; otherwise we pass nothing and the
@@ -1549,18 +1574,18 @@ def create_model(
     # DO NOT CHANGE THE PROVIDER PRIORITY ORDER!
     # DO NOT REMOVE THE has_deepseek CHECK!
     #
-    # This code is used by the OLD entry point main.py (python3 -m deep_worker_cli.main)
+    # This code is used by the OLD main.py entry point (python3 -m deep_worker_cli.main)
     # which must NOT be used for testing or production!
     #
     # THE ONLY CORRECT way to launch:
-    # ✅ deep-worker [agent-name]  - command installed on the user's PATH
+    # ✅ deep-worker [agent-name]  - command installed as `deep-worker` on PATH
     #
     # WRONG (DO NOT USE):
     # ❌ python3 -m deep_worker_cli.main
     # ❌ python3 -m deep_worker_cli.cli.main
     #
     # The deep-worker command uses agent_command.py which explicitly sets provider="deepseek"
-    # by default, so it now PASSES the provider explicitly to create_model().
+    # by default, so it now PASSES the provider explicitly into create_model().
     #
     # See: DEEPSEEK_PROVIDER.md for details
     # ============================================================================
@@ -1614,7 +1639,7 @@ def create_model(
         # round-trip and the next call was rejected with:
         #   400 - "The `reasoning_content` in the thinking mode must be passed
         #          back to the API."
-        # → the agent crashed to ERROR (observed live, 2026-05-22). We use
+        # → the agent crashed to ERROR (observed in a past incident). We use
         # ``ReasoningChatDeepSeek`` (subclass of ``langchain_deepseek``'s
         # ``ChatDeepSeek``): ChatDeepSeek READS reasoning_content inbound but
         # its 1.0.1 ``_get_request_payload`` does NOT re-send it outbound, so
@@ -1704,7 +1729,7 @@ def create_model(
         # ============================================================================
         # CRITICAL: CLAUDE_CODE_PROVIDER MUST BE IMPORTED FROM SOURCE CODE!
         # ============================================================================
-        # Import claude_code_provider from the repository root
+        # Import claude_code_provider from a local source checkout
         # This is a local package that provides LangChain wrapper for Claude Code SDK
         # ============================================================================
         _repo_root = Path(__file__).parent.parent.parent.parent

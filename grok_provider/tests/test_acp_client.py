@@ -30,8 +30,11 @@ if str(_pkg_root) not in sys.path:
 
 from grok_provider.acp_client import (  # noqa: E402
     GrokAcpClient,
+    GrokAcpClientError,
     GrokConcurrentPromptError,
+    raise_for_error_reply,
 )
+from grok_provider.limit_errors import GrokUsageLimitError  # noqa: E402
 
 
 class _FakeStdin:
@@ -290,7 +293,7 @@ class TestSessionPrompt:
     async def test_session_prompt_does_not_leak_pending_request(
         self, client_with_proc
     ) -> None:
-        """Regression (observed live, 2026-06-17): session_prompt bypasses
+        """Regression (review 2026-06-17): session_prompt bypasses
         _call's finally-pop, so the reply dispatch MUST pop the pending
         request — otherwise every turn leaks one stale entry."""
         client, proc = client_with_proc
@@ -372,6 +375,352 @@ class TestSessionPrompt:
 
         assert client._active_prompts["sess-A"] is replacement
         assert client._sinks["sess-A"] is replacement_sink
+
+
+class TestSessionCancelReleasesGuard:
+    """RC-A (incident 2026-07-01 §9b/§10 — grok_provider root cause).
+
+    ``session_cancel(session_id)`` used to only write ``session/cancel`` to
+    grok's stdin without touching the local ``_active_prompts`` guard. If grok
+    never wrote back a JSON-RPC reply for the outstanding ``session/prompt``
+    (crash, wedge, mid-turn CancelledError, session/load discarding the
+    request), the guard entry stayed forever and every subsequent
+    ``session_prompt`` on the same session id raised
+    ``GrokConcurrentPromptError`` synchronously — permanently poisoning the
+    agent thread. Cancel means "abandon this prompt", so the local guard MUST
+    be released too.
+    """
+
+    async def test_cancel_releases_active_prompt_guard(
+        self, client_with_proc: tuple[GrokAcpClient, "_FakeProc"]
+    ) -> None:
+        client, proc = client_with_proc
+        sink: asyncio.Queue[dict[str, object]] = asyncio.Queue()
+        client.session_prompt(
+            session_id="sess-A",
+            prompt=[{"type": "text", "text": "first"}],
+            notification_sink=sink,
+        )
+        assert "sess-A" in client._active_prompts
+
+        await client.session_cancel("sess-A")
+        # Give the future's done_callback one loop tick to run.
+        await asyncio.sleep(0)
+
+        # Sticky guard MUST be gone after cancel — otherwise the next
+        # session_prompt raises GrokConcurrentPromptError synchronously.
+        assert "sess-A" not in client._active_prompts
+        # Sink for the abandoned prompt is also gone (so a new turn's sink
+        # can be registered without racing the stale one).
+        assert "sess-A" not in client._sinks
+        # And session/cancel was actually written to grok's stdin (we didn't
+        # skip the wire message by mistake).
+        methods = [ln.get("method") for ln in proc.stdin.lines()]
+        assert "session/cancel" in methods
+
+    async def test_next_prompt_after_cancel_is_accepted(
+        self, client_with_proc: tuple[GrokAcpClient, "_FakeProc"]
+    ) -> None:
+        client, proc = client_with_proc
+        first_sink: asyncio.Queue[dict[str, object]] = asyncio.Queue()
+        client.session_prompt(
+            session_id="sess-A",
+            prompt=[{"type": "text", "text": "wedged"}],
+            notification_sink=first_sink,
+        )
+        # Grok never replies to the first prompt — cancel abandons it.
+        await client.session_cancel("sess-A")
+        await asyncio.sleep(0)
+
+        # A brand-new turn on the same session id must NOT hit the guard.
+        second_sink: asyncio.Queue[dict[str, object]] = asyncio.Queue()
+        fut = client.session_prompt(
+            session_id="sess-A",
+            prompt=[{"type": "text", "text": "second"}],
+            notification_sink=second_sink,
+        )
+        assert client._active_prompts["sess-A"] is fut
+        assert client._sinks["sess-A"] is second_sink
+        # Last wire message is the second session/prompt (not the cancel).
+        prompts = [
+            ln for ln in proc.stdin.lines()
+            if ln.get("method") == "session/prompt"
+        ]
+        assert prompts[-1]["params"]["prompt"][0]["text"] == "second"
+
+    async def test_cancel_does_not_touch_other_sessions(
+        self, client_with_proc: tuple[GrokAcpClient, "_FakeProc"]
+    ) -> None:
+        client, _proc = client_with_proc
+        sink_a: asyncio.Queue[dict[str, object]] = asyncio.Queue()
+        sink_b: asyncio.Queue[dict[str, object]] = asyncio.Queue()
+        fut_a = client.session_prompt(
+            session_id="sess-A",
+            prompt=[{"type": "text", "text": "a"}],
+            notification_sink=sink_a,
+        )
+        fut_b = client.session_prompt(
+            session_id="sess-B",
+            prompt=[{"type": "text", "text": "b"}],
+            notification_sink=sink_b,
+        )
+
+        await client.session_cancel("sess-A")
+        await asyncio.sleep(0)
+
+        # A is gone.
+        assert "sess-A" not in client._active_prompts
+        assert "sess-A" not in client._sinks
+        # B is untouched — releasing A's guard must not race B's turn.
+        assert client._active_prompts["sess-B"] is fut_b
+        assert client._sinks["sess-B"] is sink_b
+        # A's future was cancelled by session_cancel.
+        assert fut_a.cancelled()
+
+    async def test_cancel_none_or_unknown_is_safe_noop(
+        self, client_with_proc: tuple[GrokAcpClient, "_FakeProc"]
+    ) -> None:
+        client, proc = client_with_proc
+        # Establish B so we can prove it survives noop cancels for None/unknown.
+        sink_b: asyncio.Queue[dict[str, object]] = asyncio.Queue()
+        fut_b = client.session_prompt(
+            session_id="sess-B",
+            prompt=[{"type": "text", "text": "b"}],
+            notification_sink=sink_b,
+        )
+        writes_before = list(proc.stdin.lines())
+
+        await client.session_cancel(None)      # None → return immediately
+        await client.session_cancel("nope")    # unknown → still safe
+
+        # Unknown session_id: cancel MAY still emit a session/cancel wire
+        # message (grok will just ignore it) but the client's guard state
+        # for the other sessions must not change.
+        assert client._active_prompts["sess-B"] is fut_b
+        assert client._sinks["sess-B"] is sink_b
+        # The None call must not have written anything.
+        writes_after_none = writes_before + [
+            ln for ln in proc.stdin.lines()[len(writes_before):]
+            if ln.get("method") == "session/cancel"
+            and ln["params"].get("sessionId") == "nope"
+        ]
+        assert writes_after_none == proc.stdin.lines()
+
+    async def test_cancel_pops_pending_request_entry(
+        self, client_with_proc: tuple[GrokAcpClient, "_FakeProc"]
+    ) -> None:
+        """RC-1 (review). Cancelling an outstanding prompt must
+        also drop its entry from ``_pending_requests`` — otherwise every
+        wedged-then-cancelled prompt leaks an entry there, one per hot-loop
+        retry, exactly in the incident scenario. The active future's
+        done-callback (``release_prompt_owner``) is the natural place to
+        clean it up, since ``fut.cancel()`` alone does not remove the
+        dict entry."""
+        client, _proc = client_with_proc
+        sink: asyncio.Queue[dict[str, object]] = asyncio.Queue()
+        client.session_prompt(
+            session_id="sess-A",
+            prompt=[{"type": "text", "text": "wedged"}],
+            notification_sink=sink,
+        )
+        pending_before = list(client._pending_requests.keys())
+        assert len(pending_before) == 1
+        rid = pending_before[0]
+
+        await client.session_cancel("sess-A")
+        # Give the future's done-callback one loop tick to run.
+        await asyncio.sleep(0)
+
+        assert rid not in client._pending_requests
+        assert client._pending_requests == {}
+
+    async def test_cancel_pops_only_its_own_pending_entry(
+        self, client_with_proc: tuple[GrokAcpClient, "_FakeProc"]
+    ) -> None:
+        """Cancel on sess-A must not evict sess-B's pending JSON-RPC
+        request — B's turn is still in flight and its future waiter would
+        never resolve if the entry vanished."""
+        client, _proc = client_with_proc
+        sink_a: asyncio.Queue[dict[str, object]] = asyncio.Queue()
+        sink_b: asyncio.Queue[dict[str, object]] = asyncio.Queue()
+        client.session_prompt(
+            session_id="sess-A",
+            prompt=[{"type": "text", "text": "a"}],
+            notification_sink=sink_a,
+        )
+        fut_b = client.session_prompt(
+            session_id="sess-B",
+            prompt=[{"type": "text", "text": "b"}],
+            notification_sink=sink_b,
+        )
+        # rids are assigned in call order.
+        rids = list(client._pending_requests.keys())
+        assert len(rids) == 2
+        rid_a, rid_b = rids
+        assert client._pending_requests[rid_b] is fut_b
+
+        await client.session_cancel("sess-A")
+        await asyncio.sleep(0)
+
+        assert rid_a not in client._pending_requests
+        # B's pending entry survives so its awaiter still resolves normally.
+        assert client._pending_requests.get(rid_b) is fut_b
+
+    async def test_late_reply_for_cancelled_rid_is_a_safe_noop(
+        self, client_with_proc: tuple[GrokAcpClient, "_FakeProc"]
+    ) -> None:
+        """If grok eventually writes a JSON-RPC reply for the cancelled
+        prompt (e.g. its wedge clears seconds later), the reader must not
+        crash or corrupt any newly-registered prompt on the same session.
+        With the pending entry popped on cancel, the reply becomes an
+        unknown-id dispatch and is dropped silently."""
+        client, proc = client_with_proc
+        sink: asyncio.Queue[dict[str, object]] = asyncio.Queue()
+        client.session_prompt(
+            session_id="sess-A",
+            prompt=[{"type": "text", "text": "wedged"}],
+            notification_sink=sink,
+        )
+        first_rid = list(client._pending_requests.keys())[0]
+
+        await client.session_cancel("sess-A")
+        await asyncio.sleep(0)
+
+        # A fresh turn on the same session id (proves guard was released).
+        second_sink: asyncio.Queue[dict[str, object]] = asyncio.Queue()
+        second_fut = client.session_prompt(
+            session_id="sess-A",
+            prompt=[{"type": "text", "text": "second"}],
+            notification_sink=second_sink,
+        )
+        second_rid = client._next_id
+        assert client._pending_requests[second_rid] is second_fut
+
+        # Grok now dribbles in a late reply for the FIRST rid. Reader must
+        # not resolve the new second_fut and must not raise.
+        proc.stdout.feed_line(
+            {"jsonrpc": "2.0", "id": first_rid, "result": {"stopReason": "cancelled"}}
+        )
+        await asyncio.sleep(0.02)
+
+        assert not second_fut.done()
+        # And the new turn's pending entry is still there for its own reply.
+        assert client._pending_requests.get(second_rid) is second_fut
+
+
+class TestRaiseForErrorReply:
+    """Shared error extractor — single source of truth for both the
+    ``_call`` path and the ``session/prompt`` terminal path (chat_model)."""
+
+    def test_no_error_key_is_noop(self) -> None:
+        # A normal result reply must pass through silently.
+        raise_for_error_reply("session/prompt", {"id": 1, "result": {}})
+
+    def test_billing_error_raises_usage_limit(self) -> None:
+        reply = {"id": 1, "error": {"code": 402, "message": "Payment Required"}}
+        with pytest.raises(GrokUsageLimitError):
+            raise_for_error_reply("session/prompt", reply)
+
+    def test_insufficient_credits_raises_usage_limit(self) -> None:
+        reply = {"id": 1, "error": {"message": "insufficient credits on account"}}
+        with pytest.raises(GrokUsageLimitError):
+            raise_for_error_reply("session/prompt", reply)
+
+    def test_generic_error_raises_acp_client_error(self) -> None:
+        reply = {"id": 1, "error": {"code": -32602, "message": "bad params"}}
+        with pytest.raises(GrokAcpClientError) as excinfo:
+            raise_for_error_reply("session/new", reply)
+        # Not misclassified as a usage-limit error.
+        assert not isinstance(excinfo.value, GrokUsageLimitError)
+
+    def test_error_string_payload(self) -> None:
+        # error may be a bare string, not a dict.
+        with pytest.raises(GrokUsageLimitError):
+            raise_for_error_reply("session/prompt", {"id": 1, "error": "402 payment required"})
+
+    def test_nested_data_message_402_raises_usage_limit(self) -> None:
+        """REAL production shape (test_grok2, incident 2026-07-04): the grok
+        JSON-RPC error wraps the account-terminal 402 inside ``error.data`` and
+        puts a generic ``"Internal error"`` in the top-level ``error.message``.
+
+        The extractor MUST read ``error.data.message`` (not only the outer
+        ``error.message``) or it misclassifies a billing cap as a generic
+        ``GrokAcpClientError`` — no failover, empty AIMessages. This is the
+        exact reply copied verbatim from test_grok2.err.log."""
+        reply = {
+            "id": 5,
+            "error": {
+                "code": -32603,
+                "message": "Internal error",
+                "data": {
+                    "message": (
+                        "API error (status 402 Payment Required): "
+                        "Grok Build usage balance exhausted\n\n"
+                        "Request URL: https://cli-chat-proxy.grok.com/v1/responses"
+                    ),
+                    "http_status": 402,
+                },
+            },
+        }
+        with pytest.raises(GrokUsageLimitError):
+            raise_for_error_reply("session/prompt", reply)
+
+    def test_nested_data_http_status_402_alone_raises_usage_limit(self) -> None:
+        """Even if the nested ``data.message`` were opaque, an
+        ``http_status == 402`` is itself account-terminal and must be
+        classified as a usage/billing cap → failover."""
+        reply = {
+            "id": 7,
+            "error": {
+                "code": -32603,
+                "message": "Internal error",
+                "data": {"message": "upstream said no", "http_status": 402},
+            },
+        }
+        with pytest.raises(GrokUsageLimitError):
+            raise_for_error_reply("session/prompt", reply)
+
+    def test_nested_generic_error_still_acp_client_error(self) -> None:
+        """A genuinely generic nested error (no billing/limit markers, non-402
+        status) must NOT be misclassified as a usage limit — it stays a plain
+        ``GrokAcpClientError`` so we never burn a false failover step."""
+        reply = {
+            "id": 9,
+            "error": {
+                "code": -32603,
+                "message": "Internal error",
+                "data": {"message": "invalid session id", "http_status": 400},
+            },
+        }
+        with pytest.raises(GrokAcpClientError) as excinfo:
+            raise_for_error_reply("session/prompt", reply)
+        assert not isinstance(excinfo.value, GrokUsageLimitError)
+
+
+class TestCallErrorReplies:
+    async def test_call_raises_usage_limit_on_billing(self, client_with_proc) -> None:
+        client, proc = client_with_proc
+        task = asyncio.create_task(client.initialize())
+        await asyncio.sleep(0.01)
+        last = proc.stdin.lines()[-1]
+        proc.stdout.feed_line(
+            {"jsonrpc": "2.0", "id": last["id"],
+             "error": {"code": 402, "message": "Payment Required"}}
+        )
+        with pytest.raises(GrokUsageLimitError):
+            await asyncio.wait_for(task, timeout=1)
+
+    async def test_call_raises_client_error_on_generic(self, client_with_proc) -> None:
+        client, proc = client_with_proc
+        task = asyncio.create_task(client.session_new(cwd="/tmp", mcp_servers=[]))
+        await asyncio.sleep(0.01)
+        last = proc.stdin.lines()[-1]
+        proc.stdout.feed_line(
+            {"jsonrpc": "2.0", "id": last["id"],
+             "error": {"code": -32602, "message": "missing field mcpServers"}}
+        )
+        with pytest.raises(GrokAcpClientError):
+            await asyncio.wait_for(task, timeout=1)
 
 
 class TestClose:

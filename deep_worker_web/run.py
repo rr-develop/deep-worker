@@ -5,8 +5,8 @@ CRITICAL SECURITY NOTICE:
 This application MUST ONLY run on 127.0.0.1 on one of two approved
 ports — and no other:
 
-- 7887 for the production / hot-fix checkout at /path/to/production
-- 7888 for the developer checkout at /path/to/dev
+- 7887 for the production / hot-fix checkout
+- 7888 for the developer checkout
 
 ``app.config`` derives the correct port from the checkout location
 at import time and refuses to start anywhere else.
@@ -20,12 +20,54 @@ import sys
 from pathlib import Path
 from types import FrameType
 
+
+def _bootstrap_sys_path() -> list[str]:
+    """Make this checkout's sibling packages importable before any app import.
+
+    The server MUST NOT depend on an ambient ``PYTHONPATH`` to find its own
+    tree. It used to: ``app.routers.agents`` imports
+    ``deep_worker_cli.model_predicate`` at module scope, so launching
+    ``run.py`` without a hand-crafted ``PYTHONPATH`` died with
+    ``ModuleNotFoundError: No module named 'deep_worker_cli'``.
+
+    That turned every env-dropping launcher into an outage. The in-process
+    restart helper (``app/routers/server.py``) is exactly such a launcher: it
+    spawns ``run.py`` with no ``env=`` and with stdout/stderr at DEVNULL, so
+    the traceback was swallowed and the web server simply never came back.
+
+    Paths are resolved relative to THIS file, so a dev checkout always loads
+    its own packages and never the prod tree's. Kept in sync with the agent
+    spawn path list in ``app/routers/agents.py``.
+    """
+    tree_root = Path(__file__).resolve().parent.parent
+    candidates = [
+        tree_root / "deep_worker" / "deep_worker_cli",
+        tree_root / "deep_worker" / "deepagents",
+        Path("/path/to/rpyc_async"),
+    ]
+
+    # This file's own directory must be importable for ``import app.*`` to
+    # work when run.py is invoked by absolute path from another cwd.
+    web_root = Path(__file__).resolve().parent
+    added: list[str] = []
+    for path in [web_root, *candidates]:
+        text = str(path)
+        if path.is_dir() and text not in sys.path:
+            sys.path.insert(0, text)
+            added.append(text)
+    return added
+
+
+# MUST run before ``app.*`` is imported — app.routers.agents needs
+# deep_worker_cli at import time.
+_BOOTSTRAPPED_PATHS = _bootstrap_sys_path()
+
 import uvicorn
 
 from app.config import settings
 
 # Rotating log: ≤2 GB total. Path is hard-coded so the file can't be
-# silently redirected via a shell output redirect again (that leaked 64 GB
+# silently redirected via shell `> /tmp/X.log` again (that leaked 64 GB
 # once stdout/stderr were captured by uvicorn into an unrotated sink).
 # _setup_logging() also takes over sys.stdout/sys.stderr, so even
 # nohup-style redirects route through the RotatingFileHandler.
@@ -116,6 +158,45 @@ def _enforce_rotating_logging() -> None:
         sys.exit(1)
 
 
+def _enforce_importable_tree() -> None:
+    """Refuse to start if the tree's own packages are not importable.
+
+    Hard guard against a repeat of the ``ModuleNotFoundError:
+    deep_worker_cli`` startup crash. Failing here — with an explanatory
+    message on fd 2 — beats importing a half-wired app that only explodes
+    later on the first request to /api/agents.
+    """
+    import importlib.util
+
+    # Only the CLI package is checked here. ``app.config`` is already imported
+    # at run.py module load, so re-checking it in main() would be redundant.
+    # The residual value of this guard is an early, explicit failure for the
+    # sibling package that uvicorn would otherwise only miss later — it loads
+    # ``app.routers`` lazily from the "app.main:app" string, so a broken path
+    # would surface inside the worker on the first /api/agents request.
+    required = ("deep_worker_cli.model_predicate",)
+    missing = []
+    for name in required:
+        try:
+            if importlib.util.find_spec(name) is None:
+                missing.append(name)
+        except (ImportError, ValueError):
+            missing.append(name)
+
+    if missing:
+        os.write(
+            2,
+            (
+                "FATAL: required modules not importable: "
+                f"{', '.join(missing)}\n"
+                f"sys.path bootstrap added: {_BOOTSTRAPPED_PATHS}\n"
+                "The server resolves these from its own checkout; a missing "
+                "path means the tree layout changed. Refusing to start.\n"
+            ).encode(),
+        )
+        sys.exit(1)
+
+
 def signal_handler(sig: int, frame: FrameType | None) -> None:
     """Handle interrupt signals gracefully."""
     print(f"\nReceived interrupt signal ({sig}), shutting down gracefully...")
@@ -128,13 +209,14 @@ def main() -> None:
     # _enforce_rotating_logging() then aborts startup if rotation isn't active.
     _setup_logging()
     _enforce_rotating_logging()
+    _enforce_importable_tree()
 
     # Register signal handlers
     signal.signal(signal.SIGINT, signal_handler)
 
     # Security validation (explicit check before server start).
     # `settings.validate_security()` enforces the (checkout -> port) pairing —
-    # 7887 for /path/to/production, 7888 for /path/to/dev — so a
+    # 7887 for the production checkout, 7888 for the development one — so a
     # second sanity check here just re-runs it with a friendly error message
     # in case settings got mutated between import and main().
     print(f"🔒 SECURITY: Server will bind to {settings.host}:{settings.port} ONLY")

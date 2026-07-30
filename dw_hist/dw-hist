@@ -5,8 +5,9 @@
 # tree-local imports via PYTHONPATH, no pip install required.
 #
 # Install (per-user) — symlink into ~/.local/bin to make `dw-hist` global:
-#   ln -sf <repo>/dw_hist/dw-hist ~/.local/bin/dw-hist
-# (<repo> = this repository's checkout path)
+#   ln -sf /path/to/production-tree/dw_hist/dw-hist ~/.local/bin/dw-hist
+# or, to run from the dev tree:
+#   ln -sf /path/to/dev-tree/dw_hist/dw-hist ~/.local/bin/dw-hist
 #
 # See docs/DESIGN_DW_HIST_INITIAL.md for the design.
 
@@ -16,5 +17,31 @@ SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 
 export PYTHONPATH="$SCRIPT_DIR:$REPO_ROOT/deep_worker/deep_worker_cli:$REPO_ROOT/semantic_search:${PYTHONPATH:-}"
+
+# Force strictly-offline + quiet for the embedding model load. The model is
+# already on disk and semantic_search uses local_files_only=True; these env
+# vars just guarantee that transformers/huggingface_hub/tqdm/llama_index do
+# not attempt any HF Hub request and do not splash a progress bar / unauth
+# warning on every search. Pass --verbose on the dw-hist CLI to opt out of
+# the silencing (we detect it here so the env vars are also skipped).
+VERBOSE=0
+for arg in "$@"; do
+    if [[ "$arg" == "--verbose" || "$arg" == "-v" ]]; then
+        VERBOSE=1
+        break
+    fi
+done
+
+if [[ "$VERBOSE" == "0" ]]; then
+    : "${HF_HUB_OFFLINE:=1}";                  export HF_HUB_OFFLINE
+    : "${TRANSFORMERS_OFFLINE:=1}";            export TRANSFORMERS_OFFLINE
+    : "${HF_HUB_DISABLE_TELEMETRY:=1}";        export HF_HUB_DISABLE_TELEMETRY
+    : "${HF_HUB_DISABLE_PROGRESS_BARS:=1}";    export HF_HUB_DISABLE_PROGRESS_BARS
+    : "${HF_HUB_DISABLE_IMPLICIT_TOKEN:=1}";   export HF_HUB_DISABLE_IMPLICIT_TOKEN
+    : "${TRANSFORMERS_VERBOSITY:=error}";      export TRANSFORMERS_VERBOSITY
+    : "${TRANSFORMERS_NO_ADVISORY_WARNINGS:=1}"; export TRANSFORMERS_NO_ADVISORY_WARNINGS
+    : "${TOKENIZERS_PARALLELISM:=false}";      export TOKENIZERS_PARALLELISM
+    : "${TQDM_DISABLE:=1}";                    export TQDM_DISABLE
+fi
 
 exec python3 -m dw_hist.cli "$@"

@@ -2,13 +2,14 @@
 """Verify rpyc_async source integration.
 
 This script verifies that rpyc is imported from the correct source
-(rpyc_async) and has AsyncioServer support.
+(a local rpyc_async checkout) and has AsyncioServer support.
 """
 
 from __future__ import annotations
 
 import sys
 from pathlib import Path
+
 
 def verify_rpyc_async_integration() -> bool:
     """Verify that rpyc is imported from correct source.
@@ -17,8 +18,8 @@ def verify_rpyc_async_integration() -> bool:
         True if integration is correct, False otherwise.
     """
     try:
-        import rpyc
-        from rpyc.utils.async_server import AsyncioServer
+        import rpyc_async as rpyc
+        from rpyc_async.utils.async_server import AsyncioServer
 
         # Check that AsyncioServer is available
         assert hasattr(rpyc.utils, "async_server"), (
@@ -27,7 +28,7 @@ def verify_rpyc_async_integration() -> bool:
 
         # Check rpyc location
         rpyc_path = Path(rpyc.__file__).resolve()
-        expected_base = Path("rpyc_async")
+        expected_base = Path("/path/to/rpyc_async")
 
         # Check if rpyc is from expected location
         try:
@@ -39,7 +40,7 @@ def verify_rpyc_async_integration() -> bool:
             return False
 
         # Check protocol version
-        from rpyc.core import consts
+        from rpyc_async.core import consts
 
         if consts.PROTOCOL_VERSION < (5, 1):
             print(f"❌ Wrong protocol version: {consts.PROTOCOL_VERSION}")
@@ -63,6 +64,7 @@ def verify_rpyc_async_integration() -> bool:
     print(f"   AsyncioServer: Available")
 
     return True
+
 
 if __name__ == "__main__":
     try:

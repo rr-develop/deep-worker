@@ -64,7 +64,7 @@ def test_interactive_imports_async_connect() -> None:
     # (the existing style used in agent_client.py) or
     # `rpyc.async_connect` via the top-level package export.
     pattern = re.compile(
-        r"(from\s+rpyc\.core\.async_connect\s+import\s+async_connect)"
+        r"(from\s+rpyc_async\.core\.async_connect\s+import\s+async_connect)"
         r"|(rpyc\.async_connect\()",
     )
     assert pattern.search(src) is not None, (

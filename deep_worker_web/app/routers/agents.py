@@ -33,6 +33,22 @@ from app.schemas.agent_schemas import (
 )
 from app.services.agent_service import AgentService
 
+# Provider↔model compatibility. This used to be a hand-copied duplicate of
+# the CLI predicate, kept local because importing ``deep_worker_cli.config``
+# drags in langchain and breaks the web unit-test environment. The two copies
+# then drifted: both carried a stale Claude Code whitelist, so a saved
+# ``fable`` model failed the check here and the web spawned the agent with no
+# ``--model`` at all, silently falling back to sonnet (observed in a past
+# incident).
+#
+# ``deep_worker_cli.model_predicate`` is a dependency-free leaf module created
+# for exactly this: one implementation, importable from both sides. It has no
+# heavy or order-sensitive imports, so it belongs in the normal import block.
+# Do not reintroduce a local copy.
+from deep_worker_cli.model_predicate import (
+    model_can_belong_to_provider as _model_can_belong_to_provider,
+)
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/agents", tags=["agents"])
@@ -161,6 +177,23 @@ async def send_message(
         "message": "Message sent successfully",
         "agent_name": agent_name,
     }
+
+
+@router.post("/{agent_name}/summarize", status_code=202)
+async def summarize_agent(
+    agent_name: str,
+    service: AgentService = Depends(get_agent_service),
+) -> dict[str, Any]:
+    agent = await service.get_agent(agent_name)
+    if agent is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Agent '{agent_name}' not found",
+        )
+    response = await service.summarize_agent(agent_name)
+    if not response.get("success"):
+        raise HTTPException(status_code=503, detail=response.get("error"))
+    return response
 
 
 @router.get("/{agent_name}/history")
@@ -366,7 +399,7 @@ async def stop_task_manager(
         )
 
     # Try to stop TaskManager via fire-and-forget
-    from rpyc.utils.helpers import fire_and_forget_async
+    from rpyc_async.utils.helpers import fire_and_forget_async
 
     # Distinguish two failure modes that used to look identical:
     #
@@ -379,7 +412,8 @@ async def stop_task_manager(
     #   do" state — respond 200 (pre-existing contract).
     # NON-BLOCKING: ensure_connecting returns current connectivity and
     # kicks a single-flight background connect if needed — it never waits
-    # on a slow/stuck peer (the 2026-06-15 incident).
+    # on a slow/stuck peer (see a related internal incident analysis, not
+    # included here).
     is_connected = await service.ensure_connecting(agent_name)
 
     root = service.get_root(agent_name) if is_connected else None
@@ -591,7 +625,8 @@ async def get_dialog_text(
     # NON-BLOCKING connect gate: never wait on a slow/stuck peer. If the
     # agent is not connected yet, a single-flight background connect is
     # kicked off and we return 503 immediately (UI shows a retry banner)
-    # instead of hanging this handler (the 2026-06-15 incident).
+    # instead of hanging this handler (see a related internal incident
+    # analysis, not included here).
     if not await service.ensure_connecting(agent_name):
         raise HTTPException(
             status_code=503,
@@ -670,10 +705,11 @@ def _spawn_subprocess(
     ``AgentLifecycleService._drive_spawn`` handles the event-driven wait
     via inotify.
     """
+    effective_provider = provider or config.get("provider", "deepseek")
     cmd = [
         "python3", "-m", "deep_worker_cli.cli.agent_command",
         agent_name,
-        "--provider", provider or config.get("provider", "deepseek"),
+        "--provider", effective_provider,
         "--dir", config.get("working_dir", "."),
     ]
     # Resolve the model: explicit arg wins, else the saved config value.
@@ -681,12 +717,27 @@ def _spawn_subprocess(
     # so treat it (and an empty/None value) as "no model specified" and
     # omit ``--model`` entirely. The agent then picks its provider
     # default (codex CLI chooses its own current default). Passing
-    # ``--model unknown`` is exactly what sent a live agent to ERROR with a
-    # Codex HTTP 400 on every web restart (2026-05-20).
-    resolved_model = model if model is not None else config.get("model")
-    if isinstance(resolved_model, str) and resolved_model.strip() and \
-            resolved_model.strip().lower() != "unknown":
+    # ``--model unknown`` is exactly what sent an agent to ERROR with a
+    # Codex HTTP 400 on every web restart in a past incident.
+    saved_provider = config.get("provider")
+    resolved_model = model
+    if resolved_model is None and saved_provider == effective_provider:
+        resolved_model = config.get("model")
+    if _model_can_belong_to_provider(effective_provider, resolved_model):
         cmd += ["--model", resolved_model]
+    elif resolved_model:
+        # A non-empty model was discarded. Say so: silently substituting the
+        # provider default is the defect from that incident. This is a SERVER-side
+        # warning — the HTTP response and the browser UI are deliberately
+        # unchanged; surfacing it to the operator's browser would mean
+        # extending the endpoint contract, which is out of scope here.
+        logger.warning(
+            "Dropping model %r for agent %r: not compatible with provider %r. "
+            "The agent will use that provider's default instead.",
+            resolved_model,
+            agent_name,
+            effective_provider,
+        )
     # Preserve every persisted boolean option across restart.
     #
     # We iterate the single source of truth (``_BOOLEAN_FLAGS`` in
@@ -721,27 +772,27 @@ def _spawn_subprocess(
     #
     # The agent's ORIGINAL tree is authoritative, NOT the web server's. An
     # agent launched with ``--dev`` (dev codebase) must be RESTARTED on the
-    # dev codebase even when the restart is driven by the PROD web UI (:7887),
+    # dev codebase even when the restart is driven by the PROD web UI,
     # and vice-versa. We persist that choice as ``launch_config['dev_tree']``
     # (build_launch_config), so honor it here. Previously this hard-coded the
     # tree to the web server's OWN checkout (``__file__``), so restarting a
     # ``--dev`` agent from the prod web UI silently dropped ``--dev`` and
-    # respawned it on prod — the bug this fixes (2026-05-23). It also meant the
+    # respawned it on prod — the bug this fixes. It also meant the
     # dev web server stamped DEEP_WORKER_DEV_TREE=1 onto EVERY agent it spawned,
     # even non-dev ones. The CLI ``deep-worker --restart`` launcher already
     # auto-detects dev_tree; this brings the web path in line. See
     # docs/DESIGN_DEV_FLAG.md.
     #
-    # __file__ here = <WEB_TREE>/<web-app>/app/routers/agents.py;
+    # __file__ here = <WEB_TREE>/<web-package>/app/routers/agents.py;
     # parent x4 = <WEB_TREE> — the fallback tree for non-dev agents (prod when
-    # the web server runs from /path/to/production).
+    # the web server runs from the production tree).
     _web_tree_root = Path(__file__).resolve().parent.parent.parent.parent
     if config.get("dev_tree"):
         # DEEP_WORKER_DEV_TREE_ROOT_OVERRIDE mirrors the bash launcher's
-        # testing hook so tests don't need a real /path/to/dev.
+        # testing hook so tests don't need a real dev tree on disk.
         _tree_root = Path(
             os.environ.get(
-                "DEEP_WORKER_DEV_TREE_ROOT_OVERRIDE", "/path/to/dev"
+                "DEEP_WORKER_DEV_TREE_ROOT_OVERRIDE", "/nonexistent/dev-tree"
             )
         )
     else:

@@ -1,6 +1,6 @@
 """Test that subscriber.on_message dispatch uses asyncreq(HANDLE_CALLATTR),
 bypassing the sync_request guard that would fire on a sync-flagged netref
-when called from the asyncio loop (a related issue).
+when called from the asyncio loop (issue #48).
 """
 
 from __future__ import annotations
@@ -11,7 +11,9 @@ import pytest
 
 SOURCE = (
     pathlib.Path(__file__).resolve().parents[1]
-    / "deep_worker_cli" / "process" / "agent_process.py"
+    / "deep_worker_cli"
+    / "process"
+    / "agent_process.py"
 )
 
 
@@ -66,10 +68,10 @@ def test_asyncreq_callattr_used_twice():
 
 
 def test_hardcoded_8_matches_handle_callattr():
-    from rpyc.core.consts import HANDLE_CALLATTR
+    from rpyc_async.core.consts import HANDLE_CALLATTR
     assert HANDLE_CALLATTR == 8
 
 
 def test_asyncreq_import_resolves():
-    from rpyc.core.netref import asyncreq as _asyncreq
+    from rpyc_async.core.netref import asyncreq as _asyncreq
     assert callable(_asyncreq)

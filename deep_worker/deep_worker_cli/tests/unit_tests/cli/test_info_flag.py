@@ -2,6 +2,7 @@
 
 import json
 import os
+import sys
 import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -25,8 +26,8 @@ def temp_data_dir():
 LAUNCH_CONFIG = {
     "provider": "claude-code",
     "model": "opus",
-    "working_dir": "/path/to/dev",
-    "tree_root": "/path/to/dev",
+    "working_dir": "/tmp/agent_work",
+    "tree_root": "/tmp/agent_work",
     "dev_tree": True,
     "skip_permissions": True,
     "task_manager": True,
@@ -37,7 +38,7 @@ LAUNCH_CONFIG = {
     "clean": False,
     "started_at": "2026-06-05T20:14:29",
     "pid": 1842836,
-    "cli_args": "--restart myagent -m",
+    "cli_args": "--restart sysagent -m",
 }
 
 
@@ -109,7 +110,7 @@ class TestNoMetadata:
 class TestHappyPath:
     def test_all_required_fields_appear(self, temp_data_dir, capsys):
         """Output contains all expected fields from the design spec."""
-        agent_dir = temp_data_dir / "myagent"
+        agent_dir = temp_data_dir / "sysagent"
         _write_full_metadata(agent_dir, LAUNCH_CONFIG)
 
         from deep_worker_cli.cli.agent_command import show_agent_info
@@ -120,21 +121,21 @@ class TestHappyPath:
             patch("deep_worker_cli.process.registry.ProcessRegistry") as mock_reg,
         ):
             mock_reg().lookup.return_value = None
-            rc = show_agent_info("myagent")
+            rc = show_agent_info("sysagent")
 
         assert rc == 0
         out = capsys.readouterr().out
 
-        assert "agent: myagent" in out
+        assert "agent: sysagent" in out
         assert "provider: claude-code" in out
         assert "model: opus" in out
-        assert "working_dir: /path/to/dev" in out
+        assert "working_dir: /tmp/agent_work" in out
         assert "tree_root:" in out
         assert "dev_tree=true" in out
         assert "started_at: 2026-06-05T20:14:29" in out
         assert "pid: 1842836" in out
         assert "flags:" in out
-        assert "cli_args: --restart myagent -m" in out
+        assert "cli_args: --restart sysagent -m" in out
         assert "status: idle" in out
         assert "last_activity: 2026-06-05T20:18:42" in out
 
@@ -188,7 +189,7 @@ class TestRunningStatus:
             name="runner",
             pid=99999,
             pid_file=agent_dir / "agent.pid",
-            working_dir="/path/to/dev",
+            working_dir="/tmp/agent_work",
             started_at="2026-06-05T20:14:29",
             rpyc_port=12345,
         )
@@ -282,3 +283,61 @@ class TestParser:
 
         assert args.info is True
         assert args.name is None
+
+    def test_limits_info_flag_accepted_with_provider(self):
+        from deep_worker_cli.cli.agent_command import create_parser
+
+        parser = create_parser()
+        args = parser.parse_args(["--provider", "claude-code", "--limits-info"])
+
+        assert args.limits_info is True
+        assert args.provider == "claude-code"
+        assert args.name is None
+
+
+class TestLimitsInfoCommand:
+    def test_limits_info_requires_explicit_provider(self, capsys):
+        from deep_worker_cli.cli import agent_command
+
+        with patch.object(sys, "argv", ["deep-worker", "--limits-info"]):
+            rc = agent_command.main()
+
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert "--limits-info requires explicit --provider NAME" in err
+
+    def test_limits_info_no_record_does_not_invent_time(self, capsys):
+        from deep_worker_cli.cli.agent_command import show_provider_limits_info
+
+        with patch("deep_worker_cli.cli.agent_command.AvailabilityTracker") as MockTracker:
+            MockTracker.return_value.limit_info.return_value = None
+            rc = show_provider_limits_info("codex")
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "provider: codex" in out
+        assert "status: no_limit_record" in out
+        assert "available_after_utc:" not in out
+
+    def test_limits_info_prints_persisted_fallback_as_approximate(self, capsys):
+        from deep_worker_cli.cli.agent_command import show_provider_limits_info
+
+        with patch("deep_worker_cli.cli.agent_command.AvailabilityTracker") as MockTracker:
+            MockTracker.return_value.limit_info.return_value = {
+                "available_after_utc": "2099-07-05T14:44:51+00:00",
+                "available_after_source": "fallback",
+                "available_after_note": "No provider reset time was parseable; using 24h rough fallback for grok.",
+                "last_failure_marker": "Payment Required",
+                "last_failure_at_utc": "2026-07-04T14:44:51+00:00",
+                "last_failure_agent": "dwtest",
+            }
+            rc = show_provider_limits_info("grok")
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "provider: grok" in out
+        assert "status: limited" in out
+        assert "available_after_utc: 2099-07-05T14:44:51+00:00" in out
+        assert "source: fallback" in out
+        assert "rough fallback" in out
+        assert "last_failure_agent: dwtest" in out

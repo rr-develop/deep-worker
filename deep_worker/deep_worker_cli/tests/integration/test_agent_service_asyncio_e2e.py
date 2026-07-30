@@ -26,12 +26,18 @@ from pathlib import Path
 
 import pytest
 
-from rpyc.core import consts  # noqa: E402
-from rpyc.core.async_connect import async_connect  # noqa: E402
+# The local rpyc_async checkout must be on sys.path BEFORE importing rpyc.
+_rpyc_async_path = Path("/path/to/rpyc_async")
+if str(_rpyc_async_path) not in sys.path:
+    sys.path.insert(0, str(_rpyc_async_path))
+
+from rpyc_async.core import consts  # noqa: E402
+from rpyc_async.core.async_connect import async_connect  # noqa: E402
 
 from tests.integration._subprocess_server import (  # noqa: E402
     mock_agent_service_subprocess,
 )
+
 
 async def _async_call(conn, root, method: str, *args):
     """Invoke ``root.<method>(*args)`` without ever issuing a sync_request.
@@ -52,6 +58,7 @@ async def _async_call(conn, root, method: str, *args):
         (),
     )
     return await async_result
+
 
 @pytest.mark.asyncio
 async def test_agent_service_with_asyncio_server():
@@ -84,6 +91,7 @@ async def test_agent_service_with_asyncio_server():
         finally:
             await conn.aclose()
 
+
 @pytest.mark.asyncio
 async def test_agent_service_overridden_base_methods():
     """Overridden ``rpyc.Service`` base methods are reachable async."""
@@ -101,6 +109,7 @@ async def test_agent_service_overridden_base_methods():
             assert isinstance(aliases, list)
         finally:
             await conn.aclose()
+
 
 @pytest.mark.asyncio
 async def test_server_handles_multiple_clients_sequentially():
@@ -125,6 +134,7 @@ async def test_server_handles_multiple_clients_sequentially():
             assert isinstance(metadata2, dict)
         finally:
             await conn2.aclose()
+
 
 @pytest.mark.asyncio
 async def test_asyncio_server_graceful_shutdown():

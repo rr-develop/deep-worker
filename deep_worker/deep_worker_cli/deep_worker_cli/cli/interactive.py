@@ -20,15 +20,15 @@ from textual.widgets import Static
 # ============================================================================
 # CRITICAL: RPYC MUST BE IMPORTED FROM SOURCE CODE, NOT FROM PIP!
 # ============================================================================
-# ALWAYS import rpyc from the rpyc_async source directory (not from pip).
+# ALWAYS import rpyc from a local rpyc_async source checkout.
 # This ensures we use rpyc_async with AsyncioServer support.
 # ============================================================================
 _rpyc_async_path = Path("/path/to/rpyc_async")
 if _rpyc_async_path.exists() and str(_rpyc_async_path) not in sys.path:
     sys.path.insert(0, str(_rpyc_async_path))
 
-import rpyc
-from rpyc.core.async_connect import async_connect
+import rpyc_async as rpyc
+from rpyc_async.core.async_connect import async_connect
 from deep_worker_cli.process.registry import ProcessRegistry
 from deep_worker_cli.widgets.chat_input import ChatInput
 from deep_worker_cli.widgets.loading import LoadingWidget
@@ -375,7 +375,7 @@ class InteractiveApp(App):
         # The on_message method MUST be async to match deepagents architecture
         # where all callbacks are async (await adapter._mount_message, etc.)
         #
-        # This ensures deep-worker/dwcli follows the SAME async patterns as
+        # This ensures the CLI follows the SAME async patterns as
         # the original deepagents implementation.
         #
         # ARCHITECTURE: Single-thread, single event loop

@@ -46,7 +46,7 @@ class CompleteRPyCTracer:
             # RPyC message format: msg_type(1 byte) + pickled(seq, args)
             try:
                 import brine
-                from rpyc.core import consts
+                from rpyc_async.core import consts
                 msg_type, = brine.I1.unpack(data[:1])
                 seq, args = brine.load(data[1:])
 

@@ -42,10 +42,12 @@ if str(_pkg_root) not in sys.path:
     sys.path.insert(0, str(_pkg_root))
 
 from grok_provider import chat_model as cm  # noqa: E402
+from grok_provider.acp_client import GrokAcpClientError  # noqa: E402
 from grok_provider.chat_model import (  # noqa: E402
     GrokChatModel,
     GrokTurnCancelledError,
 )
+from grok_provider.limit_errors import GrokUsageLimitError  # noqa: E402
 from grok_provider.client_state import GrokClientState  # noqa: E402
 
 
@@ -614,3 +616,193 @@ class TestCancellationClassification:
             await model._finalize_response(
                 {"result": {"stopReason": "cancelled"}}, []
             )
+
+
+class TestErrorReplyFinalization:
+    """session/prompt resolves its future with the RAW reply and bypasses
+    ``_call``'s error check. An error reply must raise here, NOT collapse
+    into an empty AIMessage (incident 2026-07-03 — grok HTTP 402)."""
+
+    @pytest.mark.asyncio
+    async def test_billing_error_reply_raises_usage_limit(self, model) -> None:
+        # This is the exact shape session/prompt delivers on an xAI 402.
+        reply = {"id": 7, "error": {"code": 402, "message": "Payment Required"}}
+        with pytest.raises(GrokUsageLimitError):
+            await model._finalize_response(reply, ["partial"])
+
+    @pytest.mark.asyncio
+    async def test_generic_error_reply_raises_client_error(self, model) -> None:
+        reply = {"id": 7, "error": {"code": -32000, "message": "internal boom"}}
+        with pytest.raises(GrokAcpClientError):
+            await model._finalize_response(reply, [])
+
+    @pytest.mark.asyncio
+    async def test_error_reply_does_not_return_empty_aimessage(self, model) -> None:
+        # The regression: no exception, empty content, silent no-failover.
+        reply = {"id": 7, "error": {"message": "insufficient credits"}}
+        with pytest.raises(GrokUsageLimitError):
+            await model._finalize_response(reply, [])
+
+    @pytest.mark.asyncio
+    async def test_nested_402_reply_raises_usage_limit_real_path(self, model) -> None:
+        """REAL production shape (test_grok2, incident 2026-07-04) driven
+        through the REAL terminal path ``_finalize_response`` → real
+        ``raise_for_error_reply`` → real markers. The 402 is nested inside
+        ``error.data.message`` with a generic ``"Internal error"`` on top.
+
+        This is the exact reply session/prompt delivered on the live agent.
+        The earlier (2026-07-03) tests fed only a FLAT ``error.message`` the
+        real API never sends, so this nested shape still broke in production
+        until the extractor learned to read ``error.data`` (POLICIES.md §10)."""
+        reply = {
+            "id": 7,
+            "error": {
+                "code": -32603,
+                "message": "Internal error",
+                "data": {
+                    "message": (
+                        "API error (status 402 Payment Required): "
+                        "Grok Build usage balance exhausted\n\n"
+                        "Request URL: https://cli-chat-proxy.grok.com/v1/responses"
+                    ),
+                    "http_status": 402,
+                },
+            },
+        }
+        with pytest.raises(GrokUsageLimitError):
+            await model._finalize_response(reply, ["partial"])
+
+    @pytest.mark.asyncio
+    async def test_normal_result_reply_still_returns_content(self, model) -> None:
+        reply = {"id": 7, "result": {"stopReason": "end_turn"}}
+        msg = await model._finalize_response(reply, ["hello ", "world"])
+        assert msg.content == "hello world"
+
+
+# ---------------------------------------------------------------------------
+# Grok arg-compat: _map_tool_call MUST normalize rawInput on the CASE A
+# (proxy tool) path per docs/DESIGN_FIX_TOOL_VALIDATION_ERROR_STATE_AND_GROK_ARG_COMPAT.md
+# §3.2. Two proxy sub-branches:
+#   1) grok calls the bound tool by its plain name (title == tool name).
+#   2) grok wraps the call in CallMcpTool with rawInput.toolName / arguments.
+# ---------------------------------------------------------------------------
+class TestMapToolCallProxyNormalization:
+    def test_bound_tool_read_file_target_file_renamed(self, fake_home, monkeypatch) -> None:
+        cs = GrokClientState()
+        monkeypatch.setattr(cm, "get_global_client_state", lambda: cs)
+
+        @tool
+        def read_file(file_path: str) -> str:
+            """Read a file."""
+            return ""
+
+        m = GrokChatModel(model="grok-4").bind_tools([read_file])
+        m._client_state = cs
+        m._proxy_mcp = _FakeProxy()
+
+        st = cs.get_or_create("agentA")
+        tc = m._map_tool_call(
+            st,
+            {
+                "toolCallId": "tc-42",
+                "title": "read_file",
+                "rawInput": {"target_file": "/x"},
+            },
+        )
+        assert tc is not None
+        assert tc["name"] == "read_file"
+        # target_file MUST have been renamed to file_path.
+        assert tc["args"] == {"file_path": "/x"}
+
+    def test_call_mcp_tool_execute_timeout_string_coerced(
+        self, fake_home, monkeypatch
+    ) -> None:
+        cs = GrokClientState()
+        monkeypatch.setattr(cm, "get_global_client_state", lambda: cs)
+
+        @tool
+        def execute(command: str, timeout: int = 30) -> str:
+            """Run a shell command."""
+            return ""
+
+        m = GrokChatModel(model="grok-4").bind_tools([execute])
+        m._client_state = cs
+        m._proxy_mcp = _FakeProxy()
+
+        st = cs.get_or_create("agentA")
+        tc = m._map_tool_call(
+            st,
+            {
+                "toolCallId": "tc-99",
+                "title": "CallMcpTool",
+                "rawInput": {
+                    "server": m._proxy_mcp.server_name,
+                    "toolName": "execute",
+                    "arguments": {"command": "sleep 1", "timeout": "20s"},
+                },
+            },
+        )
+        assert tc is not None
+        assert tc["name"] == "execute"
+        assert tc["args"] == {"command": "sleep 1", "timeout": 20}
+
+    def test_bound_tool_read_file_no_op_when_correct_key(
+        self, fake_home, monkeypatch
+    ) -> None:
+        cs = GrokClientState()
+        monkeypatch.setattr(cm, "get_global_client_state", lambda: cs)
+
+        @tool
+        def read_file(file_path: str) -> str:
+            """Read a file."""
+            return ""
+
+        m = GrokChatModel(model="grok-4").bind_tools([read_file])
+        m._client_state = cs
+        m._proxy_mcp = _FakeProxy()
+
+        st = cs.get_or_create("agentA")
+        tc = m._map_tool_call(
+            st,
+            {
+                "toolCallId": "tc-43",
+                "title": "read_file",
+                "rawInput": {"file_path": "/y", "offset": 100},
+            },
+        )
+        assert tc is not None
+        assert tc["args"] == {"file_path": "/y", "offset": 100}
+
+    def test_builtin_passthrough_rawInput_is_not_normalized(
+        self, fake_home, monkeypatch
+    ) -> None:
+        """CASE B (built-in passthrough) MUST forward rawInput verbatim.
+
+        The compat layer is deliberately scoped to CASE A only —
+        built-in tools live inside grok and get their own args from grok's
+        own schema (see builtin_tool_passthrough.py). Renaming keys there
+        would corrupt the round-trip.
+        """
+        cs = GrokClientState()
+        monkeypatch.setattr(cm, "get_global_client_state", lambda: cs)
+        m = GrokChatModel(model="grok-4")
+        m._client_state = cs
+        m._proxy_mcp = _FakeProxy()
+
+        st = cs.get_or_create("agentA")
+        # "Read" is a KNOWN_GROK_BUILTIN — its rawInput.file_path is
+        # grok's own key, unrelated to our tool aliases. It MUST NOT be
+        # touched even though "file_path" happens to also be canonical for
+        # our own read_file tool.
+        tc = m._map_tool_call(
+            st,
+            {
+                "toolCallId": "tc-builtin-1",
+                "title": "Read",
+                "rawInput": {"file_path": "/x", "offset": 0, "limit": 100},
+            },
+        )
+        assert tc is not None
+        assert tc["name"] == "Read"
+        assert tc["args"] == {"file_path": "/x", "offset": 0, "limit": 100}
+

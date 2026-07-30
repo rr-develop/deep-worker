@@ -58,7 +58,7 @@ def test_agent_service_does_not_call_sync_rpyc_connect() -> None:
 def test_agent_service_imports_async_connect() -> None:
     src = _read_source()
     pattern = re.compile(
-        r"(from\s+rpyc\.core\.async_connect\s+import\s+async_connect)"
+        r"(from\s+rpyc_async\.core\.async_connect\s+import\s+async_connect)"
         r"|(rpyc\.async_connect\()",
     )
     assert pattern.search(src) is not None, (

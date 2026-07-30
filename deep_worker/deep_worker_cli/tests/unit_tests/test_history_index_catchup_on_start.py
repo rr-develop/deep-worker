@@ -214,3 +214,57 @@ def test_startup_block_invokes_indexer_when_stale(tmp_path: Path, monkeypatch) -
         "after every restart."
     )
     assert pending == 3
+
+
+# ---------------------------------------------------------------------------
+# Regression: U+2028 desync (single source of truth for line counting)
+# ---------------------------------------------------------------------------
+
+# U+2028 LINE SEPARATOR inside a JSON string value. Valid JSON on one physical
+# line, but str.splitlines() treats it as a line break. The cheap-check
+# (physical \n lines) and the indexer's recorded count MUST still agree.
+# Use chr(0x2028) — a literal glyph in source survives editors/transport as a
+# plain space and would silently disable this regression guard.
+_U2028 = chr(0x2028)
+
+
+def test_no_catchup_when_records_contain_u2028(tmp_path: Path) -> None:
+    """A fully-indexed file whose records embed U+2028 must report 0 pending.
+
+    Regression for the infinite-reindex bug and its false-green trap:
+
+    * ``ensure_ascii=False`` writes the RAW U+2028 (as real summaries do). With
+      the default escaping (``\\u2028``), ``str.splitlines()`` would not break
+      on it and the whole test would pass even against the buggy code.
+    * The recorded count is derived the SAME way the real indexer records it —
+      ``len(_read_jsonl_lines(...))`` — NOT via a hand-picked constant. So if
+      ``_read_jsonl_lines`` ever regresses to ``str.splitlines()`` it records a
+      shattered count (1) while the cheap-check counts physical \\n lines (3),
+      the delta is non-zero, and this test goes RED (as it must).
+    """
+    from deep_worker_cli.agent import _count_pending_history_lines
+    from semantic_search.history_indexer import _read_jsonl_lines
+
+    summaries = tmp_path
+    index_dir = summaries / ".history_index"
+    index_dir.mkdir()
+
+    j1 = summaries / "h.jsonl"
+    j1.write_text(
+        json.dumps({"i": 0, "t": f"a{_U2028}b{_U2028}c"}, ensure_ascii=False) + "\n"
+        + json.dumps({"i": 1, "t": "plain"}, ensure_ascii=False) + "\n"
+        + json.dumps({"i": 2, "t": f"x{_U2028}y"}, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    # Record exactly what the indexer would persist to line_hashes.json.
+    recorded = len(_read_jsonl_lines(j1))
+    (index_dir / "line_hashes.json").write_text(
+        json.dumps({str(j1): recorded}), encoding="utf-8",
+    )
+
+    pending = _count_pending_history_lines(summaries, [j1])
+    assert pending == 0, (
+        "U+2028 inside record content must NOT create phantom pending lines: "
+        "the indexer's recorded count and the startup cheap-check must use one "
+        "shared counter"
+    )

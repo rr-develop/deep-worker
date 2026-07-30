@@ -12,8 +12,8 @@ the Deepseek provider and may use Google Gemini by default.
 THE ONLY CORRECT WAY to launch agents:
 ✅ deep-worker [agent-name]
 
-The deep-worker command is installed on the user's PATH (e.g. ~/.local/bin/deep-worker)
-It uses the Deepseek provider by default (WITHOUT extra configuration).
+The deep-worker command is installed on PATH.
+It uses the Deepseek provider by default (NO extra configuration needed).
 
 WRONG ways (DO NOT USE):
 ❌ python3 -m deep_worker_cli.main      (may use gemini instead of deepseek)
@@ -215,6 +215,10 @@ def parse_args() -> argparse.Namespace:
     # External MCP — see docs/DESIGN_EXTERNAL_MCP_TOOLS.md.
     from deep_worker_cli.cli.mcp_command import setup_mcp_parser
     setup_mcp_parser(subparsers, make_help_action=_make_help_action)
+
+    # Optional LSP navigation — see lsp/docs/DESIGN_LSP_MCP_INTEGRATION.md.
+    from deep_worker_cli.cli.lsp_command import setup_lsp_parser
+    setup_lsp_parser(subparsers, make_help_action=_make_help_action)
 
     threads_parser = subparsers.add_parser(
         "threads",
@@ -528,6 +532,9 @@ def cli_main() -> None:
         elif args.command == "mcp":
             from deep_worker_cli.cli.mcp_command import handle_mcp_command
             sys.exit(handle_mcp_command(args))
+        elif args.command == "lsp":
+            from deep_worker_cli.cli.lsp_command import handle_lsp_command
+            sys.exit(handle_lsp_command(args))
         elif args.command == "threads":
             # "ls" is an argparse alias for "list" — argparse stores the
             # alias as-is in the namespace, so we must match both values.

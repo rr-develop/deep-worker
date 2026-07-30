@@ -36,7 +36,7 @@ def test_rpyc_is_importable_from_interactive():
 
     # Try to import rpyc directly
     try:
-        import rpyc
+        import rpyc_async as rpyc
         assert rpyc is not None
     except ModuleNotFoundError:
         pytest.fail("rpyc module not found - sys.path not properly configured")

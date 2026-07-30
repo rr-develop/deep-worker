@@ -6,13 +6,13 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, cast
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 
 from deepagents.backends.protocol import BackendProtocol, EditResult, FileDownloadResponse, WriteResult
-from deepagents.middleware.summarization import SummarizationMiddleware
+from deepagents.middleware.summarization import HistoryOffloadError, SummarizationMiddleware
 from deepagents.middleware.summarization_history import (
     deserialize_summarized_messages_jsonl,
     serialize_summarized_messages_jsonl,
@@ -233,6 +233,220 @@ def make_mock_model(summary_response: str = "This is a test summary.") -> MagicM
     model.profile = {"max_input_tokens": 100000}
     model._get_ls_params.return_value = {"ls_provider": "test"}
     return model
+
+
+@pytest.mark.asyncio
+async def test_requested_summary_forces_real_compaction_below_trigger() -> None:
+    backend = MockBackend()
+    model = make_mock_model()
+    model.ainvoke = AsyncMock(return_value=MagicMock(text="Requested real summary"))
+    middleware = SummarizationMiddleware(
+        model=model,
+        backend=backend,
+        trigger=("messages", 100),
+        keep=("messages", 2),
+    )
+    messages = make_conversation_messages(num_old=6, num_recent=2)
+
+    result = await middleware.apply_requested_summary(
+        "requested-thread",
+        messages,
+    )
+
+    assert result.summarized is True
+    assert result.history_path == "/conversation_history/requested-thread.jsonl"
+    assert result.replacement_messages is not None
+    assert result.replacement_messages[0].additional_kwargs["lc_source"] == "summarization"
+    assert "Requested real summary" in result.replacement_messages[0].content
+    assert result.replacement_messages[-2:] == messages[-2:]
+    assert backend.write_calls[0][0] == result.history_path
+    assert model.ainvoke.await_args.kwargs["config"] == {
+        "configurable": {"thread_id": "requested-thread"},
+        "metadata": {"lc_source": "summarization"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_requested_summary_below_cutoff_reports_no_change() -> None:
+    middleware = SummarizationMiddleware(
+        model=make_mock_model(),
+        backend=MockBackend(),
+        trigger=("messages", 100),
+        keep=("messages", 20),
+    )
+
+    result = await middleware.apply_requested_summary(
+        "requested-thread",
+        [HumanMessage(content="Only message", id="h1")],
+    )
+
+    assert result.summarized is False
+    assert result.replacement_messages is None
+    assert result.history_path is None
+
+
+@pytest.mark.asyncio
+async def test_requested_summary_uses_custom_prompt_without_mutating_default() -> None:
+    backend = MockBackend()
+    model = make_mock_model()
+    model.ainvoke = AsyncMock(return_value=MagicMock(text="Focused summary"))
+    middleware = SummarizationMiddleware(
+        model=model,
+        backend=backend,
+        trigger=("messages", 100),
+        keep=("messages", 2),
+    )
+    default_prompt = middleware.summary_prompt
+
+    await middleware.apply_requested_summary(
+        "custom-thread",
+        make_conversation_messages(num_old=6, num_recent=2),
+        "Focus on decisions",
+    )
+
+    invoked_prompt = model.ainvoke.await_args.args[0]
+    assert invoked_prompt.startswith("Focus on decisions\n\n")
+    assert "User message 0" in invoked_prompt
+    assert middleware.summary_prompt == default_prompt
+
+
+@pytest.mark.asyncio
+async def test_requested_summary_rejects_factory_backend() -> None:
+    middleware = SummarizationMiddleware(
+        model=make_mock_model(),
+        backend=lambda runtime: MockBackend(),
+        trigger=("messages", 100),
+        keep=("messages", 2),
+    )
+
+    with pytest.raises(RuntimeError, match="concrete backend"):
+        await middleware.apply_requested_summary(
+            "explicit-thread",
+            make_conversation_messages(num_old=6, num_recent=2),
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "prompt",
+    ["Broken {", "Unknown {topic}", "{messages} and {messages}"],
+)
+async def test_requested_summary_rejects_invalid_custom_prompt(prompt: str) -> None:
+    middleware = SummarizationMiddleware(
+        model=make_mock_model(),
+        backend=MockBackend(),
+        trigger=("messages", 100),
+        keep=("messages", 2),
+    )
+
+    with pytest.raises((ValueError, KeyError)):
+        await middleware.apply_requested_summary(
+            "prompt-thread",
+            make_conversation_messages(num_old=6, num_recent=2),
+            prompt,
+        )
+
+
+@pytest.mark.asyncio
+async def test_automatic_model_failure_soft_errors_after_offload() -> None:
+    messages = make_conversation_messages(num_old=6, num_recent=2)
+    backend = MockBackend()
+    model = make_mock_model()
+    model.ainvoke = AsyncMock(side_effect=RuntimeError("model down"))
+    middleware = SummarizationMiddleware(
+        model=model,
+        backend=backend,
+        trigger=("messages", 5),
+        keep=("messages", 2),
+    )
+
+    with mock_get_config("auto-fail-thread"):
+        result = await middleware.abefore_model(
+            cast("AgentState[Any]", {"messages": messages}),
+            make_mock_runtime(),
+        )
+
+    assert result is not None
+    replacement = result["messages"][1:]
+    assert "Error generating summary: model down" in replacement[0].content
+    assert backend.write_calls, "offload still happens before model failure"
+
+
+@pytest.mark.asyncio
+async def test_requested_model_failure_hard_fails_after_offload() -> None:
+    messages = make_conversation_messages(num_old=6, num_recent=2)
+    backend = MockBackend()
+    model = make_mock_model()
+    model.ainvoke = AsyncMock(side_effect=RuntimeError("model down"))
+    middleware = SummarizationMiddleware(
+        model=model,
+        backend=backend,
+        trigger=("messages", 100),
+        keep=("messages", 2),
+    )
+
+    with pytest.raises(RuntimeError, match="model down"):
+        await middleware.apply_requested_summary("requested-fail-thread", messages)
+    assert backend.write_calls, "offload still happens before model failure"
+
+
+@pytest.mark.asyncio
+async def test_requested_and_automatic_async_compaction_are_equivalent() -> None:
+    messages = make_conversation_messages(num_old=6, num_recent=2)
+    automatic_backend = MockBackend()
+    requested_backend = MockBackend()
+    automatic_model = make_mock_model()
+    requested_model = make_mock_model()
+    automatic_model.ainvoke = AsyncMock(
+        return_value=MagicMock(text="Equivalent summary")
+    )
+    requested_model.ainvoke = AsyncMock(
+        return_value=MagicMock(text="Equivalent summary")
+    )
+    automatic = SummarizationMiddleware(
+        model=automatic_model,
+        backend=automatic_backend,
+        trigger=("messages", 5),
+        keep=("messages", 2),
+    )
+    requested = SummarizationMiddleware(
+        model=requested_model,
+        backend=requested_backend,
+        trigger=("messages", 100),
+        keep=("messages", 2),
+    )
+
+    with mock_get_config("equivalent-thread"):
+        auto_result = await automatic.abefore_model(
+            cast("AgentState[Any]", {"messages": messages}),
+            make_mock_runtime(),
+        )
+    requested_result = await requested.apply_requested_summary(
+        "equivalent-thread",
+        messages,
+    )
+
+    assert auto_result is not None
+    auto_messages = auto_result["messages"][1:]
+    requested_messages = requested_result.replacement_messages
+    assert requested_messages is not None
+    assert [message.content for message in auto_messages] == [
+        message.content for message in requested_messages
+    ]
+    assert automatic_backend.write_calls[0][0] == requested_backend.write_calls[0][0]
+    assert deserialize_summarized_messages_jsonl(
+        automatic_backend.write_calls[0][1]
+    ) == deserialize_summarized_messages_jsonl(
+        requested_backend.write_calls[0][1]
+    )
+    assert automatic_model.ainvoke.await_args.args == requested_model.ainvoke.await_args.args
+    assert automatic_model.ainvoke.await_args.kwargs["config"] == {
+        "metadata": {"lc_source": "summarization"}
+    }
+    assert requested_model.ainvoke.await_args.kwargs["config"] == {
+        "configurable": {"thread_id": "equivalent-thread"},
+        "metadata": {"lc_source": "summarization"},
+    }
 
 
 # -----------------------------------------------------------------------------
@@ -599,7 +813,13 @@ class TestSummaryMessageFormat:
         assert summary_msg.additional_kwargs.get("lc_source") == "summarization"
 
     def test_summarization_aborts_on_backend_failure(self) -> None:
-        """Test that summarization warns when backend write fails but still summarizes."""
+        """Test that summarization raises HistoryOffloadError when backend write fails.
+
+        Fail-loud contract per DESIGN_FAIL_LOUD_SUMMARIZATION_OFFLOAD.md:
+        continuing summarization would silently discard the evicted history,
+        so we raise instead and let the runtime catch-all transition the
+        agent to ``AgentStatus.ERROR``.
+        """
         backend = MockBackend(should_fail=True)
         mock_model = make_mock_model(summary_response="Unused summary")
 
@@ -614,12 +834,8 @@ class TestSummaryMessageFormat:
         state = cast("AgentState[Any]", {"messages": messages})
         runtime = make_mock_runtime()
 
-        with pytest.warns(UserWarning, match="Offloading conversation history to backend failed"):
-            result = middleware.before_model(state, runtime)
-
-        # Should still produce summarization result despite backend failure
-        assert result is not None
-        assert "messages" in result
+        with pytest.raises(HistoryOffloadError):
+            middleware.before_model(state, runtime)
 
     def test_summary_includes_file_path_after_second_summarization(self) -> None:
         """Test that summary message includes file path reference after multiple summarizations.
@@ -706,10 +922,13 @@ class TestNoSummarizationTriggered:
 
 
 class TestBackendFailureHandling:
-    """Tests for backend failure handling - summarization aborts to prevent data loss."""
+    """Tests for backend failure handling — summarization raises HistoryOffloadError.
+
+    See DESIGN_FAIL_LOUD_SUMMARIZATION_OFFLOAD.md.
+    """
 
     def test_summarization_aborts_on_write_failure(self) -> None:
-        """Test that summarization warns when backend write fails but still summarizes."""
+        """Backend returning ``WriteResult(error=...)`` raises HistoryOffloadError with actionable message."""
         backend = MockBackend(should_fail=True, error_message="Storage unavailable")
         mock_model = make_mock_model()
 
@@ -724,18 +943,12 @@ class TestBackendFailureHandling:
         state = cast("AgentState[Any]", {"messages": messages})
         runtime = make_mock_runtime()
 
-        with pytest.warns(UserWarning, match="Offloading conversation history to backend failed"):
-            result = middleware.before_model(state, runtime)
-
-        # Should still produce summarization result despite backend failure
-        assert result is not None
-        assert "messages" in result
+        with pytest.raises(HistoryOffloadError, match="Storage unavailable"):
+            middleware.before_model(state, runtime)
 
     def test_summarization_aborts_on_write_exception(self) -> None:
-        """Test that summarization warns when backend raises exception but still summarizes."""
-        backend = MagicMock()
-        backend.download_files.return_value = []
-        backend.write.side_effect = Exception("Network error")
+        """Backend ``write`` raising bubbles up as HistoryOffloadError with __cause__ chain."""
+        backend = MockBackend(write_raises=True)
         mock_model = make_mock_model()
 
         middleware = SummarizationMiddleware(
@@ -749,12 +962,10 @@ class TestBackendFailureHandling:
         state = cast("AgentState[Any]", {"messages": messages})
         runtime = make_mock_runtime()
 
-        with pytest.warns(UserWarning, match="Offloading conversation history to backend failed"):
-            result = middleware.before_model(state, runtime)
-
-        # Should still produce summarization result despite backend failure
-        assert result is not None
-        assert "messages" in result
+        with pytest.raises(HistoryOffloadError, match="Mock write exception") as exc:
+            middleware.before_model(state, runtime)
+        # The original backend exception is chained as __cause__.
+        assert isinstance(exc.value.__cause__, RuntimeError)
 
 
 class TestThreadIdExtraction:
@@ -817,7 +1028,7 @@ class TestAsyncBehavior:
         backend = MockBackend()
         mock_model = make_mock_model()
         # Mock the async create summary
-        mock_model.ainvoke = MagicMock(return_value=MagicMock(text="Async summary"))
+        mock_model.ainvoke = AsyncMock(return_value=MagicMock(text="Async summary"))
 
         middleware = SummarizationMiddleware(
             model=mock_model,
@@ -837,10 +1048,10 @@ class TestAsyncBehavior:
 
     @pytest.mark.anyio
     async def test_async_aborts_on_failure(self) -> None:
-        """Test that async summarization warns on backend failure but still summarizes."""
+        """Async summarization raises HistoryOffloadError on backend failure."""
         backend = MockBackend(should_fail=True)
         mock_model = make_mock_model()
-        mock_model.ainvoke = MagicMock(return_value=MagicMock(text="Async summary"))
+        mock_model.ainvoke = AsyncMock(return_value=MagicMock(text="Async summary"))
 
         middleware = SummarizationMiddleware(
             model=mock_model,
@@ -853,12 +1064,8 @@ class TestAsyncBehavior:
         state = cast("AgentState[Any]", {"messages": messages})
         runtime = make_mock_runtime()
 
-        with pytest.warns(UserWarning, match="Offloading conversation history to backend failed"):
-            result = await middleware.abefore_model(state, runtime)
-
-        # Should still produce summarization result despite backend failure
-        assert result is not None
-        assert "messages" in result
+        with pytest.raises(HistoryOffloadError):
+            await middleware.abefore_model(state, runtime)
 
 
 class TestBackendFactoryInvocation:
@@ -983,7 +1190,7 @@ class TestDownloadFilesException:
         """Test that async summarization continues when adownload_files raises."""
         backend = MockBackend(download_raises=True)
         mock_model = make_mock_model()
-        mock_model.ainvoke = MagicMock(return_value=MagicMock(text="Async summary"))
+        mock_model.ainvoke = AsyncMock(return_value=MagicMock(text="Async summary"))
 
         middleware = SummarizationMiddleware(
             model=mock_model,
@@ -1006,13 +1213,13 @@ class TestDownloadFilesException:
 
 
 class TestWriteEditException:
-    """Tests for exception handling when `write`/`edit` raises - summarization aborts."""
+    """Tests for exception handling when `write`/`edit` raises — summarization raises HistoryOffloadError.
+
+    See DESIGN_FAIL_LOUD_SUMMARIZATION_OFFLOAD.md.
+    """
 
     def test_summarization_aborts_on_write_exception(self) -> None:
-        """Test that summarization warns when `write` raises an exception but still summarizes.
-
-        Covers lines 314-322: Exception handler for write in _offload_to_backend.
-        """
+        """Exception from ``write`` bubbles up wrapped in HistoryOffloadError."""
         backend = MockBackend(write_raises=True)
         mock_model = make_mock_model()
 
@@ -1027,22 +1234,15 @@ class TestWriteEditException:
         state = cast("AgentState[Any]", {"messages": messages})
         runtime = make_mock_runtime()
 
-        with pytest.warns(UserWarning, match="Offloading conversation history to backend failed"):
-            result = middleware.before_model(state, runtime)
-
-        # Should still produce summarization result despite backend failure
-        assert result is not None
-        assert "messages" in result
+        with pytest.raises(HistoryOffloadError, match="Mock write exception"):
+            middleware.before_model(state, runtime)
 
     @pytest.mark.anyio
     async def test_async_summarization_aborts_on_write_exception(self) -> None:
-        """Test that async summarization warns when `awrite` raises but still summarizes.
-
-        Covers lines 387-395: Exception handler for awrite in _aoffload_to_backend.
-        """
+        """Async: exception from ``awrite`` bubbles up wrapped in HistoryOffloadError."""
         backend = MockBackend(write_raises=True)
         mock_model = make_mock_model()
-        mock_model.ainvoke = MagicMock(return_value=MagicMock(text="Async summary"))
+        mock_model.ainvoke = AsyncMock(return_value=MagicMock(text="Async summary"))
 
         middleware = SummarizationMiddleware(
             model=mock_model,
@@ -1055,18 +1255,11 @@ class TestWriteEditException:
         state = cast("AgentState[Any]", {"messages": messages})
         runtime = make_mock_runtime()
 
-        with pytest.warns(UserWarning, match="Offloading conversation history to backend failed"):
-            result = await middleware.abefore_model(state, runtime)
-
-        # Should still produce summarization result despite backend failure
-        assert result is not None
-        assert "messages" in result
+        with pytest.raises(HistoryOffloadError, match="Mock awrite exception"):
+            await middleware.abefore_model(state, runtime)
 
     def test_summarization_aborts_on_edit_exception(self) -> None:
-        """Test that summarization warns when `edit` raises an exception but still summarizes (existing content).
-
-        Covers lines 314-322: Exception handler for edit in _offload_to_backend.
-        """
+        """Exception from ``edit`` (with existing content) bubbles up wrapped in HistoryOffloadError."""
         existing = serialize_summarized_messages_jsonl([HumanMessage(content="Previous message", id="prev-human")])
         backend = MockBackend(existing_content=existing, write_raises=True)
         mock_model = make_mock_model()
@@ -1082,23 +1275,16 @@ class TestWriteEditException:
         state = cast("AgentState[Any]", {"messages": messages})
         runtime = make_mock_runtime()
 
-        with pytest.warns(UserWarning, match="Offloading conversation history to backend failed"):
-            result = middleware.before_model(state, runtime)
-
-        # Should still produce summarization result despite backend failure
-        assert result is not None
-        assert "messages" in result
+        with pytest.raises(HistoryOffloadError, match="Mock edit exception"):
+            middleware.before_model(state, runtime)
 
     @pytest.mark.anyio
     async def test_async_summarization_aborts_on_edit_exception(self) -> None:
-        """Test that async summarization warns when `aedit` raises but still summarizes (existing content).
-
-        Covers lines 387-395: Exception handler for aedit in _aoffload_to_backend.
-        """
+        """Async: exception from ``aedit`` (with existing content) bubbles up wrapped."""
         existing = serialize_summarized_messages_jsonl([HumanMessage(content="Previous message", id="prev-human")])
         backend = MockBackend(existing_content=existing, write_raises=True)
         mock_model = make_mock_model()
-        mock_model.ainvoke = MagicMock(return_value=MagicMock(text="Async summary"))
+        mock_model.ainvoke = AsyncMock(return_value=MagicMock(text="Async summary"))
 
         middleware = SummarizationMiddleware(
             model=mock_model,
@@ -1111,12 +1297,8 @@ class TestWriteEditException:
         state = cast("AgentState[Any]", {"messages": messages})
         runtime = make_mock_runtime()
 
-        with pytest.warns(UserWarning, match="Offloading conversation history to backend failed"):
-            result = await middleware.abefore_model(state, runtime)
-
-        # Should still produce summarization result despite backend failure
-        assert result is not None
-        assert "messages" in result
+        with pytest.raises(HistoryOffloadError, match="Mock aedit exception"):
+            await middleware.abefore_model(state, runtime)
 
 
 class TestCutoffIndexEdgeCases:
@@ -1179,7 +1361,7 @@ class TestCutoffIndexEdgeCases:
         """Test that async `abefore_model` returns `None` when `cutoff_index <= 0`."""
         backend = MockBackend()
         mock_model = make_mock_model()
-        mock_model.ainvoke = MagicMock(return_value=MagicMock(text="Async summary"))
+        mock_model.ainvoke = AsyncMock(return_value=MagicMock(text="Async summary"))
 
         middleware = SummarizationMiddleware(
             model=mock_model,

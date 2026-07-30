@@ -7,9 +7,16 @@ import os
 import sys
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 from deep_worker_cli.agent_config_pkg.agent_config import AgentConfig
+from deep_worker_cli.client.agent_client import AgentClient
 from deep_worker_cli.process.agent_process import AgentProcess
+from deep_worker_cli.process.registry import ProcessRegistry
+from deep_worker_cli.runtime.availability_tracker import AvailabilityTracker
+
+clear_history_index = None
+index_all_history_files = None
 
 # Claude-session import (DESIGN_IMPORT_CLAUDE_SESSION.md). The provider lives at
 # <repo-root>/claude_code_provider/ and is NOT importable until the repo root is
@@ -149,7 +156,7 @@ def _explicit_cli_flags(argv: list[str] | None = None) -> set[str]:
     default": the parser default for ``--provider`` is ``"deepseek"``, so a
     user who runs ``--restart a --provider deepseek`` produces a value that
     equals the default and would be mistaken for "flag not passed" — the
-    saved provider would silently win (a related internal incident).
+    saved provider would silently win (observed in a past incident).
 
     To detect presence reliably we re-parse ``argv`` with a throwaway parser
     whose options default to ``argparse.SUPPRESS``. With SUPPRESS, a dest only
@@ -214,6 +221,55 @@ def _explicit_cli_flags(argv: list[str] | None = None) -> set[str]:
     return set(vars(ns).keys()) - {"name"}
 
 
+def _warn_model_reset(
+    reason: str,
+    provider: str | None,
+    dropped: str | None,
+    replacement: str | None,
+) -> None:
+    """Tell the operator, exactly once, that a model was dropped.
+
+    A silent substitution is the whole point of this guard: the operator ran
+    ``--model fable`` and got ``sonnet`` with nothing on screen. Any transition
+    that DISCARDS a model value must pass through here.
+
+    Emission is a single ``print`` to stderr. There is deliberately no
+    accompanying ``logger.warning``: in a normal CLI invocation the root logger
+    already has a stderr StreamHandler, so doing both prints the same sentence
+    twice. Note that ``merge_restart_config`` runs in the foreground restart
+    invoker, *before* the daemon installs its stderr redirection — so this
+    reaches the operator's terminal, but is not thereby guaranteed to land in
+    the restarted agent's ``.err.log``.
+
+    Args:
+        reason: Machine-greppable cause. One of ``unknown-alias`` (the
+            provider does not recognise the token), ``stale-provider`` (the
+            saved model belonged to a different provider),
+            ``provider-declared`` (operator named a provider without a model),
+            ``preferred-reset-after-invalid-explicit`` (a *valid* preferred
+            model cleared because the explicit replacement was invalid).
+        provider: The provider the model was being applied to.
+        dropped: The value being discarded. Falsy ⇒ nothing happened, no output.
+        replacement: What will actually be used instead, as resolved by
+            :func:`get_default_model_name`. ``None`` means the provider pins
+            no default and its CLI will choose.
+    """
+    if not dropped:
+        return
+    repl_txt = (
+        "provider default (resolved by the provider CLI)"
+        if replacement is None
+        else repr(replacement)
+    )
+    print(
+        f"[deep-worker] WARNING: model {dropped!r} was reset "
+        f"(reason={reason}, provider={provider!r}); "
+        f"using {repl_txt} instead.",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
 def merge_restart_config(
     saved: dict,
     args: argparse.Namespace,
@@ -227,7 +283,7 @@ def merge_restart_config(
     default" alone is unsafe for ``--provider``, whose default is a real
     provider name (``"deepseek"``): an explicit ``--provider deepseek`` would
     otherwise be indistinguishable from "not passed" and silently dropped
-    (a related internal incident).
+    (observed in a past incident).
 
     When the provider is overridden but ``--model`` is NOT explicitly given,
     the saved model is NOT inherited (it belongs to the OLD provider and would
@@ -259,7 +315,7 @@ def merge_restart_config(
     effective.provider = saved.get("provider", _PARSER_DEFAULTS["provider"])
     effective.model = saved.get("model", _PARSER_DEFAULTS["model"])
     # Heal legacy poison: older builds persisted an unspecified model as
-    # the literal "unknown" (a related internal incident). Treat that
+    # the literal "unknown" (observed in a past incident). Treat that
     # as "no model specified" so the provider default kicks back in on
     # restart instead of forwarding the bad string to the API.
     if effective.model == "unknown":
@@ -359,7 +415,7 @@ def merge_restart_config(
         effective.provider = args.preferred_provider
 
     # ------------------------------------------------------------------
-    # Consolidated model reset (operator rule; a related internal incident)
+    # Consolidated model reset (operator rule, from a past incident)
     # ------------------------------------------------------------------
     # When the operator explicitly declares a provider (via ``-pp`` OR
     # ``--provider``) but gives no ``--model``, the saved model is taken to be
@@ -383,7 +439,54 @@ def merge_restart_config(
         and not model_explicit
         and not no_update_preferred
     )
+    from deep_worker_cli.config import (
+        get_default_model_name,
+        model_can_belong_to_provider,
+    )
+
+    # Why a model was dropped, or None if nothing was dropped. Consumed by the
+    # preferred_model cascade below, which cannot re-derive the intent from
+    # state that has already been mutated.
+    model_reset_cause: str | None = None
+
+    # T1: operator declared a provider without --model.
     if provider_decl_unpinned:
+        if effective.model:
+            _warn_model_reset(
+                "provider-declared",
+                effective.provider,
+                effective.model,
+                get_default_model_name(effective.provider),
+            )
+            model_reset_cause = "provider-declared"
+        effective.model = None
+
+    # T2: the model belongs to another provider, or the provider does not
+    # recognise the token.
+    saved_model_provider = saved.get("model_provider")
+    provider_mismatch = bool(
+        isinstance(saved_model_provider, str)
+        and saved_model_provider
+        and saved_model_provider != effective.provider
+    )
+    if model_explicit:
+        # ``saved_model_provider`` describes the PREVIOUS token and says
+        # nothing about the one the operator just typed. Attributing it would
+        # report a typo'd --model as a provider mismatch and send the operator
+        # debugging the wrong thing.
+        provider_mismatch = False
+    if effective.model and (
+        provider_mismatch
+        or not model_can_belong_to_provider(effective.provider, effective.model)
+    ):
+        reason = "stale-provider" if provider_mismatch else "unknown-alias"
+        _warn_model_reset(
+            reason,
+            effective.provider,
+            effective.model,
+            get_default_model_name(effective.provider),
+        )
+        model_reset_cause = reason
         effective.model = None
 
     # --no-update-preferred: keep preferred_provider intact even when
@@ -401,30 +504,68 @@ def merge_restart_config(
     saved_provider = saved.get("provider", _PARSER_DEFAULTS["provider"])
     # When ``-pp`` moved the preferred provider to a new one, any saved
     # preferred_model belonged to the OLD preferred provider and is stale —
-    # do not carry it over (a related internal incident). The new preferred provider
+    # do not carry it over (from a past incident). The new preferred provider
     # resolves its own default unless an explicit --model was given.
     pp_switched = pp_explicit and args.preferred_provider != saved.get(
         "preferred_provider", saved_provider
     )
     if provider_decl_unpinned:
-        # RC-1 (internal review): on ANY explicit provider declaration without
+        # RC-1 (review finding): on ANY explicit provider declaration without
         # --model, preferred_model must track the (None) reset of model.
         # Otherwise a stale ``preferred_model`` survives same-provider ``-pp``
         # and would re-pin the foreign model later via the restore-on-idle /
         # failover path. ``effective.model`` was just reset to None above.
         effective.preferred_model = effective.model
+    elif (
+        model_explicit
+        and model_reset_cause == "unknown-alias"
+        and effective.provider == effective.preferred_provider
+    ):
+        # The operator asked to REPLACE the model on their preferred provider
+        # and the new token was invalid. Falling through to the branches below
+        # would restore ``saved["preferred_model"]`` — silently resurrecting
+        # the very preference they were replacing. Collapse both to the
+        # provider default instead.
+        #
+        # The provider == preferred_provider guard matters: when a temporary
+        # failover has moved us onto a different provider, a model dropped
+        # here says nothing about the preference belonging to the preferred
+        # provider, which must survive untouched (design C3).
+        saved_preferred = saved.get("preferred_model")
+        if saved_preferred:
+            # NOT ``unknown-alias``: the preferred model itself may be
+            # perfectly valid (e.g. ``opus``). It is cleared because the
+            # explicit replacement failed, and the message must say so.
+            _warn_model_reset(
+                "preferred-reset-after-invalid-explicit",
+                effective.preferred_provider,
+                saved_preferred,
+                get_default_model_name(effective.preferred_provider),
+            )
+        effective.preferred_model = None
     elif pp_switched and not model_explicit:
         effective.preferred_model = effective.model
-    elif saved.get("preferred_model"):
+    elif saved.get("preferred_model") and model_can_belong_to_provider(
+        effective.preferred_provider, saved.get("preferred_model")
+    ):
         effective.preferred_model = saved.get("preferred_model")
-    elif saved_pp and saved_provider == saved_pp and saved.get("model"):
+    elif (
+        saved_pp
+        and saved_provider == saved_pp
+        and saved.get("model")
+        and model_can_belong_to_provider(saved_pp, saved.get("model"))
+    ):
         effective.preferred_model = saved.get("model")
     else:
         effective.preferred_model = None
 
     if getattr(args, "no_update_preferred", False) and provider_overridden:
         target = effective.provider
-        if target == effective.preferred_provider and effective.preferred_model:
+        if (
+            target == effective.preferred_provider
+            and effective.preferred_model
+            and model_can_belong_to_provider(target, effective.preferred_model)
+        ):
             # Restore-on-idle / failover return: keep opus (etc.), not provider default.
             if not model_explicit:
                 effective.model = effective.preferred_model
@@ -453,7 +594,7 @@ def build_launch_config(args: argparse.Namespace) -> dict:
         # None — the codex CLI then picks its own current default. Do
         # NOT coerce to "unknown": that string would be read back on
         # restart and forwarded to CodexChatModel, which the API
-        # rejects with HTTP 400 (a related internal incident).
+        # rejects with HTTP 400 (observed in a past incident).
         model = get_default_model_name(args.provider)
 
     working_dir = args.dir
@@ -475,14 +616,15 @@ def build_launch_config(args: argparse.Namespace) -> dict:
     # reconstructs the spawn on the PROD tree (``_spawn_subprocess`` keys off
     # ``dev_tree``), where a dev-only provider like ``grok`` is unknown to the
     # argparse ``--provider`` choices → the agent dies at startup and never
-    # comes back (a related internal incident). Deriving dev_tree from the
+    # comes back (observed in a past incident). Deriving dev_tree from the
     # real code tree keeps the persisted flag consistent with reality, so the
     # flag never lies about which tree must be used on restart. The canonical
-    # dev tree path mirrors the bash launcher's DEV_TREE (override honored for
+    # dev tree path is deployment-specific and mirrors the bash launcher's
+    # DEV_TREE; it is supplied through the override env var (also honored for
     # tests).
     _dev_tree_root = Path(
         os.environ.get(
-            "DEEP_WORKER_DEV_TREE_ROOT_OVERRIDE", "/path/to/dev_tree"
+            "DEEP_WORKER_DEV_TREE_ROOT_OVERRIDE", "/nonexistent/dev-tree"
         )
     )
     _running_from_dev_tree = _repo_root.resolve() == _dev_tree_root.resolve()
@@ -495,6 +637,7 @@ def build_launch_config(args: argparse.Namespace) -> dict:
     return {
         "provider": args.provider,
         "model": model,
+        "model_provider": args.provider if model else None,
         "working_dir": str(working_dir),
         "skip_permissions": args.skip_permissions,
         "task_manager": args.task_manager,
@@ -853,8 +996,8 @@ def create_parser() -> argparse.ArgumentParser:
         action="store_true",
         dest="dev_tree",
         help=(
-            "Run the agent using the development codebase instead of the "
-            "production codebase. The flag is normally consumed by the "
+            "Run the agent using the development code tree instead of the "
+            "production code tree. The flag is normally consumed by the "
             "bash launcher (deep-worker) BEFORE Python starts; it is also "
             "declared here so argparse does not reject it inside the dev "
             "tree after the re-exec, and so it can be persisted to "
@@ -1023,6 +1166,13 @@ def create_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
+        "--limits-info",
+        action="store_true",
+        dest="limits_info",
+        help="Show persisted provider limit/reset information for --provider (read-only).",
+    )
+
+    parser.add_argument(
         "--list-summaries",
         action="store_true",
         dest="list_summaries",
@@ -1031,6 +1181,13 @@ def create_parser() -> argparse.ArgumentParser:
             "~/.deep_worker/<agent>/summaries/. Use --agent NAME to filter, "
             "--format json for machine-readable output."
         ),
+    )
+
+    parser.add_argument(
+        "--reindex-history",
+        action="store_true",
+        dest="reindex_history",
+        help="Rebuild this agent's history-memory index and exit.",
     )
 
     parser.add_argument(
@@ -1121,15 +1278,145 @@ def create_parser() -> argparse.ArgumentParser:
             "Overrides any same-named entry from config files."
         ),
     )
+    parser.add_argument(
+        "--summarize",
+        action="store_true",
+        help=(
+            "Summarize the agent's active context now. With --query or "
+            "--query-file, that text is used as a one-shot summary prompt."
+        ),
+    )
+
+    # Startup query options — see docs/DESIGN_STARTUP_QUERY_OPTIONS.md.
+    # Two independent mutually-exclusive pairs. --sum-query* offloads the
+    # current thread history to <agent>.jsonl and starts from a summary-shape
+    # message; -q/--query* is a plain starting query. Both pairs may be
+    # combined (sum-query + query → a single turn with two HumanMessage).
+    # Neither is persisted to launch_config (one-shot per invocation).
+    sum_query_group = parser.add_mutually_exclusive_group()
+    sum_query_group.add_argument(
+        "--sum-query",
+        dest="sum_query",
+        default=None,
+        metavar="TEXT",
+        help=(
+            "Starting query treated as a pseudo-summary: the current thread "
+            "history is offloaded to ~/.deep_worker/<agent>/summaries/"
+            "<agent>.jsonl, the active context is wiped, and this text becomes "
+            "a summary-shape starting message. One-shot; not persisted."
+        ),
+    )
+    sum_query_group.add_argument(
+        "--sum-query-file",
+        dest="sum_query_file",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Same as --sum-query but the text is read from a UTF-8 file.",
+    )
+
+    query_group = parser.add_mutually_exclusive_group()
+    query_group.add_argument(
+        "-q",
+        "--query",
+        dest="query",
+        default=None,
+        metavar="TEXT",
+        help=(
+            "Plain starting query — the agent begins executing it immediately "
+            "after startup, with no history offload. One-shot; not persisted."
+        ),
+    )
+    query_group.add_argument(
+        "--query-file",
+        dest="query_file",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Same as --query but the text is read from a UTF-8 file.",
+    )
 
     return parser
+
+
+def resolve_startup_queries(
+    args: argparse.Namespace,
+) -> tuple[str | None, str | None]:
+    """Resolve the startup sum-query and plain query from parsed args.
+
+    Reads the ``--sum-query`` / ``--sum-query-file`` and ``-q/--query`` /
+    ``--query-file`` options into two resolved strings. File variants are
+    read as UTF-8. Empty / whitespace-only content (inline OR file) is a
+    hard error, matching the fail-loud goal (§2.6).
+
+    The argparse mutual-exclusion groups already reject giving both members
+    of a pair, so this helper only has to handle file I/O and emptiness.
+
+    Args:
+        args: Parsed CLI namespace.
+
+    Returns:
+        ``(sum_query, query)`` — each is the resolved text or ``None`` when
+        that option was not supplied.
+
+    Raises:
+        SystemExit: (exit code 2) when a file is unreadable or resolved
+            content is empty / whitespace-only. Raised via
+            ``argparse``-style ``parser.error`` semantics — but since we do
+            not hold the parser here, we raise ``SystemExit(2)`` directly
+            after writing to stderr, matching the pre-daemonize contract.
+    """
+
+    def _read_file(path: Path, opt: str) -> str:
+        try:
+            content = path.read_text(encoding="utf-8")
+        except OSError as e:
+            sys.stderr.write(f"deep-worker: {opt}: cannot read {path}: {e}\n")
+            raise SystemExit(2) from e
+        return content
+
+    def _resolve(text: str | None, file: Path | None, opt: str) -> str | None:
+        if text is not None:
+            value = text
+        elif file is not None:
+            value = _read_file(file, opt)
+        else:
+            return None
+        if not value.strip():
+            sys.stderr.write(
+                f"deep-worker: {opt}: query text is empty or whitespace-only\n"
+            )
+            raise SystemExit(2)
+        return value
+
+    if getattr(args, "summarize", False) and (
+        getattr(args, "sum_query", None) is not None
+        or getattr(args, "sum_query_file", None) is not None
+    ):
+        sys.stderr.write(
+            "deep-worker: --summarize cannot be combined with --sum-query "
+            "or --sum-query-file\n"
+        )
+        raise SystemExit(2)
+
+    sum_query = _resolve(
+        getattr(args, "sum_query", None),
+        getattr(args, "sum_query_file", None),
+        "--sum-query",
+    )
+    query = _resolve(
+        getattr(args, "query", None),
+        getattr(args, "query_file", None),
+        "--query",
+    )
+    return sum_query, query
 
 
 # ⚠️ DO NOT re-add a "seed the claude session_uuid hint" step here.
 #
 # An earlier version seeded ``claude_session_state.json`` with the imported
 # transcript's uuid so the claude-code provider would RESUME that real file.
-# That broke tool availability (a related internal incident): the imported transcript is
+# That broke tool availability (observed in a past incident): the imported transcript is
 # an ORDINARY ``claude`` session created OUTSIDE deep_worker. Resuming it makes
 # the CLI restore THAT session's tool/permission configuration, which has no
 # ``mcp__deepworker__*`` tools. deep_worker only sets ``disallowed_tools`` (it
@@ -1240,6 +1527,97 @@ async def migrate_storage_command(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _send_startup_query_to_running_agent(
+    agent_name: str,
+    sum_query: str | None,
+    query: str | None,
+) -> int:
+    """Send a startup query to an ALREADY-RUNNING agent via RPyC (§4.5).
+
+    Instead of spawning a new process, dispatch ``sum_query`` / ``query`` to
+    the live agent's extended ``exposed_invoke_agent`` so it runs the same
+    offload→wipe→invoke sequence in-process. Fire-and-forget from the CLI's
+    perspective — the agent streams to its subscribers as usual.
+
+    Args:
+        agent_name: Name of the running agent.
+        sum_query: Pseudo-summary query text, or ``None``.
+        query: Plain query text, or ``None``.
+
+    Returns:
+        Process exit code (0 on success, 1 on failure).
+    """
+    from deep_worker_cli.client.agent_client import AgentClient
+
+    client = AgentClient(agent_name)
+    try:
+        await client.connect()
+        response = await client._send_command(
+            {
+                "command": "invoke",
+                "message": "",
+                "stream": True,
+                "sum_query": sum_query,
+                "query": query,
+            }
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"Error: failed to send startup query to '{agent_name}': {e}", file=sys.stderr)
+        return 1
+    finally:
+        try:
+            await client.disconnect()
+        except Exception:  # noqa: BLE001
+            pass
+
+    if not response.get("success"):
+        print(
+            f"Error: agent '{agent_name}' rejected startup query: "
+            f"{response.get('error', 'unknown error')}",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"Startup query sent to running agent '{agent_name}'.")
+    return 0
+
+
+async def _send_summarize_to_running_agent(
+    agent_name: str,
+    prompt: str | None,
+) -> int:
+    from deep_worker_cli.client.agent_client import AgentClient
+
+    client = AgentClient(agent_name)
+    try:
+        await client.connect()
+        response = await client._send_command(
+            {"command": "summarize", "prompt": prompt}
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"Error: failed to summarize '{agent_name}': {exc}",
+            file=sys.stderr,
+        )
+        return 1
+    finally:
+        try:
+            await client.disconnect()
+        except Exception:  # noqa: BLE001
+            pass
+    if not response.get("success"):
+        print(
+            f"Error: agent '{agent_name}' rejected summarization: "
+            f"{response.get('error', 'unknown error')}",
+            file=sys.stderr,
+        )
+        return 1
+    print(
+        f"Agent '{agent_name}' context "
+        f"{'summarized' if response.get('summarized') else 'did not require replacement'}."
+    )
+    return 0
+
+
 async def run_agent(args: argparse.Namespace) -> int:
     """Run the agent process.
 
@@ -1276,7 +1654,7 @@ async def run_agent(args: argparse.Namespace) -> int:
         # dict here was MISSING ``dev_tree`` and ``preferred_provider`` — the
         # same wart the fork path already avoided (see line ~593). A missing
         # ``dev_tree`` is exactly what left an agent un-restartable from the
-        # web UI on 2026-06-18: the metadata never recorded that the agent
+        # web UI in a past incident: the metadata never recorded that the agent
         # ran on the dev tree, so ``_spawn_subprocess`` rebuilt the launch on
         # the prod tree where the ``grok`` provider is unknown to argparse.
         # build_launch_config also auto-detects dev_tree from the running
@@ -1285,6 +1663,16 @@ async def run_agent(args: argparse.Namespace) -> int:
         # restart by merge_restart_config), which is what build_launch_config
         # expects.
         launch_config = build_launch_config(args)
+
+        # One-shot startup queries (never persisted to launch_config). NIT-2:
+        # avoid a second physical file read (TOCTOU). main() already resolved
+        # them PRE-daemonize and stashed the results on args; reuse those.
+        # Fall back to resolving here only for direct run_agent() callers/tests
+        # that never went through main().
+        if getattr(args, "_resolved_startup_queries", None) is not None:
+            startup_sum_query, startup_query = args._resolved_startup_queries
+        else:
+            startup_sum_query, startup_query = resolve_startup_queries(args)
 
         # Create and start agent
         agent = AgentProcess(
@@ -1303,6 +1691,12 @@ async def run_agent(args: argparse.Namespace) -> int:
             ],
             mcp_server_inline=list(
                 getattr(args, "mcp_server_inline", None) or []
+            ),
+            startup_query=startup_query,
+            startup_sum_query=startup_sum_query,
+            startup_summarize=bool(getattr(args, "summarize", False)),
+            startup_summary_prompt=(
+                startup_query if getattr(args, "summarize", False) else None
             ),
         )
 
@@ -1343,9 +1737,9 @@ def _detach_from_session_scope(agent_name: str | None = None) -> None:
     because cgroup membership was inherited across ``fork`` and
     ``setsid`` does not touch it.
 
-    Production incident this guards against: an agent
-    died at the moment systemd deactivated the SSH
-    session-scope of the bash that originally launched it, even
+    Production incident this guards against: an agent died at the
+    moment systemd deactivated the SSH session-scope of the bash
+    that originally launched it, even
     though ``loginctl enable-linger`` was set on the user. ``linger``
     keeps ``user@UID.service`` running after SSH logout, but it
     does not make session-scopes immortal — and the daemon was in
@@ -1446,6 +1840,25 @@ def _detach_from_session_scope(agent_name: str | None = None) -> None:
         pass
 
 
+# File-mode mask applied by ``daemonize()`` right after ``setsid()``.
+#
+# The historical daemon recipe (Stevens' *Advanced Programming in the UNIX
+# Environment*) uses ``umask(0)`` so a daemon writing files with *explicit*
+# mode bits does not inherit the caller's umask. That is the WRONG choice
+# for us: our daemon runs an LLM agent that creates user-visible files and
+# directories WITHOUT explicit mode (via ``execute``/``write_file`` and via
+# plenty of internal ``Path.mkdir(parents=True, exist_ok=True)`` sites), so
+# the daemon must behave like a normal interactive user shell.
+#
+# Value: ``0o022`` — the system default from ``/etc/login.defs`` (``UMASK
+# 022``). Effect: files created without explicit mode become ``0o644``,
+# directories ``0o755``. Private storage paths remain private: they use
+# explicit ``chmod 0o600/0o700`` in ``storage_paths.py``
+# (``ensure_private_file`` / ``ensure_private_dir``) and are unaffected by
+# this mask. See ``docs/DESIGN_FIX_DAEMONIZE_UMASK.md``.
+DAEMON_UMASK = 0o022
+
+
 def _reap_empty_cgroup_leaves() -> None:
     """rmdir every EMPTY ``dwagent-*`` leaf cgroup under
     ``user@UID.service``.
@@ -1509,6 +1922,18 @@ def daemonize(name: str, log_dir: Path | None = None) -> None:
     if log_dir is None:
         log_dir = Path.home() / Path("~/.deep_worker").name / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
+    # ``mkdir`` above inherits the CALLER's umask, and the parent process that
+    # kicked off ``deep-worker --restart`` may itself run under umask 0
+    # (older daemon, systemd unit, misconfigured shell), giving 0o777. Force
+    # 0o755 explicitly so the log directory is not world-writable regardless
+    # of the caller's umask. See ``docs/DESIGN_FIX_DAEMONIZE_UMASK.md``.
+    try:
+        log_dir.chmod(0o755)
+    except OSError:
+        # If we cannot chmod (foreign owner, read-only fs, …) proceed anyway;
+        # the daemon still needs to run. The umask fix below covers all future
+        # creates inside the daemon itself.
+        pass
 
     # Log file paths
     stdout_log = log_dir / f"{name}.out.log"
@@ -1537,7 +1962,12 @@ def daemonize(name: str, log_dir: Path | None = None) -> None:
     # Decouple from parent environment
     os.chdir("/")
     os.setsid()
-    os.umask(0)
+    # Set the daemon umask to the normal user default (0o022) — files 644,
+    # dirs 755, matching /etc/login.defs and interactive-shell behaviour. Do
+    # NOT use the historical umask(0): it makes every implicit-mode file/dir
+    # world-writable (666/777). Private paths are protected by explicit
+    # chmod in storage_paths.py and are unaffected by this mask.
+    os.umask(DAEMON_UMASK)
 
     # Reap leftover empty dwagent-* leaf cgroups from agents that have since
     # died. Nothing else removes them (kernel doesn't auto-rmdir empty cgroup
@@ -1933,6 +2363,42 @@ def _human_size(n: int) -> str:
     return f"{n}GB"
 
 
+def show_provider_limits_info(provider: str) -> int:
+    """Display persisted provider limit/reset information."""
+    info = AvailabilityTracker().limit_info(provider)
+    print(f"provider: {provider}")
+    if info is None:
+        print("status: no_limit_record")
+        return 0
+
+    raw_reset = info.get("available_after_utc")
+    status = "limited"
+    if isinstance(raw_reset, str):
+        try:
+            reset = datetime.fromisoformat(raw_reset)
+            if reset <= datetime.now(reset.tzinfo):
+                status = "available"
+        except ValueError:
+            status = "unknown"
+    elif raw_reset is None:
+        status = "unknown"
+    print(f"status: {status}")
+    if raw_reset:
+        print(f"available_after_utc: {raw_reset}")
+    source = info.get("available_after_source")
+    if source:
+        print(f"source: {source}")
+    note = info.get("available_after_note")
+    if note:
+        print(f"note: {note}")
+    print(f"last_failure_at_utc: {info.get('last_failure_at_utc', '')}")
+    print(f"last_failure_agent: {info.get('last_failure_agent', '')}")
+    marker = info.get("last_failure_marker")
+    if marker:
+        print(f"last_failure_marker: {marker}")
+    return 0
+
+
 def show_agent_info(name: str) -> int:
     """Display launch configuration and runtime status of an agent.
 
@@ -2047,6 +2513,213 @@ def show_agent_info(name: str) -> int:
     return 0
 
 
+def _normalize_status_value(status: object) -> str:
+    status_value = getattr(status, "value", status)
+    return str(status_value).lower()
+
+
+def _history_indexer_funcs():
+    global clear_history_index, index_all_history_files
+    # Offline CLI path: no runtime middleware has injected the semantic_search
+    # wrapper dir onto sys.path, so do it here before importing the nested
+    # package. See deep_worker_cli/semantic_search_path.py.
+    from deep_worker_cli.semantic_search_path import (
+        ensure_semantic_search_importable,
+        semantic_search_wrapper_dir,
+    )
+
+    if not ensure_semantic_search_importable():
+        raise ModuleNotFoundError(
+            "semantic_search package not found: expected wrapper dir at "
+            f"{semantic_search_wrapper_dir()}"
+        )
+    if clear_history_index is None:
+        from semantic_search.history_indexer import clear_history_index as _clear
+
+        clear_history_index = _clear
+    if index_all_history_files is None:
+        from semantic_search.history_indexer import index_all_history_files as _index
+
+        index_all_history_files = _index
+    return clear_history_index, index_all_history_files
+
+
+def _run_reindex_with_progress(summaries_dir: Path):
+    from rich.progress import (
+        BarColumn,
+        MofNCompleteColumn,
+        Progress,
+        SpinnerColumn,
+        TaskProgressColumn,
+        TextColumn,
+        TimeElapsedColumn,
+        TimeRemainingColumn,
+    )
+
+    _, index_func = _history_indexer_funcs()
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),          # percentage
+        MofNCompleteColumn(),          # done/total messages
+        TextColumn("msgs"),
+        TimeElapsedColumn(),
+        TextColumn("<"),
+        TimeRemainingColumn(),         # ETA
+    ) as progress:
+        # Progress is measured in MESSAGES (jsonl lines) — a count known up
+        # front, so the bar shows X/N, %%, and ETA from the first tick.
+        # (Chunk counts are only known after the slow chunking pass, so they
+        # cannot drive an ETA and were the cause of the "0/None" bar.)
+        # Two phases share one bar (analyze then index) with a distinct total
+        # each: Phase 1 ticks by message GROUP during chunking so the long
+        # tokenization pass is not silent; Phase 2 ticks by MESSAGE during
+        # embedding/writing with X/N + %% + ETA.
+        task = progress.add_task("Reindexing history...", total=None)
+        current_file = {"name": ""}
+
+        def on_progress(filename: str) -> None:
+            current_file["name"] = filename
+            progress.update(task, description=f"Analyzing {filename}")
+
+        def on_analyze_progress(done: int, total: int) -> None:
+            desc = (
+                f"Analyzing {current_file['name']}"
+                if current_file["name"]
+                else "Analyzing history..."
+            )
+            progress.update(task, completed=done, total=total, description=desc)
+
+        def on_message_progress(done: int, total: int) -> None:
+            desc = (
+                f"Indexing {current_file['name']}"
+                if current_file["name"]
+                else "Indexing history..."
+            )
+            progress.update(task, completed=done, total=total, description=desc)
+
+        return index_func(
+            summaries_dir,
+            on_progress=on_progress,
+            on_message_progress=on_message_progress,
+            on_analyze_progress=on_analyze_progress,
+        )
+
+
+def _print_reindex_stats(stats: object) -> None:
+    print(
+        f"Reindexed {getattr(stats, 'files_processed')} file(s): "
+        f"{getattr(stats, 'lines_read')} lines -> "
+        f"{getattr(stats, 'chunks_indexed')} chunks "
+        f"({getattr(stats, 'errors')} error(s))."
+    )
+
+
+async def _reindex_running_agent(agent_name: str, status: object) -> int:
+    normalized_status = _normalize_status_value(status)
+    if normalized_status != "idle":
+        print(
+            f"Error: agent '{agent_name}' is busy (status: {normalized_status}); "
+            "stop it or wait until idle before reindexing.",
+            file=sys.stderr,
+        )
+        return 1
+
+    client = AgentClient(agent_name)
+    try:
+        await client.connect()
+        from rich.console import Console
+
+        console = Console()
+        with console.status(f"Reindexing history for '{agent_name}'..."):
+            result = await client.reindex_history()
+    except Exception as exc:
+        print(
+            f"Error: failed to reach running agent '{agent_name}': {exc}",
+            file=sys.stderr,
+        )
+        return 1
+    finally:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+
+    if not result.get("success"):
+        print(
+            f"Error: failed to rebuild history index for '{agent_name}': "
+            f"{result.get('error', 'unknown error')}",
+            file=sys.stderr,
+        )
+        return 1
+
+    stats = SimpleNamespace(
+        files_processed=result.get("files", 0),
+        lines_read=result.get("lines", 0),
+        chunks_indexed=result.get("chunks", 0),
+        errors=result.get("errors", 0),
+    )
+    _print_reindex_stats(stats)
+    return 1 if stats.errors else 0
+
+
+async def reindex_history_command(agent_name: str) -> int:
+    process_info = ProcessRegistry().lookup(agent_name)
+    if process_info is not None:
+        client = AgentClient(agent_name)
+        try:
+            await client.connect()
+            session_info = await client.get_status()
+            status = getattr(session_info, "status", "unknown")
+        except Exception as exc:
+            print(
+                f"Error: failed to reach running agent '{agent_name}': {exc}",
+                file=sys.stderr,
+            )
+            return 1
+        finally:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+        return await _reindex_running_agent(agent_name, status)
+
+    from deep_worker_cli.summaries import get_summaries_dir
+
+    summaries_dir = get_summaries_dir(agent_name)
+    if not summaries_dir.exists():
+        print(
+            f"Error: no summaries directory for agent '{agent_name}' ({summaries_dir})",
+            file=sys.stderr,
+        )
+        return 1
+
+    jsonl_files = sorted(summaries_dir.glob("*.jsonl"))
+    if not jsonl_files:
+        print(
+            f"Agent '{agent_name}' has no conversation history "
+            f"(no *.jsonl in {summaries_dir}); nothing to reindex."
+        )
+        return 0
+
+    try:
+        clear_func, _ = _history_indexer_funcs()
+        clear_func(summaries_dir)
+    except Exception as exc:
+        print(f"Error: failed to clear history index: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        stats = _run_reindex_with_progress(summaries_dir)
+    except Exception as exc:
+        print(f"Error: failed to rebuild history index: {exc}", file=sys.stderr)
+        return 1
+
+    _print_reindex_stats(stats)
+    return 1 if stats.errors else 0
+
+
 def main() -> int:
     """Main entry point for deep-worker command.
 
@@ -2097,6 +2770,21 @@ def main() -> int:
         return asyncio.run(
             list_summaries_command(agent_name=args.agent, fmt=args.format)
         )
+
+    if getattr(args, "reindex_history", False):
+        if not args.name:
+            print("Error: --reindex-history requires an agent name.", file=sys.stderr)
+            return 2
+        return asyncio.run(reindex_history_command(args.name))
+
+    if getattr(args, "limits_info", False):
+        if args.name:
+            print("Error: --limits-info does not take an agent name; use --provider NAME.", file=sys.stderr)
+            return 2
+        if "provider" not in _explicit_cli_flags():
+            print("Error: --limits-info requires explicit --provider NAME.", file=sys.stderr)
+            return 2
+        return show_provider_limits_info(args.provider)
 
     # Require agent name for all other operations
     if not args.name:
@@ -2241,6 +2929,20 @@ def main() -> int:
     # Only checks that are both (a) fast and (b) produce an error message the
     # user MUST see on their terminal belong here.
     # ========================================================================
+    # Validate + resolve one-shot startup queries PRE-DAEMONIZE so the user
+    # sees file-read / empty-text errors (exit 2) on their terminal, not in a
+    # log file. The resolved values are recomputed inside run_agent from the
+    # same args (idempotent) — here we only need the validation side effect and
+    # the values for the running-agent send-through path below.
+    startup_sum_query, startup_query = resolve_startup_queries(args)
+    # Stash so run_agent() (in the daemonized child) reuses these instead of
+    # re-reading the file a second time (NIT-2 / TOCTOU).
+    args._resolved_startup_queries = (startup_sum_query, startup_query)
+    summarize = bool(getattr(args, "summarize", False))
+    has_startup_query = startup_sum_query is not None or (
+        startup_query is not None and not summarize
+    )
+
     from deep_worker_cli.process.registry import ProcessRegistry
     registry = ProcessRegistry()
 
@@ -2248,6 +2950,19 @@ def main() -> int:
     #     pure registry lookup (file + fcntl) — sub-millisecond.
     existing = registry.lookup(args.name)
     if existing:
+        if summarize:
+            return asyncio.run(
+                _send_summarize_to_running_agent(args.name, startup_query)
+            )
+        # Idle send-through (§4.5): a running agent + a startup query means
+        # "send this query to the live agent" rather than an error. Dispatch
+        # via the existing RPyC invoke path (no new endpoint) and return.
+        if has_startup_query:
+            return asyncio.run(
+                _send_startup_query_to_running_agent(
+                    args.name, startup_sum_query, startup_query
+                )
+            )
         print(
             f"Error: Agent '{args.name}' is already running (PID {existing.pid})",
             file=sys.stderr,

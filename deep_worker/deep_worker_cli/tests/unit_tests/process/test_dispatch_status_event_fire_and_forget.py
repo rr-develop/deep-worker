@@ -10,7 +10,7 @@ the agent's status push is wired through
 call leaks a task that holds an ``AsyncResult`` slot on the
 connection's ``_request_callbacks``. Long-running agents will
 eventually trip the inbound-backpressure quarantine on web
-(see ``rpyc_async/docs/DESIGN_INBOUND_BACKPRESSURE.md``).
+(see the rpyc_async inbound-backpressure design notes).
 
 Contract: ``_dispatch_status_event`` schedules each subscriber's
 ``on_message`` via ``fire_and_forget_async`` with a finite timeout,
@@ -153,10 +153,10 @@ async def test_dispatch_status_event_logs_subscriber_failure(
 @pytest.mark.asyncio
 async def test_dispatch_status_event_task_is_pinned_in_INFLIGHT() -> None:
     """Strong-ref pin via ``rpyc.utils.helpers._INFLIGHT`` — the same
-    invariant we assert for ``_notify_subscribers``. See the 2026-05-08
-    / 2026-05-11 GC-race incident reports.
+    invariant we assert for ``_notify_subscribers``. See the past
+    GC-race incident reports.
     """
-    from rpyc.utils import helpers as h
+    from rpyc_async.utils import helpers as h
 
     sub_started = asyncio.Event()
     release = asyncio.Event()
@@ -225,7 +225,7 @@ async def test_dead_subscriber_is_evicted_after_push_error() -> None:
     corpse.
 
     Root cause of the "stuck at idle during inter-agent
-    conversation" bug (a related internal incident): the web client died/restarted
+    conversation" bug: the web client died/restarted
     without calling ``exposed_unsubscribe_messages``. The agent's
     ``on_disconnect`` deliberately does NOT clean up (it relies on a
     graceful unsubscribe that never came). The dead
@@ -259,7 +259,7 @@ async def test_dead_subscriber_is_evicted_after_push_error() -> None:
 
     assert dead not in agent._message_subscribers, (
         "a subscriber whose on_message failed must be evicted so the "
-        "agent stops pushing status to a dead peer (a related internal incident)"
+        "agent stops pushing status to a dead peer (observed in a past incident)"
     )
 
 

@@ -43,7 +43,7 @@ import json
 import logging
 from typing import TYPE_CHECKING, Any
 
-import rpyc
+import rpyc_async as rpyc
 
 if TYPE_CHECKING:
     from deep_worker_cli.process.agent_process import AgentProcess
@@ -62,7 +62,7 @@ def evict_subscriber_by_identity(subscriber_set: set[Any], target: Any) -> None:
     ``hash(dead_netref)`` → wire round-trip → ``EOFError`` again. In
     ``_notify_subscribers`` that secondary EOFError used to escape into
     ``_handle_invoke`` and force the agent to ERROR over a dead UI socket
-    (a related internal incident).
+    (observed in a past incident).
 
     The ONLY safe way to evict a dead netref is by **object identity**: we
     iterate the set (iteration never hashes elements) and rebuild it,
@@ -313,8 +313,45 @@ class AgentService(rpyc.Service):
             result = {"success": False, "error": str(e)}
             return json.dumps(result)
 
+    async def exposed_reindex_history(self) -> str:
+        if not self._agent_process:
+            return json.dumps({"success": False, "error": "Agent not initialized"})
+        try:
+            session_manager = getattr(self._agent_process, "session_manager", None)
+            status = getattr(session_manager, "status", "unknown")
+            status_value = getattr(status, "value", status)
+            normalized_status = str(status_value).lower()
+            if normalized_status != "idle":
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": f"Agent is busy (status: {normalized_status})",
+                    }
+                )
+            stats = await self._agent_process.reindex_history_owned()
+            return json.dumps({"success": True, **stats})
+        except Exception as e:
+            logger.exception("Error reindexing history: %s", e)
+            return json.dumps({"success": False, "error": str(e)})
+
+    async def exposed_summarize(self, prompt: str | None = None) -> str:
+        if not self._agent_process:
+            return json.dumps(
+                {"success": False, "error": "Agent not initialized"}
+            )
+        try:
+            result = await self._agent_process.request_summarization(prompt)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Error summarizing agent context: %s", exc)
+            return json.dumps({"success": False, "error": str(exc)})
+        return json.dumps({"success": True, **result})
+
     async def exposed_invoke_agent(
-        self, message: str, stream: bool = False
+        self,
+        message: str,
+        stream: bool = False,
+        sum_query: str | None = None,
+        query: str | None = None,
     ) -> str:
         """
         Invoke agent with message (async for AsyncioServer!).
@@ -342,6 +379,65 @@ class AgentService(rpyc.Service):
         if not self._agent_process:
             result = {"success": False, "error": "Agent not initialized"}
             return json.dumps(result)
+
+        # Startup-query send-through (§4.5): when sum_query / query are present
+        # (an idle agent receiving `deep-worker <name> --sum-query/-q ...`),
+        # route through the SAME offload→wipe→invoke helper used by the startup
+        # hook so the two paths cannot drift. No new endpoint.
+        #
+        # CRITICAL: this MUST use the same asyncio.shield + detach discipline as
+        # the normal invoke path below. exposed_invoke_agent runs inside the
+        # RPyC dispatch task; rpyc_async's inbound-quarantine cancels dispatch
+        # tasks on an overloaded connection (possibly from a DIFFERENT client).
+        # If we awaited _run_startup_or_send_query inline, that cancellation
+        # would kill the startup turn mid-flight and the agent status would
+        # stick "running" (same failure class as a past incident). So we
+        # run it in a DEDICATED task and await via asyncio.shield; if THIS
+        # dispatch task is cancelled, the turn detaches and keeps running.
+        if sum_query is not None or query is not None:
+            # Two client conventions reach this endpoint:
+            #   * CLI send-through (agent_command._send_startup_query_to_running)
+            #     sends message="" and puts the plain request in `query`.
+            #   * Web (the web layer's AgentService.send_message) puts the plain
+            #     request in `message` and, historically, could not send `query`
+            #     at all — so a call with sum_query + a real `message` arrived
+            #     here as (message=<request>, sum_query=<prefix>, query=None).
+            # In the second case the request lived in `message` and was silently
+            # dropped (only the summary-shape reached the model — bug 2026-07-04,
+            # reported by mj2_vac: 0/11 drafts). Normalise: if `query` was not
+            # given explicitly but a non-empty `message` was, treat `message` as
+            # the plain query so it becomes the second sequential turn. CLI is
+            # unaffected (it sends message="" → falsy → no override).
+            effective_query = query
+            if effective_query is None and message:
+                effective_query = message
+            startup_task = asyncio.ensure_future(
+                self._agent_process._run_startup_or_send_query(
+                    sum_query,
+                    effective_query,
+                    connection=None,
+                    notify_callback=self._notify_subscribers,
+                    approval_callback=None,
+                )
+            )
+            try:
+                await asyncio.shield(startup_task)
+            except asyncio.CancelledError:
+                if startup_task.cancelled():
+                    # Real interrupt (exposed_interrupt_agent) → propagate.
+                    raise
+                # Channel drain / quarantine: the startup turn is STILL running.
+                # Detach it so it is not GC'd, and re-raise to unwind only this
+                # dispatch task. The turn settles its own status via
+                # session_manager (driven inside _handle_invoke).
+                self._agent_process._detached_invoke_tasks.add(startup_task)
+                startup_task.add_done_callback(
+                    self._agent_process._detached_invoke_tasks.discard
+                )
+                raise
+            except Exception as e:  # noqa: BLE001
+                return json.dumps({"success": False, "error": str(e)})
+            return json.dumps({"success": True})
 
         try:
             # ====================================================================
@@ -401,7 +497,7 @@ class AgentService(rpyc.Service):
             # client (the web UI), not the one that sent this invoke. If we
             # awaited _handle_invoke inline, that cancellation would kill the
             # running agent turn and it would be misread as a user interrupt
-            # → spurious INTERRUPTED (a related internal incident).
+            # → spurious INTERRUPTED (observed in a past incident).
             #
             # So run _handle_invoke in a DEDICATED task and await it via
             # asyncio.shield. If THIS dispatch task is cancelled (quarantine,
@@ -606,8 +702,8 @@ class AgentService(rpyc.Service):
     async def exposed_get_system_prompt(self) -> str:
         """Get the invariant (startup) system prompt (async for AsyncioServer).
 
-        Backs Full Dialog verbosity mode ``system_prompt`` (§9 of
-        the Full Dialog design document on final response pairs).
+        Backs Full Dialog verbosity mode ``system_prompt`` (§9 of the
+        web layer's Full Dialog / final-response-pairs design notes).
 
         IMPORTANT: Returns JSON-serialized string to eliminate RPyC netref
         overhead. Client must json.loads() the response.
@@ -737,7 +833,7 @@ class AgentService(rpyc.Service):
                     # Use asyncreq(HANDLE_CALLATTR) to avoid sync_request
                     # guard (same pattern as _dispatch_status_event in
                     # agent_process.py, issue #48).
-                    from rpyc.core.netref import asyncreq as _asyncreq  # noqa: PLC0415
+                    from rpyc_async.core.netref import asyncreq as _asyncreq  # noqa: PLC0415
                     ar = _asyncreq(
                         callback,
                         8,  # HANDLE_CALLATTR
@@ -778,8 +874,8 @@ class AgentService(rpyc.Service):
                 # Evict by identity (no __hash__ on the netref). Graceful
                 # unsubscribe normally happens on a live channel, but a client
                 # racing disconnect+unsubscribe could present a dead netref,
-                # and ``discard`` would then re-raise EOFError (a related
-                # internal incident). Identity eviction is always safe.
+                # and ``discard`` would then re-raise EOFError (observed in
+                # a past incident). Identity eviction is always safe.
                 evict_subscriber_by_identity(
                     self._agent_process._message_subscribers, callback
                 )
@@ -826,9 +922,20 @@ class AgentService(rpyc.Service):
             model = None
             provider = None
             if config:
+                from deep_worker_cli.config import model_can_belong_to_provider
                 provider = config.provider
                 dynamic_model = getattr(config, "dynamic_display_model", None)
-                model = config.model or dynamic_model or config.resolved_model
+                if not model_can_belong_to_provider(provider, dynamic_model):
+                    dynamic_model = None
+                config_model = (
+                    config.model
+                    if model_can_belong_to_provider(provider, config.model)
+                    else None
+                )
+                resolved_model = config.resolved_model
+                if not model_can_belong_to_provider(provider, resolved_model):
+                    resolved_model = None
+                model = config_model or dynamic_model or resolved_model
 
             status_metadata = None
             session_manager = getattr(self._agent_process, "session_manager", None)
@@ -1368,8 +1475,8 @@ class AgentService(rpyc.Service):
         # hung (e.g. its broadcast queue was full or its WS client was
         # dead), the agent's whole ``_handle_invoke`` flow blocked on the
         # very first pre-flight broadcast and no user message ever
-        # reached ``ainvoke``. Production incident: a hung web peer
-        # (>60 min hang, 3 parked ``_dispatch_request_async`` tasks).
+        # reached ``ainvoke``. Production incident: a >60 min hang with
+        # 3 parked ``_dispatch_request_async`` tasks.
         #
         # The fix: hand each ``on_message`` call to
         # ``fire_and_forget_async`` which:
@@ -1381,7 +1488,7 @@ class AgentService(rpyc.Service):
         #   * pins the Task in ``rpyc.utils.helpers._INFLIGHT`` (with
         #     auto-discard via ``add_done_callback``) so a GC pass can't
         #     drop a half-finished outbound RPC and leak the chain
-        #     (incidents 2026-05-08, 2026-05-11).
+        #     (observed in past incidents).
         #
         # Why NOT ``rpyc.async_(...)``: that forces ``HANDLE_CALL`` (sync
         # handler dispatch on the peer). Web's ``exposed_on_message`` is
@@ -1393,8 +1500,8 @@ class AgentService(rpyc.Service):
         # Why serialise once on the agent side: a netref payload forces
         # the subscriber's async loop to walk it via ``sync_request``,
         # which RPyC blocks with the "sync_request() from asyncio loop"
-        # guard and leaks the remote ref. See
-        # the design document on agent-service memory fixes (F2).
+        # guard and leaks the remote ref. See the web layer's
+        # agent-service memory-fix design notes (F2).
         # ════════════════════════════════════════════════════════════════
 
         try:
@@ -1418,7 +1525,7 @@ class AgentService(rpyc.Service):
         except ValueError:
             notify_timeout = 10.0
 
-        from rpyc.utils.helpers import fire_and_forget_async  # noqa: PLC0415
+        from rpyc_async.utils.helpers import fire_and_forget_async  # noqa: PLC0415
 
         # The shared subscriber set we evict dead peers from. Eviction
         # matters here for the same reason as in
@@ -1426,8 +1533,8 @@ class AgentService(rpyc.Service):
         # NOT clean up (it relies on a graceful unsubscribe that never
         # arrives when a web client dies/restarts ungracefully). Without
         # eviction the dead netref lingers forever and every broadcast
-        # wastes a 10 s timeout against the corpse (a related internal
-        # incident). A live web re-subscribes on its next connect_to_agent.
+        # wastes a 10 s timeout against the corpse (observed in a past incident).
+        # A live web re-subscribes on its next connect_to_agent.
         subscriber_set = self._agent_process._message_subscribers
 
         for subscriber in subscribers:
@@ -1449,14 +1556,14 @@ class AgentService(rpyc.Service):
                 )
                 # Evict by IDENTITY — ``set.discard(netref)`` would call
                 # ``netref.__hash__`` → wire round-trip → EOFError on a dead
-                # channel (a related internal incident). See evict_subscriber_by_identity.
+                # channel (observed in a past incident). See evict_subscriber_by_identity.
                 evict_subscriber_by_identity(subscriber_set, _sub)
 
             try:
                 # Use asyncreq(HANDLE_CALLATTR=8) to avoid the
                 # sync_request guard (same pattern as agent_process.py
                 # _dispatch_status_event, issue #48).
-                from rpyc.core.netref import asyncreq as _asyncreq  # noqa: PLC0415
+                from rpyc_async.core.netref import asyncreq as _asyncreq  # noqa: PLC0415
                 awaitable = _asyncreq(
                     subscriber,
                     8,  # HANDLE_CALLATTR
@@ -1473,7 +1580,7 @@ class AgentService(rpyc.Service):
                 # Evict by IDENTITY — ``set.discard(netref)`` would re-raise
                 # EOFError via ``netref.__hash__`` on the dead channel, and
                 # that secondary error used to escape into _handle_invoke and
-                # force the agent to ERROR (a related internal incident).
+                # force the agent to ERROR (observed in a past incident).
                 evict_subscriber_by_identity(subscriber_set, subscriber)
                 continue
 
