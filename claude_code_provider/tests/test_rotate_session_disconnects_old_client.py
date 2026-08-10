@@ -8,13 +8,13 @@ Bug:
     overwrote the slot and the old client's subprocess became unreachable
     with its pipes still open. Each summarization round leaked one
     'claude' process; several leaked processes eventually hit the pipe-I/O
-    deadlock (see a related internal incident analysis, not included here).
+    deadlock (see the internal sandbox pipe-deadlock incident report).
 
 Fix:
     rotate_session() is now async; it pops the old client first and
     awaits client.disconnect() (best-effort) before bumping the epoch.
 
-Additional fix (related issue):
+Additional fix (Issue #119):
     rotate_session() now acquires ``_creation_locks[thread_id]`` so that
     pop+disconnect is serialised against concurrent get_or_create_client()
     for the same thread_id. Without the lock, a concurrent ainvoke could
@@ -31,9 +31,11 @@ the assertions are about real state transitions, not stub recordings.
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 import pytest
 
 from claude_code_provider.client_manager import ClientManager
+from claude_code_provider.session_state import load_session_state, save_session_state
 
 
 class FakeClient:
@@ -110,12 +112,17 @@ class FakeSlowClient(FakeClient):
     """Double whose disconnect() blocks until an event is set, so we can
     prove the creation lock serialises rotate_session vs get_or_create_client."""
 
-    def __init__(self, name: str, hold: asyncio.Event) -> None:
+    def __init__(
+        self, name: str, hold: asyncio.Event, entered: asyncio.Event | None = None
+    ) -> None:
         super().__init__(name)
         self._hold = hold
+        self._entered = entered
 
     async def disconnect(self) -> None:
         self.disconnect_calls += 1
+        if self._entered is not None:
+            self._entered.set()
         await self._hold.wait()  # block inside the lock
 
 
@@ -171,3 +178,50 @@ class TestRotateSessionLock:
         assert proxy is not None
         # The old client was disconnected exactly once.
         assert old.disconnect_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_persisted_invalidation_is_atomic_with_rotation(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))  # pyright: ignore[reportUnknownLambdaType]
+        manager = ClientManager()
+        hold = asyncio.Event()
+        entered = asyncio.Event()
+        old = FakeSlowClient("poisoned", hold, entered)
+        manager.clients["tR"] = (old, object())  # type: ignore[assignment]
+        save_session_state("tR", sent_count=9, session_uuid="poisoned-uuid")
+
+        rotate_task = asyncio.create_task(
+            manager.rotate_session("tR", invalidate_persisted=True)
+        )
+        await entered.wait()
+
+        async def create_and_persist_clean_session() -> None:
+            async with manager._creation_locks["tR"]:
+                save_session_state(
+                    "tR", sent_count=1, session_uuid="clean-generation-2"
+                )
+
+        writer_task = asyncio.create_task(create_and_persist_clean_session())
+        assert manager._creation_locks["tR"].locked()
+        hold.set()
+        await asyncio.gather(rotate_task, writer_task)
+
+        assert load_session_state("tR") == {
+            "sent_count": 1,
+            "session_uuid": "clean-generation-2",
+        }
+
+    @pytest.mark.asyncio
+    async def test_fresh_manager_after_poison_reset_has_no_resume_hint(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))  # pyright: ignore[reportUnknownLambdaType]
+        save_session_state("tRestart", sent_count=7, session_uuid="poisoned-uuid")
+        manager = ClientManager()
+
+        await manager.rotate_session("tRestart", invalidate_persisted=True)
+
+        restarted_manager = ClientManager()
+        assert restarted_manager.get_session_epoch("tRestart") == 0
+        assert load_session_state("tRestart") is None

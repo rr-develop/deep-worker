@@ -72,7 +72,7 @@ dwcli --list
 ```bash
 # All of these commands must work right away:
 which dwcli
-# Output: ~/.local/bin/dwcli
+# Output: /home/<user>/.local/bin/dwcli
 
 dwcli --help
 # Output: usage: deep-worker-cli [-h] ...

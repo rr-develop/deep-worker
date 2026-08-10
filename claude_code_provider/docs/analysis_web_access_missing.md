@@ -1,27 +1,27 @@
-# Analysis: Agents Have No Internet Access
+# Analysis: Agents have no internet access
 
 ## Problem
 
-Agents (via the claude-code provider and others) report that they have NO internet access:
+Deep-worker agents (via the claude-code provider and others) report that they have NO internet access:
 
 ```
 > Do you have internet access?
 
-No, I do not have internet access.
+No, I don't have internet access.
 
 I work in an isolated sandbox environment and have access only to the local file system.
 
-But I cannot:
+But I can't:
 • Download files from the internet
-• Access web sites
+• Access websites
 • Make HTTP requests
 ```
 
 ## Investigation
 
-### 1. Web tools exist in the code base
+### 1. Web tools exist in the codebase
 
-**File:** `tools.py`
+**File:** `deep_worker/deep_worker_cli/deep_worker_cli/tools.py`
 
 **Available functions:**
 - `http_request()` - Make HTTP requests to APIs and web services (lines 24-88)
@@ -39,7 +39,7 @@ tavily_client = (
 
 ### 2. Web tools are registered in main.py
 
-**File:** `main.py`
+**File:** `deep_worker/deep_worker_cli/deep_worker_cli/main.py`
 
 **Lines 393-395:**
 ```python
@@ -48,11 +48,11 @@ if settings.has_tavily:
     tools.append(web_search)
 ```
 
-The web tools are added and passed into `create_cli_agent()` when the CLI client is started interactively.
+Web tools are added and passed to `create_cli_agent()` when dwcli is started interactively.
 
-### 3. Web tools are NOT passed into AgentProcess
+### 3. Web tools are NOT passed to AgentProcess
 
-**File:** `process/agent_process.py`
+**File:** `deep_worker/deep_worker_cli/deep_worker_cli/process/agent_process.py`
 
 **Lines 211-219:**
 ```python
@@ -69,9 +69,9 @@ self.agent, self.backend = create_cli_agent(
 
 **PROBLEM:** The `tools=...` parameter is **NOT passed**!
 
-### 4. Tavily API key configuration
+### 4. Tavily API Key configuration
 
-**File:** `config.py`
+**File:** `deep_worker/deep_worker_cli/deep_worker_cli/config.py`
 
 **Line 475:**
 ```python
@@ -88,7 +88,7 @@ def has_tavily(self) -> bool:
 
 ## Root cause
 
-### In main.py (the interactive CLI client):
+### In main.py (interactive dwcli):
 
 ```python
 # main.py lines 393-395
@@ -100,7 +100,7 @@ if settings.has_tavily:
 agent, backend = create_cli_agent(
     model=model,
     assistant_id=assistant_id,
-    tools=tools,  # ← The web tools are passed!
+    tools=tools,  # ← Web tools ARE passed!
     ...
 )
 ```
@@ -112,17 +112,17 @@ agent, backend = create_cli_agent(
 self.agent, self.backend = create_cli_agent(
     model=model,
     assistant_id=self.name,
-    # tools=???  ← There is NO tools parameter!
+    # tools=???  ← NO tools parameter!
     auto_approve=self.skip_permissions,
     ...
 )
 ```
 
-**Conclusion:** The web tools are NOT added for agents started via AgentProcess (RPyC mode).
+**Conclusion:** Web tools are NOT added for agents launched through AgentProcess (RPyC mode).
 
-## Comparison: interactive vs RPyC mode
+## Comparison: Interactive vs RPyC mode
 
-| Function | Interactive CLI client (main.py) | RPyC agent (agent_process.py) |
+| Function | Interactive dwcli (main.py) | RPyC agent (agent_process.py) |
 |---------|-------------------------------|-------------------------------|
 | `http_request` | ✅ Passed | ❌ NOT passed |
 | `fetch_url` | ✅ Passed | ❌ NOT passed |
@@ -132,9 +132,9 @@ self.agent, self.backend = create_cli_agent(
 
 ## Solution
 
-### Option 1: Add the web tools in agent_process.py (simple)
+### Option 1: Add web tools to agent_process.py (simple)
 
-**File:** `process/agent_process.py`
+**File:** `deep_worker/deep_worker_cli/deep_worker_cli/process/agent_process.py`
 
 **Changes:**
 
@@ -143,7 +143,7 @@ self.agent, self.backend = create_cli_agent(
 from deep_worker_cli.tools import http_request, fetch_url, web_search
 
 # CHANGE the create_cli_agent call (lines 211-219):
-# Prepare the web tools
+# Prepare web tools
 web_tools = [http_request, fetch_url]
 
 # Load settings to check tavily_api_key
@@ -165,7 +165,7 @@ self.agent, self.backend = create_cli_agent(
 
 ### Option 2: Add a parameter to AgentConfig (more flexible)
 
-**File:** `config/models.py`
+**File:** the module that defines the `AgentConfig` class
 
 Add:
 ```python
@@ -176,53 +176,53 @@ class AgentConfig:
 
 Then check `self.config.enable_web_tools` in `agent_process.py`.
 
-### Option 3: Always add the web tools (recommended)
+### Option 3: Always add web tools (recommended)
 
-The web tools are safe (they only make GET/POST requests). There is no reason NOT to enable them.
+Web tools are safe (they only make GET/POST requests). There is no reason NOT to enable them.
 
-**Recommendation:** Use Option 1 - simply add the web tools in agent_process.py
+**Recommendation:** Use Option 1 - simply add web tools to agent_process.py
 
-## Tavily API key requirements
+## Tavily API Key requirements
 
 **web_search** requires a Tavily API key:
-- Obtain it at: https://tavily.com
-- Set it: `export TAVILY_API_KEY=tvly-...` in `~/.deepagents/.env`
+- Get one at: https://tavily.com
+- Set: `export TAVILY_API_KEY=tvly-...` in the local `.env` file
 
 **http_request** and **fetch_url** work WITHOUT an API key (they only use `requests`).
 
 ## Current state
 
-### The .env file
+### .env file
 
-**Location:** `~/.deepagents/.env`
+**Location:** the local `.env` file
 
-Check whether it is present:
+Check for its presence:
 ```bash
-cat ~/.deepagents/.env | grep TAVILY
+cat .env | grep TAVILY
 ```
 
-If not, add it:
+If absent, add:
 ```bash
-echo "TAVILY_API_KEY=tvly-YOUR_KEY_HERE" >> ~/.deepagents/.env
+echo "TAVILY_API_KEY=tvly-YOUR_KEY_HERE" >> .env
 ```
 
 ## Testing after the fix
 
-### 1. http_request (without an API key)
+### 1. http_request (no API key)
 
 ```
 > Make an HTTP request to https://api.github.com
 ```
 
-Expected: A successful response with GitHub API data
+Expected: Successful response with GitHub API data
 
-### 2. fetch_url (without an API key)
+### 2. fetch_url (no API key)
 
 ```
-> Fetch the contents of the page https://example.com
+> Load the contents of the page https://example.com
 ```
 
-Expected: The Markdown content of the page
+Expected: Markdown content of the page
 
 ### 3. web_search (requires tavily_api_key)
 
@@ -232,19 +232,19 @@ Expected: The Markdown content of the page
 
 Expected:
 - If tavily_api_key is configured → search results
-- If NOT → the error "Tavily API key not configured"
+- If NOT → error "Tavily API key not configured"
 
 ## Summary
 
-**Cause:** The web tools exist but are NOT passed into `create_cli_agent()` in `agent_process.py`
+**Cause:** Web tools exist but are NOT passed to `create_cli_agent()` in `agent_process.py`
 
-**Solution:** Add the parameter `tools=[http_request, fetch_url, web_search]` when creating the agent
+**Solution:** Add the `tools=[http_request, fetch_url, web_search]` parameter when creating the agent
 
 **Files to change:**
-- `process/agent_process.py`
+- `deep_worker/deep_worker_cli/deep_worker_cli/process/agent_process.py`
 
 **API Keys:**
 - `http_request`, `fetch_url` - work WITHOUT keys ✅
-- `web_search` - requires `TAVILY_API_KEY` in `~/.deepagents/.env`
+- `web_search` - requires `TAVILY_API_KEY` in the local `.env` file
 
-**Additionally:** Check for the presence of a Tavily API key in the environment
+**Additionally:** Check for the presence of the Tavily API key in the environment

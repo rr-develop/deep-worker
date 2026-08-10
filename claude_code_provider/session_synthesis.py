@@ -31,12 +31,18 @@ crash. See the design doc.
 
 from __future__ import annotations
 
+import base64
+import binascii
+import io
 import json
 import re
 import uuid as _uuid
+import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from PIL import Image
 
 from langchain_core.messages import (
     AIMessage,
@@ -84,17 +90,228 @@ def session_project_dir(cwd: str) -> Path:
     return Path.home() / ".claude" / "projects" / _sanitize_cwd(cwd)
 
 
+# ===========================================================================
+# IMAGE CONTENT BLOCKS
+#
+# See docs/DESIGN_FIX_IMAGE_BLOCKS_IN_SYNTHESIZED_TRANSCRIPT.md.
+#
+# ⚠️ POLICY — FAIL CLOSED. This module writes a transcript that is replayed
+# VERBATIM to the Anthropic Messages API on every ``--resume``. A single
+# invalid block poisons the session permanently (production incident
+# 2026-08-04: a leaked OpenAI-style ``image_url`` block
+# made even ``2+2`` fail with a 400). Therefore an ``image`` block is emitted
+# ONLY when it is PROVABLY valid; anything doubtful degrades to a diagnostic
+# text block. Never raise: history restore is an optimization and must never
+# break a turn.
+#
+# ⚠️ DO NOT "simplify" this by reusing ``chat_model._build_mcp_content``. That
+# builds the MCP shape (``data``/``mimeType``) for the LIVE tool path. The
+# transcript needs the Anthropic Messages API shape (``source``); ``mimeType``
+# is not a valid key there and would 400 again.
+# ===========================================================================
+
+# Anthropic Vision docs: "The maximum size per image is 10 MB (base64-encoded)
+# when using the Claude API directly."
+# https://platform.claude.com/docs/en/build-with-claude/vision
+#
+# ⚠️ This bounds the BASE64-ENCODED payload, NOT the decoded bytes. Capping
+# decoded bytes at 10e6 would allow ~13.33 MB encoded — over the limit, which
+# is exactly the failure this module exists to prevent. The name says
+# ``BASE64`` on purpose; a decoded-sounding name is how that confusion recurs.
+# Decimal MB (not MiB): 10_000_000 < 10_485_760, so we are conservative under
+# either reading of the docs.
+_MAX_BASE64_IMAGE_BYTES = 10_000_000
+
+# Only these are accepted by the Messages API (Vision docs, "Supported
+# formats"). Anything else — SVG, BMP, application/octet-stream — is rejected.
+_SUPPORTED_IMAGE_MEDIA_TYPES = frozenset(
+    {"image/jpeg", "image/png", "image/gif", "image/webp"}
+)
+
+# Anthropic max dimension is 8000x8000 px. Note 8000*8000 = 64e6 px is BELOW
+# Pillow's DecompressionBombWarning threshold (MAX_IMAGE_PIXELS = 89_478_485),
+# so this check alone already rejects the whole "warn but don't raise" band.
+_MAX_IMAGE_DIMENSION = 8000
+
+# Magic-number prefixes, to catch a payload whose declared media_type lies.
+#
+# ⚠️ WebP is NOT a simple prefix: the RIFF container is shared with WAVE, AVI
+# and others, so a bare ``b"RIFF"`` check would accept ``RIFF....WAVE`` as an
+# image. The real signature is ``RIFF`` at [0:4] AND ``WEBP`` at [8:12] (the
+# 4 bytes in between are the chunk size). Handled by ``_magic_ok`` below.
+_IMAGE_MAGIC: dict[str, tuple[bytes, ...]] = {
+    "image/png": (b"\x89PNG\r\n\x1a\n",),
+    "image/jpeg": (b"\xff\xd8\xff",),
+    "image/gif": (b"GIF87a", b"GIF89a"),
+}
+
+
+def _magic_ok(media_type: str, decoded: bytes) -> bool:
+    """True iff ``decoded``'s magic number matches the declared media type."""
+    if media_type == "image/webp":
+        # RIFF container + explicit WEBP form type — see note above.
+        return (
+            len(decoded) >= 12
+            and decoded[:4] == b"RIFF"
+            and decoded[8:12] == b"WEBP"
+        )
+    prefixes = _IMAGE_MAGIC.get(media_type, ())
+    if not prefixes:
+        return False
+    return any(decoded.startswith(p) for p in prefixes)
+
+# API-supported ``tool_result`` block types. Exactly the set enumerated by the
+# real 400 message. Non-image ones keep their PRE-EXISTING pass-through
+# contract (``type`` checked only) — see design §5.0: this module validates
+# IMAGE blocks, and does not claim to schema-validate the others.
+_PASSTHROUGH_BLOCK_TYPES = frozenset(
+    {"text", "document", "search_result", "tool_reference"}
+)
+
+# ``data:<media-type>[;<param>=<value>]*;base64,<data>``. The media type may
+# carry parameters (e.g. ``;charset=utf-8``) before the ``;base64`` marker, so
+# everything up to the LAST ``;base64,`` is the media-type field and is
+# normalized by ``_normalize_media_type`` (which strips parameters).
+_DATA_URL_RE = re.compile(r"^data:(?P<media>[^,]*?);base64,(?P<data>.*)$", re.S)
+
+
+def _reject(reason: str, media_type: str, size: int) -> dict[str, Any]:
+    """A diagnostic text block for an image we refuse to emit.
+
+    ⚠️ NEVER interpolate the payload (or any prefix of it) — that would put
+    image bytes back into the transcript as text and defeat the size guard.
+    """
+    return {
+        "type": "text",
+        "text": (
+            f"[Image omitted from restored history: {reason}; "
+            f"media_type={media_type or 'unknown'}, {size} bytes]"
+        ),
+    }
+
+
+def _normalize_media_type(raw: Any) -> str:
+    if not isinstance(raw, str):
+        return ""
+    return raw.split(";")[0].strip().lower()
+
+
+def _anthropic_image_block(media_type: str, data: Any) -> dict[str, Any]:
+    """Build a validated Anthropic image block, or a diagnostic text block.
+
+    Validation order is normative (design §5.1): the ENCODED-size check runs
+    FIRST, before any decoding, so an oversized payload never reaches
+    ``b64decode`` or Pillow.
+    """
+    if not isinstance(data, str) or not data:
+        return _reject("empty image data", media_type, 0)
+
+    if media_type not in _SUPPORTED_IMAGE_MEDIA_TYPES:
+        return _reject("unsupported media type", media_type, len(data))
+
+    # (a) EXACT encoded-size check — this IS the documented Anthropic limit,
+    #     and it also bounds allocation: nothing oversized gets decoded.
+    try:
+        encoded = data.encode("ascii")
+    except UnicodeEncodeError:
+        return _reject("invalid base64", media_type, len(data))
+    if len(encoded) > _MAX_BASE64_IMAGE_BYTES:
+        return _reject("too large", media_type, len(encoded))
+
+    # (b) strict decode
+    try:
+        decoded = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError):
+        return _reject("invalid base64", media_type, len(encoded))
+    if not decoded:
+        return _reject("empty image data", media_type, 0)
+
+    # (c) magic-number agreement — a declared png that is really something
+    #     else must not be emitted.
+    if not _magic_ok(media_type, decoded):
+        return _reject("media type mismatch", media_type, len(decoded))
+
+    # (d) dimensions, header-only. Pillow only WARNS between MAX_IMAGE_PIXELS
+    #     and 2x that, so the warning is promoted to an error here; our own
+    #     8000x8000 rule is the authoritative guard. Belt and braces.
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(io.BytesIO(decoded)) as img:
+                width, height = img.size
+    except Exception:  # noqa: BLE001 — any failure ⇒ reject, never raise
+        return _reject("unreadable image", media_type, len(decoded))
+
+    if width > _MAX_IMAGE_DIMENSION or height > _MAX_IMAGE_DIMENSION:
+        return _reject("dimensions too large", media_type, len(decoded))
+
+    return {
+        "type": "image",
+        "source": {
+            "type": "base64",
+            "media_type": media_type,
+            "data": data,
+        },
+    }
+
+
+def _transcript_block(block: Any) -> dict[str, Any]:
+    """Map one LangChain content block to a transcript-safe block."""
+    if not isinstance(block, dict):
+        return {"type": "text", "text": str(block)}
+
+    block_type = block.get("type")
+
+    if block_type in _PASSTHROUGH_BLOCK_TYPES:
+        return block
+
+    if block_type == "image_url":
+        raw = block.get("image_url")
+        url = raw.get("url", "") if isinstance(raw, dict) else raw
+        if not isinstance(url, str):
+            return _reject("invalid base64", "", 0)
+        match = _DATA_URL_RE.match(url)
+        if match is None:
+            # A remote URL is NOT converted to an Anthropic url-source: the
+            # transcript is replayed later, so that would introduce a
+            # fetch-at-replay-time failure mode and an egress concern.
+            return {"type": "text", "text": f"[Image: {url}]"}
+        return _anthropic_image_block(
+            _normalize_media_type(match.group("media")), match.group("data")
+        )
+
+    if block_type == "image":
+        source = block.get("source")
+        if isinstance(source, dict):
+            # Already-Anthropic. Re-validate rather than pass through:
+            # unconditional idempotence would PRESERVE a poisoned block.
+            if source.get("type") != "base64":
+                return _reject("unsupported media type", "", 0)
+            return _anthropic_image_block(
+                _normalize_media_type(source.get("media_type")), source.get("data")
+            )
+        # MCP shape ({"data": ..., "mimeType": ...}) — normalize it.
+        return _anthropic_image_block(
+            _normalize_media_type(block.get("mimeType")), block.get("data")
+        )
+
+    return {"type": "text", "text": str(block)}
+
+
 def _tool_result_content(content: Any) -> Any:
     """Shape a ToolMessage's content for a ``tool_result`` block.
 
-    Claude accepts either a string or a list of content blocks. LangGraph
-    ToolMessages are usually strings; pass strings through, and stringify
-    anything exotic so the transcript stays valid JSON the CLI can parse.
+    Claude accepts either a string or a list of content blocks. Strings — the
+    overwhelmingly common case — pass through untouched. Lists are converted
+    block-by-block so that multimodal tool results (``read_image``) become
+    valid Anthropic content instead of poisoning the session.
     """
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        return content
+        blocks = [_transcript_block(b) for b in content]
+        # An empty content list is invalid for the API; degrade to "".
+        return blocks or ""
     return str(content)
 
 

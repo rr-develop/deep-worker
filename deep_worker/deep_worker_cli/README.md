@@ -1,25 +1,24 @@
-# 🧠🤖 Deep Agents CLI
+# Deep Worker CLI
 
-[![PyPI - Version](https://img.shields.io/pypi/v/deepagents-cli?label=%20)](https://pypi.org/project/deepagents-cli/#history)
-[![PyPI - License](https://img.shields.io/pypi/l/deepagents-cli)](https://opensource.org/licenses/MIT)
-[![PyPI - Downloads](https://img.shields.io/pepy/dt/deepagents-cli)](https://pypistats.org/packages/deepagents-cli)
-[![Twitter](https://img.shields.io/twitter/url/https/twitter.com/langchain.svg?style=social&label=Follow%20%40LangChain)](https://x.com/langchain)
+`deep-worker` is a Python package that runs LangChain agents as background
+daemon processes and exposes them to the interactive `dwcli` client.
 
-Looking for the JS/TS version? Check out [Deep Agents CLI.js](https://github.com/langchain-ai/deepagentsjs).
-
-To help you ship LangChain apps to production faster, check out [LangSmith](https://smith.langchain.com).
-LangSmith is a unified developer platform for building, testing, and monitoring LLM applications.
-
-<p align="center">
-  <img src="https://raw.githubusercontent.com/langchain-ai/deepagents/master/libs/cli/images/cli.png" alt="Deep Agents CLI" width="600"/>
-</p>
+This is a fork of [LangChain's `deepagents-cli`](https://github.com/langchain-ai/deepagents),
+renamed to `deep-worker` and extended with additional providers, tools, and
+infrastructure (see the root [README](../../README.md) for the component map).
 
 ## Quick Install
 
+This repository is used from a source checkout — no `pip install`:
+
 ```bash
-uv tool install deepagents-cli
-deepagents
+# Point the launchers into your PATH (project policy: no virtual environments)
+ln -sf /path/to/checkout/deep_worker/deep_worker_cli/deep-worker ~/.local/bin/deep-worker
+ln -sf /path/to/checkout/deep_worker/deep_worker_cli/dwcli ~/.local/bin/dwcli
 ```
+
+See [`deep_worker/README.md`](../../deep_worker/README.md) for the no-venv
+runtime model.
 
 ## Key Features
 
@@ -48,7 +47,7 @@ Using an LLM to call tools in a loop is the simplest form of an agent. This arch
 
 Applications like "Deep Research", "Manus", and "Claude Code" have gotten around this limitation by implementing a combination of four things: a **planning tool**, **sub agents**, access to a **file system**, and a **detailed prompt**.
 
-`deepagents` is a Python package that implements these in a general purpose way so that you can easily create a Deep Agent for your application. For a full overview and quickstart of Deep Agents, the best resource is our [docs](https://docs.langchain.com/oss/python/deepagents/overview).
+`deep-worker` implements these in a general purpose way so that you can easily create a Deep Agent for your application.
 
 **Acknowledgements: This project was primarily inspired by Claude Code, and initially was largely an attempt to see what made Claude Code general purpose, and make it even more so.**
 
@@ -160,17 +159,7 @@ The `--remove-before DATE` command also prunes summary files:
 
 ## 📖 Resources
 
-- **[Documentation](https://docs.langchain.com/oss/python/deepagents/cli)** — Full documentation
-- **[Deep Agents](https://github.com/langchain-ai/deepagents)** — The underlying agent harness
-- **[Chat LangChain](https://chat.langchain.com)** - Chat interactively with the docs
-
-## 📕 Releases & Versioning
-
-See our [Releases](https://docs.langchain.com/oss/python/release-policy) and [Versioning](https://docs.langchain.com/oss/python/versioning) policies.
-
-## 💁 Contributing
-
-As an open-source project in a rapidly developing field, we are extremely open to contributions, whether it be in the form of a new feature, improved infrastructure, or better documentation.
-
-For detailed information on how to contribute, see the [Contributing Guide](https://docs.langchain.com/oss/python/contributing/overview).
-# Test cleanup
+- Root [README](../../README.md) — component map and quick start
+- [docs/](../../docs/README.md) — documentation index
+- [SECURITY.md](SECURITY.md) — security model
+- [Upstream](https://github.com/langchain-ai/deepagents) — the `deepagents-cli` project this is forked from

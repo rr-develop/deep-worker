@@ -196,6 +196,57 @@ async def summarize_agent(
     return response
 
 
+@router.get("/{agent_name}/stats")
+async def get_agent_stats(
+    agent_name: str,
+    service: AgentService = Depends(get_agent_service),
+) -> dict[str, Any]:
+    """Get token/cache usage statistics for an agent (§6.1).
+
+    Contract (DESIGN_AGENT_TOKEN_STATS.md §6.1):
+
+    - The "known agent" criterion is the same as ``list_agents`` (the
+      web registry). Unknown agent → 404.
+    - Known agent with no stats file → 200 with zero-filled aggregates;
+      the GET never creates a file/directory.
+    - Invalid agent name → 400 (ValueError from ``validate_agent_name``
+      is a client error, not a 500).
+
+    The reader/aggregator is the single shared implementation in
+    ``deep_worker_cli.stats.token_stats`` (MAJOR-1 v2) — no duplicated
+    formulas. The path is resolved via ``storage_paths.agent_root``
+    (no raw path join from the URL).
+    """
+    # Client error first: a malformed name must never reach path
+    # resolution.
+    from deep_worker_cli.storage_paths import (  # noqa: PLC0415
+        agent_root,
+        validate_agent_name,
+    )
+
+    try:
+        validate_agent_name(agent_name)
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid agent name: {agent_name!r}",
+        ) from None
+
+    # Known-agent criterion: the web registry (same source as
+    # list_agents). Unknown → 404.
+    agent = await service.get_agent(agent_name)
+    if agent is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Agent '{agent_name}' not found",
+        )
+
+    from deep_worker_cli.stats.token_stats import stats_for_agent  # noqa: PLC0415
+
+    data_dir = agent_root(agent_name, create=False)
+    return stats_for_agent(agent_name, data_dir).to_dict()
+
+
 @router.get("/{agent_name}/history")
 async def get_history(
     agent_name: str,

@@ -5,9 +5,11 @@ import asyncio
 import json
 import os
 import sys
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 from deep_worker_cli.agent_config_pkg.agent_config import AgentConfig
 from deep_worker_cli.client.agent_client import AgentClient
@@ -875,6 +877,20 @@ def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="deep-worker",
         description="Start a deep-worker agent process",
+        # Subcommands are not registered through add_subparsers (the positional
+        # ``name`` with nargs='?' would make that a breaking change — see
+        # _dispatch_subcommand), so we list them in the epilog:
+        # without this, the user would not find the command in --help.
+        epilog=(
+            "subcommands (run '<subcommand> --help' for details):\n"
+            "  lsp enable|disable|status\n"
+            "                        Manage optional LSP code navigation "
+            "(Serena MCP)\n"
+            "  mcp list|add|remove   Manage external MCP servers\n"
+            "  skills ...            Manage agent skills\n"
+            "  threads list|delete   Manage conversation threads\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
     parser.add_argument(
@@ -2720,12 +2736,159 @@ async def reindex_history_command(agent_name: str) -> int:
     return 1 if stats.errors else 0
 
 
+def _build_subcommand_registry() -> dict[str, tuple[Any, Any]]:
+    """``{name: (setup_parser, handler)}`` for the generic subcommands.
+
+    Imports are local and lazy: the registry is only built once the first
+    token turns out to be a subcommand, so a normal agent launch does not
+    pay for loading these modules.
+
+    ``skills`` is NOT part of this: its ``setup_skills_parser`` requires a
+    keyword-only ``make_help_action``, and ``execute_skills_command``
+    returns ``None`` instead of a return code. It is handled separately
+    in :func:`_dispatch_skills_subcommand`.
+    """
+    from deep_worker_cli.cli.lsp_command import (
+        handle_lsp_command,
+        setup_lsp_parser,
+    )
+    from deep_worker_cli.cli.mcp_command import (
+        handle_mcp_command,
+        setup_mcp_parser,
+    )
+
+    return {
+        "lsp": (setup_lsp_parser, handle_lsp_command),
+        "mcp": (setup_mcp_parser, handle_mcp_command),
+    }
+
+
+def _dispatch_skills_subcommand(argv: list[str]) -> int | None:
+    """``deep-worker skills …``.
+
+    Kept separate from the generic registry because of its different signature (see above):
+    its parser needs ``make_help_action``, and its handler does not return a code.
+    """
+    if not argv or argv[0] != "skills":
+        return None
+
+    from deep_worker_cli.skills import execute_skills_command, setup_skills_parser
+
+    def _make_help_action(show: Callable[[], None]) -> type[argparse.Action]:
+        class _HelpAction(argparse.Action):
+            def __init__(self, option_strings, dest, **kwargs):  # type: ignore[no-untyped-def]
+                super().__init__(option_strings, dest, nargs=0, **kwargs)
+
+            def __call__(self, parser, namespace, values, option_string=None):  # type: ignore[no-untyped-def]
+                show()
+                parser.exit()
+
+        return _HelpAction
+
+    parser = argparse.ArgumentParser(
+        prog="deep-worker", description="Start a deep-worker agent process"
+    )
+    subparsers = parser.add_subparsers(dest="command")
+    setup_skills_parser(subparsers, make_help_action=_make_help_action)
+    execute_skills_command(parser.parse_args(argv))
+    return 0
+
+
+def _dispatch_subcommand(argv: list[str]) -> int | None:
+    """Intercept ``deep-worker <subcommand> …`` BEFORE the main parser.
+
+    Why not ``add_subparsers`` on the main parser: it has a positional
+    ``name`` with ``nargs='?'``. Adding subparsers breaks ALL normal
+    launches — ``deep-worker myagent`` starts failing with
+    ``invalid choice: 'myagent'``. So routing is done here, and the main
+    parser is left untouched.
+
+    The comparison is by FULL match of the first token: an agent name
+    like ``lspagent`` / ``mcpagent`` will not be intercepted.
+
+    Returns:
+        The return code if the command was handled; ``None`` if this is
+        not a subcommand and the normal agent-launch path should continue.
+
+    See lsp/docs/DESIGN_LSP_MCP_INTEGRATION.md §4.6.
+    """
+    if not argv or argv[0].startswith("-"):
+        return None
+
+    registry = _build_subcommand_registry()
+    entry = registry.get(argv[0])
+    if entry is None:
+        return None
+
+    setup_parser, handler = entry
+
+    parser = argparse.ArgumentParser(
+        prog="deep-worker", description="Start a deep-worker agent process"
+    )
+    subparsers = parser.add_subparsers(dest="command")
+    setup_parser(subparsers)
+    return handler(parser.parse_args(argv))
+
+
+def _dispatch_threads_subcommand(argv: list[str]) -> int | None:
+    """``deep-worker threads list|delete`` — a thin wrapper over the already
+    existing thread commands of the main parser.
+
+    Kept separate because ``threads`` has no dedicated ``setup_*_parser``:
+    its subcommands are described inline (see main.py, dead entry point)
+    and map onto the existing handlers ``list_threads_command`` /
+    ``remove_thread_command``.
+    """
+    if len(argv) < 1 or argv[0] != "threads":
+        return None
+
+    parser = argparse.ArgumentParser(prog="deep-worker threads")
+    sub = parser.add_subparsers(dest="threads_command")
+
+    list_p = sub.add_parser("list", aliases=["ls"], help="List conversation threads")
+    list_p.add_argument("--agent", default=None, help="Filter by agent name")
+    list_p.add_argument("--format", default="text", choices=["text", "json"])
+    list_p.add_argument("--with-counts", action="store_true")
+    list_p.add_argument("--sort", default="updated",
+                        choices=["thread_id", "agent", "updated"])
+    list_p.add_argument("--reverse", action="store_true")
+
+    del_p = sub.add_parser("delete", aliases=["rm"], help="Delete a thread")
+    del_p.add_argument("thread_id")
+    del_p.add_argument("--dry-run", action="store_true")
+
+    args = parser.parse_args(argv[1:])
+
+    if args.threads_command in {"list", "ls"}:
+        args.list_threads = True
+        args.name = None
+        return asyncio.run(list_threads_command(args))
+    if args.threads_command in {"delete", "rm"}:
+        return asyncio.run(remove_thread_command(args.thread_id, args.dry_run))
+
+    parser.print_help()
+    return 2
+
+
 def main() -> int:
     """Main entry point for deep-worker command.
 
     Returns:
         Exit code
     """
+    # CLI subcommands are routed BEFORE create_parser() — see
+    # _dispatch_subcommand (the main parser uses a positional ``name``,
+    # so subparsers cannot be added to it).
+    _argv = sys.argv[1:]
+    for _dispatch in (
+        _dispatch_subcommand,
+        _dispatch_skills_subcommand,
+        _dispatch_threads_subcommand,
+    ):
+        _sub_rc = _dispatch(_argv)
+        if _sub_rc is not None:
+            return _sub_rc
+
     parser = create_parser()
     args = parser.parse_args()
 

@@ -1,155 +1,57 @@
-# LangChain Integration with Security
+# Deep Worker
 
-Complete LangChain agent integration for the web application with a Claude Code-compatible security model and `skip_permissions` support.
+An AI agent framework for running LLM agents as local background processes and
+interacting with them through a terminal CLI.
 
-## Overview
+Deep Worker is a fork and continuation of
+[`deepagents-cli`](https://github.com/langchain-ai/deepagents) (content-equivalent
+to `langchain-ai/deepagents@8f8fc98`): agents run as daemon processes, persist
+conversation history, and are driven interactively with `dwcli`.
 
-This project provides a comprehensive LangChain agent framework integrated with the web application, featuring:
+## Components
 
-- **Security Framework**: STRICT (default) and PERMISSIVE (--skip-permissions) modes matching Claude Code behavior
-- **16 Tools**: Shell, File, Python, Git, and Web tools for agent interaction
-- **Session Management**: Full lifecycle management with message history
-- **WebSocket Support**: Real-time streaming of task execution
-- **UI Integration**: Form-based session creation with working directory and permission controls
+| Directory | Purpose |
+|---|---|
+| `deep_worker/deep_worker_cli` | Core agent runtime: `deep-worker` daemon and `dwcli` interactive client |
+| `claude_code_provider` | Claude Code provider — LangChain `BaseChatModel` backed by the Claude Code SDK |
+| `codex_provider` | OpenAI Codex CLI provider — drop-in sibling of `claude_code_provider` |
+| `grok_provider` | xAI Grok CLI provider (Agent Client Protocol, ACP v1) |
+| `dw_hist` | `dw-hist` — host-level CLI for semantically browsing agent conversation history |
+| `lsp` | Optional LSP code navigation for agents (Serena MCP integration) |
+| `semantic_search` | Semantic search over history (LlamaIndex + LanceDB) and per-message embeddings |
+| `deep_worker_web` | Local web UI for working with deep-worker agents (127.0.0.1 only) |
+| `tools` | Helper tools: custom agent tools, memory monitoring, RSS monitor |
 
 ## Quick Start
 
-### Installation
+Deep Worker is developed to run from a source checkout with the system Python —
+no virtual environment (see `deep_worker/README.md` for why).
 
 ```bash
-cd <repository-root>
-pip install -r requirements.txt
+# 1. Make the launchers globally available (project policy: no pip install)
+ln -sf "$PWD/deep_worker/deep_worker_cli/deep-worker" ~/.local/bin/deep-worker
+ln -sf "$PWD/deep_worker/deep_worker_cli/dwcli" ~/.local/bin/dwcli
+
+# 2. Start an agent as a background daemon
+deep-worker my_agent
+
+# 3. Connect to it interactively
+dwcli my_agent
 ```
 
-### Running Examples
-
-```bash
-# Basic LangChain usage
-python examples/example_gemini.py
-
-# Check API quota
-python examples/check_quota.py
-
-# Full comparison of providers
-python examples/comparison.py
-```
+The agent daemon and the CLI communicate over RPyC on `127.0.0.1`. All services
+bind to localhost only and are designed for **local trusted environments** — see
+`deep_worker/deep_worker_cli/SECURITY.md`.
 
 ## Documentation
 
-- **[docs/](docs/)** - Complete documentation including:
-  - API guides
-  - Security policies
-  - Deployment instructions
-  - Phase overviews
-  - Integration analysis
-
-- **[examples/](examples/)** - Working examples:
-  - Gemini provider setup
-  - OpenAI integration
-  - DeepSeek integration
-  - Quota checking
-  - Provider comparison
-
-- **[scripts/](scripts/)** - Setup and utility scripts
-
-## Security Model
-
-### STRICT Mode (Default)
-- Blocks dangerous shell commands (rm, mkfs, kill, chmod, etc.)
-- Blocks dangerous Python patterns (subprocess, exec, eval, os.system)
-- Prevents path traversal attacks
-- Protects system paths (/etc, /sys, /proc, /dev, /root, ~/.ssh)
-
-### PERMISSIVE Mode (--skip-permissions)
-- Allows all dangerous operations
-- Maintains output and size limits
-- Maintains working directory isolation
-- Equivalent to `claude --skip-permissions`
-
-## Key Features
-
-### Resource Limits (Claude Code Compatible)
-- Command timeout: 60 seconds
-- Max output: 100KB
-- Max file read: 10MB
-- Max file write: 50MB
-- Python timeout: 60 seconds
-- Web timeout: 30 seconds
-
-### Tool Categories
-
-**Shell Tools**
-- `execute_command`: Run shell commands
-- `get_cwd`: Get current working directory
-- `list_dir`: List directory contents
-
-**File Tools**
-- `read_file`: Read file contents
-- `write_file`: Write to file
-- `append_file`: Append to file
-- `delete_file`: Delete file
-- `search_files`: Search with glob patterns
-
-**Python Tools**
-- `execute_python`: Execute Python code
-- `eval_expr`: Evaluate Python expressions
-
-**Git Tools**
-- `git_status`: Get repository status
-- `git_log`: View commit history
-- `git_diff`: Show differences
-- `git_branch`: Get current branch
-
-**Web Tools**
-- `fetch_url`: Fetch URL content
-- `search_web`: Web search (placeholder)
-
-## Architecture
-
-```
-.
-├── docs/              # Documentation
-├── examples/          # Code examples
-├── scripts/           # Setup scripts
-├── requirements.txt   # Dependencies
-└── README.md         # This file
-```
-
-## API Integration
-
-The system integrates with the web application through REST API and WebSocket:
-
-- Create sessions with `skip_permissions` flag
-- Execute tasks with real-time streaming
-- Monitor session status
-- Access message history
-
-## Dependencies
-
-- `langchain-core`: Core LangChain framework
-- `langchain-google-genai`: Google Gemini integration
-- `langchain-openai`: OpenAI integration
-- `google-generativeai`: Direct Gemini API access
-
-See `requirements.txt` for full dependency list.
-
-## Environment Variables
-
-```bash
-# Google Gemini API
-export GOOGLE_API_KEY="your-api-key"
-
-# OpenAI API
-export OPENAI_API_KEY="your-api-key"
-
-# DeepSeek API (if using)
-export DEEPSEEK_API_KEY="your-api-key"
-```
+- [`docs/`](docs/) — component documentation, design notes and internal policies
+- [`deep_worker/deep_worker_cli/README.md`](deep_worker/deep_worker_cli/README.md) — CLI usage, storage options, thread management
+- [`dw_hist/README.md`](dw_hist/README.md) — `dw-hist` usage
+- [`lsp/README.md`](lsp/README.md) — LSP code navigation for agents
+- [`semantic_search/docs/README_MESSAGE_EMBEDDINGS.md`](semantic_search/docs/README_MESSAGE_EMBEDDINGS.md) — per-message embeddings
 
 ## License
 
-MIT
-
-## Contributing
-
-This is part of the main web application project. See the main repository for contribution guidelines.
+[MIT](LICENSE). Upstream portions are Copyright (c) LangChain, Inc.; local
+contributions are Copyright (c) Roman Rodionov.

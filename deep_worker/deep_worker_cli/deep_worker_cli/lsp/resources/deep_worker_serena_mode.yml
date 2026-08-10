@@ -1,0 +1,23 @@
+# Serena mode YAML for the deep-worker shared LSP service.
+#
+# Serena 1.6.x exposes ``restart_language_server`` only when a project
+# / mode / global config explicitly opts it in via
+# ``included_optional_tools``. Our watcher-triggered ``RefreshProject``
+# calls that tool to make Serena re-scan the workspace after real
+# file-tree changes (new / removed source files, gitignore edits).
+#
+# Without this mode the tool is not advertised and ``SerenaBackend.refresh``
+# fails loudly ("no serena refresh tool advertised"), which is exactly
+# the defect the commit-11 stress test caught.
+#
+# Passed to Serena via ``--add-mode <path>`` from
+# ``build_serena_mcp_entry`` so we do NOT touch the user's global
+# ``~/.serena/serena_config.yml`` or any per-project ``.serena/project.yml``.
+description: |
+  deep-worker shared LSP service — enable restart_language_server so
+  the watcher-triggered RefreshProject can reload Serena's language
+  server state after source-tree changes.
+prompt: ""
+excluded_tools: []
+included_optional_tools:
+  - restart_language_server

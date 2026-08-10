@@ -52,6 +52,10 @@ def test_mcp_add_and_remove_write_private_project_file(
     tmp_path: Path, monkeypatch
 ) -> None:
     monkeypatch.chdir(tmp_path)
+    # project-scope resolves from the LAUNCH directory (cli/cwd.py), not from
+    # the process cwd. A DEEP_WORKER_ORIGINAL_CWD inherited from the parent
+    # would override the chdir above and divert the write into the real repo.
+    monkeypatch.delenv("DEEP_WORKER_ORIGINAL_CWD", raising=False)
     add_args = argparse.Namespace(
         command="python3 server.py",
         url=None,

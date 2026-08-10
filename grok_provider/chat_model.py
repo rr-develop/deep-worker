@@ -173,6 +173,9 @@ class GrokChatModel(BaseChatModel):
     _last_reported_model_name: str | None = PrivateAttr(default=None)
     _proxy_started: bool = PrivateAttr(default=False)
     _acp_started: bool = PrivateAttr(default=False)
+    # Token-stats usage-event callback (DESIGN_AGENT_TOKEN_STATS.md §5.2):
+    # async callable installed by create_model via set_usage_event_callback.
+    _usage_event_callback: Any = PrivateAttr(default=None)
 
     # ------------------------------------------------------------------
     # Pydantic schema overrides — same surgery as codex/claude-code:
@@ -252,6 +255,57 @@ class GrokChatModel(BaseChatModel):
         result = self._resolved_model_callback(model)
         if inspect.isawaitable(result):
             await result
+
+    def set_usage_event_callback(self, callback: Any) -> None:
+        """Install the async usage-event callback (§5.2).
+
+        ``create_model`` injects the token-stats state-machine callback here
+        (custom providers never receive a LangChain callback handler — the
+        event callback is the single usage source, MAJOR-2).
+        """
+        self._usage_event_callback = callback
+
+    async def _emit_usage_event(
+        self,
+        *,
+        event: str,
+        status: str,
+        usage: dict[str, Any] | None = None,
+        session_id: str | None = None,
+        context_used: int | None = None,
+        context_size: int | None = None,
+    ) -> None:
+        """Report the per-turn usage to the stats callback (§5.2).
+
+        Best-effort: the callback is awaited; failures are logged and never
+        break the provider turn (except ``asyncio.CancelledError``, which
+        propagates).
+
+        grok (live-verified 0.2.73, DESIGN §2.2 live-probe): per-turn token
+        usage arrives in the ``session/prompt`` RESULT ``_meta``
+        (``inputTokens``/``outputTokens``/``cachedReadTokens``/``totalTokens``)
+        — a plain token record like codex. A ``usage_update``-derived context
+        gauge (``context_used``/``context_size``) is the fallback when no
+        ``_meta`` usage was seen. ``event_key`` is always null (no stable
+        provider id, MINOR v3).
+        """
+        cb = getattr(self, "_usage_event_callback", None)
+        if cb is None:
+            return
+        try:
+            await cb(
+                event=event,
+                status=status,
+                usage=usage,
+                model=getattr(self, "_resolved_model_name", None) or "",
+                session_id=session_id,
+                context_used=context_used,
+                context_size=context_size,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — best-effort
+            logger.exception("[token-stats] grok usage event callback failed")
 
     # ------------------------------------------------------------------
     # Tools — extract MCP metadata (same algorithm as codex/claude-code).
@@ -430,6 +484,18 @@ class GrokChatModel(BaseChatModel):
                 "defaults are forbidden."
             )
         agent_thread_id: str = cfg["thread_id"]
+
+        # Token-stats: mark the invocation start (no record is written here —
+        # the record closes at the turn boundary in _finalize_response, §5.2).
+        # Best-effort.
+        _cb = getattr(self, "_usage_event_callback", None)
+        if _cb is not None:
+            try:
+                await _cb(event="invocation_start")
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                logger.exception("[token-stats] invocation_start callback failed")
 
         # 3. Per-thread state.
         state = self._client_state.get_or_create(agent_thread_id)
@@ -783,7 +849,7 @@ class GrokChatModel(BaseChatModel):
                 state.pending_session_prompt_future = None
                 cleared_normally = True
                 return await self._finalize_response(
-                    queued_response, final_text_parts
+                    queued_response, final_text_parts, state
                 )
 
             # If the pump already queued tool_calls AND the response future
@@ -848,7 +914,7 @@ class GrokChatModel(BaseChatModel):
                     state.pending_session_prompt_future = None
                     cleared_normally = True
                     return await self._finalize_response(
-                        response, final_text_parts
+                        response, final_text_parts, state
                     )
 
                 notif = get_task.result()
@@ -929,6 +995,23 @@ class GrokChatModel(BaseChatModel):
                 tool_calls_acc.append(tc)
         elif kind == "tool_call_update":
             self._resolve_builtin_update(agent_thread_id, upd)
+        elif kind == "usage_update":
+            # Context gauge (DESIGN_AGENT_TOKEN_STATS.md §5.2): used/size at
+            # the top level of the update per ACP spec, with a content{}-dict
+            # fallback. Keeps the LATEST snapshot of the current turn; emitted
+            # once at the turn boundary in _finalize_response.
+            gauge: dict[str, Any] = (
+                upd.get("content")
+                if isinstance(upd.get("content"), dict)
+                else upd
+            )
+            used = gauge.get("used")
+            size = gauge.get("size")
+            if isinstance(used, (int, float)) or isinstance(size, (int, float)):
+                state.usage_snapshot = {
+                    "used": int(used) if isinstance(used, (int, float)) else 0,
+                    "size": int(size) if isinstance(size, (int, float)) else 0,
+                }
         elif kind == "plan":
             tc = _plan_to_tool_call(upd)
             if tc is not None:
@@ -936,11 +1019,15 @@ class GrokChatModel(BaseChatModel):
         # other kinds — silently ignored
 
     async def _finalize_response(
-        self, response: dict, text_acc: list[str]
+        self,
+        response: dict,
+        text_acc: list[str],
+        state: Any | None = None,
     ) -> AIMessage:
         """Common terminal path: report modelId, raise on cancelled/refusal,
-        return the assembled AIMessage. Shared between the natural turn-end
-        in ``_consume_turn`` and the pump-prefetched response path.
+        emit the token-stats context snapshot, return the assembled AIMessage.
+        Shared between the natural turn-end in ``_consume_turn`` and the
+        pump-prefetched response path.
 
         ``session/prompt`` resolves its future with the RAW reply (see
         ``acp_client._dispatch``) and bypasses ``_call``'s error check, so an
@@ -963,6 +1050,52 @@ class GrokChatModel(BaseChatModel):
             raise GrokTurnCancelledError("grok turn cancelled by ACP")
         if stop_reason == "refusal":
             raise GrokRefusalError("grok refused to continue")
+        # Token-stats (DESIGN §2.2 live-probe, live-verified 0.2.73): the
+        # session/prompt RESULT._meta carries per-turn token usage
+        # (inputTokens/outputTokens/cachedReadTokens/totalTokens) — record it
+        # as a plain token record (cache hit = cachedReadTokens). The
+        # usage_update-derived context gauge (usage_snapshot) is the fallback
+        # when no _meta usage was seen. Emit once at the turn boundary and
+        # reset the accumulator. Best-effort.
+        if state is not None:
+            meta = result.get("_meta") or {}
+            meta_usage: dict[str, Any] | None = None
+            inp = meta.get("inputTokens")
+            out = meta.get("outputTokens")
+            if isinstance(inp, (int, float)) or isinstance(out, (int, float)):
+                meta_usage = {
+                    "input_tokens": int(inp or 0),
+                    "output_tokens": int(out or 0),
+                    "cached_input_tokens": (
+                        int(meta["cachedReadTokens"])
+                        if isinstance(meta.get("cachedReadTokens"), (int, float))
+                        else None
+                    ),
+                    "total_tokens": (
+                        int(meta["totalTokens"])
+                        if isinstance(meta.get("totalTokens"), (int, float))
+                        else None
+                    ),
+                }
+            if meta_usage is not None:
+                await self._emit_usage_event(
+                    event="terminal",
+                    status="ok",
+                    usage=meta_usage,
+                    session_id=getattr(state, "grok_session_id", None),
+                )
+                state.usage_snapshot = None
+            else:
+                snapshot = getattr(state, "usage_snapshot", None)
+                if snapshot is not None:
+                    await self._emit_usage_event(
+                        event="terminal",
+                        status="ok",
+                        session_id=getattr(state, "grok_session_id", None),
+                        context_used=snapshot.get("used"),
+                        context_size=snapshot.get("size"),
+                    )
+                    state.usage_snapshot = None
         return AIMessage(content="".join(text_acc))
 
     # ------------------------------------------------------------------

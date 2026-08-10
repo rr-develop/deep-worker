@@ -53,6 +53,7 @@ YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
 # Determine repository root
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 DEEP_WORKER_DIR="${REPO_ROOT}/deep_worker"
 DEEP_WORKER_CLI_DIR="${DEEP_WORKER_DIR}/deep_worker_cli"
@@ -106,8 +107,8 @@ cleanup_venvs() {
     # while pytest ran on system langchain 1.2.9, and tests written
     # against either signature failed in the other environment. The
     # fix was to pin versions in pyproject.toml AND keep uv.lock in
-    # the tree; the pre-commit hook was updated to permit uv.lock at
-    # the same time. Do NOT re-add deletion here.
+    # the tree; the pre-commit hook was updated to permit
+    # uv.lock at the same time. Do NOT re-add deletion here.
     return $rc
 }
 trap cleanup_venvs EXIT INT TERM
@@ -161,12 +162,16 @@ else
     echo -e "  1. Review the type errors shown above"
     echo -e "  2. Fix the type errors in your code"
     echo -e "  3. Run type checks manually to verify:"
+    echo -e "     - ${SCRIPT_DIR}/type-check.sh              # both packages"
     if [ -d "${DEEP_WORKER_CLI_DIR}" ]; then
-        echo -e "     - cd ${DEEP_WORKER_CLI_DIR} && uv run --all-groups ty check deep_worker_cli"
+        echo -e "     - ${SCRIPT_DIR}/type-check.sh deep_worker_cli"
     fi
     if [ -d "${DEEPAGENTS_DIR}" ]; then
-        echo -e "     - cd ${DEEPAGENTS_DIR} && uv run --all-groups ty check deepagents"
+        echo -e "     - ${SCRIPT_DIR}/type-check.sh deepagents"
     fi
+    echo -e "     (that wrapper deletes the venv it creates; calling the"
+    echo -e "      package manager directly leaves a .venv behind and blocks"
+    echo -e "      your NEXT commit)"
     echo -e "  4. Try committing again"
     echo ""
     echo -e "${RED}⚠️  DO NOT bypass this check with --no-verify${NC}"

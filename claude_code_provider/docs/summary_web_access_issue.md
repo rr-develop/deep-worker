@@ -80,7 +80,7 @@ self.agent, self.backend = create_cli_agent(
 
 **web_search** - requires a Tavily API key:
 1. Obtain one at https://tavily.com
-2. Add it to `~/.deepagents/.env`:
+2. Add it to `/home/<user>/.deepagents/.env`:
    ```
    TAVILY_API_KEY=tvly-YOUR_KEY_HERE
    ```

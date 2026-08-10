@@ -102,9 +102,16 @@ async def test_slow_tool_becomes_inprogress_not_error() -> None:
     text = out.content if isinstance(out.content, str) else str(out.content)
     assert "in_progress" in text
     assert "wait_for_job" in text and "kill_job" in text
-    # job_id is the tool_call_id.
-    assert "toolu_TEST" in text
-    # The tool_call_id round-trips so LangGraph pairs the message.
+    # job_id is a CANONICAL job_N — the same namespace wait_for_job/kill_job
+    # resolve. It must NOT be the tool_call_id: advertising a ``toolu_…`` as a
+    # job id gave the model an unresolvable handle (internal defect, 2026-07-31).
+    # See tests/unit_tests/test_parked_job_id_namespace.py.
+    import re as _re
+
+    assert _re.search(r"\bjob_\d+\b", text), text
+    assert "toolu_TEST" not in text
+    # The tool_call_id round-trips so LangGraph pairs the message — that field
+    # is the LangChain protocol, NOT a job id.
     assert out.tool_call_id == "toolu_TEST"
     # The real work was shielded — NOT cancelled by the timeout.
     await asyncio.sleep(0)
@@ -116,7 +123,7 @@ async def test_slow_tool_becomes_inprogress_not_error() -> None:
 
 async def test_stage_a_dispatch_wait_is_bounded() -> None:
     """A proxy provider's dispatch wait that NEVER completes (lost control
-    request — a hole observed on a live agent) must hit the SAME timer and degrade to a
+    request — the lost-control hole) must hit the SAME timer and degrade to a
     non-error in_progress handle, NOT hang forever."""
     from deepagents.middleware.tool_dispatch_bridge import (
         register_dispatch_waiter,
@@ -173,7 +180,7 @@ async def test_stage_a_dispatch_wait_is_bounded() -> None:
 
 async def test_stage_a_dispatch_patches_authoritative_args() -> None:
     """When dispatch completes, the AUTHORITATIVE args from the provider
-    replace the announced args before the tool runs (observed live)."""
+    replace the announced args before the tool runs (internal fix)."""
     from deepagents.middleware.tool_dispatch_bridge import (
         register_dispatch_waiter,
         unregister_dispatch_waiter,

@@ -1041,22 +1041,25 @@ class TestFilesystemMiddleware:
         assert result == tool_message
         assert result.content == content_blocks
 
-    def test_intercept_content_block_non_text_type(self):
-        """Test that content blocks with non-text type get evicted if large when stringified."""
-        from langgraph.types import Command
+    def test_intercept_image_block_is_preserved_not_evicted(self):
+        """Image blocks are preserved in place instead of being evicted.
 
+        Unlike text, the model cannot recover an image by reading the offloaded
+        file, so a lone image block below the caps causes no eviction at all.
+        """
         middleware = FilesystemMiddleware(tool_token_limit_before_evict=100)
         state = FilesystemState(messages=[], files={})
         runtime = ToolRuntime(state=state, context=None, tool_call_id="test_other", store=None, stream_writer=lambda _: None, config={})
 
-        # Create list with content block with different type that's large when stringified
+        # An inline image payload, large enough that stringifying it would once
+        # have crossed the eviction threshold.
         content_blocks = [{"type": "image", "data": "x" * 5000}]
         tool_message = ToolMessage(content=content_blocks, tool_call_id="test_other")
         result = middleware._intercept_large_tool_result(tool_message, runtime)
 
-        # All content types are evicted if large when converted to string
-        assert isinstance(result, Command)
-        assert "/large_tool_results/test_other" in result.update["files"]
+        # Nothing evictable remains, so the original message is returned as-is.
+        assert result is tool_message
+        assert result.content == content_blocks
 
     def test_intercept_list_content_gets_evicted_if_large(self):
         """Test that list content gets evicted if large when stringified."""
@@ -1120,7 +1123,12 @@ class TestFilesystemMiddleware:
         assert file_text.startswith("[{")
 
     def test_mixed_content_blocks_stringifies_all(self):
-        """Test that mixed content block types (text + image) stringify entire structure."""
+        """Test that mixed content block types (text + image) stringify entire structure.
+
+        A remote-URL image carries no inline payload to preserve, and deepagents
+        must not decide on a provider's behalf that a URL is unusable, so the
+        block travels into the offloaded text exactly as it arrived.
+        """
         from langgraph.types import Command
 
         middleware = FilesystemMiddleware(tool_token_limit_before_evict=100)
@@ -1143,6 +1151,7 @@ class TestFilesystemMiddleware:
         # Should contain both blocks in the stringified output
         assert "'type': 'text'" in file_text
         assert "'type': 'image'" in file_text
+        assert "https://example.com/image.png" in file_text
 
     def test_execute_tool_returns_error_when_backend_doesnt_support(self):
         """Test that execute tool returns friendly error instead of raising exception."""

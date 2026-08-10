@@ -507,51 +507,65 @@ class ProxyMCPServer:
                 except asyncio.TimeoutError:
                     # Park the live Future (work is NOT cancelled) so it can
                     # be picked up later and is never lost.
-                    self._jobs[call_id] = {
+                    #
+                    # Namespace contract (observed incident, 2026-07-31 —
+                    # fourth locus of the same class of defect). The
+                    # advertised ``job_id`` MUST be a canonical ``job_N``
+                    # from ``ParkedJobRegistry`` so ``wait_for_job``/
+                    # ``kill_job`` resolve it. We keep the local
+                    # ``self._jobs`` dict under the SAME ``job_N`` key —
+                    # not the ``call_id`` — and reach it from
+                    # ``resolve_call`` via the registry's ``tool_use_id``
+                    # alias (dual-key lookup, §10 reviewer decision).
+                    #
+                    # If ``BoundedToolCallMiddleware`` (or another proxy
+                    # site) already parked this same ``call_id``, reuse
+                    # that ``job_N`` instead of minting a second one —
+                    # avoids the §3.1 race that used to produce two
+                    # different job ids for the same live Future.
+                    from deepagents.middleware.parked_job_registry import (  # noqa: PLC0415
+                        get_parked_job_registry,
+                    )
+                    from deepagents.middleware.bounded_tool_call import (  # noqa: PLC0415
+                        build_in_progress_notice,
+                    )
+
+                    registry = get_parked_job_registry()
+                    existing = (
+                        registry.resolve_by_alias(call_id) if call_id else None
+                    )
+                    job_id = (
+                        existing.job_id
+                        if existing is not None
+                        else registry.allocate()
+                    )
+                    registry.register(
+                        job_id,
+                        kind="tool",
+                        handle=future,
+                        alias=call_id or None,
+                        tool_name=tool_name,
+                    )
+                    future.add_done_callback(lambda _f: registry.drop(job_id))
+
+                    self._jobs[job_id] = {
                         "future": future,
                         "tool_name": tool_name,
                         "args": args,
                         "agent_name": self._agent_name,
+                        "tool_call_id": call_id,
                     }
+                    text = build_in_progress_notice(
+                        tool_name, job_id, wait_seconds
+                    )
                     if mode == "timeout_notice":
-                        # Explicit opt-out tool: inform + continue. NOT an
+                        # Explicit opt-out tool: same shared notice + a
+                        # trailing sentence keeping the older tone. NOT an
                         # error.
-                        return {
-                            "content": [
-                                {
-                                    "type": "text",
-                                    "text": (
-                                        f"Tool '{tool_name}' timed out after "
-                                        f"{wait_seconds:g}s but was NOT "
-                                        f"killed and is still running in the "
-                                        f"background. status: in_progress. "
-                                        f"job_id: {call_id}. actions: "
-                                        f"wait_for_job(job_id=\"{call_id}\", "
-                                        f"timeout=<seconds>) or kill_job("
-                                        f"job_id=\"{call_id}\"). You may also "
-                                        f"just continue or retry."
-                                    ),
-                                }
-                            ],
-                        }
-                    # Default job-handle.
-                    return {
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": (
-                                    f"Tool '{tool_name}' is still "
-                                    f"running after {wait_seconds:g}s. "
-                                    f"status: in_progress. "
-                                    f"job_id: {call_id}. "
-                                    f"actions: wait_for_job(job_id="
-                                    f"\"{call_id}\", timeout=<seconds>) "
-                                    f"or kill_job(job_id="
-                                    f"\"{call_id}\")."
-                                ),
-                            }
-                        ],
-                    }
+                        text = (
+                            text + " You may also just continue or retry."
+                        )
+                    return {"content": [{"type": "text", "text": text}]}
             finally:
                 # Remove from pending_calls if still there (it is removed
                 # both on normal resolve and on job-park). For long-running
@@ -667,8 +681,22 @@ class ProxyMCPServer:
             if not future.done():
                 future.set_result(result)
             return
+        # Dual-key parked-job lookup (observed fix, 2026-07-31): the local
+        # dict is now keyed by canonical ``job_N``, but the SDK still hands
+        # us the originating ``tool_use_id`` (``toolu_…``). Resolve either
+        # namespace via the shared ``ParkedJobRegistry`` alias.
+        job_key: str | None = None
         if call_id in self._jobs:
-            future = self._jobs.pop(call_id)["future"]
+            job_key = call_id
+        else:
+            from deepagents.middleware.parked_job_registry import (  # noqa: PLC0415
+                get_parked_job_registry,
+            )
+            parked = get_parked_job_registry().resolve(call_id)
+            if parked is not None and parked.job_id in self._jobs:
+                job_key = parked.job_id
+        if job_key is not None:
+            future = self._jobs.pop(job_key)["future"]
             if not future.done():
                 future.set_result(result)
 
@@ -779,8 +807,11 @@ class ProxyMCPServer:
     def get_job_registry(self) -> dict[str, JobHandle]:
         """Expose the in-flight long_running job handles.
 
-        Used by ``wait_for_job`` / ``kill_job`` (registered as general
-        BaseTools at the AgentProcess layer) and by tests.
+        Keys are canonical ``job_N`` ids from the shared
+        ``ParkedJobRegistry`` — the same namespace ``wait_for_job``/
+        ``kill_job`` resolve. Each entry additionally carries the
+        originating ``tool_call_id`` in ``entry["tool_call_id"]``, since
+        ``resolve_call`` still enters by that field (LangChain protocol).
         """
         return self._jobs
 

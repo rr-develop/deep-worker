@@ -46,13 +46,20 @@ class JobHandle(TypedDict):
     The Future is NOT cancelled — the real work continues on the
     LangGraph ToolNode side. Claude has been handed an intermediate
     handle and can call ``wait_for_job`` / ``kill_job`` against the
-    same ``job_id`` (which equals the original Claude ``tool_use_id``).
+    canonical ``job_N`` id (from ``ParkedJobRegistry``) — NOT against
+    the originating ``tool_use_id``. See docs/DESIGN_FIX_SANDBOX_
+    EXECUTE_JOB_ID.md (observed incident, 2026-07-31).
+
+    ``tool_call_id`` retains the originating Claude ``tool_use_id`` so
+    ``resolve_call`` (entered by the SDK with that id) can complete the
+    parked Future via dual-key lookup.
     """
 
     future: Any  # asyncio.Future
     tool_name: str
     args: dict[str, Any]
     agent_name: NotRequired[str | None]
+    tool_call_id: NotRequired[str]
 
 
 class PendingCall(TypedDict):

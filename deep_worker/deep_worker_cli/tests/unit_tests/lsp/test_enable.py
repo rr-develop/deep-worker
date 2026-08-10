@@ -31,7 +31,11 @@ def test_creates_config_with_serena_entry(tmp_path: Path) -> None:
 
     data = _read(cfg)
     assert SERENA_SERVER_NAME in data["mcpServers"]
-    assert data["mcpServers"][SERENA_SERVER_NAME]["command"] == "serena"
+    # §14: the entry launches the thin bridge, not the backend binary —
+    # one shared service per project instead of one per agent.
+    entry = data["mcpServers"][SERENA_SERVER_NAME]
+    assert entry["command"] == "deep-worker"
+    assert entry["args"][:2] == ["lsp", "bridge"]
 
 
 def test_file_mode_is_0600_and_dir_0700(tmp_path: Path) -> None:
@@ -84,7 +88,10 @@ def test_force_overwrites_existing_entry(tmp_path: Path) -> None:
     changed = enable_lsp_at_path(cfg, workspace_root=tmp_path, force=True)
 
     assert changed is True
-    assert _read(cfg)["mcpServers"][SERENA_SERVER_NAME]["args"][0] == "start-mcp-server"
+    assert _read(cfg)["mcpServers"][SERENA_SERVER_NAME]["args"][:2] == [
+        "lsp",
+        "bridge",
+    ]
 
 
 def test_flat_cursor_style_config_is_migrated_not_lost(tmp_path: Path) -> None:

@@ -38,8 +38,18 @@ The hook runs automatically before every commit. No manual intervention is neede
 
 1. Review the type errors displayed
 2. Fix the errors in your code
-3. Verify the fix: `cd deep_worker/deep_worker_cli && uv run --all-groups ty check deep_worker_cli`
+3. Verify the fix with `deep_worker/scripts/type-check.sh`:
+   ```bash
+   deep_worker/scripts/type-check.sh                  # both packages
+   deep_worker/scripts/type-check.sh deepagents       # just one, to iterate
+   ```
 4. Commit again
+
+> Use that wrapper rather than calling `uv` yourself. It deletes the virtual
+> environment it creates; invoking the package manager directly leaves a
+> `.venv` behind, and the next commit is then rejected by the `.venv` check
+> instead of by your type error.
+> See [`DESIGN_FIX_TYPE_CHECK_VENV_LEAK.md`](DESIGN_FIX_TYPE_CHECK_VENV_LEAK.md).
 
 ### Policy
 

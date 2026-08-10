@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import logging
 import os
 import sys
 from pathlib import Path
@@ -121,6 +122,9 @@ DEFAULT_CONFIG_OVERRIDES: tuple[tuple[str, str], ...] = (
 )
 
 
+_logger = logging.getLogger(__name__)
+
+
 # NOTE: The legacy ``BLOCKED_NATIVE_ITEM_TYPES`` / ``_raise_if_blocked_
 # native_item`` defense-in-depth scheme was removed on 2026-05-18. It
 # fired a ``RuntimeError`` whenever Codex emitted a native tool event,
@@ -217,6 +221,9 @@ class CodexChatModel(BaseChatModel):
     _resolved_model_name: str | None = PrivateAttr(default=None)
     _resolved_model_callback: Callable[[str], Awaitable[None] | None] | None = PrivateAttr(default=None)
     _last_reported_model_name: str | None = PrivateAttr(default=None)
+    # Token-stats usage-event callback (DESIGN_AGENT_TOKEN_STATS.md §5.2):
+    # async callable installed by create_model via set_usage_event_callback.
+    _usage_event_callback: Any = PrivateAttr(default=None)
     _disabled_features: tuple[str, ...] = PrivateAttr(default=DEFAULT_DISABLED_FEATURES)
     _config_overrides: tuple[tuple[str, str], ...] = PrivateAttr(
         default=DEFAULT_CONFIG_OVERRIDES,
@@ -312,6 +319,50 @@ class CodexChatModel(BaseChatModel):
         result = self._resolved_model_callback(model)
         if inspect.isawaitable(result):
             await result
+
+    def set_usage_event_callback(self, callback: Any) -> None:
+        """Install the async usage-event callback (§5.2).
+
+        ``create_model`` injects the token-stats state-machine callback here
+        (custom providers never receive a LangChain callback handler — the
+        event callback is the single usage source, MAJOR-2).
+        """
+        self._usage_event_callback = callback
+
+    async def _emit_usage_event(
+        self,
+        *,
+        event: str,
+        status: str,
+        usage: dict[str, Any] | None = None,
+        session_id: str | None = None,
+        turn_id: str | None = None,
+    ) -> None:
+        """Report a terminal Codex event to the stats callback (§5.2).
+
+        Best-effort: the callback is awaited; failures are logged and never
+        break the provider turn (except ``asyncio.CancelledError``, which
+        propagates). ``TurnCompletedEvent.usage`` is already a plain dict —
+        copied defensively before handing over (MAJOR-4).
+        """
+        cb = getattr(self, "_usage_event_callback", None)
+        if cb is None:
+            return
+        try:
+            if isinstance(usage, dict):
+                usage = dict(usage)
+            await cb(
+                event=event,
+                status=status,
+                usage=usage,
+                model=getattr(self, "_resolved_model_name", None) or "",
+                session_id=session_id,
+                turn_id=turn_id,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — best-effort
+            _logger.exception("[token-stats] codex usage event callback failed")
 
     # ------------------------------------------------------------------
     # Tools
@@ -443,6 +494,18 @@ class CodexChatModel(BaseChatModel):
                 "Implicit defaults are forbidden."
             )
         agent_thread_id: str = cfg["thread_id"]
+
+        # Token-stats: mark the invocation start (no record is written here —
+        # the record closes on the terminal TurnCompletedEvent/TurnFailedEvent,
+        # §5.2). Best-effort.
+        _cb = getattr(self, "_usage_event_callback", None)
+        if _cb is not None:
+            try:
+                await _cb(event="invocation_start")
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                _logger.exception("[token-stats] invocation_start callback failed")
 
         # 3. Per-agent_thread_id state
         state = self._client_state.get_or_create(agent_thread_id)
@@ -673,6 +736,9 @@ class CodexChatModel(BaseChatModel):
         final_text = ""
         pending_tool_calls: list[dict[str, Any]] = []
         turn_done = False
+        # Token-stats (§5.2): the id of the last AgentMessageItem before the
+        # terminal event — part of the stable dedup key ``codex|<thread_id>|<id>``.
+        last_agent_message_id: str | None = None
         try:
             while True:
                 event = await handle.ainvoke_queue.get()
@@ -721,13 +787,20 @@ class CodexChatModel(BaseChatModel):
                                 arguments=it.arguments,
                             )
                         except asyncio.TimeoutError:
+                            # No pending call ever registered → no work was
+                            # parked. The prior in_progress notice advertised
+                            # wait_for_job/kill_job under it.id or it.tool
+                            # (neither is a canonical job_N) — a false
+                            # promise the model could not honour. Emit the
+                            # honest not_started notice; the turn still ends
+                            # cleanly (no phantom tool_call).
+                            # See DESIGN_FIX_STAGE_A_FALSE_PROMISE.md.
                             from deepagents.middleware.bounded_tool_call import (  # noqa: PLC0415
-                                build_in_progress_notice,
+                                build_dispatch_timeout_notice,
                                 resolve_tool_wait_seconds,
                             )
-                            final_text = build_in_progress_notice(
+                            final_text = build_dispatch_timeout_notice(
                                 tool_name=it.tool,
-                                job_id=getattr(it, "id", None) or it.tool,
                                 wait_seconds=resolve_tool_wait_seconds(),
                             )
                             turn_done = True
@@ -759,14 +832,32 @@ class CodexChatModel(BaseChatModel):
                     it = event.item
                     if isinstance(it, AgentMessageItem):
                         final_text = it.text
+                        last_agent_message_id = it.id
                     # McpToolCallItem completion was filtered by the
                     # pump; native item.completed was consumed into
                     # native_futures by the pump and never reaches
                     # here.
                 elif isinstance(event, TurnCompletedEvent):
+                    # Token-stats: terminal event with per-turn usage
+                    # (§5.2, branch A). One record per observed terminal event.
+                    await self._emit_usage_event(
+                        event="terminal",
+                        status="ok",
+                        usage=event.usage,
+                        session_id=state.codex_session_uuid,
+                        turn_id=last_agent_message_id,
+                    )
                     turn_done = True
                     break
                 elif isinstance(event, TurnFailedEvent):
+                    # Token-stats: terminal failure → status="failed" (§5.2).
+                    await self._emit_usage_event(
+                        event="terminal",
+                        status="failed",
+                        usage=None,
+                        session_id=state.codex_session_uuid,
+                        turn_id=last_agent_message_id,
+                    )
                     turn_done = True
                     raise RuntimeError(f"Codex turn failed: {event.error_message}")
         finally:

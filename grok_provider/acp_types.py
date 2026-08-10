@@ -27,6 +27,7 @@ HANDLED_SESSION_UPDATE_KINDS: frozenset[str] = frozenset(
         "tool_call",  # a tool invocation begins
         "tool_call_update",  # streaming/terminal status for a tool_call
         "plan",  # grok's plan — surfaced as update_plan tool_call
+        "usage_update",  # context gauge (used/size/cost) — token-stats snapshot
     }
 )
 

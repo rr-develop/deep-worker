@@ -130,7 +130,7 @@ dwcli --stop my-agent
 Add to the `.env` file at the repository root:
 
 ```env
-DEEPSEEK_API_KEY=<your-deepseek-api-key>
+DEEPSEEK_API_KEY=sk-EXAMPLE_REPLACE_WITH_YOUR_DEEPSEEK_KEY
 ```
 
 The key is loaded automatically when the agent starts.

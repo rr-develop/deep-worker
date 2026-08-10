@@ -53,11 +53,20 @@ class MCPResult(TypedDict, total=False):
 class JobHandle(TypedDict):
     """An in-flight tool call parked as a background job after its wait
     elapsed. The Future is NOT cancelled — the real work continues on the
-    LangGraph ToolNode side and is resolved later."""
+    LangGraph ToolNode side and is resolved later. The agent reaches it via
+    the canonical ``job_N`` id from ``ParkedJobRegistry`` (NOT the
+    originating ``call_id``). See docs/DESIGN_FIX_SANDBOX_EXECUTE_JOB_ID.md
+    (a related internal incident analysis).
+
+    ``tool_call_id`` retains the originating ``call_id`` so ``resolve_call``
+    (entered by the CLI with that id) can complete the parked Future via
+    dual-key lookup in the shared registry.
+    """
 
     future: "asyncio.Future[MCPResult]"
     tool_name: str
     args: dict[str, Any]
+    tool_call_id: NotRequired[str]
 
 
 class PendingCall(TypedDict):
@@ -182,3 +191,12 @@ class ThreadState:
     # terminal stopReason. The next ainvoke returns the final AIMessage
     # without re-entering _consume_turn.
     queued_response: "dict | None" = field(default=None, repr=False)
+
+    # ── Token-stats context gauge (DESIGN_AGENT_TOKEN_STATS.md §5.2) ────────
+    # Latest ``usage_update`` snapshot for the CURRENT turn:
+    # {"used": int, "size": int} — context gauge of the grok session.
+    # Updated by ``_apply_update`` on every usage_update (from either
+    # ``_consume_turn`` or the mid-turn pump); emitted once at the turn
+    # boundary (``_finalize_response``) as usage_semantics="context_snapshot"
+    # and reset to None. Never persisted.
+    usage_snapshot: "dict[str, int] | None" = field(default=None, repr=False)

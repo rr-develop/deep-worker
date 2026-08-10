@@ -48,6 +48,7 @@ pytestmark = pytest.mark.integration
 _POOL_START_BUDGET_SEC = 40.0
 _TOOL_CALL_BUDGET_SEC = 30.0
 _TOTAL_BUDGET_SEC = 60.0
+_PKG_ROOT = Path(__file__).resolve().parents[3]
 
 _FIND_SYMBOL = f"{SERENA_SERVER_NAME}__find_symbol"
 _FIND_REFS = f"{SERENA_SERVER_NAME}__find_referencing_symbols"
@@ -221,3 +222,400 @@ async def test_generated_config_is_what_pool_consumes(tmp_path: Path) -> None:
     assert entry["command"] == SERENA_COMMAND
     assert str(workspace.resolve()) in entry["args"]
     assert sys.executable  # sanity: the test runs in a real interpreter
+
+
+@pytest.mark.asyncio
+async def test_unset_optional_args_reach_server_as_omitted(tmp_path: Path) -> None:
+    """Unset optional arguments must not go out as JSON ``null``.
+
+    A regression test for a defect that was caught by neither unit nor
+    integration tests and only surfaced while the agent was working live:
+    the adapter substituted ``None`` for every unset optional field and
+    sent it to the server. Serena's schema declares such fields strictly
+    typed (``{"type": "integer", "default": -1}``), so an explicit
+    ``null`` is a validation error, while omitting the key yields the
+    server-side default. 12 of the 22 tools were affected.
+
+    Only the required argument is passed here — exactly the path that used
+    to fail: the remaining fields must be omitted by the adapter.
+    """
+    _require_serena()
+
+    workspace = tmp_path / "fixture"
+    _make_fixture_project(workspace)
+    cfg = tmp_path / ".deepagents" / "mcp.json"
+    _write_mcp_config(cfg, workspace)
+
+    pids_before = _serena_child_pids()
+    overview_name = f"{SERENA_SERVER_NAME}__get_symbols_overview"
+
+    async def _scenario() -> None:
+        pool = await asyncio.wait_for(
+            ExternalMCPClientPool.create(
+                user_path=cfg,
+                project_path=None,
+                agent_path=None,
+                cli_configs=[],
+                cli_servers=[],
+            ),
+            timeout=_POOL_START_BUDGET_SEC,
+        )
+        try:
+            names = [t.name for t in pool.tools]
+            assert overview_name in names, names
+
+            # IMPORTANT: the call goes through ``ainvoke``, NOT ``_arun``.
+            # Only ainvoke runs the arguments through ``args_schema``,
+            # where unset optional fields get their default — that is the
+            # only path that reproduces the agent's behaviour. A direct
+            # ``_arun(**kwargs)`` bypasses validation, so the regression
+            # is invisible under it.
+            tool = next(t for t in pool.tools if t.name == overview_name)
+            out = await asyncio.wait_for(
+                tool.ainvoke({"relative_path": "pkg/mod.py"}),
+                timeout=_TOOL_CALL_BUDGET_SEC,
+            )
+            out = str(out)
+            # Under the regression this used to raise a pydantic ValidationError
+            # "Input should be a valid integer" instead of a result.
+            assert "valid integer" not in out, (
+                f"unset optional fields went out as null:\n{out}"
+            )
+            assert "LspProbeTarget" in out, out
+
+            # A regression fixed in an earlier commit: the _UNSET sentinel leaked into
+            # model_json_schema(), pydantic raised PydanticJsonSchemaWarning, and the
+            # claude-code provider filtered out the Serena tools, so they became
+            # invisible to the agent.
+            import warnings as _w
+            with _w.catch_warnings():
+                _w.simplefilter("error")
+                js = tool.args_schema.model_json_schema()
+            # The schema would go to the LLM: the type and default must be the server's.
+            depth = js["properties"]["depth"]
+            assert depth.get("type") == "integer", depth
+            assert depth.get("default") == -1, depth
+            assert "UNSET" not in json.dumps(js), js
+        finally:
+            await pool.stop()
+
+    try:
+        await asyncio.wait_for(_scenario(), timeout=_TOTAL_BUDGET_SEC)
+    except TimeoutError:
+        pytest.fail(
+            f"LSP integration exceeded the {_TOTAL_BUDGET_SEC}s budget — "
+            "treat as a real failure (hang), not a flake"
+        )
+
+    leaked = _serena_child_pids() - pids_before
+    assert not leaked, f"serena process(es) leaked after pool.stop(): {leaked}"
+
+
+@pytest.mark.asyncio
+async def test_optional_fields_are_fully_omissible_on_wire(tmp_path: Path) -> None:
+    """A "best-quality" UX contract: the agent calls a tool with ONE required
+    field — and exactly that single key goes out on the MCP wire. The other
+    optional fields must not be sent (the server applies its own defaults).
+
+    The regression covers three classes of possible breakage:
+      * pydantic validation starts requiring optional fields (ValidationError);
+      * the adapter starts sending the `_UNSET` sentinel or `None` instead of omitting;
+      * the provider/pool starts filling in optional fields from the schema.
+
+    We verify through a LIVE ExternalMCPClientPool plus a spy on
+    session.call_tool — i.e. exactly the path the agent takes in production.
+    """
+    _require_serena()
+
+    workspace = tmp_path / "fixture"
+    _make_fixture_project(workspace)
+    cfg = tmp_path / ".deepagents" / "mcp.json"
+    _write_mcp_config(cfg, workspace)
+
+    pids_before = _serena_child_pids()
+
+    async def _scenario() -> None:
+        pool = await asyncio.wait_for(
+            ExternalMCPClientPool.create(
+                user_path=cfg,
+                project_path=None,
+                agent_path=None,
+                cli_configs=[],
+                cli_servers=[],
+            ),
+            timeout=_POOL_START_BUDGET_SEC,
+        )
+        try:
+            cases = [
+                (
+                    f"{SERENA_SERVER_NAME}__find_symbol",
+                    {"name_path_pattern": "LspProbeTarget"},
+                    "LspProbeTarget",
+                ),
+                (
+                    f"{SERENA_SERVER_NAME}__get_symbols_overview",
+                    {"relative_path": "pkg/mod.py"},
+                    "LspProbeTarget",
+                ),
+            ]
+            for tool_name, minimal_kwargs, expect_in_result in cases:
+                tool = next(t for t in pool.tools if t.name == tool_name)
+
+                # Wrapper over session.call_tool: intercepts what actually went out
+                # on the MCP wire. bare_tool_name is the name without the server prefix.
+                bare = tool._bare_tool_name
+                captured: dict[str, dict] = {}
+                orig = tool._session.call_tool
+
+                async def spy(name: str, args: dict, _orig=orig, _cap=captured):
+                    _cap[name] = dict(args)
+                    return await _orig(name, args)
+
+                tool._session.call_tool = spy  # type: ignore[method-assign]
+                try:
+                    out = await asyncio.wait_for(
+                        tool.ainvoke(minimal_kwargs),
+                        timeout=_TOOL_CALL_BUDGET_SEC,
+                    )
+                finally:
+                    tool._session.call_tool = orig  # type: ignore[method-assign]
+
+                sent = captured.get(bare)
+                assert sent == minimal_kwargs, (
+                    f"UX contract violated for {tool_name}: "
+                    f"expected on the wire {minimal_kwargs!r}, "
+                    f"actually sent {sent!r}"
+                )
+                assert expect_in_result in str(out), (
+                    f"{tool_name} with only required fields did not return the expected "
+                    f"result: {str(out)[:200]}"
+                )
+        finally:
+            await pool.stop()
+
+    try:
+        await asyncio.wait_for(_scenario(), timeout=_TOTAL_BUDGET_SEC)
+    except TimeoutError:
+        pytest.fail(
+            f"LSP integration exceeded the {_TOTAL_BUDGET_SEC}s budget — "
+            "treat as a real failure (hang), not a flake"
+        )
+
+    leaked = _serena_child_pids() - pids_before
+    assert not leaked, f"serena process(es) leaked after pool.stop(): {leaked}"
+
+
+@pytest.mark.asyncio
+async def test_pyright_config_resolves_system_site_packages(
+    tmp_path: Path,
+) -> None:
+    """Regression: `get_diagnostics_for_file` must not report false
+    `reportMissingImports` for packages installed system-wide (without .venv).
+
+    The project deliberately forbids `.venv` (see the repo's pre-commit
+    hook) and installs dev dependencies system-wide via
+    `~/.local/lib/pythonX.Y/site-packages`. Pyright launched by Serena does
+    not see these paths out of the box and reports 5+ false
+    `reportMissingImports` for every `pydantic`/`langchain_core` import.
+    The fix is a root `pyrightconfig.json` with the real interpreter's
+    `pythonVersion` and `extraPaths` pointing at site-packages.
+
+    The test spins up a miniature fixture project in which:
+      * there is a file importing a REAL installed `pydantic`;
+      * there is a root `pyrightconfig.json` of the same kind as in the
+        project's root tree — pythonVersion 3.12 plus extraPaths on the
+        interpreter's site-packages.
+
+    Then, through a live ExternalMCPClientPool, it calls
+    `get_diagnostics_for_file` and asserts that no
+    `reportMissingImports` for `pydantic` appeared.
+
+    The "remove extraPaths" mutation → the test fails with a message
+    containing `pydantic` and `reportMissingImports`.
+    """
+    _require_serena()
+
+    # The real system-site path of the current interpreter (the same one
+    # the production root config uses).
+    import site
+    import sys
+
+    site_paths = [p for p in [site.getusersitepackages(), *site.getsitepackages()] if p]
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "pyrightconfig.json").write_text(
+        json.dumps(
+            {
+                "include": ["."],
+                "extraPaths": site_paths,
+                "pythonVersion": f"{sys.version_info.major}.{sys.version_info.minor}",
+                "pythonPlatform": "Linux",
+                "typeCheckingMode": "off",
+                "reportMissingImports": "error",
+            }
+        ),
+        encoding="utf-8",
+    )
+    probe_file = "probe.py"
+    (workspace / probe_file).write_text(
+        "from pydantic import BaseModel\n"
+        "\n"
+        "\n"
+        "class Probe(BaseModel):\n"
+        "    x: int\n",
+        encoding="utf-8",
+    )
+    cfg = tmp_path / ".deepagents" / "mcp.json"
+    _write_mcp_config(cfg, workspace)
+
+    pids_before = _serena_child_pids()
+    tool_name = f"{SERENA_SERVER_NAME}__get_diagnostics_for_file"
+
+    async def _scenario() -> None:
+        pool = await asyncio.wait_for(
+            ExternalMCPClientPool.create(
+                user_path=cfg,
+                project_path=None,
+                agent_path=None,
+                cli_configs=[],
+                cli_servers=[],
+            ),
+            timeout=_POOL_START_BUDGET_SEC,
+        )
+        try:
+            tool = next(t for t in pool.tools if t.name == tool_name)
+            out = await asyncio.wait_for(
+                tool.ainvoke({"relative_path": probe_file}),
+                timeout=_TOOL_CALL_BUDGET_SEC,
+            )
+            payload = str(out)
+            # `reportMissingImports` on `pydantic` is exactly the false
+            # error the config must eliminate. We parse it as JSON to
+            # work around quote escaping in the message.
+            diagnostics = json.loads(payload) if payload else {}
+            missing_imports: list[str] = []
+            for _file, by_sev in diagnostics.items():
+                for _sev, by_sym in by_sev.items():
+                    for _sym, diags in by_sym.items():
+                        for d in diags:
+                            if (
+                                d.get("code") == "reportMissingImports"
+                                and "pydantic" in d.get("message", "")
+                            ):
+                                missing_imports.append(d["message"])
+            assert not missing_imports, (
+                "pyright did not see the system-installed pydantic — "
+                "check `extraPaths` / `pythonVersion` in the fixture "
+                "pyrightconfig.json.\nErrors:\n  - "
+                + "\n  - ".join(missing_imports)
+            )
+        finally:
+            await pool.stop()
+
+    try:
+        await asyncio.wait_for(_scenario(), timeout=_TOTAL_BUDGET_SEC)
+    except TimeoutError:
+        pytest.fail(
+            f"LSP integration exceeded the {_TOTAL_BUDGET_SEC}s budget — "
+            "treat as a real failure (hang), not a flake"
+        )
+
+    leaked = _serena_child_pids() - pids_before
+    assert not leaked, f"serena process(es) leaked after pool.stop(): {leaked}"
+
+
+@pytest.mark.asyncio
+async def test_repo_root_pyrightconfig_kills_false_missing_imports() -> None:
+    """Lock on the production root `pyrightconfig.json`: diagnostics of the
+    real `adapter.py` (which imports pydantic/langchain_core) through the
+    same Serena that runs in production must be free of
+    `reportMissingImports`.
+
+    The test does NOT create a fixture: it checks the **actual** file in
+    the tree, so it directly catches regressions of the root config
+    (deleted, broke `extraPaths`, changed `pythonVersion`, etc.).
+    """
+    _require_serena()
+
+    repo_root = _PKG_ROOT.parents[1].resolve()
+    cfg = repo_root / ".deepagents" / "mcp.json"
+    if not repo_root.is_dir() or not cfg.is_file():
+        pytest.skip(
+            f"test is tied to a dev checkout {repo_root} with Serena configured "
+            f"({cfg}); it is not applicable in other environments"
+        )
+    # NOT skip, but fail: the root config is mandatory, otherwise Serena
+    # reports false reportMissingImports across the whole tree.
+    root_cfg = repo_root / "pyrightconfig.json"
+    assert root_cfg.is_file(), (
+        f"root {root_cfg} is missing — Serena LSP will report "
+        "false reportMissingImports; add a config with pythonVersion "
+        "and extraPaths on system site-packages"
+    )
+    workspace = repo_root
+
+    tool_name = f"{SERENA_SERVER_NAME}__get_diagnostics_for_file"
+    # A file that genuinely imports several external packages.
+    target = (
+        "deep_worker/deep_worker_cli/deep_worker_cli/external_mcp/adapter.py"
+    )
+    if not (workspace / target).is_file():
+        pytest.skip(f"target file {target} not found in the current tree")
+
+    async def _scenario() -> None:
+        pool = await asyncio.wait_for(
+            ExternalMCPClientPool.create(
+                user_path=cfg,
+                project_path=None,
+                agent_path=None,
+                cli_configs=[],
+                cli_servers=[],
+            ),
+            timeout=_POOL_START_BUDGET_SEC,
+        )
+        try:
+            tool = next(t for t in pool.tools if t.name == tool_name)
+            out = await asyncio.wait_for(
+                tool.ainvoke({"relative_path": target}),
+                timeout=_TOOL_CALL_BUDGET_SEC,
+            )
+            payload = str(out)
+            # Neither pydantic, nor langchain_core, nor pydantic_core may show up
+            # as "missing import". We parse the reply as JSON — it arrives as a
+            # dump of dict{path: {severity: {sym: [diags]}}} and substring
+            # comparison is unreliable because of quote escaping.
+            diagnostics = json.loads(payload)
+            missing_imports: list[str] = []
+            for _file, by_sev in diagnostics.items():
+                for _sev, by_sym in by_sev.items():
+                    for _sym, diags in by_sym.items():
+                        for d in diags:
+                            code = d.get("code", "")
+                            msg = d.get("message", "")
+                            if code != "reportMissingImports":
+                                continue
+                            for pkg in (
+                                "pydantic",
+                                "langchain_core",
+                                "pydantic_core",
+                            ):
+                                if pkg in msg:
+                                    missing_imports.append(msg)
+                                    break
+            assert not missing_imports, (
+                "pyright again does not see the system-installed packages — "
+                "check the root pyrightconfig.json (extraPaths / "
+                "pythonVersion). False reportMissingImports:\n  - "
+                + "\n  - ".join(missing_imports)
+            )
+        finally:
+            await pool.stop()
+
+    try:
+        await asyncio.wait_for(_scenario(), timeout=_TOTAL_BUDGET_SEC)
+    except TimeoutError:
+        pytest.fail(
+            f"LSP integration exceeded the {_TOTAL_BUDGET_SEC}s budget — "
+            "treat as a real failure (hang), not a flake"
+        )

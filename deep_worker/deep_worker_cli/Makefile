@@ -6,6 +6,15 @@ all: help
 .EXPORT_ALL_VARIABLES:
 UV_FROZEN = true
 
+# All `uv run` invocations go through this wrapper, which creates the project
+# venv, runs the command, and ALWAYS deletes the venv again (trap on
+# EXIT/INT/TERM). A bare `uv run` here would leave a .venv behind and block the
+# next commit on the .githooks/pre-commit venv check -- see
+# ../scripts/DESIGN_FIX_TYPE_CHECK_VENV_LEAK.md and .githooks/pre-commit:64.
+# `:=` is required: MAKEFILE_LIST grows as makefiles are included, so a
+# recursive `=` would resolve against whatever was included last.
+UV_RUN := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../scripts/uv-run.sh)
+
 ######################
 # TESTING AND COVERAGE
 ######################
@@ -15,23 +24,23 @@ TEST_FILE ?= tests/unit_tests/
 integration_test integration_tests: TEST_FILE=tests/integration_tests/
 
 test tests:
-	uv run --group test pytest -vvv --disable-socket --allow-unix-socket $(TEST_FILE)
+	$(UV_RUN) --group test pytest -vvv --disable-socket --allow-unix-socket $(TEST_FILE)
 
 coverage:
-	uv run --group test pytest --cov \
+	$(UV_RUN) --group test pytest --cov \
 		--cov-config=.coveragerc \
 		--cov-report xml \
 		--cov-report term-missing:skip-covered \
 		$(TEST_FILE)
 
 integration_test integration_tests:
-	uv run --group test pytest -n auto -vvv --timeout 30 $(TEST_FILE)
+	$(UV_RUN) --group test pytest -n auto -vvv --timeout 30 $(TEST_FILE)
 
 test_watch:
-	uv run --group test ptw --now . -- -vv $(TEST_FILE)
+	$(UV_RUN) --group test ptw --now . -- -vv $(TEST_FILE)
 
 benchmark:
-	uv run --group test pytest ./tests -m benchmark
+	$(UV_RUN) --group test pytest ./tests -m benchmark
 
 run:
 	uvx --no-cache --reinstall .
@@ -49,19 +58,19 @@ lint_package: PYTHON_FILES=deepagents_cli
 lint_tests: PYTHON_FILES=tests
 
 lint lint_diff lint_package lint_tests:
-	[ "$(PYTHON_FILES)" = "" ] || uv run --all-groups ruff check $(PYTHON_FILES)
-	[ "$(PYTHON_FILES)" = "" ] || uv run --all-groups ruff format $(PYTHON_FILES) --diff
-	[ "$(PYTHON_FILES)" = "" ] || uv run --all-groups ty check $(PYTHON_FILES)
+	[ "$(PYTHON_FILES)" = "" ] || $(UV_RUN) --all-groups ruff check $(PYTHON_FILES)
+	[ "$(PYTHON_FILES)" = "" ] || $(UV_RUN) --all-groups ruff format $(PYTHON_FILES) --diff
+	[ "$(PYTHON_FILES)" = "" ] || $(UV_RUN) --all-groups ty check $(PYTHON_FILES)
 
 type:
-	uv run --all-groups ty check $(PYTHON_FILES)
+	$(UV_RUN) --all-groups ty check $(PYTHON_FILES)
 
 format format_diff:
-	[ "$(PYTHON_FILES)" = "" ] || uv run --all-groups ruff format $(PYTHON_FILES)
-	[ "$(PYTHON_FILES)" = "" ] || uv run --all-groups ruff check --fix $(PYTHON_FILES)
+	[ "$(PYTHON_FILES)" = "" ] || $(UV_RUN) --all-groups ruff format $(PYTHON_FILES)
+	[ "$(PYTHON_FILES)" = "" ] || $(UV_RUN) --all-groups ruff check --fix $(PYTHON_FILES)
 
 check_imports: $(shell find deepagents_cli -name '*.py')
-	uv run --all-groups python ./scripts/check_imports.py $^
+	$(UV_RUN) --all-groups python ./scripts/check_imports.py $^
 
 ######################
 # HELP

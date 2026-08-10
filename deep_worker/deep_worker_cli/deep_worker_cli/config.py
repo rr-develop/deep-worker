@@ -9,7 +9,7 @@ import sys
 import uuid
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any
+from typing import Any, Callable
 from importlib.metadata import PackageNotFoundError, distribution
 from pathlib import Path
 
@@ -1452,6 +1452,9 @@ def create_model(
     provider: str | None = None,
     model_name: str | None = None,
     user: str | None = None,
+    kind: str | None = None,
+    stats_callback_factory: Callable[..., Any] | None = None,
+    usage_event_callback_factory: Callable[..., Any] | None = None,
 ) -> BaseChatModel:
     """Create the appropriate model based on provider and model name.
 
@@ -1467,6 +1470,17 @@ def create_model(
               When set, different users get separate KV caches so that
               concurrent agents do not evict each other's prefixed cache
               entries. See DESIGN_CACHE_USER_ID_AND_MODEL_UPDATE.md.
+        kind: Token-stats kind ("agent" | "tm" | "other"); when a stats
+              factory is provided, this tags every recorded usage record.
+        stats_callback_factory: Optional ``(kind, *, provider, model_name)``
+              factory producing the LangChain callback handler for standard
+              providers (DESIGN_AGENT_TOKEN_STATS.md §5.1). Called AFTER
+              provider/model resolution so the handler records into the
+              resolved provider bucket (failover-aware).
+        usage_event_callback_factory: Optional ``(kind, *, provider, model_name)``
+              factory producing the event callback installed via
+              ``model.set_usage_event_callback`` on custom providers
+              (claude-code/codex/grok).
 
     Returns:
         ChatModel instance (OpenAI, Anthropic, Google, or ClaudeCode)
@@ -1653,6 +1667,22 @@ def create_model(
             "model": model_name,
             "api_base": "https://api.deepseek.com",
             "api_key": settings.deepseek_api_key,
+            # Explicit guarantee for token statistics — NOT the fix for the
+            # 2026-08-03 incident (that was a normalizer gap: the aggregate
+            # ``AIMessage.usage_metadata`` shape was not understood; see
+            # ``_from_langchain_usage_metadata``). Live-verified: DeepSeek
+            # streams usage even WITHOUT this flag.
+            #
+            # We set it anyway because statistics are wanted by default and
+            # the upstream default is fragile: ``stream_options=
+            # {"include_usage": true}`` is only sent when
+            # ``self.stream_usage`` is on, and langchain_openai auto-enables
+            # it ONLY for the default base URL (``chat_models/base.py``
+            # requires ``openai_api_base is None``). We always pass an
+            # explicit ``api_base``, so the flag would otherwise stay off and
+            # any endpoint/config that does omit usage without it would
+            # silently produce ``no_usage`` records.
+            "stream_usage": True,
         }
         if user is not None:
             # Pass user_id for KV-cache isolation (DeepSeek API).
@@ -1669,7 +1699,11 @@ def create_model(
     elif provider == "openai":
         from langchain_openai import ChatOpenAI
 
-        model = ChatOpenAI(model=model_name)
+        # stream_usage=True: same policy as the deepseek branch above — an
+        # explicit guarantee that streamed responses carry token counts for
+        # the statistics subsystem, rather than relying on the upstream
+        # base-URL heuristic.
+        model = ChatOpenAI(model=model_name, stream_usage=True)
     elif provider == "anthropic":
         from langchain_anthropic import ChatAnthropic
 
@@ -1794,7 +1828,72 @@ def create_model(
     if isinstance(profile, dict) and isinstance(profile.get("max_input_tokens"), int):
         settings.model_context_limit = profile["max_input_tokens"]
 
+    # Token-stats instrumentation (DESIGN_AGENT_TOKEN_STATS.md §5.1, §7).
+    # Standard LangChain providers get an instance-level AsyncCallbackHandler;
+    # custom providers (claude-code/codex/grok) get ONLY the event callback via
+    # ``set_usage_event_callback`` — a double source is impossible structurally.
+    if stats_callback_factory is not None or usage_event_callback_factory is not None:
+        _attach_token_stats(
+            model,
+            provider=provider,
+            model_name=model_name or "",
+            kind=kind or "other",
+            stats_callback_factory=stats_callback_factory,
+            usage_event_callback_factory=usage_event_callback_factory,
+        )
+
     return model
+
+
+def _attach_token_stats(
+    model: BaseChatModel,
+    *,
+    provider: str,
+    model_name: str,
+    kind: str,
+    stats_callback_factory: Callable[..., Any] | None,
+    usage_event_callback_factory: Callable[..., Any] | None,
+) -> None:
+    """Attach token-stats instrumentation to a freshly created model (§5.1).
+
+    Standard LangChain providers (deepseek/openai/anthropic/google/vertexai)
+    receive a ``TokenStatsCallbackHandler`` on the model instance (inherited by
+    ``bind_tools`` copies → summarization included). Custom providers
+    (claude-code/codex/grok) receive ONLY ``set_usage_event_callback(cb)`` —
+    never the LangChain handler, so a double usage source is impossible
+    structurally (MAJOR-2, DESIGN_AGENT_TOKEN_STATS.md).
+    """
+    from deep_worker_cli.stats.token_stats import (
+        CUSTOM_PROVIDERS,
+        STANDARD_PROVIDERS,
+    )
+
+    try:
+        if provider in STANDARD_PROVIDERS and stats_callback_factory is not None:
+            from deep_worker_cli.stats.callback import TokenStatsCallbackHandler
+
+            handler = stats_callback_factory(kind, provider=provider, model_name=model_name)
+            if not isinstance(handler, TokenStatsCallbackHandler):
+                logger.warning("token-stats: factory returned %r, skipping", type(handler).__name__)
+                return
+            existing = list(getattr(model, "callbacks", None) or [])
+            if not any(isinstance(cb, TokenStatsCallbackHandler) for cb in existing):
+                model.callbacks = [*existing, handler]
+        elif provider in CUSTOM_PROVIDERS and usage_event_callback_factory is not None:
+            callback = usage_event_callback_factory(kind, provider=provider, model_name=model_name)
+            setter = getattr(model, "set_usage_event_callback", None)
+            if callable(setter):
+                setter(callback)
+            else:
+                logger.warning(
+                    "token-stats: provider %r has no set_usage_event_callback — "
+                    "usage events will not be recorded",
+                    provider,
+                )
+    except Exception:  # noqa: BLE001 — instrumentation must never break create_model
+        logger.exception(
+            "token-stats: failed to attach instrumentation (provider=%s)", provider
+        )
 
 
 def validate_model_capabilities(model: BaseChatModel, model_name: str) -> None:

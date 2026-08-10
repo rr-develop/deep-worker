@@ -102,12 +102,13 @@ class _FakeAcpClient:
              "params": {"sessionId": session_id, "update": update}}
         )
 
-    def finish(self, stop_reason: str = "end_turn") -> None:
+    def finish(self, stop_reason: str = "end_turn", meta: dict | None = None) -> None:
         assert self.last_prompt_future is not None
         if not self.last_prompt_future.done():
-            self.last_prompt_future.set_result(
-                {"result": {"stopReason": stop_reason}}
-            )
+            result: dict[str, Any] = {"stopReason": stop_reason}
+            if meta is not None:
+                result["_meta"] = meta
+            self.last_prompt_future.set_result({"result": result})
 
 
 class _FakeProxy:

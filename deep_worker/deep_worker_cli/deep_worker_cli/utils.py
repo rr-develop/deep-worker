@@ -4,6 +4,8 @@ import logging
 import os
 import sys
 
+from deep_worker_cli.stats.token_stats import normalize_usage
+
 
 def is_running_tests() -> bool:
     """Detect if running in test environment.
@@ -48,9 +50,9 @@ def log_token_usage(
     LangChain's ``AIMessage.response_metadata["token_usage"]`` and logs
     them at INFO level.
 
-    Handles two cache-field conventions:
-    - ``prompt_cache_hit_tokens`` / ``prompt_cache_miss_tokens`` (top-level)
-    - ``prompt_tokens_details.cached_tokens`` (OpenAI-compatible format)
+    The extraction goes through :func:`deep_worker_cli.stats.token_stats.normalize_usage`
+    (shared with the token-stats recorder, DESIGN_AGENT_TOKEN_STATS.md §5.3);
+    the log-line format and behaviour are preserved byte-for-byte.
 
     Args:
         logger: Logger instance to use.
@@ -64,35 +66,24 @@ def log_token_usage(
     if not token_usage or not isinstance(token_usage, dict):
         return
 
-    prompt_tokens = token_usage.get("prompt_tokens", 0)
-    completion_tokens = token_usage.get("completion_tokens", 0)
+    usage = normalize_usage(None, token_usage)
+    if usage is None:
+        return
 
-    # Try top-level cache fields first (LangChain-normalised)
-    hit = token_usage.get("prompt_cache_hit_tokens")
-    miss = token_usage.get("prompt_cache_miss_tokens")
-
-    # Fallback to prompt_tokens_details.cached_tokens (OpenAI format)
-    if hit is None and miss is None:
-        details = token_usage.get("prompt_tokens_details")
-        if isinstance(details, dict):
-            cached = details.get("cached_tokens")
-            if cached is not None:
-                hit = cached
-                miss = prompt_tokens - cached if prompt_tokens else 0
-
-    total = token_usage.get("total_tokens", prompt_tokens + completion_tokens)
+    total = usage.total_tokens
     tag = f"[{label}] " if label else ""
 
-    if hit is not None and prompt_tokens:
-        pct = 100.0 * hit / prompt_tokens
+    if usage.cache_hit_tokens is not None and usage.prompt_tokens:
+        pct = 100.0 * usage.cache_hit_tokens / usage.prompt_tokens
         logger.info(
             "%s%s prompt=%s cache_hit=%s miss=%s completion=%s total=%s (cache %.1f%%)",
-            tag, agent_name, prompt_tokens, hit, miss or 0,
-            completion_tokens, total, pct,
+            tag, agent_name, usage.prompt_tokens, usage.cache_hit_tokens,
+            usage.cache_miss_tokens or 0,
+            usage.completion_tokens, total, pct,
         )
     else:
         # No cache info available (different provider or old model)
         logger.info(
             "%s%s prompt=%s completion=%s total=%s (no cache info)",
-            tag, agent_name, prompt_tokens, completion_tokens, total,
+            tag, agent_name, usage.prompt_tokens, usage.completion_tokens, total,
         )

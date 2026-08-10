@@ -75,12 +75,19 @@ async def test_unflagged_tool_degrades_to_job_handle_not_hang() -> None:
     assert result.get("is_error") is not True
     text = result["content"][0]["text"]
     assert "in_progress" in text
-    assert "toolu_EDIT" in text  # job_id == tool_use_id
+    # ``job_id`` is a canonical ``job_N`` from the shared ParkedJobRegistry —
+    # NOT the ``tool_use_id``. Advertising ``toolu_…`` was the observed defect
+    # (2026-07-31): ``wait_for_job``/``kill_job`` could never resolve it.
+    import re
+    m = re.search(r"\bjob_\d+\b", text)
+    assert m, f"notice must advertise a canonical job_N id: {text!r}"
+    job_id = m.group(0)
+    assert "toolu_EDIT" not in text, f"tool_use_id leaked into notice: {text!r}"
     assert "wait_for_job" in text and "kill_job" in text
-    # The real Future is parked, not cancelled.
+    # The real Future is parked (under the canonical id), not cancelled.
     reg = proxy.get_job_registry()
-    assert "toolu_EDIT" in reg and not reg["toolu_EDIT"]["future"].done()
-    reg["toolu_EDIT"]["future"].cancel()
+    assert job_id in reg and not reg[job_id]["future"].done()
+    reg[job_id]["future"].cancel()
 
 
 async def test_unflagged_tool_resolves_normally_before_wait() -> None:
@@ -125,9 +132,18 @@ async def test_explicit_optout_with_timeout_returns_notice_not_error() -> None:
         "a timeout must NOT become an agent error — inform and continue"
     )
     text = result["content"][0]["text"]
-    assert "toolu_Q" in text
-    # It must convey timeout/still-running info so the agent can decide.
-    assert "timed out" in text.lower() or "still" in text.lower()
+    # Notice must advertise a canonical ``job_N`` (observed fix, 2026-07-31),
+    # NOT the ``tool_use_id``.
+    import re
+    assert re.search(r"\bjob_\d+\b", text), (
+        f"notice must advertise a canonical job_N id: {text!r}"
+    )
+    assert "toolu_Q" not in text, f"tool_use_id leaked into notice: {text!r}"
+    # It must convey still-running info so the agent can decide.
+    assert "still" in text.lower()
+    # Cleanup: parked Future.
+    for entry in proxy.get_job_registry().values():
+        entry["future"].cancel()
 
 
 async def test_no_tool_ever_waits_forever() -> None:

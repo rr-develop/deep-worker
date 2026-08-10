@@ -1,103 +1,46 @@
-# Deep Worker - AI Agent Framework
+# Deep Worker — AI Agent Framework
 
-## ⚠️ CRITICAL: NO VIRTUAL ENVIRONMENTS ALLOWED ⚠️
+`deep_worker` is the core agent runtime of this repository. It runs agents as
+background daemon processes and exposes them to the interactive `dwcli` client.
 
-**THIS PROJECT MUST RUN GLOBALLY WITHOUT ANY VIRTUAL ENVIRONMENT (.venv)**
+## Runtime model
 
-### Why No Virtual Environments?
+- Agents run as daemon processes on the local machine.
+- All network services bind to **127.0.0.1 only** — this is a local, trusted
+  environment tool (see `deep_worker_cli/SECURITY.md`).
+- The daemon and client communicate over RPyC (AsyncioServer, single event
+  loop, no threads).
 
-1. **RPyC from source**: This project uses a local RPyC source checkout for RPyC with AsyncioServer (single event loop, no threads)
-2. **Version Conflicts**: Using `pip install rpyc` or installing into `.venv` causes incompatibility issues
-3. **RPyC Proxy Errors**: Installing packages creates version mismatches leading to `AttributeError: cannot access '__reversed__'` and other proxy-related errors
+## ⚠️ No virtual environments
 
-### FORBIDDEN ACTIONS
+This project must run with the **system Python** — **no `.venv`, no
+`pip install rpyc`**.
+
+The reason is that RPyC is imported from a local source checkout
+(`rpyc-async`, an AsyncioServer-based RPyC fork). Installing RPyC from PyPI or
+creating a virtual environment causes version mismatches that break the proxy
+layer (e.g. `AttributeError: cannot access '__reversed__'`).
 
 ```bash
-# ❌ NEVER DO THIS:
+# ✅ Correct — run via the bash launchers (no venv)
+# Make the CLI globally available by symlinking the launchers into ~/.local/bin:
+ln -sf "$PWD/deep_worker_cli/deep-worker" ~/.local/bin/deep-worker
+ln -sf "$PWD/deep_worker_cli/dwcli" ~/.local/bin/dwcli
+deep-worker my_agent          # start an agent daemon
+dwcli my_agent                # connect to it interactively
+
+# ❌ Never do this
 python -m venv .venv
 pip install rpyc
 pip install -e .
 ```
 
-### REQUIRED SETUP
+If you see a `.venv` path under this tree, delete it and re-run with the
+system interpreter.
 
-```bash
-# ✅ ALWAYS DO THIS:
-# 1. Run directly on host without venv
-# 2. Use system Python3
-# 3. RPyC is imported from the local RPyC source checkout (AsyncioServer)
-```
+## Layout
 
-### Detecting Virtual Environment Violations
-
-If you see paths like:
-```
-deep_worker/deep_worker_cli/.venv/lib/python3.14/site-packages/rpyc
-```
-
-**THIS IS WRONG!** Delete `.venv` immediately:
-```bash
-rm -rf deep_worker/deep_worker_cli/.venv
-rm -rf deep_worker/deepagents/.venv
-```
-
-### How RPyC is Imported
-
-The codebase imports RPyC from the local RPyC source checkout:
-
-```python
-# CORRECT: Import from the rpyc_async source directory
-_rpyc_async_path = Path(RPYC_ASYNC_SOURCE_DIR)
-if _rpyc_async_path.exists() and str(_rpyc_async_path) not in sys.path:
-    sys.path.insert(0, str(_rpyc_async_path))
-
-import rpyc
-from rpyc.utils.async_server import AsyncioServer
-```
-
-### Related Repositories
-
-Any companion repositories checked out alongside this one MUST also run without `.venv`.
-
-## Project Structure
-
-```
-deep_worker/
-├── deep_worker_cli/     # Main CLI application
-├── deepagents/          # Agent framework
-└── rpyc_async/          # RPyC with AsyncioServer (imported via sys.path)
-```
-
-## Installation
-
-NO installation required. Run directly:
-
-<!-- ============================================================================
-PROTECTIVE COMMENT FOR FUTURE AGENTS:
-DO NOT REPLACE deep-worker WITH ANYTHING ELSE (deepagents, python3 -m, etc.)!
-deep-worker is the ONLY correct way to run this project.
-The command is installed globally on the user's PATH.
-============================================================================ -->
-
-```bash
-# The ONLY CORRECT way to run it (uses Deepseek by default):
-deep-worker my-agent
-
-# ⚠️ DO NOT USE:
-# ⚠️   python3 -m deep_worker_cli.main       - old entry point, may use gemini
-# ⚠️   python3 -m deep_worker_cli.cli.main   - the same thing
-# ⚠️   deep_worker/deep_worker_cli/deep-worker - local script, use the global command
-# ⚠️
-# ⚠️ See: DEEPSEEK_PROVIDER.md for details
-```
-
-## Testing
-
-```bash
-cd deep_worker/deep_worker_cli
-pytest tests/
-```
-
----
-
-**Remember: If you see `.venv` anywhere in this project, DELETE IT IMMEDIATELY!**
+| Path | Purpose |
+|---|---|
+| `deep_worker_cli/` | `deep-worker` daemon and `dwcli` client (the CLI package) |
+| `deepagents/` | vendored copy of the upstream `deepagents-cli` source |

@@ -423,6 +423,14 @@ function openFullDialog() {
     window.open(url, '_blank');
 }
 
+// Open the token/cache stats page for the selected agent (§6.2).
+// The page fetches the snapshot itself on load; no polling.
+function openAgentStats() {
+    if (!selectedAgent) return;
+    const url = `/static/stats.html?agent=${encodeURIComponent(selectedAgent)}`;
+    window.open(url, '_blank');
+}
+
 // Load agent history using fire-and-forget with request correlation
 async function loadAgentHistory(name) {
     const requestId = generateUUID();

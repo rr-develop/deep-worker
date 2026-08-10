@@ -93,10 +93,16 @@ async def test_edit_file_never_resolving_becomes_job_handle_at_120s() -> None:
     assert result.get("is_error") is not True
     text = result["content"][0]["text"]
     assert "in_progress" in text
-    assert "toolu_EDIT" in text
+    # ``job_id`` is a canonical ``job_N`` from the shared ParkedJobRegistry,
+    # NOT the ``tool_use_id`` (observed fix, 2026-07-31).
+    import re
+    m = re.search(r"\bjob_\d+\b", text)
+    assert m, f"notice must advertise a canonical job_N: {text!r}"
+    job_id = m.group(0)
+    assert "toolu_EDIT" not in text, f"tool_use_id leaked into notice: {text!r}"
     assert "wait_for_job" in text and "kill_job" in text
 
-    # The real work is preserved (parked), not cancelled/lost.
+    # The real work is preserved (parked under the canonical id).
     reg = proxy.get_job_registry()
-    assert "toolu_EDIT" in reg and not reg["toolu_EDIT"]["future"].done()
-    reg["toolu_EDIT"]["future"].cancel()
+    assert job_id in reg and not reg[job_id]["future"].done()
+    reg[job_id]["future"].cancel()

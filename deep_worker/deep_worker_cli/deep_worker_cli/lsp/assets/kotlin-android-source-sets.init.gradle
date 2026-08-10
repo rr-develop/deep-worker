@@ -1,0 +1,163 @@
+// deep-worker:kotlin-android-source-sets v1
+/*
+ * Workaround for two Kotlin LSP (JetBrains IntelliJ Language Server) defects
+ * that together break cross-file navigation in Android Gradle Plugin projects.
+ *
+ * Installed by `deep-worker lsp enable` into $GRADLE_USER_HOME/init.d.
+ * Remove with `deep-worker lsp disable` (or delete this file).
+ * Full analysis: lsp/docs/DESIGN_KOTLIN_LSP_ANDROID_SOURCE_SETS.md
+ *
+ * Symptom without this script
+ * ---------------------------
+ *     IdeaProjectMapper - <project> has an empty set of source sets
+ * The imported workspace model then holds libraries but not a single source
+ * root, so textDocument/references, /definition and /implementation silently
+ * return empty for every cross-file query (same-file queries still work,
+ * which makes the LSP look healthy).
+ *
+ * Defect 1 - variants are never collected
+ *   AndroidVariants.collectAndroidVariants(Gradle) registers its per-project
+ *   collector via `gradle.lifecycle.beforeProject { }` and, inside it, calls
+ *   `project.extensions.findByName("androidComponents")` immediately. At
+ *   beforeProject time the Android plugin is not applied yet, so the lookup
+ *   returns null and `onVariants` is never registered. The server logs
+ *   "Failed to call 'onVariants' in 'androidComponents' extension".
+ *   Fix: re-run the collector from `pluginManager.withPlugin("com.android.*")`,
+ *   which fires once the extension exists but before variants are locked.
+ *   setAndroidVariants stores a MUTABLE list in the project Extras and the
+ *   onVariants callback appends to that same list, so the importer later
+ *   reads a populated list.
+ *
+ * Defect 2 - source dirs cannot be read at configuration time
+ *   AndroidSourceSets.resolveAndroidSourceSets() queries
+ *   `variant.sources.kotlin/java` - Providers that AGP maps over the outputs
+ *   of `generate<Variant>BuildConfig`. Gradle forbids reading such a Provider
+ *   before the producing task has run:
+ *       Querying the mapped value of ... before task
+ *       ':app:generateDebugBuildConfig' has completed is not supported
+ *   That exception aborts source-set resolution entirely. Fix: wrap the
+ *   ModuleSourceSets tooling-model builder and, for the duration of that one
+ *   call, mark the BuildConfig-generating tasks as already executed - the
+ *   guard in TransformBackedProvider.beforeRead tests exactly
+ *   `task.state.executed`, and TaskStateInternal.getExecuted() is simply
+ *   `outcome != null`. The previous outcome is restored in `finally`.
+ *
+ * Why the window must stay narrow
+ *   TaskStateInternal.isConfigurable() is `!executed && !executing`. While a
+ *   task is marked executed it is NOT configurable, and a wider window breaks
+ *   configuration with
+ *       Cannot call Task.finalizedBy(Object...) on task
+ *       ':app:generateDebugBuildConfig' after task has started execution.
+ *   (observed in practice). Hence: one buildAll call, restore in finally.
+ *
+ * Safety
+ *   Everything below is a no-op unless the Kotlin LSP importer plugin is on
+ *   the build classpath, so ordinary Gradle builds are unaffected. Every
+ *   reflective step is wrapped in try/catch on Throwable: a version skew in
+ *   Kotlin LSP degrades to the current (broken) navigation, never to a failed
+ *   import. Throwable is deliberate - it also covers AssertionError from
+ *   `assert outcome == null` inside setOutcome when the daemon runs with -ea,
+ *   and IllegalStateException from a non-configurable task.
+ */
+
+/** The importer plugin is applied to the Gradle object, not to projects. */
+def lspPluginOf(p) {
+    return p.gradle.plugins.find {
+        it.class.name == "com.jetbrains.ls.imports.gradle.IdeaGradleLspPlugin"
+    }
+}
+
+/** Defect 1: re-run the Android variant collector where it actually works. */
+def recollectVariants(p, lspPlugin) {
+    try {
+        def variants = lspPlugin.class.classLoader.loadClass(
+                "com.jetbrains.ls.imports.gradle.model.builder.android.AndroidVariants")
+        def collect = variants.getDeclaredMethod(
+                "access\$collectAndroidVariants", org.gradle.api.Project)
+        collect.accessible = true
+        collect.invoke(null, p)
+    } catch (Throwable t) {
+        println("[deep-worker:lsp-android] ${p.path}: variant collection skipped: " + t)
+    }
+}
+
+/** Defect 2: let the source Providers be read while the model is built. */
+def installSourceSetsBuilderWrapper(p, lspPlugin) {
+    try {
+        def registry = p.services.get(
+                org.gradle.tooling.provider.model.ToolingModelBuilderRegistry)
+        def modelName = "com.jetbrains.ls.imports.gradle.model.ModuleSourceSets"
+        def delegate = registry.getBuilder(modelName)
+        if (delegate == null) return
+        if (delegate.class.name.contains("DeepWorkerLspAndroidFix")) return
+
+        def outcomeClass = lspPlugin.class.classLoader.loadClass(
+                "org.gradle.api.internal.tasks.TaskExecutionOutcome")
+        def upToDate = Enum.valueOf(outcomeClass, "UP_TO_DATE")
+
+        registry.register(new DeepWorkerLspAndroidFixBuilder(
+                delegate: delegate, modelName: modelName,
+                outcomeClass: outcomeClass, upToDate: upToDate))
+    } catch (Throwable t) {
+        println("[deep-worker:lsp-android] ${p.path}: source-set wrapper skipped: " + t)
+    }
+}
+
+class DeepWorkerLspAndroidFixBuilder
+        implements org.gradle.tooling.provider.model.ToolingModelBuilder {
+    def delegate
+    String modelName
+    Class outcomeClass
+    def upToDate
+
+    boolean canBuild(String name) { return name == modelName }
+
+    Object buildAll(String name, org.gradle.api.Project project) {
+        def touched = []
+        try {
+            project.tasks.names.findAll {
+                it.startsWith("generate") && it.contains("BuildConfig")
+            }.each { n ->
+                try {
+                    def t = project.tasks.named(n).get()
+                    def st = t.state
+                    // Only tasks that have not executed: getExecuted() is
+                    // `outcome != null`, and setOutcome asserts on that same
+                    // precondition. A task that already ran needs no help.
+                    if (!st.executed) {
+                        // Capture the previous outcome instead of assuming
+                        // null: restoring a value we invented would corrupt
+                        // task state if the guard above ever loosens.
+                        def prev = st.outcome
+                        st.class.getMethod("setOutcome", outcomeClass).invoke(st, upToDate)
+                        touched << [state: st, prev: prev]
+                    }
+                } catch (Throwable ignored) {
+                    // This task stays unmarked; resolution may still succeed
+                    // for the rest. Never fail the import over it.
+                }
+            }
+            return delegate.buildAll(name, project)
+        } finally {
+            touched.each { e ->
+                try {
+                    // Restore exactly what was there before we interfered.
+                    e.state.class.getMethod("setOutcome", outcomeClass)
+                            .invoke(e.state, e.prev)
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+    }
+}
+
+allprojects { project ->
+    ["com.android.application", "com.android.library"].each { pluginId ->
+        project.pluginManager.withPlugin(pluginId) {
+            def lspPlugin = lspPluginOf(project)
+            if (lspPlugin == null) return   // not an LSP import run - no-op
+            recollectVariants(project, lspPlugin)
+            installSourceSetsBuilderWrapper(project, lspPlugin)
+        }
+    }
+}

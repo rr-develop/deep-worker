@@ -59,12 +59,20 @@ class JobHandle(TypedDict):
     """An in-flight tool call parked as a background job after its wait
     elapsed. The Future is NOT cancelled — the real work continues on the
     LangGraph ToolNode side and is later resolved. The agent was handed an
-    intermediate handle and can ``wait_for_job`` / ``kill_job`` it.
+    intermediate handle and can ``wait_for_job`` / ``kill_job`` it using
+    the canonical ``job_N`` id from ``ParkedJobRegistry`` — NOT the
+    originating ``call_id``. See docs/DESIGN_FIX_SANDBOX_EXECUTE_JOB_ID.md
+    (observed incident, 2026-07-31).
+
+    ``tool_call_id`` retains the originating ``call_id`` so ``resolve_call``
+    (entered by the CLI with that id) can complete the parked Future via
+    dual-key lookup in the shared registry.
     """
 
     future: "asyncio.Future[MCPResult]"
     tool_name: str
     args: dict[str, Any]
+    tool_call_id: NotRequired[str]
 
 
 class PendingCall(TypedDict):

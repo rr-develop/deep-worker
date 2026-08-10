@@ -49,7 +49,7 @@ This document outlines the complete migration plan to transition the `deep_worke
 5. [Component Migration Steps](#5-component-migration-steps)
 6. [Testing Strategy](#6-testing-strategy)
 7. [Rollout Plan](#7-rollout-plan)
-8. [Risk Assessment & Mitigation](#8-risk-assessment--mitigation)
+8. [Hazards and Mitigations](#8-hazards-and-mitigations)
 9. [Success Criteria](#9-success-criteria)
 10. [Appendix: File Mapping](#10-appendix-file-mapping)
 
@@ -1612,7 +1612,7 @@ export DEEPWORKER_USE_ASYNCIO_SERVER=false
 
 ---
 
-## 8. Risk Assessment & Mitigation
+## 8. Hazards and Mitigations
 
 ### 8.1 Identified Risks
 

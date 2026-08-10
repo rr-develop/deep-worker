@@ -14,7 +14,7 @@ Agent `agent_a` (working_dir `/path/to/project`) appeared hung: `session_metadat
 1. Agent started; one turn completed fine (final answer `'9'`).
 2. First real `project_memory` call → `semantic_search.retriever.search` lazily instantiated `HuggingFaceEmbedding(model_name="intfloat/multilingual-e5-small")`.
 3. Log shows `Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN ...` then `Loading weights: 0% … 7% (14/199)` and **stops**.
-4. `ss` showed two external `:443` sockets to HF/CloudFront ranges (`3.173.21.63`, `18.239.50.16`) in **`CLOSE-WAIT`** with bytes stuck in `recv-q` — the remote closed mid-fetch and the loader neither finished nor errored.
+4. `ss` showed two external `:443` sockets to HF/CloudFront ranges (`<HF-ENDPOINT>`, `<HF-ENDPOINT>`) in **`CLOSE-WAIT`** with bytes stuck in `recv-q` — the remote closed mid-fetch and the loader neither finished nor errored.
 
 ### Root cause
 - The embedding model `intfloat/multilingual-e5-small` **is present locally and complete** at `~/.cache/llama_index/models--intfloat--multilingual-e5-small` (llama_index's default `cache_folder = get_cache_dir()`). Verified: with the network disabled, `search()` over `/path/to/project` returns correct results from that cache.

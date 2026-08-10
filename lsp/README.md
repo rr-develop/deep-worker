@@ -81,8 +81,77 @@ Serena tools are marked `auto_approve` — no HITL is requested for them
 
 - **Python** — pyright, works out of the box.
 - **Kotlin** — official `Kotlin/kotlin-lsp`, Serena downloads it itself;
-  first start is noticeably slower (JVM).
+  first start is noticeably slower (JVM). On Android projects (AGP) a
+  Gradle init script is required — installed automatically, see below.
 - The other 40+ languages — as needed, through the same unified interface.
+
+### Kotlin + Android: Gradle init script
+
+Without it, cross-file navigation in an AGP project is **silently empty**:
+the server imports the module without a single source root, and
+`find_referencing_symbols`, `find_declaration`, `find_implementations`
+return `[]` for any cross-file request. Requests within a single file still
+work, which makes the LSP look healthy. The server log shows `has an empty
+set of source sets` and `Failed to call 'onVariants' in 'androidComponents'
+extension`.
+
+The cause is two Kotlin LSP defects: Android variants are assembled in
+`beforeProject`, when the `androidComponents` extension does not exist yet;
+and source dirs are read in the configuration phase, which Gradle forbids
+(`Querying the mapped value of ... before task ':app:generateDebugBuildConfig'
+has completed`). Full analysis — in
+[DESIGN_KOTLIN_LSP_ANDROID_SOURCE_SETS.md](docs/DESIGN_KOTLIN_LSP_ANDROID_SOURCE_SETS.md).
+
+`deep-worker lsp enable` installs the workaround:
+
+```
+$GRADLE_USER_HOME/init.d/deep-worker-kotlin-android-source-sets.gradle
+```
+
+by default — `~/.gradle/init.d/…`, permissions `0644` in a `0755` directory.
+
+**The file is global.** Gradle reads init scripts only from
+`$GRADLE_USER_HOME/init.d` (a script placed in the project directory is
+**not** applied), so it ends up in all of the user's builds. Outside the
+Kotlin LSP import the script is a no-op: it exits immediately if the build
+has no `IdeaGradleLspPlugin` plugin. All reflection is wrapped in
+`try/catch (Throwable)`: if the Kotlin LSP versions diverge, navigation
+degrades to the current (broken) state, but the import does not fail.
+
+Opt out when enabling:
+
+```bash
+deep-worker lsp enable --no-gradle-init
+```
+
+Remove:
+
+```bash
+deep-worker lsp disable          # removes only the file with our version marker
+rm ~/.gradle/init.d/deep-worker-kotlin-android-source-sets.gradle   # manually
+```
+
+A manually edited file is not overwritten by `enable` without `--force`, and
+`disable` does not remove it (the version marker in the first line no longer
+matches). The current state is shown by `deep-worker lsp status`.
+
+#### Kotlin LSP version
+
+Verified on `kotlin_server-262.9593.0` (bundled JBR 25). Serena downloads
+an older build, and `kotlin_lsp_version` in `.serena/project.yml` does not
+work for new versions: SolidLSP only supports `.zip`, whereas linux-x64
+starting with `v262.4739.0` is published as `.tar.gz`. Therefore the new
+server is specified as an unpacked directory in the target project's
+`.serena/project.yml`:
+
+```yaml
+ls_specific_settings:
+  kotlin:
+    ls_path: /path/to/kotlin_server-262.9593.0/bin/intellij-server
+```
+
+`.serena/project.yml` belongs to the target project; `deep-worker` does not
+manage it — it only writes `mcp.json`.
 
 ## Highlights
 
@@ -103,9 +172,15 @@ Serena tools are marked `auto_approve` — no HITL is requested for them
 # unit
 python3 -m pytest tests/unit_tests/lsp/ -q
 
-# integration (real Serena, no mocks; skipped without the binary)
+# integration (real Serena + the real deep-worker binary, no mocks)
 python3 -m pytest tests/integration_tests/lsp/ -q -m integration
 ```
+
+The integration suite includes `test_lsp_cli_wiring.py` — it launches the
+**real** `deep-worker lsp status` through the launcher. It exists because
+the parser unit tests once missed a wiring defect: the command was
+registered in a dead entry point `main.py` and did not work. Details and
+the rule for the future — §4.6 of the design.
 
 In strict mode (`DEEP_WORKER_REQUIRE_INTEGRATION=1`) a missing `serena`
 binary fails the test instead of skipping it.
@@ -113,4 +188,5 @@ binary fails the test instead of skipping it.
 ## Documents
 
 - [Integration design](docs/DESIGN_LSP_MCP_INTEGRATION.md)
+- [Kotlin/Android source sets](docs/DESIGN_KOTLIN_LSP_ANDROID_SOURCE_SETS.md)
 - [OSS research](research/RESEARCH_LSP_MCP.md)

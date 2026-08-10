@@ -223,8 +223,20 @@ class ProxyMCPServer:
             if not fut.done():
                 fut.set_result(result)
             return
-        job = self._jobs.pop(call_id, None)
-        if job is not None:
+        # Dual-key parked-job lookup (observed fix, 2026-07-31): the local
+        # ``self._jobs`` dict is keyed by canonical ``job_N`` now, but this
+        # method is still entered by the originating ``call_id`` — resolve
+        # either namespace via the shared ``ParkedJobRegistry`` alias.
+        job_key: str | None = call_id if call_id in self._jobs else None
+        if job_key is None:
+            from deepagents.middleware.parked_job_registry import (  # noqa: PLC0415
+                get_parked_job_registry,
+            )
+            parked = get_parked_job_registry().resolve(call_id)
+            if parked is not None and parked.job_id in self._jobs:
+                job_key = parked.job_id
+        if job_key is not None:
+            job = self._jobs.pop(job_key)
             jfut = job["future"]
             if not jfut.done():
                 jfut.set_result(result)
@@ -311,27 +323,45 @@ class ProxyMCPServer:
             return result.get("content", [])
         except asyncio.TimeoutError:
             # Park the live Future as a job (NOT cancelled, NOT lost).
-            self._jobs[call_id] = {
-                "future": fut, "tool_name": tool_name, "args": args,
+            #
+            # Namespace contract (observed incident, 2026-07-31 — fourth
+            # locus). The advertised ``job_id`` MUST be a canonical
+            # ``job_N`` from ``ParkedJobRegistry`` so ``wait_for_job``/
+            # ``kill_job`` resolve it. Reuse any id the middleware already
+            # minted under the same alias to avoid duplicating a live job.
+            # See docs/DESIGN_FIX_SANDBOX_EXECUTE_JOB_ID.md.
+            from deepagents.middleware.parked_job_registry import (  # noqa: PLC0415
+                get_parked_job_registry,
+            )
+            from deepagents.middleware.bounded_tool_call import (  # noqa: PLC0415
+                build_in_progress_notice,
+            )
+
+            registry = get_parked_job_registry()
+            existing = registry.resolve_by_alias(call_id) if call_id else None
+            job_id = (
+                existing.job_id if existing is not None else registry.allocate()
+            )
+            registry.register(
+                job_id,
+                kind="tool",
+                handle=fut,
+                alias=call_id or None,
+                tool_name=tool_name,
+            )
+            fut.add_done_callback(lambda _f: registry.drop(job_id))
+
+            self._jobs[job_id] = {
+                "future": fut,
+                "tool_name": tool_name,
+                "args": args,
+                "tool_call_id": call_id,
             }
             parked = True
+            text = build_in_progress_notice(tool_name, job_id, wait_seconds)
             if mode == "timeout_notice":
-                text = (
-                    f"Tool '{tool_name}' timed out after {wait_seconds:g}s "
-                    f"but was NOT killed and is still running in the "
-                    f"background. status: in_progress. job_id: {call_id}. "
-                    f"actions: wait_for_job(job_id=\"{call_id}\", "
-                    f"timeout=<seconds>) or kill_job(job_id=\"{call_id}\"). "
-                    f"You may also just continue or retry."
-                )
-            else:
-                text = (
-                    f"Tool '{tool_name}' is still running after "
-                    f"{wait_seconds:g}s. status: in_progress. "
-                    f"job_id: {call_id}. actions: wait_for_job(job_id="
-                    f"\"{call_id}\", timeout=<seconds>) or kill_job("
-                    f"job_id=\"{call_id}\")."
-                )
+                # Keep the older tone for explicit opt-out.
+                text = text + " You may also just continue or retry."
             # NON-error result — never is_error.
             return [{"type": "text", "text": text}]
         finally:

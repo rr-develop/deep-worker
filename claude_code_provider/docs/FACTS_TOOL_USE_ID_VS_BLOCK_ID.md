@@ -193,7 +193,7 @@ primitives).
 
 ```python
 import json, glob, collections
-files = glob.glob("~/.claude/projects/*/*.jsonl")
+files = glob.glob("/home/<user>/.claude/projects/*/*.jsonl")
 msg_to_tools = {}
 for f in files:
     for line in open(f, errors="ignore"):

@@ -7,11 +7,10 @@ broken empty-session replay path runs. Persisting ``sent_count`` (and the
 last-known Claude session uuid as a *hint* for locating the resumable
 transcript) makes restart deterministic.
 
-Storage: a small JSON file co-located with the agent's data dir — the
-per-agent state file (``claude_session_state.json``) under the agent's data
-directory (the ``:tm`` / ``__epoch_N`` suffixes are stripped so the
-TaskManager thread and the main agent share the agent's data dir but keep
-per-thread entries).
+Storage: a small JSON file named ``claude_session_state.json`` co-located
+with the agent's data dir (the ``:tm`` / ``__epoch_N`` suffixes are stripped
+so the TaskManager thread and the main agent share the agent's data dir but
+keep per-thread entries).
 """
 
 from __future__ import annotations
@@ -21,6 +20,7 @@ from pathlib import Path
 import pytest
 
 from claude_code_provider.session_state import (
+    invalidate_session_state,
     load_session_state,
     save_session_state,
     session_state_path,
@@ -32,11 +32,11 @@ def test_path_strips_tm_and_epoch_suffixes(
 ) -> None:
     monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))  # pyright: ignore[reportUnknownLambdaType]
     # main agent, :tm, and an epoch-rotated id all map to the SAME data dir.
-    assert session_state_path("agent_main").parent.name == "agent_main"
-    assert session_state_path("agent_main:tm").parent.name == "agent_main"
-    assert session_state_path("agent_main__epoch_3").parent.name == "agent_main"
-    assert session_state_path("agent_main:tm__epoch_2").parent.name == "agent_main"
-    assert session_state_path("agent_main").name == "claude_session_state.json"
+    assert session_state_path("user_thread").parent.name == "user_thread"
+    assert session_state_path("user_thread:tm").parent.name == "user_thread"
+    assert session_state_path("user_thread__epoch_3").parent.name == "user_thread"
+    assert session_state_path("user_thread:tm__epoch_2").parent.name == "user_thread"
+    assert session_state_path("user_thread").name == "claude_session_state.json"
 
 
 def test_save_then_load_round_trip(
@@ -109,6 +109,46 @@ def test_corrupt_file_returns_none(
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text("{ this is not json")
     assert load_session_state("agentC") is None
+
+
+def test_invalidate_removes_only_target_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))  # pyright: ignore[reportUnknownLambdaType]
+    save_session_state("agentR", sent_count=8, session_uuid="poisoned")
+    save_session_state("agentR:tm", sent_count=3, session_uuid="tm-clean")
+
+    invalidate_session_state("agentR")
+
+    assert load_session_state("agentR") is None
+    assert load_session_state("agentR:tm") == {
+        "sent_count": 3,
+        "session_uuid": "tm-clean",
+    }
+
+
+def test_invalidate_missing_and_corrupt_are_best_effort(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))  # pyright: ignore[reportUnknownLambdaType]
+    invalidate_session_state("missing")
+    path = session_state_path("corrupt")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("not-json")
+    invalidate_session_state("corrupt")
+
+
+def test_invalidate_write_error_is_best_effort(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))  # pyright: ignore[reportUnknownLambdaType]
+    save_session_state("agentO", sent_count=1, session_uuid="poisoned")
+
+    def fail_write(self: Path, data: str, *args: object, **kwargs: object) -> int:
+        raise OSError("disk unavailable")
+
+    monkeypatch.setattr(Path, "write_text", fail_write)
+    invalidate_session_state("agentO")
 
 
 if __name__ == "__main__":

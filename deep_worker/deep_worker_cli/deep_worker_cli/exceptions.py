@@ -248,6 +248,11 @@ PROVIDER_API_ERROR_TYPES: frozenset[str] = frozenset({
     "GrokConcurrentPromptError",
     # codex exec protocol error that is not a usage cap.
     "CodexProtocolError",
+    # claude-code CLI returned an upstream API error AS the turn (repacked
+    # into a TextBlock or signalled via ResultMessage.is_error /
+    # AssistantMessage.error). Recoverable at the account level; the request
+    # itself failed. See DESIGN_FIX_API_ERROR_AS_FINAL_ANSWER.md.
+    "ClaudeApiResponseError",
 })
 
 

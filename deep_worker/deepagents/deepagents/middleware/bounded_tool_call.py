@@ -11,9 +11,12 @@ LangGraph's ToolNode. Because middleware lives on the agent graph (see
 Contract on the wait elapsing (default 120s, env
 ``DW_LONG_RUNNING_WAIT_SECONDS``):
   * the tool's work is PARKED in the background — NOT cancelled (``shield``);
-  * the model gets a NON-error ``in_progress`` ``ToolMessage`` carrying the
-    ``tool_call_id`` as ``job_id`` plus the ``wait_for_job`` / ``kill_job``
-    actions;
+  * the model gets a NON-error ``in_progress`` ``ToolMessage`` carrying a
+    CANONICAL ``job_N`` as ``job_id`` (minted from the shared
+    ``ParkedJobRegistry`` — the same namespace ``wait_for_job`` / ``kill_job``
+    resolve) plus those two actions. The ``tool_call_id`` is recorded only as
+    an alias; advertising it as the ``job_id`` was an internal defect
+    (2026-07-31) and is forbidden;
   * a timeout is NEVER ``status="error"`` — it informs and the agent
     continues / retries.
 
@@ -33,6 +36,7 @@ from langchain.tools.tool_node import ToolCallRequest
 from langchain_core.messages import ToolMessage
 from langgraph.types import Command
 
+from deepagents.middleware.parked_job_registry import get_parked_job_registry
 from deepagents.middleware.tool_dispatch_bridge import get_dispatch_waiter
 
 DEFAULT_TOOL_WAIT_SECONDS = 120.0
@@ -111,7 +115,16 @@ def resolve_effective_tool_wait_seconds(
 
 def build_in_progress_notice(tool_name: str, job_id: str, wait_seconds: float) -> str:
     """THE single in_progress message shared by every bounded wait site, so a
-    timeout reads identically wherever the bound fires. NEVER an error."""
+    timeout reads identically wherever the bound fires. NEVER an error.
+
+    ``job_id`` MUST be a canonical ``job_N`` from ``ParkedJobRegistry`` — the
+    caller is asserting that real work has been parked and can be reached by
+    ``wait_for_job`` / ``kill_job``. Callers that never parked work (e.g.
+    CLI-provider stage-A dispatch timeouts, where a control request never
+    arrived) MUST use ``build_dispatch_timeout_notice`` instead — advertising a
+    ``job_id`` for work that does not exist is the same internal defect
+    (2026-07-31). See DESIGN_FIX_STAGE_A_FALSE_PROMISE.md.
+    """
     return (
         f"Tool '{tool_name}' is still running after {wait_seconds:g}s. "
         f"status: in_progress. job_id: {job_id}. "
@@ -120,19 +133,52 @@ def build_in_progress_notice(tool_name: str, job_id: str, wait_seconds: float) -
     )
 
 
-class _ParkedToolJob:
-    """A tool whose execution outlived the bound. Its task keeps running
-    (the work was NOT cancelled); ``wait_for_job`` / ``kill_job`` can pick it
-    up later by ``job_id`` (== the originating ``tool_call_id``)."""
+def build_dispatch_timeout_notice(tool_name: str, wait_seconds: float) -> str:
+    """CLI stage-A dispatch timeout notice: the CLI announced the tool call
+    but the control request never arrived within the bound.
 
-    __slots__ = ("job_id", "tool_name", "task")
+    NO job was parked — there is no process, no task, no future for
+    ``wait_for_job`` / ``kill_job`` to key off. Advertising a ``job_id`` here
+    (which the two provider sites did until the follow-up to 6bd042b)
+    reproduced the very ``no background job with id '…'`` symptom the
+    ParkedJobRegistry fix removed for real parks. This notice states the
+    honest truth: the tool did not start, no job exists, the model should
+    retry.
+
+    NEVER an error (POLICIES §7.1). See DESIGN_FIX_STAGE_A_FALSE_PROMISE.md.
+    """
+    return (
+        f"Tool '{tool_name}' did not start within {wait_seconds:g}s "
+        f"(the CLI announced the call but the control request never arrived). "
+        f"status: not_started. No background job was created. "
+        f"The turn ends; retry the tool call."
+    )
+
+
+class _ParkedToolJob:
+    """A tool whose execution outlived the bound. Its work keeps running (it
+    was NOT cancelled); ``wait_for_job`` / ``kill_job`` pick it up later by its
+    canonical ``job_N`` id, or by the originating ``tool_call_id`` alias.
+
+    ``job_id`` is a canonical ``job_N`` minted from ``ParkedJobRegistry`` — it
+    is NOT the ``tool_call_id``. Advertising the ``tool_call_id`` as a job id
+    is precisely the internal defect (2026-07-31): ``wait_for_job`` could never
+    resolve it.
+    """
+
+    __slots__ = ("job_id", "tool_name", "task", "tool_call_id")
 
     def __init__(
-        self, job_id: str, tool_name: str, task: "asyncio.Task[Any]"
+        self,
+        job_id: str,
+        tool_name: str,
+        task: "asyncio.Task[Any]",
+        tool_call_id: str = "",
     ) -> None:
         self.job_id = job_id
         self.tool_name = tool_name
         self.task = task
+        self.tool_call_id = tool_call_id
 
 
 class BoundedToolCallMiddleware(AgentMiddleware):
@@ -150,7 +196,16 @@ class BoundedToolCallMiddleware(AgentMiddleware):
         self._jobs: dict[str, _ParkedToolJob] = {}
 
     def get_job_registry(self) -> dict[str, _ParkedToolJob]:
-        return self._jobs
+        """Snapshot of this middleware's parked tool jobs, keyed by canonical
+        ``job_N``.
+
+        A COPY on purpose: a parked job removes itself the moment its work
+        settles (``add_done_callback``), so handing out the live dict would
+        let a caller iterating it hit "dictionary changed size during
+        iteration". The shared ``ParkedJobRegistry`` is the source of truth;
+        this accessor exists for diagnostics and tests.
+        """
+        return dict(self._jobs)
 
     def wrap_tool_call(
         self,
@@ -182,9 +237,32 @@ class BoundedToolCallMiddleware(AgentMiddleware):
         except concurrent.futures.TimeoutError:
             # Work continues on the thread (NOT cancelled). Do not shut the
             # executor down with wait=True — that would block on the timeout.
+            #
+            # Park under a canonical ``job_N`` exactly like the async path, so
+            # the advertised id is always resolvable and the two paths cannot
+            # drift apart again. NOTE: a thread cannot be cancelled, so
+            # ``kill_job`` on such a job can only report that it is still
+            # running — see ``ParkedJob.handle`` (a concurrent Future).
+            registry = get_parked_job_registry()
+            existing = (
+                registry.resolve_by_alias(tool_call_id)
+                if tool_call_id
+                else None
+            )
+            job_id = (
+                existing.job_id if existing is not None else registry.allocate()
+            )
+            registry.register(
+                job_id,
+                kind="tool",
+                handle=future,
+                alias=tool_call_id or None,
+                tool_name=tool_name,
+            )
+            future.add_done_callback(lambda _f: registry.drop(job_id))
             return ToolMessage(
                 content=build_in_progress_notice(
-                    tool_name, tool_call_id, wait_seconds
+                    tool_name, job_id, wait_seconds
                 ),
                 tool_call_id=tool_call_id,
                 status="success",
@@ -221,7 +299,7 @@ class BoundedToolCallMiddleware(AgentMiddleware):
                 authoritative_args = await waiter(tool_call_id)
                 if authoritative_args is not None:
                     # Authoritative args from the control channel override the
-                    # announced args (observed live, 2026-05-26).
+                    # announced args (internal fix 2026-05-26).
                     request.tool_call["args"] = authoritative_args
             return await handler(request)
 
@@ -235,13 +313,63 @@ class BoundedToolCallMiddleware(AgentMiddleware):
         except asyncio.TimeoutError:
             # Park the live task (NOT cancelled, NOT lost) and inform the
             # model. NEVER an error.
-            self._jobs[tool_call_id] = _ParkedToolJob(
-                job_id=tool_call_id, tool_name=tool_name, task=task
-            )
+            #
+            # The advertised job_id MUST be a canonical ``job_N`` from the
+            # shared registry — the same namespace ``wait_for_job`` /
+            # ``kill_job`` resolve. Handing back ``tool_call_id`` (a
+            # ``toolu_…``) was the internal defect: the model got an id no
+            # registry could honour and lost control of live background work.
+            # ``ToolMessage.tool_call_id`` below still carries the
+            # ``toolu_…`` because that field is the LangChain protocol — it
+            # is NOT a job id, and conflating the two caused the bug.
+            job_id = self._park_task(task, tool_name, tool_call_id)
             return ToolMessage(
                 content=build_in_progress_notice(
-                    tool_name, tool_call_id, wait_seconds
+                    tool_name, job_id, wait_seconds
                 ),
                 tool_call_id=tool_call_id,
                 status="success",
             )
+
+    def _park_task(
+        self,
+        task: "asyncio.Task[Any]",
+        tool_name: str,
+        tool_call_id: str,
+    ) -> str:
+        """Register a still-running tool task under a canonical ``job_N`` and
+        return that id. The originating ``tool_call_id`` is recorded as an
+        alias so a model that echoes it still reaches the job.
+
+        The job drops itself from the registry when the work finishes —
+        event-driven via ``add_done_callback``, never polled.
+        """
+        registry = get_parked_job_registry()
+        # If the other parking layer (the shell backend) already parked work
+        # for this very tool call, reuse its id instead of minting a second.
+        existing = (
+            registry.resolve_by_alias(tool_call_id) if tool_call_id else None
+        )
+        job_id = existing.job_id if existing is not None else registry.allocate()
+
+        parked = _ParkedToolJob(
+            job_id=job_id,
+            tool_name=tool_name,
+            task=task,
+            tool_call_id=tool_call_id,
+        )
+        self._jobs[job_id] = parked
+        registry.register(
+            job_id,
+            kind="tool",
+            handle=parked,
+            alias=tool_call_id or None,
+            tool_name=tool_name,
+        )
+
+        def _drop(_fut: "asyncio.Future[Any]") -> None:
+            registry.drop(job_id)
+            self._jobs.pop(job_id, None)
+
+        task.add_done_callback(_drop)
+        return job_id

@@ -1,0 +1,215 @@
+// LSP shared-service gRPC contract.
+//
+// See docs/DESIGN_LSP_SHARED_SERVICE.md §4.1 for the authoritative surface.
+//
+// Wire compatibility:
+//   * package is versioned (deep_worker.lsp.v1); breaking changes MUST bump
+//     the version segment and add a new package alongside the old one for at
+//     least one release cycle.
+//   * fields are numbered stably; DO NOT renumber. Deprecated fields keep
+//     their number and get a `reserved` line.
+//
+// Regeneration:
+//   python -m grpc_tools.protoc \
+//     -I deep_worker/deep_worker_cli/deep_worker_cli/lsp/service/proto \
+//     --python_out=deep_worker/deep_worker_cli/deep_worker_cli/lsp/service/proto \
+//     --grpc_python_out=deep_worker/deep_worker_cli/deep_worker_cli/lsp/service/proto \
+//     lsp_service.proto
+//   (stubs live next to the .proto and ARE committed — see policy §7)
+
+syntax = "proto3";
+
+package deep_worker.lsp.v1;
+
+// ---------- Common types ----------
+
+// A file location. Line/character are 0-based per LSP convention.
+message Position {
+  int32 line = 1;
+  int32 character = 2;
+}
+
+message Range {
+  Position start = 1;
+  Position end = 2;
+}
+
+message Location {
+  string uri = 1;   // file:// or workspace-relative — server-defined
+  Range range = 2;
+}
+
+// Symbol kind, LSP-compatible integer.
+message Symbol {
+  string name = 1;
+  int32 kind = 2;
+  Location location = 3;
+  string container = 4;   // fully-qualified path within its file
+  string detail = 5;      // signature / type info if available
+}
+
+// A Serena tool result is opaque to the transport: raw JSON stays here so
+// upstream Serena tools can evolve without breaking the wire schema.
+message ToolResult {
+  string content_json = 1;   // JSON produced by the Serena tool
+  bool is_error = 2;
+  string error_message = 3;  // only set when is_error
+}
+
+// ---------- Administrative ----------
+
+message HealthRequest {}
+
+message HealthReply {
+  bool alive = 1;
+  string service_version = 2;
+  string serena_version = 3;
+  string project_root = 4;
+  int64 uptime_seconds = 5;
+  int32 attached_clients = 6;
+  // Commit 12 (observability): seconds since the current live backend
+  // was attached; 0 while not ready.
+  int64 backend_uptime_seconds = 7;
+  // Commit 12: number of SUCCESSFUL Serena auto-restarts this
+  // service process has performed since it started.
+  int64 restarts_total = 8;
+}
+
+message AttachRequest {
+  string client_id = 1;      // free-form (agent name + pid recommended)
+  string project_root = 2;   // realpath; server must match its own
+}
+
+// Top-level enum: nested-in-message enums generate a .pyi with
+// `class Type(int, metaclass=EnumTypeWrapper)` which trips
+// `ty`'s conflicting-metaclass check. Top-level enums avoid that.
+enum SessionEventType {
+  SESSION_EVENT_UNKNOWN = 0;
+  SESSION_EVENT_ATTACHED = 1;
+  SESSION_EVENT_KEEPALIVE = 2;
+  SESSION_EVENT_REFRESH_STARTED = 3;
+  SESSION_EVENT_REFRESH_FINISHED = 4;
+  SESSION_EVENT_SHUTDOWN = 5;
+  SESSION_EVENT_DIAGNOSTICS_UPDATED = 6;
+}
+
+// Server-stream. Emitted on:
+//   * successful attach (event_type = SESSION_EVENT_ATTACHED)
+//   * change-detector refresh (SESSION_EVENT_REFRESH_STARTED /
+//     SESSION_EVENT_REFRESH_FINISHED)
+//   * fatal service shutdown (SESSION_EVENT_SHUTDOWN)
+//   * periodic keepalive (SESSION_EVENT_KEEPALIVE) — server-driven,
+//     no polling
+message SessionEvent {
+  SessionEventType event_type = 1;
+  string message = 2;
+  string uri = 3;              // only for DIAGNOSTICS_UPDATED
+  int64 timestamp_ns = 4;
+}
+
+message RefreshRequest {
+  bool force = 1;   // bypass the "empty diff → no-op" rule
+}
+
+message RefreshReply {
+  bool triggered = 1;
+  string reason = 2;   // "empty diff" / "structural change" / "forced"
+}
+
+message StatusRequest {}
+
+message StatusReply {
+  string project_root = 1;
+  string slug = 2;
+  string transport = 3;         // "uds" | "tcp+psk"
+  string transport_address = 4; // socket path or 127.0.0.1:port
+  int64 pid = 5;
+  int64 uptime_seconds = 6;
+  int32 attached_clients = 7;
+  int64 last_refresh_unix = 8;
+  string last_refresh_reason = 9;
+  repeated string active_providers = 10;    // e.g. ["kotlin_gradle", "python"]
+  repeated string watched_paths = 11;
+  // Commit 12 (observability): live backend metrics.
+  int64 backend_uptime_seconds = 12;
+  int64 restarts_total = 13;
+  // POSIX seconds of the last successful (is_error=False) tool call.
+  int64 last_tool_call_unix = 14;
+  int64 tool_calls_total = 15;
+  // Cached serverInfo.version from Serena's initialize response.
+  string serena_version = 16;
+  // Transient LSP cancellations (-32800/-32801) we retried instead of
+  // surfacing to the agent. A rising count means the language server
+  // is reindexing often, not that anything is broken.
+  int64 transient_retries_total = 17;
+  // Language-server deaths we rode out by replaying a read-only tool
+  // call after the backend came back. A rising count means the LS is
+  // crashing (see DESIGN_LSP_LS_TERMINATED_RETRY.md) while the agent
+  // saw nothing. Mutating calls are never replayed, so they never
+  // bump this.
+  int64 ls_terminated_retries_total = 18;
+}
+
+// ---------- Symbol tools (1:1 with Serena MCP surface) ----------
+//
+// Every request carries the raw JSON arguments as Serena expects them.
+// This lets us evolve Serena tools without changing the .proto — a tool
+// that gains a new optional parameter simply sees it appear in args_json
+// on the server side.
+
+message FindSymbolRequest {
+  string args_json = 1;
+}
+message FindSymbolReply {
+  ToolResult result = 1;
+}
+
+message RefRequest { string args_json = 1; }
+message RefReply   { ToolResult result = 1; }
+
+message DeclRequest { string args_json = 1; }
+message DeclReply   { ToolResult result = 1; }
+
+message ImplRequest { string args_json = 1; }
+message ImplReply   { ToolResult result = 1; }
+
+message OverviewRequest { string args_json = 1; }
+message OverviewReply   { ToolResult result = 1; }
+
+message DiagRequest { string args_json = 1; }
+message DiagReply   { ToolResult result = 1; }
+
+message RenameRequest  { string args_json = 1; }
+message RenameReply    { ToolResult result = 1; }
+
+message ReplaceRequest { string args_json = 1; }
+message ReplaceReply   { ToolResult result = 1; }
+
+message InsertRequest  { string args_json = 1; }
+message InsertReply    { ToolResult result = 1; }
+
+message DeleteRequest  { string args_json = 1; }
+message DeleteReply    { ToolResult result = 1; }
+
+// ---------- Service ----------
+
+service LspService {
+  // Administrative
+  rpc Health(HealthRequest) returns (HealthReply);
+  rpc AttachSession(AttachRequest) returns (stream SessionEvent);
+  rpc RefreshProject(RefreshRequest) returns (RefreshReply);
+  rpc ProjectStatus(StatusRequest) returns (StatusReply);
+
+  // Serena tools
+  rpc FindSymbol(FindSymbolRequest) returns (FindSymbolReply);
+  rpc FindReferencingSymbols(RefRequest) returns (RefReply);
+  rpc FindDeclaration(DeclRequest) returns (DeclReply);
+  rpc FindImplementations(ImplRequest) returns (ImplReply);
+  rpc GetSymbolsOverview(OverviewRequest) returns (OverviewReply);
+  rpc GetDiagnosticsForFile(DiagRequest) returns (DiagReply);
+  rpc RenameSymbol(RenameRequest) returns (RenameReply);
+  rpc ReplaceSymbolBody(ReplaceRequest) returns (ReplaceReply);
+  rpc InsertBeforeSymbol(InsertRequest) returns (InsertReply);
+  rpc InsertAfterSymbol(InsertRequest) returns (InsertReply);
+  rpc SafeDeleteSymbol(DeleteRequest) returns (DeleteReply);
+}

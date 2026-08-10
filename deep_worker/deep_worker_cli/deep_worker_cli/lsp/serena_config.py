@@ -80,6 +80,13 @@ def build_serena_mcp_entry(
         ``external_mcp.config._parse_one``.
     """
     root = Path(workspace_root).resolve()
+    # ``--add-mode`` layers our shipped YAML on top of the built-in
+    # context/mode set so ``restart_language_server`` becomes an
+    # advertised MCP tool (commit-11 refresh-tool fix). Without this
+    # Serena 1.6.x hides the tool behind ``ToolMarkerOptional`` and
+    # ``SerenaBackend.refresh`` has nothing to call.
+    from deep_worker_cli.lsp.resources import SERENA_MODE_YML  # noqa: PLC0415
+
     return {
         "type": "stdio",
         "command": serena_command or SERENA_COMMAND,
@@ -93,6 +100,8 @@ def build_serena_mcp_entry(
             # child process is not guaranteed and is not worktree-safe.
             "--project",
             str(root),
+            "--add-mode",
+            str(SERENA_MODE_YML),
         ],
         "auto_approve": bool(auto_approve),
     }

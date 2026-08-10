@@ -96,3 +96,57 @@ def test_generated_entry_parses_via_existing_loader(tmp_path: Path) -> None:
     assert spec.command == "serena"
     assert spec.auto_approve is True
     assert str(workspace.resolve()) in spec.args
+
+
+def test_entry_layers_the_deep_worker_serena_mode(tmp_path: Path) -> None:
+    """Commit 11 refresh-tool fix: without ``--add-mode`` pointing at
+    our shipped YAML, Serena 1.6.x hides ``restart_language_server``
+    and ``SerenaBackend.refresh`` has nothing to call — a defect the
+    multi-agent stress test caught live.
+
+    Pins two things:
+
+    * ``args`` contains ``--add-mode`` immediately followed by an
+      absolute path.
+    * That path exists on disk and its YAML actually opts
+      ``restart_language_server`` into ``included_optional_tools``.
+    """
+    from deep_worker_cli.lsp.resources import SERENA_MODE_YML
+
+    args = build_serena_mcp_entry(workspace_root=tmp_path)["args"]
+    assert "--add-mode" in args, (
+        "regression: commit-11 refresh fix — build_serena_mcp_entry "
+        "must layer the deep-worker mode YAML so "
+        "restart_language_server is advertised"
+    )
+    mode_arg = args[args.index("--add-mode") + 1]
+    mode_path = Path(mode_arg)
+    assert mode_path.is_absolute()
+    assert mode_path == SERENA_MODE_YML
+    assert mode_path.is_file(), f"shipped mode YAML missing on disk: {mode_path}"
+    text = mode_path.read_text(encoding="utf-8")
+    assert "included_optional_tools" in text
+    assert "restart_language_server" in text
+
+
+def test_refresh_tool_candidates_prefer_restart_language_server() -> None:
+    """Commit 11 refresh-tool fix: ``restart_language_server`` must
+    come FIRST in the pick order — it's the only candidate Serena
+    1.6.x actually advertises, and picking it over legacy names is
+    what makes ``SerenaBackend.refresh`` work under load.
+    """
+    from deep_worker_cli.lsp.service.serena_backend import (
+        _REFRESH_TOOL_CANDIDATES,
+        pick_refresh_tool,
+    )
+
+    assert _REFRESH_TOOL_CANDIDATES[0] == "restart_language_server"
+    # Sanity: when Serena advertises the full 1.6.x set (find_symbol
+    # etc. + restart_language_server), pick() returns exactly that.
+    advertised = [
+        "find_symbol",
+        "get_symbols_overview",
+        "restart_language_server",
+        "activate_project",  # legacy, must NOT win
+    ]
+    assert pick_refresh_tool(advertised) == "restart_language_server"

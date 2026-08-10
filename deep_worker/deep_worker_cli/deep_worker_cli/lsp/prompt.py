@@ -86,4 +86,8 @@ def lsp_prompt_fragment(
         "available: more precise than editing by line numbers.\n"
         "- A one-time delay while the language server warms up is possible — "
         "that is normal, do not treat it as a hang and do not repeat the request.\n"
+        "- Pass ONLY the required fields of the tool. Optional fields "
+        "(with a `default` in the schema) are filled in by the server "
+        "itself — override them only when you deliberately want a "
+        "different value. Fewer fields — fewer tokens, faster call.\n"
     )

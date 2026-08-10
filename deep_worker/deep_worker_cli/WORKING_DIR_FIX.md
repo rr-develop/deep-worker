@@ -6,11 +6,10 @@ When running `deep-worker agent_name` from the `/tmp` directory, the agent start
 
 **Example of the problem:**
 ```bash
-$ cd /tmp
-$ deep-worker test_22
+<user>@<host>:/tmp$ deep-worker test_22
 Agent 'test_22' starting in background...
 
-$ cco -ls
+<user>@<host>:/tmp$ cco -ls
 Active Claude sessions:
 test_22              [dw]         /        # ← Wrong! Should be /tmp
 ```
@@ -94,11 +93,10 @@ $ uv run --all-groups pytest tests/unit_tests/cli/ -v
 The agent now correctly uses the directory it was started from:
 
 ```bash
-$ cd /tmp
-$ deep-worker test_22
+<user>@<host>:/tmp$ deep-worker test_22
 Agent 'test_22' starting in background...
 
-$ cco -ls
+<user>@<host>:/tmp$ cco -ls
 Active Claude sessions:
 test_22              [dw]         /tmp     # ✓ Correct!
 ```

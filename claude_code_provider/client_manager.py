@@ -747,7 +747,9 @@ class ClientManager:
             return thread_id
         return f"{thread_id}__epoch_{epoch}"
 
-    async def rotate_session(self, thread_id: str) -> str:
+    async def rotate_session(
+        self, thread_id: str, *, invalidate_persisted: bool = False
+    ) -> str:
         """Rotate to a new Claude CLI session for this thread.
 
         Called when LangGraph summarization resets the message history
@@ -794,6 +796,12 @@ class ClientManager:
             current = self._session_epoch.get(thread_id, 0)
             self._session_epoch[thread_id] = current + 1
             self._sent_count[thread_id] = 0
+            if invalidate_persisted:
+                from claude_code_provider.session_state import (  # noqa: PLC0415
+                    invalidate_session_state,
+                )
+
+                invalidate_session_state(thread_id)
             return self.get_effective_session_id(thread_id)
 
     async def cleanup_client(self, thread_id: str) -> None:

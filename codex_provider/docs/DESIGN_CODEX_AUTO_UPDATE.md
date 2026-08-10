@@ -56,9 +56,9 @@ with the same update story as any other npm tool).
 
 A user-systemd timer that fires the upgrade once a day. Three artefacts on the
 host, all owned by the `develop` user — **no `sudo`** needed because the npm
-prefix is `~/.npm-global` (verified):
+prefix is `/home/<user>/.npm-global` (verified):
 
-### 1. `~/.local/bin/codex-auto-update.sh` (mode 755)
+### 1. `/home/<user>/.local/bin/codex-auto-update.sh` (mode 755)
 
 The actual upgrader. Idempotent and safe:
 
@@ -67,7 +67,7 @@ The actual upgrader. Idempotent and safe:
 # Auto-update @openai/codex globally if a newer version is available on npm.
 # Invoked by the user-systemd timer `codex-auto-update.timer` (once a day).
 set -u
-PATH=$HOME/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
+PATH=/home/<user>/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
 
 log() { printf '[%s] %s\n' "$(date -Iseconds)" "$*"; }
 
@@ -109,11 +109,11 @@ Design notes:
 ```ini
 [Unit]
 Description=Auto-update @openai/codex CLI to the latest npm release
-ConditionPathExists=%h/.local/bin/codex-auto-update.sh
+ConditionPathExists=/home/<user>/.local/bin/codex-auto-update.sh
 
 [Service]
 Type=oneshot
-ExecStart=%h/.local/bin/codex-auto-update.sh
+ExecStart=/home/<user>/.local/bin/codex-auto-update.sh
 Nice=10
 IOSchedulingClass=idle
 TimeoutStartSec=10min

@@ -70,6 +70,43 @@ class ClaudeUsageLimitError(RuntimeError):
     """
 
 
+class ClaudeApiResponseError(RuntimeError):
+    """Raised when the Claude CLI returns an upstream API error AS the turn.
+
+    Distinct from :class:`ClaudeUsageLimitError`: the account is fine, only
+    this request failed (e.g. HTTP 400 on a malformed message payload). The
+    error is *recoverable* — the runtime keeps the conversation alive and the
+    next request may succeed once the trigger is gone.
+
+    Registered in ``deep_worker_cli.exceptions.PROVIDER_API_ERROR_TYPES``
+    (NOT in ``FATAL_EXCEPTION_TYPES``) so ``agent_process._handle_invoke``'s
+    recoverable branch surfaces the real API text as a persistent
+    ``type="error"`` notify and appends it to conversation history, while
+    the agent stays IDLE. See docs/DESIGN_FIX_API_ERROR_AS_FINAL_ANSWER.md
+    and docs/POLICIES.md §9.
+
+    Carries structured context so diagnostics stay honest and a future
+    failover policy has something to key on. ``str(exc)`` renders the real
+    upstream text (never an empty string, never ordinary partial assistant
+    prose — see the §3.2 precedence in the design).
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        assistant_error: str | None = None,
+        result_subtype: str | None = None,
+        result_errors: tuple[str, ...] | list[str] = (),
+        stop_reason: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.assistant_error = assistant_error
+        self.result_subtype = result_subtype
+        self.result_errors: tuple[str, ...] = tuple(result_errors)
+        self.stop_reason = stop_reason
+
+
 # Standalone marker the Claude CLI emits when the account usage cap is hit.
 # Matched at the START of a stripped response (it is the whole turn), so a
 # normal answer that merely discusses session limits is not a false positive.
@@ -207,6 +244,9 @@ class ClaudeCodeChatModel(BaseChatModel):
     # ⚠️ NO _tool_executors! Tools execute via LangGraph ToolNode.
     # See ProxyMCPServer module docstring for architecture explanation.
     _working_dir: str | None = PrivateAttr(default=None)
+    # Token-stats usage-event callback (DESIGN_AGENT_TOKEN_STATS.md §5.2):
+    # async callable installed by create_model via set_usage_event_callback.
+    _usage_event_callback: Any = PrivateAttr(default=None)
 
     # Properties for backward compatibility with existing code
     @property
@@ -223,6 +263,44 @@ class ClaudeCodeChatModel(BaseChatModel):
     def tools_metadata(self) -> list[ToolMetadata]:
         """Get tools metadata."""
         return self._tools_metadata
+
+    def set_usage_event_callback(self, callback: Any) -> None:
+        """Install the async usage-event callback (§5.2).
+
+        ``create_model`` injects the token-stats state-machine callback here
+        (custom providers never receive a LangChain callback handler — the
+        event callback is the single usage source, MAJOR-2).
+        """
+        self._usage_event_callback = callback
+
+    async def _emit_usage_event(self, event: Any) -> None:
+        """Report a terminal ``ResultMessage`` to the stats callback (§5.2).
+
+        Best-effort: the callback is awaited; failures are logged and never
+        break the provider turn (except ``asyncio.CancelledError``, which
+        propagates). ``ResultMessage.usage`` is already a plain dict — copied
+        defensively before handing over (SDK objects are not assumed
+        JSON-serializable, MAJOR-4).
+        """
+        cb = getattr(self, "_usage_event_callback", None)
+        if cb is None:
+            return
+        try:
+            usage = getattr(event, "usage", None)
+            if isinstance(usage, dict):
+                usage = dict(usage)
+            await cb(
+                event="terminal",
+                status="failed" if bool(getattr(event, "is_error", False)) else "ok",
+                usage=usage,
+                model=getattr(self, "model", None) or "",
+                session_id=getattr(event, "session_id", None) or None,
+                uuid=getattr(event, "uuid", None) or None,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — best-effort
+            _logger.exception("[token-stats] claude-code usage event callback failed")
 
     async def drain_after_inter_agent_send(self, thread_id: str) -> None:
         """Drain the rest of the current Claude turn after a successful
@@ -630,6 +708,12 @@ class ClaudeCodeChatModel(BaseChatModel):
         new_model = ClaudeCodeChatModel(base_options=self._base_options)
         new_model._tools_metadata = tools_metadata
         new_model._working_dir = self._working_dir
+        # Token-stats (DESIGN_AGENT_TOKEN_STATS.md §5.2): LangChain's
+        # bind_tools contract returns a NEW instance, so PrivateAttrs are
+        # NOT carried over automatically. The real model used by LangGraph
+        # (turn-node bind + _bind_tools_for_middleware) is this copy — it
+        # must keep the usage-event callback or stats silently go missing.
+        new_model._usage_event_callback = self._usage_event_callback
 
         return new_model
 
@@ -705,6 +789,17 @@ class ClaudeCodeChatModel(BaseChatModel):
                 "Implicit defaults are forbidden to prevent session state corruption."
             )
         thread_id = config["configurable"]["thread_id"]
+
+        # Token-stats: mark the invocation start (no record is written here —
+        # the record closes on the terminal ResultMessage, §5.2). Best-effort.
+        _cb = getattr(self, "_usage_event_callback", None)
+        if _cb is not None:
+            try:
+                await _cb(event="invocation_start")
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                _logger.exception("[token-stats] invocation_start callback failed")
 
         # 3. Extract system prompt from SystemMessage (if present)
         # ⚠️ CRITICAL: SystemMessage contains cognitive hints from middleware
@@ -1165,6 +1260,23 @@ class ClaudeCodeChatModel(BaseChatModel):
         pending_tool_calls: list[dict[str, Any]] | None = None
         proxy_tool_names = {tool["name"] for tool in self._tools_metadata}
 
+        # ── API-error signal capture (§3.3 of
+        # DESIGN_FIX_API_ERROR_AS_FINAL_ANSWER.md) ──
+        # Terminal-signal state for the post-loop API-error detector.
+        # Declared at ainvoke top-level so EVERY exit path (including the
+        # orphan-reconcile shortcut that skips the receive_response block
+        # entirely, and the empty-turn path where neither ``user_message_sent``
+        # nor ``tool_resolved`` is true) sees defined bindings. Last non-None
+        # wins for scalar fields inside the receive loop: the terminal
+        # message is authoritative.
+        last_assistant_error: str | None = None
+        last_usage: Any | None = None
+        result_is_error: bool = False
+        result_subtype: str | None = None
+        result_errors: tuple[str, ...] = ()
+        result_text: str | None = None
+        result_stop_reason: str | None = None
+
         _logger.info(f"[DEBUG ainvoke] user_message_sent={user_message_sent}, tool_resolved={tool_resolved}")
 
         if user_message_sent or tool_resolved:
@@ -1302,6 +1414,14 @@ class ClaudeCodeChatModel(BaseChatModel):
                         break
 
                     if isinstance(event, ClaudeAssistantMessage):
+                        # Capture API-error signals off the AssistantMessage
+                        # (see DESIGN_FIX_API_ERROR_AS_FINAL_ANSWER.md §3.3).
+                        _err = getattr(event, "error", None)
+                        if _err is not None:
+                            last_assistant_error = str(_err)
+                        _usage = getattr(event, "usage", None)
+                        if _usage is not None:
+                            last_usage = _usage
                         for block in event.content:
                             if isinstance(block, TextBlock):
                                 response_text += block.text
@@ -1387,6 +1507,32 @@ class ClaudeCodeChatModel(BaseChatModel):
                         _sid = getattr(event, "session_id", None)
                         if _sid:
                             self._client_manager.record_session_uuid(thread_id, _sid)
+                        # Capture API-error signals off the ResultMessage
+                        # (see DESIGN_FIX_API_ERROR_AS_FINAL_ANSWER.md §3.3).
+                        result_is_error = bool(getattr(event, "is_error", False))
+                        _sub = getattr(event, "subtype", None)
+                        if _sub is not None:
+                            result_subtype = str(_sub)
+                        _errs = getattr(event, "errors", None)
+                        if _errs:
+                            try:
+                                result_errors = tuple(str(e) for e in _errs)
+                            except Exception:
+                                result_errors = ()
+                        _rt = getattr(event, "result", None)
+                        if _rt is not None:
+                            result_text = str(_rt)
+                        _sr = getattr(event, "stop_reason", None)
+                        if _sr is not None:
+                            result_stop_reason = str(_sr)
+                        _u = getattr(event, "usage", None)
+                        if _u is not None and last_usage is None:
+                            # Fallback: use ResultMessage usage only if no
+                            # AssistantMessage carried it.
+                            last_usage = _u
+                        # Token-stats: terminal event → exactly one record per
+                        # observed ResultMessage (§5.2).
+                        await self._emit_usage_event(event)
                         break
 
                 # ── A: event-driven wait FOR THE EXACT id ──
@@ -1477,13 +1623,19 @@ class ClaudeCodeChatModel(BaseChatModel):
                             expected_proxy_tool_call_id
                         )
                     except DispatchTimeout:
+                        # No pending call ever registered → no work was
+                        # parked. Advertising a job_id here (as we used to)
+                        # promised wait_for_job/kill_job for something that
+                        # does not exist — the same "no background job"
+                        # symptom the 6bd042b registry fix removed for real
+                        # parks. Emit the honest not_started notice instead.
+                        # See DESIGN_FIX_STAGE_A_FALSE_PROMISE.md.
                         from deepagents.middleware.bounded_tool_call import (  # noqa: PLC0415
-                            build_in_progress_notice,
+                            build_dispatch_timeout_notice,
                             resolve_tool_wait_seconds,
                         )
-                        response_text = build_in_progress_notice(
+                        response_text = build_dispatch_timeout_notice(
                             tool_name=expected_proxy_tool_name or "tool",
-                            job_id=expected_proxy_tool_call_id,
                             wait_seconds=resolve_tool_wait_seconds(),
                         )
 
@@ -1497,6 +1649,45 @@ class ClaudeCodeChatModel(BaseChatModel):
             and response_text.strip().startswith(_SESSION_LIMIT_MARKER)
         ):
             raise ClaudeUsageLimitError(response_text.strip())
+
+        # 8.b Guard: an upstream API error must NOT become the agent's answer
+        # (No-Silent-API-Errors Policy, docs/POLICIES.md §9). Consult the
+        # detector iff we are NOT about to return tool_calls to LangGraph —
+        # same authoritative guard as the usage-limit check above. When
+        # returning tool_calls, the terminal turn is a tool-dispatch turn
+        # and classification is not our concern. See
+        # docs/DESIGN_FIX_API_ERROR_AS_FINAL_ANSWER.md §3.2b, §3.3.
+        returning_tool_calls = bool(
+            pending_tool_calls or proxy_mcp.has_pending_calls()
+        )
+        if not returning_tool_calls:
+            from claude_code_provider.api_error_detect import detect_api_error  # noqa: PLC0415
+            detected = detect_api_error(
+                response_text=response_text,
+                assistant_error=last_assistant_error,
+                result_is_error=result_is_error,
+                result_subtype=result_subtype,
+                result_errors=result_errors,
+                result_text=result_text,
+                stop_reason=result_stop_reason,
+                usage=last_usage,
+            )
+            if detected is not None:
+                await self._client_manager.rotate_session(
+                    thread_id, invalidate_persisted=True
+                )
+                _logger.warning(
+                    "[ainvoke] Claude API error detected on terminal turn — "
+                    "raising ClaudeApiResponseError (recoverable): %s",
+                    detected.message[:200],
+                )
+                raise ClaudeApiResponseError(
+                    detected.message,
+                    assistant_error=detected.assistant_error,
+                    result_subtype=detected.result_subtype,
+                    result_errors=detected.result_errors,
+                    stop_reason=detected.stop_reason,
+                )
 
         # 9. Check for pending tool calls from MCP proxy.
         if pending_tool_calls is not None:

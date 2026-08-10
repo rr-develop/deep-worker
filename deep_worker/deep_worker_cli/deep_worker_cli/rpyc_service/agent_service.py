@@ -241,6 +241,15 @@ class AgentService(rpyc.Service):
     def set_agent_process(self, agent_process: AgentProcess) -> None:
         """Set reference to agent process."""
         self._agent_process = agent_process
+        # Inject the subscriber-fanout callback into the durable-inbox drain.
+        # Assignment ONLY — the drain task is created by AgentProcess itself so
+        # it runs even before/without a service attaching (it must recover
+        # records left by a restart). The drain re-reads this on every record,
+        # so injecting it here is picked up by the next delivery.
+        # See DESIGN_DURABLE_INTER_AGENT_DELIVERY.md §3.3.3.
+        setter = getattr(agent_process, "set_inbox_notify", None)
+        if setter is not None:
+            setter(self._notify_subscribers)
 
     def set_event_loop(self, event_loop: Any) -> None:
         """Set reference to event loop."""
@@ -403,8 +412,8 @@ class AgentService(rpyc.Service):
             #     at all — so a call with sum_query + a real `message` arrived
             #     here as (message=<request>, sum_query=<prefix>, query=None).
             # In the second case the request lived in `message` and was silently
-            # dropped (only the summary-shape reached the model — bug 2026-07-04,
-            # reported by mj2_vac: 0/11 drafts). Normalise: if `query` was not
+            # dropped (only the summary-shape reached the model — a reported bug
+            # affecting 0/11 drafts). Normalise: if `query` was not
             # given explicitly but a non-empty `message` was, treat `message` as
             # the plain query so it becomes the second sequential turn. CLI is
             # unaffected (it sends message="" → falsy → no override).
@@ -574,7 +583,7 @@ class AgentService(rpyc.Service):
             #    broadcast ``agent_interrupted``. Return a clean structured
             #    *interrupted* result instead of letting CancelledError cross
             #    the RPyC boundary as a remote exception (which the web side
-            #    would mis-render as an error — user report 2026-05-20).
+            #    would mis-render as an error — per a user report).
             _invoke_task = locals().get("invoke_task")
             if _invoke_task is not None and not _invoke_task.cancelled():
                 # Channel drain — agent keeps working, no interrupt reported.
@@ -609,44 +618,38 @@ class AgentService(rpyc.Service):
         Returns a JSON string ``{"success": true, "delivered_content": "<message>"}``
         on successful enqueue, or ``{"success": false, "error": "..."}`` on
         failure. The background turn's result is NOT awaited here.
+
+        DURABILITY (DESIGN_DURABLE_INTER_AGENT_DELIVERY.md, a related
+        internal incident analysis (not included here)): ``success: true``
+        means the message is FSYNCED TO DISK,
+        not merely scheduled. Previously this method returned success right
+        after ``asyncio.create_task``, when the payload existed only as a local
+        in a coroutine that had not started — so a recipient that was busy and
+        then died (``restart_self`` → ``os._exit``) lost the message silently
+        while the sender was told it had arrived. The publish→event→ack
+        ordering below is what makes the acknowledgement honest.
         """
         if not self._agent_process:
             return json.dumps({"success": False, "error": "Agent not initialized"})
 
-        # Pin the non-None reference locally. Narrowing of `self._agent_process`
-        # does NOT survive into the nested async function below — ty re-reads
-        # the attribute and sees `AgentProcess | None`.
         agent_process = self._agent_process
 
         try:
-            # Fire off the agent turn in the background. Exceptions inside
-            # the task are logged but don't affect the enqueue response.
-            async def _bg_turn() -> None:
-                try:
-                    await agent_process._handle_invoke(
-                        {
-                            "command": "invoke",
-                            "message": message,
-                            "stream": True,
-                            "reply_back": reply_back,
-                            "inter_agent_delivery": True,
-                        },
-                        connection=None,
-                        notify_callback=self._notify_subscribers,
-                        approval_callback=None,
-                    )
-                except Exception:  # pragma: no cover - defensive
-                    logger.exception(
-                        "Background turn failed for enqueued message"
-                    )
-
-            asyncio.create_task(_bg_turn())
+            # 1. Durable publish. Returns only after the record is fsynced and
+            #    its directory entry is durable. 2. The publish itself sets the
+            #    drain's event. Only then do we acknowledge (3, below).
+            delivery_id = await agent_process.publish_inbox_message(
+                message, reply_back
+            )
 
             return json.dumps({
                 "success": True,
                 "delivered_content": message,
+                "delivery_id": delivery_id,
             })
         except Exception as e:
+            # Loss must be LOUD: if we could not persist, the sender has to
+            # know. tools.py already surfaces success=false to the model.
             logger.exception("Error enqueueing message: %s", e)
             return json.dumps({"success": False, "error": str(e)})
 

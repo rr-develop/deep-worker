@@ -77,6 +77,7 @@ class TaskManager:
         config: 'AgentConfig',
         session_manager: 'SessionManager',
         checkpointer: BaseCheckpointSaver | None = None,
+        token_stats_recorder: Any | None = None,
     ):
         """
         Initialize TaskManager.
@@ -90,11 +91,16 @@ class TaskManager:
                          - InMemorySaver if main agent uses InMemorySaver
                          - AsyncSqliteSaver if main agent uses AsyncSqliteSaver
                          If None, defaults to InMemorySaver (test mode)
+            token_stats_recorder: Shared token-stats recorder (owned by the
+                         main AgentProcess) so TM invocations land in the same
+                         ``token_stats.jsonl`` with ``kind="tm"``
+                         (token-stats design §5.1).
         """
         self.agent_name = agent_name
         self.config = config
         self.session_manager = session_manager
         self.checkpointer = checkpointer
+        self.token_stats_recorder = token_stats_recorder
 
         # Manager agent components (initialized in start())
         self.manager_agent: Pregel | None = None
@@ -210,6 +216,10 @@ class TaskManager:
         try:
             from deep_worker_cli.agent import create_cli_agent
             from deep_worker_cli.config import create_model
+            from deep_worker_cli.stats.callback import (
+                make_stats_callback_factory,
+                make_usage_event_callback_factory,
+            )
 
             logger.info(f"[TaskManager] Initializing manager agent...")
 
@@ -220,10 +230,22 @@ class TaskManager:
             # TaskManager thread does NOT share a cache with the main agent
             # thread — they have different system prompts and conversation
             # prefixes, so sharing the cache would cause mutual eviction.
+            stats_kwargs: dict[str, Any] = {}
+            if self.token_stats_recorder is not None:
+                stats_kwargs = {
+                    "kind": "tm",
+                    "stats_callback_factory": make_stats_callback_factory(
+                        self.token_stats_recorder
+                    ),
+                    "usage_event_callback_factory": make_usage_event_callback_factory(
+                        self.token_stats_recorder
+                    ),
+                }
             model = create_model(
                 provider=self.config.provider,
                 model_name=self.config.model,
                 user=f"{self.agent_name}:tm",
+                **stats_kwargs,
             )
 
             # Set working_dir on model for providers that need it (e.g. claude-code

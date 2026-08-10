@@ -266,6 +266,87 @@ separate renaming layer — it would add a failure point without benefit.
 
 ---
 
+### 4.6 CLI wiring: where the subcommands are registered
+
+**A rake we already stepped on (2026-07-30).** The `lsp` command was
+originally registered in `deep_worker_cli/main.py` following the pattern of
+the neighbouring `mcp` command. The tests passed (they called
+`setup_lsp_parser`/`handle_lsp_command` directly), but the real command
+failed:
+
+```
+$ deep-worker --help | grep lsp      # empty
+$ deep-worker lsp status             # error: unrecognized arguments: status
+```
+
+Reason: **`main.py` is a dead entry point.** The real launch chain:
+
+```
+deep-worker (bash launcher)
+  └─ python3 -m deep_worker_cli.cli.agent_command   ← the actual entry point
+       └─ main() → create_parser()
+```
+
+`main.py` marks itself in its own docstring as "❌ python3 -m
+deep_worker_cli.main", and `config.py` calls it the "OLD entry point".
+Registering subcommands there does not produce a working command.
+
+**Why we cannot simply add `add_subparsers` to `create_parser()`.**
+The main parser has a positional `name` (`nargs='?'`). Adding subparsers
+breaks **all** normal launches — verified experimentally:
+
+```
+deep-worker myagent  →  error: argument command: invalid choice: 'myagent'
+```
+
+**Decision taken.** Route before `create_parser()` in
+`agent_command.main()`:
+
+- `_dispatch_subcommand(sys.argv[1:])` compares the first token WHOLLY
+  against the names of the known subcommands (the agent name
+  `lspagent`/`mcpagent` is not intercepted); tokens starting with `-` are
+  ignored;
+- handled → returns the exit code, the main parser is not created;
+- not a subcommand → returns `None`, the normal agent launch path is
+  unaffected;
+- the positional `name` and the main parser are **not touched at all**;
+- in `--help` the command is visible via `epilog` (subparsers cannot be
+  added).
+
+**Regression protection** — integration tests on the REAL binary
+(`tests/integration_tests/lsp/test_lsp_cli_wiring.py`), including the lock
+`test_normal_agent_launch_still_parses`: a normal launch must not break.
+Parser unit tests are fundamentally insufficient here — they are exactly
+what missed the original defect.
+
+**Rule for the future:** new CLI subcommands are registered in
+`cli/agent_command.py`, not in `main.py`, and must be accompanied by a
+subprocess test on the real launcher.
+
+**The neighbouring commands suffered from the same defect** (fixed in a
+separate commit at the user's request): `mcp`, `skills`, `threads` — all
+were registered only in `main.py`, i.e. `deep-worker mcp list` failed with
+`unrecognized arguments: list`. Discovered during verification: a cursory
+`deep-worker mcp --help` returned exit 0 and therefore looked working — in
+fact argparse treated `mcp` as an AGENT NAME and printed the general help.
+The only reliable check is a real subcommand (`mcp list`), not `--help`.
+
+Final routing scheme in `agent_command.main()`:
+
+| Mechanism | Commands | Why |
+|---|---|---|
+| `_build_subcommand_registry()` | `lsp`, `mcp` | common contract: `setup_*_parser(subparsers)` + `handler(args) -> int` |
+| `_dispatch_skills_subcommand` | `skills` | `setup_skills_parser` requires keyword-only `make_help_action`; the handler returns `None` |
+| `_dispatch_threads_subcommand` | `threads` | no own `setup_*_parser` — the subcommands are described inline, mapped onto the existing `list_threads_command` / `remove_thread_command` |
+
+All of them are listed in `epilog` — otherwise they are not visible in
+`--help`. Coverage:
+`tests/integration_tests/cli/test_dead_entrypoint_subcommands.py` (10 tests
+on the real binary, including the lock of the normal launch and a check that
+agent names like `mcpagent`/`lspagent` are not intercepted).
+
+---
+
 ## 5. Language servers
 
 | Priority | Language | LS | Installation | Note |

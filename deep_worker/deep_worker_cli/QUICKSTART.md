@@ -7,7 +7,7 @@ These are the ONLY correct commands for working with deep-worker in this project
 - deep-worker - for starting agents (the ONLY way)
 - dwcli - for managing agents (list, status, stop, interactive)
 - dwtmux - for working with agents in tmux sessions (persistence)
-The commands are installed globally in a bin directory on the PATH
+The commands are installed globally in /home/<user>/.local/bin/
 DO NOT use python3 -m or any other direct launch method!
 ============================================================================ -->
 

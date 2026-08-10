@@ -68,6 +68,11 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from asyncio.subprocess import Process
 
+    from deepagents.middleware.parked_job_registry import (
+        ParkedJob,
+        ParkedJobRegistry,
+    )
+
 _TIMEOUT_DESC = (
     "Optional timeout in seconds (default 120). On timeout the command is "
     "NOT killed — it keeps running in the background and you get a job_id. "
@@ -84,6 +89,11 @@ class _BackgroundJob:
     final ``(stdout, stderr)`` in ``result``. Because the task is shielded
     from the timeout cancellation, the command keeps running after execute()
     returns — the agent decides whether to ``wait_for_job`` or ``kill_job``.
+
+    ``owner`` is the ``CLIShellBackend`` that parked the job. Required so
+    ``wait_for_job`` / ``kill_job`` on a *different* backend instance can
+    still drop the job from the owner's ``_jobs`` (fifth locus, 2026-07-31 —
+    see docs/DESIGN_FIX_SHELL_JOB_CROSS_BACKEND.md).
     """
 
     job_id: str
@@ -92,6 +102,7 @@ class _BackgroundJob:
     reader: "asyncio.Task[tuple[bytes, bytes]]"
     started_at: float
     result: tuple[bytes, bytes] | None = field(default=None)
+    owner: object | None = field(default=None, repr=False)
 
     @property
     def finished(self) -> bool:
@@ -144,23 +155,151 @@ class CLIShellBackend(LocalShellBackend):
         return tid or None
 
     def _resolve_job(self, job_id: str) -> _BackgroundJob | None:
-        """Look up a parked job by EITHER its canonical ``job_N`` id or the
-        ``tool_use_id`` alias of the ``execute`` call that spawned it."""
+        """Look up a parked SHELL job by EITHER its canonical ``job_N`` id or
+        the ``tool_use_id`` alias of the ``execute`` call that spawned it.
+
+        Resolution order (fifth locus — cross-backend visibility):
+
+        1. This instance's ``_jobs`` / ``_job_aliases`` (fast path).
+        2. The process-wide ``ParkedJobRegistry`` for ``kind="shell"`` —
+           handle is the ``_BackgroundJob`` itself, so a *different*
+           ``CLIShellBackend`` instance can still wait/kill the process.
+
+        Tool jobs parked by middleware / proxy-MCP live in the same registry
+        under ``kind="tool"`` and are handled by ``_resolve_parked``.
+        """
         job = self._jobs.get(job_id)
         if job is not None:
             return job
         canonical = self._job_aliases.get(job_id)
         if canonical is not None:
-            return self._jobs.get(canonical)
+            found = self._jobs.get(canonical)
+            if found is not None:
+                return found
+        return self._resolve_shell_from_registry(job_id)
+
+    def _resolve_shell_from_registry(self, job_id: str) -> _BackgroundJob | None:
+        """Shell job from the shared registry (any owning backend instance)."""
+        registry = self._shared_registry()
+        if registry is None:
+            return None
+        parked = registry.resolve(job_id)
+        if parked is None or parked.kind != "shell":
+            return None
+        handle = parked.handle
+        if isinstance(handle, _BackgroundJob):
+            return handle
+        # Backward-compat: older register() put the backend as handle.
+        if isinstance(handle, CLIShellBackend):
+            return handle._jobs.get(parked.job_id)
         return None
 
+    @staticmethod
+    def _resolve_parked(job_id: str) -> "ParkedJob | None":
+        """Look up a job parked by the tool-call middleware (``kind="tool"``).
+
+        Both parking layers share ONE id namespace via ``ParkedJobRegistry``,
+        so ``wait_for_job``/``kill_job`` must be able to see either kind —
+        otherwise the model is handed an id the tools cannot honour, which is
+        exactly the observed defect (2026-07-31). Best-effort: returns ``None``
+        when deepagents is unavailable (e.g. isolated backend tests).
+
+        Only ``ImportError`` is tolerated: any OTHER exception raised while
+        importing means the registry module itself is broken, and silently
+        disabling the bridge would resurrect the very "no background job"
+        symptom this fix removes.
+        """
+        try:
+            from deepagents.middleware.parked_job_registry import (  # noqa: PLC0415
+                get_parked_job_registry,
+            )
+        except ImportError:  # deepagents genuinely absent (isolated tests)
+            return None
+        job = get_parked_job_registry().resolve(job_id)
+        if job is None or job.kind != "tool":
+            return None
+        return job
+
+    @staticmethod
+    def _shared_registry() -> "ParkedJobRegistry | None":
+        """The process-wide ``ParkedJobRegistry``, or ``None`` when deepagents
+        is not importable (isolated backend tests).
+
+        Narrow on purpose — see ``_resolve_parked``: a broken registry module
+        must surface, not silently degrade.
+        """
+        try:
+            from deepagents.middleware.parked_job_registry import (  # noqa: PLC0415
+                get_parked_job_registry,
+            )
+        except ImportError:  # deepagents genuinely absent (isolated tests)
+            return None
+        return get_parked_job_registry()
+
+    def _allocate_job_id(self, tool_use_id: str | None) -> str:
+        """Mint the canonical ``job_N`` for a shell job.
+
+        Ids come from the SHARED counter so that a job parked here and a job
+        parked by ``BoundedToolCallMiddleware`` can never collide. If the
+        middleware already parked work for this very tool call, reuse its id
+        instead of minting a second one for the same command.
+        """
+        registry = self._shared_registry()
+        if registry is None:
+            return f"job_{next(self._job_counter)}"
+        if tool_use_id:
+            existing = registry.resolve_by_alias(tool_use_id)
+            if existing is not None:
+                return str(existing.job_id)
+        return registry.allocate()
+
+    def _register_shared(
+        self,
+        job_id: str,
+        tool_use_id: str | None,
+        *,
+        job: _BackgroundJob,
+    ) -> None:
+        """Publish a shell job into the shared registry so every id the model
+        may be given resolves in ONE place — including on a *different*
+        ``CLIShellBackend`` instance (handle is the ``_BackgroundJob``, not
+        ``self``)."""
+        registry = self._shared_registry()
+        if registry is None:
+            return
+        registry.register(
+            job_id,
+            kind="shell",
+            handle=job,
+            alias=tool_use_id or None,
+            tool_name="execute",
+        )
+
     def _drop_job(self, job: _BackgroundJob) -> None:
-        """Remove a finished/killed job from ``_jobs`` and purge every alias
-        that points at it — no stale alias, no leak."""
-        self._jobs.pop(job.job_id, None)
-        stale = [a for a, canon in self._job_aliases.items() if canon == job.job_id]
+        """Remove a finished/killed job from the owning backend's ``_jobs``,
+        purge aliases, and drop the shared-registry entry.
+
+        Must work when called from a backend that is NOT the owner (cross-
+        instance wait/kill).
+        """
+        owner = job.owner if isinstance(job.owner, CLIShellBackend) else self
+        owner._jobs.pop(job.job_id, None)
+        stale = [
+            a for a, canon in owner._job_aliases.items() if canon == job.job_id
+        ]
         for alias in stale:
-            self._job_aliases.pop(alias, None)
+            owner._job_aliases.pop(alias, None)
+        # Also clear this instance if it held a stale alias copy.
+        if owner is not self:
+            self._jobs.pop(job.job_id, None)
+            stale_self = [
+                a for a, canon in self._job_aliases.items() if canon == job.job_id
+            ]
+            for alias in stale_self:
+                self._job_aliases.pop(alias, None)
+        registry = self._shared_registry()
+        if registry is not None:
+            registry.drop(job.job_id)
 
     def _format_partial(self, stdout: bytes, stderr: bytes) -> str:
         """Format already-captured output for an in-flight/finished job."""
@@ -277,20 +416,23 @@ class CLIShellBackend(LocalShellBackend):
                 # kill_job(job_id) to stop it.
                 import time as _time
 
-                job_id = f"job_{next(self._job_counter)}"
-                self._jobs[job_id] = _BackgroundJob(
+                _tool_use_id = self._current_tool_use_id()
+                job_id = self._allocate_job_id(_tool_use_id)
+                bg_job = _BackgroundJob(
                     job_id=job_id,
                     command=command,
                     proc=proc,
                     reader=reader,
                     started_at=_time.monotonic(),
+                    owner=self,
                 )
+                self._jobs[job_id] = bg_job
                 # Also reach this job by the originating tool_use_id, so the
                 # model can't get stuck if it passes ``toolu_…`` instead of
                 # the advertised ``job_N`` (mj2_vac, 2026-06-17).
-                _tool_use_id = self._current_tool_use_id()
                 if _tool_use_id and _tool_use_id != job_id:
                     self._job_aliases[_tool_use_id] = job_id
+                self._register_shared(job_id, _tool_use_id, job=bg_job)
                 return ExecuteResponse(
                     output=(
                         f"Command still running after {effective_timeout}s timeout — "
@@ -362,6 +504,158 @@ class CLIShellBackend(LocalShellBackend):
             truncated=truncated,
         )
 
+    @staticmethod
+    def _parked_tool_task(parked: "ParkedJob") -> object | None:
+        """The awaitable/cancellable handle inside a parked tool job.
+
+        The async path parks a ``_ParkedToolJob`` (whose ``.task`` is an
+        ``asyncio.Task``); the sync path parks a ``concurrent.futures.Future``
+        directly. Both expose ``cancel``/``done``.
+        """
+        handle = parked.handle
+        return getattr(handle, "task", handle)
+
+    async def _wait_parked_tool(
+        self, parked: "ParkedJob", timeout: int | None
+    ) -> ExecuteResponse:
+        """Wait for a job parked by the tool-call middleware.
+
+        Returns the tool's own result once it finishes (status + result, per
+        design review) so the agent is not left blind after a long tool
+        outlived the outer bound. While it is still running the answer restates
+        the canonical id — never an error.
+        """
+        job_id = parked.job_id
+        name = parked.tool_name or "tool"
+        task = self._parked_tool_task(parked)
+        effective_timeout = timeout if timeout is not None else self._timeout
+        if effective_timeout <= 0:
+            msg = f"timeout must be positive, got {effective_timeout}"
+            raise ValueError(msg)
+
+        if isinstance(task, asyncio.Task):
+            try:
+                result = await asyncio.wait_for(
+                    asyncio.shield(task), timeout=effective_timeout
+                )
+            except asyncio.TimeoutError:
+                return ExecuteResponse(
+                    output=(
+                        f"Job '{job_id}' (tool '{name}') is STILL running "
+                        f"after waiting {effective_timeout}s — not killed.\n"
+                        f"  • wait_for_job(job_id=\"{job_id}\", "
+                        f"timeout=<seconds>) to keep waiting\n"
+                        f"  • kill_job(job_id=\"{job_id}\") to stop it"
+                    ),
+                    exit_code=None,
+                    truncated=False,
+                )
+            except asyncio.CancelledError:
+                return ExecuteResponse(
+                    output=f"Job '{job_id}' (tool '{name}') was cancelled.",
+                    exit_code=1,
+                    truncated=False,
+                )
+            except Exception as exc:  # noqa: BLE001 — surface the tool's error
+                return ExecuteResponse(
+                    output=(
+                        f"Job '{job_id}' (tool '{name}') failed: "
+                        f"{type(exc).__name__}: {exc}"
+                    ),
+                    exit_code=1,
+                    truncated=False,
+                )
+            return ExecuteResponse(
+                output=self._render_tool_result(job_id, name, result),
+                exit_code=self._tool_exit_code(result),
+                truncated=False,
+            )
+
+        # Sync path: a thread-backed future cannot be awaited without blocking
+        # the loop, so only report its state. It is never cancellable.
+        done = bool(getattr(task, "done", lambda: False)())
+        if done:
+            finished = getattr(task, "result", lambda: None)()
+            return ExecuteResponse(
+                output=self._render_tool_result(job_id, name, finished),
+                exit_code=self._tool_exit_code(finished),
+                truncated=False,
+            )
+        return ExecuteResponse(
+            output=(
+                f"Job '{job_id}' (tool '{name}') is STILL running on a worker "
+                f"thread — it cannot be cancelled. Wait again with "
+                f"wait_for_job(job_id=\"{job_id}\")."
+            ),
+            exit_code=None,
+            truncated=False,
+        )
+
+    @staticmethod
+    def _tool_exit_code(result: object) -> int:
+        """Map a finished tool's own status onto an execute-style exit code.
+
+        A tool that completed but reported failure must not look like a clean
+        success just because the JOB finished. The content is returned either
+        way — only the code distinguishes them.
+        """
+        return 1 if getattr(result, "status", None) == "error" else 0
+
+    @staticmethod
+    def _render_tool_result(job_id: str, name: str, result: object) -> str:
+        """Map a finished tool's result into execute-style output."""
+        content = getattr(result, "content", result)
+        text = content if isinstance(content, str) else str(content)
+        return f"Job '{job_id}' (tool '{name}') finished.\n{text}"
+
+    async def _kill_parked_tool(self, parked: "ParkedJob") -> ExecuteResponse:
+        """Cancel a job parked by the tool-call middleware.
+
+        ``task.cancel()`` is the correct API. Per design review we then wait
+        BRIEFLY and bounded for the task to settle — never unbounded, because
+        work that swallows ``CancelledError`` would hang us forever.
+        """
+        job_id = parked.job_id
+        name = parked.tool_name or "tool"
+        task = self._parked_tool_task(parked)
+
+        if not isinstance(task, asyncio.Task):
+            return ExecuteResponse(
+                output=(
+                    f"Job '{job_id}' (tool '{name}') runs on a worker thread "
+                    f"and cannot be killed; it will finish on its own."
+                ),
+                exit_code=1,
+                truncated=False,
+            )
+
+        task.cancel()
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=2.0)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            pass
+        except Exception:  # noqa: BLE001 — the tool's own failure is fine here
+            pass
+
+        registry = self._shared_registry()
+        if registry is not None:
+            registry.drop(job_id)
+
+        if task.done():
+            return ExecuteResponse(
+                output=f"Job '{job_id}' (tool '{name}') killed.",
+                exit_code=0,
+                truncated=False,
+            )
+        return ExecuteResponse(
+            output=(
+                f"Job '{job_id}' (tool '{name}'): cancellation requested, but "
+                f"the task has not stopped yet."
+            ),
+            exit_code=1,
+            truncated=False,
+        )
+
     async def wait_for_job(
         self, job_id: str, *, timeout: int | None = None
     ) -> ExecuteResponse:
@@ -376,6 +670,9 @@ class CLIShellBackend(LocalShellBackend):
         """
         job = self._resolve_job(job_id)
         if job is None:
+            parked = self._resolve_parked(job_id)
+            if parked is not None:
+                return await self._wait_parked_tool(parked, timeout)
             return ExecuteResponse(
                 output=f"Error: no background job with id '{job_id}'.",
                 exit_code=1,
@@ -415,6 +712,9 @@ class CLIShellBackend(LocalShellBackend):
         ``tool_use_id`` of the ``execute`` call that spawned the job."""
         job = self._resolve_job(job_id)
         if job is None:
+            parked = self._resolve_parked(job_id)
+            if parked is not None:
+                return await self._kill_parked_tool(parked)
             return ExecuteResponse(
                 output=f"Error: no background job with id '{job_id}'.",
                 exit_code=1,

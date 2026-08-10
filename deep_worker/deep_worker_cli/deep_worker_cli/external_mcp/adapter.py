@@ -24,8 +24,74 @@ from typing import Any
 
 from langchain_core.tools import BaseTool
 from pydantic import BaseModel, ConfigDict, Field, create_model
+from pydantic import GetJsonSchemaHandler
+from pydantic.json_schema import JsonSchemaValue
+from pydantic_core import CoreSchema, core_schema
 
 from deep_worker_cli.external_mcp.mangler import MCPToolNameMangler
+
+
+class _UnsetType:
+    """Sentinel for "argument not provided by the caller".
+
+    Needed to distinguish a skipped optional argument from a deliberately
+    passed ``None``: the former is not sent to the MCP server at all
+    (the server applies its own default), the latter goes as an explicit ``null``.
+
+    IMPORTANT: the sentinel lives ONLY inside the adapter's internal
+    pydantic model. It must not appear in the JSON schema the adapter
+    hands to the LLM via ``model_json_schema()`` — otherwise pydantic
+    would raise ``PydanticJsonSchemaWarning: Default value <UNSET> is not
+    JSON serializable`` and the provider would filter out such tools.
+
+    ``__get_pydantic_core_schema__`` declares the sentinel acceptable at
+    validation time (otherwise pydantic would reject a field typed
+    ``py_type | _UnsetType``), and ``__get_pydantic_json_schema__``
+    returns an empty ``{}`` — the field's actual JSON schema is supplied
+    entirely by ``__json_schema_extra`` (see ``_schema_to_pydantic``).
+    """
+
+    _instance: _UnsetType | None = None
+
+    def __new__(cls) -> _UnsetType:
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __repr__(self) -> str:
+        return "<UNSET>"
+
+    def __bool__(self) -> bool:
+        return False
+
+    @classmethod
+    def __get_pydantic_core_schema__(  # noqa: PLW3201  (pydantic protocol)
+        cls, _source_type: Any, _handler: Any
+    ) -> CoreSchema:
+        # Pass the sentinel through any validation as-is; on the wire to
+        # MCP goes the filtered dict (see ``_arun``), but pydantic would
+        # still try to serialize ``default=_UNSET`` when building the
+        # JSON schema — without this serializer it would raise
+        # ``PydanticJsonSchemaWarning: Default value <UNSET> is not JSON
+        # serializable``, and the provider would filter out such tools.
+        return core_schema.no_info_plain_validator_function(
+            lambda v: v,
+            serialization=core_schema.plain_serializer_function_ser_schema(
+                lambda _v: None
+            ),
+        )
+
+    @classmethod
+    def __get_pydantic_json_schema__(  # noqa: PLW3201  (pydantic protocol)
+        cls, _core_schema: CoreSchema, _handler: GetJsonSchemaHandler
+    ) -> JsonSchemaValue:
+        # The part of the field schema coming from the sentinel type is
+        # empty: the whole content (type/default/description) comes from
+        # the original ``input_schema`` via ``json_schema_extra``.
+        return {}
+
+
+_UNSET = _UnsetType()
 
 _JSON_TO_PY = {
     "string": str,
@@ -43,25 +109,60 @@ def _schema_to_pydantic(
     """Build a permissive pydantic-v2 args model from a JSON Schema.
 
     We deliberately do NOT enforce strict validation here — MCP servers
-    are the source of truth for argument validity; we only need a
-    schema rich enough for LangChain's tool-call machinery to bind. So
-    every property is typed loosely (its JSON-type or ``Any``), and
-    nothing extra is rejected.
+    are the source of truth for argument validity; we only need a schema
+    rich enough for LangChain's tool-call machinery to bind.
+
+    JSON-schema invariant (for the LLM):
+        Every field in the ``model_json_schema()`` output matches the original
+        ``input_schema[prop_name]`` (type, description, default — including the
+        ABSENCE of ``default`` if the server did not specify one). The ``_UNSET``
+        sentinel is an adapter-runtime detail; it does not flow into the schema.
+
+    Runtime invariant (see ``_arun``):
+        unset -> omit the key; explicit None -> send null;
+        falsy 0/'' -> send. Enforced by the sentinel.
     """
     fields: dict[str, Any] = {}
     props = (input_schema or {}).get("properties") or {}
     required = set((input_schema or {}).get("required") or [])
     for prop_name, prop_spec in props.items():
         py_type: Any = Any
+        prop_spec_dict: dict[str, Any] = {}
         if isinstance(prop_spec, dict):
+            prop_spec_dict = prop_spec
             jt = prop_spec.get("type")
             if isinstance(jt, str):
                 py_type = _JSON_TO_PY.get(jt, Any)
             description = prop_spec.get("description") or ""
         else:
             description = ""
-        default = ... if prop_name in required else None
-        fields[prop_name] = (py_type, Field(default=default, description=description))
+        if prop_name in required:
+            fields[prop_name] = (py_type, Field(..., description=description))
+        else:
+            # At runtime the sentinel distinguishes "not provided" from a
+            # deliberate None; at validation time it is acceptable thanks to
+            # ``_UnsetType.__get_pydantic_core_schema__``.
+            #
+            # For the LLM-bound JSON schema we replace the field schema
+            # with the original ``input_schema[prop_name]``: the server's
+            # type, default (or its absence), description — all preserved.
+            field_json = dict(prop_spec_dict)
+
+            def _override(_schema: dict[str, Any], _src: dict[str, Any] = field_json) -> None:
+                _schema.clear()
+                _schema.update(_src)
+
+            # ``Any | _UnsetType`` degenerates into ``Any`` and loses the
+            # server's type in the schema — stitch the union only when py_type is set.
+            field_type: Any = py_type if py_type is Any else (py_type | _UnsetType)
+            fields[prop_name] = (
+                field_type,
+                Field(
+                    default=_UNSET,
+                    description=description,
+                    json_schema_extra=_override,
+                ),
+            )
 
     model_name = f"MCPArgs_{server_name}_{tool_name}"
     # ``extra='allow'`` — MCP servers may also allow other arguments.
@@ -163,7 +264,12 @@ class MCPToolAdapter(BaseTool):
         # ignore it (validation already happened in args_schema, the rest is
         # up to the MCP server).
         sess = self._session
-        result = await sess.call_tool(self._bare_tool_name, kwargs)
+        # Drop unset optional arguments: the JSON Schema of many MCP
+        # tools declares them strictly typed (``{"type": "integer",
+        # "default": -1}``), so an explicit ``null`` is a validation
+        # error, while omitting the key yields the server default.
+        call_args = {k: v for k, v in kwargs.items() if not isinstance(v, _UnsetType)}
+        result = await sess.call_tool(self._bare_tool_name, call_args)
         if getattr(result, "isError", False):
             text = _flatten_call_result(result) or "MCP tool returned isError=True"
             raise RuntimeError(text)

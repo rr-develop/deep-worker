@@ -562,7 +562,7 @@ The MCP server is hosted **inside the deep-worker agent process** as
 an asyncio task running a small HTTP listener bound to
 `127.0.0.1:<random-free-port>`. Concretely: an
 `mcp.server.streamable_http` instance (the Python MCP SDK already
-ships this — `mcp/server/streamable_http.py`),
+ships this — `/home/<user>/.local/lib/python3.12/site-packages/mcp/server/streamable_http.py`),
 mounted on a small ASGI app and `asyncio.create_task`-ed during
 `bind_tools()` or first `ainvoke()`. **No `subprocess.Popen`, no
 `multiprocessing.Process`, no `os.fork`.** The handler functions are
@@ -1168,7 +1168,7 @@ A reviewer can validate this document without running anything:
    `effective_session_id` / `rotate_session` precedent — Codex design
    renames these to `codex_session_uuid` and "drop on summarization",
    same effect, clearer names.
-8. Read the Python MCP SDK's `server/streamable_http.py`
+8. Read `/home/<user>/.local/lib/python3.12/site-packages/mcp/server/streamable_http.py`
    — Python MCP SDK ships an in-process HTTP server we mount on
    asyncio. No external process is needed for the proxy.
 

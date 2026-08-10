@@ -17,6 +17,7 @@ import argparse
 import json
 from pathlib import Path
 
+from deep_worker_cli.cli.cwd import invocation_cwd
 from deep_worker_cli.external_mcp.config import (
     ServerSpec,
     load_mcp_config,
@@ -30,7 +31,11 @@ def _scope_to_path(scope: str) -> Path:
     if scope == "project":
         from deep_worker_cli.project_utils import find_project_root
 
-        root = find_project_root(Path.cwd()) or Path.cwd()
+        # Starting point is the INVOCATION directory, not the process cwd:
+        # the launcher does ``cd "$SCRIPT_DIR"``, which made project-scope
+        # resolve to the install directory (writing into another repo). See cli/cwd.py.
+        start = invocation_cwd()
+        root = find_project_root(start) or start
         return root / ".deepagents" / "mcp.json"
     if scope.startswith("agent:"):
         name = scope.split(":", 1)[1].strip()

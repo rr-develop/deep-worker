@@ -1,11 +1,10 @@
 # pyright: reportPrivateUsage=false
-"""Regression test: the new MCP-handler contract after the related
-internal incident (analysis not included here).
+"""Regression test: the new MCP-handler contract after incident 2026-06-14.
 
-Background — the related internal incident
-==========================================
-The "three identical copies of the same code block" symptom (observed
-live) was caused by TWO defects in ProxyMCPServer + chat_model
+Background — incident 2026-06-14
+================================
+The "three identical copies of the same code block" symptom (observed,
+2026-06-14) was caused by TWO defects in ProxyMCPServer + chat_model
 that amplified each other:
 
  A) Two-worlds identity. ``_create_tool_handler`` synthesised its own
@@ -35,7 +34,7 @@ N-second windows. So:
  A) ONE identity end-to-end: the Claude ``tool_use_id`` from MCP
     ``_meta.claudecode/toolUseId`` flows through the SDK's
     ``_mcp_context`` ContextVar (already implemented in the vendored
-    SDK), is read by ``_create_tool_handler`` and
+    SDK at ``claude_sdk``), is read by ``_create_tool_handler`` and
     stored as the ``pending_calls`` key.
 
  B) No phantom timeout. ``ProxyMCPServer.__init__`` no longer accepts
@@ -130,7 +129,7 @@ class TestPartAUnifiedToolUseId:
             assert "toolu_01ABC" in proxy.pending_calls, (
                 f"handler did not use Claude tool_use_id as key — got "
                 f"{list(proxy.pending_calls)!r}. Identity-A invariant"
-                f" broken."
+                f" broken (incident 2026-06-14)."
             )
             # Cleanup — resolve so the task can return.
             proxy.resolve_call("toolu_01ABC",
@@ -163,7 +162,7 @@ class TestPartAUnifiedToolUseId:
         proxy = ProxyMCPServer([_short("read_file")])
         assert not hasattr(proxy, "_call_counter"), (
             "_call_counter is the legacy synthetic-id counter and MUST "
-            "be removed."
+            "be removed (incident 2026-06-14)."
         )
 
 
@@ -325,10 +324,9 @@ class TestPartBNoPhantomTimeout:
     async def test_no_phantom_error_on_timeout(self) -> None:
         """No-phantom-timeout means: a timeout NEVER reports ``is_error=
         true`` to the LLM (which caused retries + duplicate side effects in
-        the related internal incident, not included here). It does NOT mean
-        "wait forever".
+        incident 2026-06-14). It does NOT mean "wait forever".
 
-        HARD POLICY: every tool is bounded — by default it
+        HARD POLICY (2026-06-16): every tool is bounded — by default it
         degrades to a non-error job-handle (see
         ``test_job_handle_by_default.py``). This test pins the surviving
         part of the §7 contract: when the bound is hit, the result is
@@ -354,11 +352,19 @@ class TestPartBNoPhantomTimeout:
                 "retry/duplicate bug (§7)."
             )
             text = result["content"][0]["text"]
-            assert "in_progress" in text and "toolu_LONG" in text
-            # The real Future is parked, not cancelled/lost.
+            assert "in_progress" in text
+            # ``job_id`` is a canonical ``job_N`` from the shared
+            # ParkedJobRegistry, NOT the ``tool_use_id`` (observed fix,
+            # 2026-07-31).
+            import re  # noqa: PLC0415
+            m = re.search(r"\bjob_\d+\b", text)
+            assert m, f"notice must advertise a canonical job_N: {text!r}"
+            job_id = m.group(0)
+            assert "toolu_LONG" not in text, text
+            # The real Future is parked (under the canonical id), not lost.
             reg = proxy.get_job_registry()
-            assert "toolu_LONG" in reg and not reg["toolu_LONG"]["future"].done()
-            reg["toolu_LONG"]["future"].cancel()
+            assert job_id in reg and not reg[job_id]["future"].done()
+            reg[job_id]["future"].cancel()
 
             # And the normal fast-resolve path still returns the real result.
             set_current_claude_tool_use_id("toolu_FAST")
@@ -424,22 +430,27 @@ class TestPartCLongRunningJobHandle:
                 handler({"command": "sleep 999"}), timeout=1.0,
             )
 
-            # Shape contract — see the related internal incident
-            # analysis (not included here), Part C.
+            # Shape contract — see incident 2026-06-14 Part C.
             assert "is_error" not in result or result.get("is_error") is not True
             text_payload = result["content"][0]["text"]
             assert "in_progress" in text_payload
-            assert "toolu_LR" in text_payload  # job_id == tool_use_id
+            # ``job_id`` is a canonical ``job_N`` (observed fix, 2026-07-31),
+            # NOT the ``tool_use_id`` — the latter had no resolver.
+            import re  # noqa: PLC0415
+            m = re.search(r"\bjob_\d+\b", text_payload)
+            assert m, f"notice must advertise a canonical job_N: {text_payload!r}"
+            job_id = m.group(0)
+            assert "toolu_LR" not in text_payload, text_payload
             assert "wait_for_job" in text_payload
             assert "kill_job" in text_payload
 
-            # Real Future is still alive — JobRegistry holds it.
+            # Real Future is still alive — JobRegistry holds it under job_N.
             registry = proxy.get_job_registry()
-            assert "toolu_LR" in registry
-            assert not registry["toolu_LR"]["future"].done()
+            assert job_id in registry
+            assert not registry[job_id]["future"].done()
 
             # Cleanup so test does not leak the task.
-            registry["toolu_LR"]["future"].cancel()
+            registry[job_id]["future"].cancel()
         finally:
             reset_current_claude_tool_use_id(token)
 
@@ -467,11 +478,17 @@ class TestPartCLongRunningJobHandle:
             result = await asyncio.wait_for(handler({"path": "/x"}), timeout=1.0)
             assert result.get("is_error") is not True
             text = result["content"][0]["text"]
-            assert "toolu_S" in text
-            assert "timed out" in text.lower() or "still" in text.lower()
-            # Work preserved (parked), not lost.
-            assert "toolu_S" in proxy.get_job_registry()
-            proxy.get_job_registry()["toolu_S"]["future"].cancel()
+            # ``job_id`` is a canonical ``job_N`` (observed fix, 2026-07-31).
+            import re  # noqa: PLC0415
+            m = re.search(r"\bjob_\d+\b", text)
+            assert m, f"notice must advertise a canonical job_N: {text!r}"
+            job_id = m.group(0)
+            assert "toolu_S" not in text, text
+            assert "still" in text.lower()
+            # Work preserved (parked under the canonical id), not lost.
+            reg = proxy.get_job_registry()
+            assert job_id in reg
+            reg[job_id]["future"].cancel()
 
             # Fast-resolve path still returns the real result.
             set_current_claude_tool_use_id("toolu_S2")

@@ -19,9 +19,9 @@ import os
 from pathlib import Path
 from typing import Any
 
+from deep_worker_cli.lsp.bridge import build_bridge_mcp_entry
 from deep_worker_cli.lsp.serena_config import (
     SERENA_SERVER_NAME,
-    build_serena_mcp_entry,
     resolve_workspace_root,
 )
 
@@ -116,7 +116,10 @@ def enable_lsp_at_path(
     if SERENA_SERVER_NAME in servers and not force:
         return False
 
-    servers[SERENA_SERVER_NAME] = build_serena_mcp_entry(
+    # §14 policy: the entry must launch the thin BRIDGE, never the
+    # backend binary. One shared service per project; N agents attach
+    # to it instead of spawning N language servers.
+    servers[SERENA_SERVER_NAME] = build_bridge_mcp_entry(
         workspace_root=resolve_workspace_root(workspace_root),
         auto_approve=auto_approve,
     )

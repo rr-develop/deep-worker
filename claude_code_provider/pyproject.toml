@@ -5,6 +5,14 @@ description = "Claude Code SDK provider for deep-worker with full LangChain comp
 requires-python = ">=3.11"
 dependencies = [
     "langchain-core>=0.3.0",
+    # Pillow is a RUNTIME dependency: session_synthesis validates image
+    # dimensions (header-only) before emitting an Anthropic image block into a
+    # synthesized transcript. Imported at module top level, so a missing
+    # Pillow breaks the import — it must be declared, not merely happen to be
+    # installed. Bounds are kept IDENTICAL to deep_worker_cli's pyproject
+    # (which declares pillow for ``read_image``) so the two manifests can
+    # never resolve to conflicting Pillow versions in one environment.
+    "pillow>=10.0.0,<13.0.0",
 ]
 
 [dependency-groups]

@@ -85,3 +85,35 @@ def test_custom_server_prefix_is_respected() -> None:
     """The server name in mcp.json may differ from 'serena'."""
     frag = lsp_prompt_fragment(["lsp__find_symbol"], server_name="lsp")
     assert "lsp__find_symbol" in frag
+
+
+def test_fragment_tells_agent_to_omit_optional_fields() -> None:
+    """Top-quality UX: the agent should by default NOT pass optional fields
+    and override them only deliberately.
+
+    Why the instruction was added: a Claude model, seeing fields with
+    ``default`` in a tool's JSON schema, tends to proactively pass them all
+    ("just in case"). Every extra key is tokens and cognitive load. The wire
+    contract is already satisfied (the server applies its own defaults when a
+    key is omitted — proven by the integration test
+    ``test_optional_fields_are_fully_omissible_on_wire``); here we close the
+    UX contract on the prompt side.
+
+    We check CONTENT (by keywords), not the exact wording, so the text can
+    be improved without rewriting the test.
+    """
+    frag = lsp_prompt_fragment(["serena__find_symbol"])
+    lower = frag.lower()
+    # Instruction about "pass only the required fields".
+    assert "required" in lower, frag
+    # Explicit mention that optional fields may be omitted.
+    assert "optional" in lower, frag
+    # And the note that the server applies its own defaults.
+    assert "default" in lower, frag
+
+
+def test_omit_optional_instruction_absent_when_no_lsp_tools() -> None:
+    """Prompt optionality: if there are no LSP tools, no text (including
+    about optional fields) is mixed into the prompt."""
+    assert lsp_prompt_fragment([]) == ""
+    assert lsp_prompt_fragment(["github__create_issue"]) == ""

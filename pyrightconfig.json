@@ -1,0 +1,34 @@
+{
+  "//": "Root config for Serena LSP navigation via pyright. The pre-commit type-check hook uses 'ty' and its own temporary .venv (deep_worker/scripts/pre-commit-type-check.sh) — this file does not affect the hook. Reason for existence: the project deliberately forbids .venv, dev dependencies are installed system-wide in python3.12 site-packages, but pyright run from uvx uses its own python3.14 and without extraPaths cannot see those packages. Without this config, Serena's get_diagnostics_for_file/find_symbol report 5+ false reportMissingImports on pydantic/langchain_core for every file.",
+
+  "//extraPaths": "<python-site-symlink> — a NEUTRAL symlink to this machine's site-packages; created by a setup script. The direct path cannot be written here: it would hardcode the user name into a tracked file, and pyright expands neither '~' nor environment variables. The symlink lives OUTSIDE the repository. If it is missing, only LSP navigation breaks; commits are not blocked.",
+
+  "include": ["."],
+  "exclude": [
+    "**/__pycache__",
+    "**/.mypy_cache",
+    "**/.ruff_cache",
+    "**/.pytest_cache",
+    "**/.serena",
+    "**/.venv",
+    "**/node_modules",
+
+    "claude_code_provider",
+    "codex_provider",
+    "grok_provider"
+  ],
+
+  "extraPaths": [
+    "<python-site-symlink>",
+    "/usr/lib/python3/dist-packages",
+    "/usr/local/lib/python3.12/dist-packages",
+    "/usr/lib/python3.12/dist-packages",
+    "deep_worker/deepagents"
+  ],
+
+  "pythonVersion": "3.12",
+  "pythonPlatform": "Linux",
+
+  "typeCheckingMode": "off",
+  "reportMissingImports": "error"
+}

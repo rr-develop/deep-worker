@@ -320,8 +320,8 @@ def _unwrap_proxy_backend(backend: object) -> object:
     execution-capable; otherwise the ``execute`` tool is wrongly filtered out
     of the model's toolset entirely. Duck-typed (no import of the concrete
     proxy type — keeps deepagents independent). Iterative + visited-set so a
-    cyclic wrapper can never spin. See a related internal incident
-    analysis (not included here).
+    cyclic wrapper can never spin. See a related internal incident analysis
+    (not included here).
     """
     seen: set[int] = set()
     current = backend
@@ -390,6 +390,300 @@ TOOLS_EXCLUDED_FROM_EVICTION = (
     "edit_file",
     "write_file",
 )
+
+
+# --- Image-block preservation during large-tool-result eviction ---------------
+#
+# Tool results may carry image blocks (e.g. from `read_image`). Those blocks are
+# semantically irreplaceable: unlike text, the model cannot recover them by
+# reading an offloaded file. They are therefore preserved in place rather than
+# stringified, subject to the conservative context-cost ceilings below.
+#
+# `deepagents` is provider-agnostic and deliberately performs no MIME, magic-byte
+# or dimension validation -- provider adapters remain authoritative for whether a
+# preserved block is acceptable to their API. These caps bound context cost only.
+
+# Per-block cap on the base64/ASCII payload, measured as an exact character count
+# before any decode (no decoding, no image library dependency here).
+_MAX_PRESERVED_IMAGE_ENCODED_BYTES = 10_000_000
+
+# Per-result cap on how many image blocks may be preserved.
+_MAX_PRESERVED_IMAGE_BLOCKS = 8
+
+# Aggregate encoded budget across a whole tool result. Without this, the
+# per-block cap alone would permit _MAX_PRESERVED_IMAGE_BLOCKS * 10 MB.
+_MAX_PRESERVED_IMAGE_TOTAL_BYTES = 10_000_000
+
+# Block `type` values recognised as images across the shapes we interoperate
+# with: LangChain (`image_url`), Anthropic transcript and MCP (both `image`).
+_IMAGE_BLOCK_TYPES = ("image_url", "image")
+
+_IMAGE_OMITTED_OVERSIZE = "[Image omitted: encoded payload {actual} exceeds {limit} per-image limit]"
+_IMAGE_OMITTED_COUNT = "[Image omitted: more than {limit} image blocks in one tool result]"
+_IMAGE_OMITTED_BUDGET = "[Image omitted: aggregate image budget {limit} exhausted]"
+_IMAGE_OMITTED_MALFORMED = "[Image omitted: malformed or empty image block]"
+
+# Base64 alphabet used for the ASCII precheck (standard and URL-safe variants).
+_BASE64_ALPHABET = (
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/-_"
+)
+
+
+def _format_mb(num_bytes: int) -> str:
+    """Render a byte count as a short human-readable MB string."""
+    return f"{num_bytes / 1_000_000:.1f} MB"
+
+
+def _base64_payload_length(payload: object) -> int | None:
+    """Return the exact ASCII length of a base64 payload, or None if unusable.
+
+    The measurement is an exact character count taken **before** any decode, per
+    the design: no decoding, no image library, no MIME sniffing. But a count is
+    only meaningful if the payload really is base64 text, so this enforces the
+    base64 alphabet and ASCII-ness first. A payload that is not base64 (for
+    example the plain-text body of `data:image/png,hello`) or that carries
+    non-ASCII characters is rejected, so it can be downgraded rather than
+    silently preserved and measured as if it were an image.
+    """
+    if not isinstance(payload, str) or not payload:
+        return None
+
+    try:
+        encoded = payload.encode("ascii")
+    except UnicodeEncodeError:
+        return None
+
+    # Base64 is 4-character groups, optionally padded with one or two '='.
+    stripped = encoded.rstrip(b"=")
+    padding = len(encoded) - len(stripped)
+    if padding > 2 or len(encoded) % 4 != 0:
+        return None
+    if not stripped or stripped.translate(None, _BASE64_ALPHABET) != b"":
+        return None
+
+    return len(encoded)
+
+
+def _image_payload_length(block: dict) -> int | None:
+    """Return the encoded payload length of an image block, or None.
+
+    None means "not a preservable inline image": a malformed block, a block
+    whose payload is not valid base64, or a block referencing a remote URL.
+    Remote URLs are never fetched -- doing so would add egress and a
+    time-of-replay contract -- so they stay evictable.
+    """
+    block_type = block.get("type")
+
+    if block_type == "image_url":
+        image_url = block.get("image_url")
+        if isinstance(image_url, str):
+            url = image_url
+        elif isinstance(image_url, dict):
+            raw_url = image_url.get("url")
+            url = raw_url if isinstance(raw_url, str) else None
+        else:
+            url = None
+        if not url or not url.startswith("data:"):
+            return None
+        header, separator, payload = url.partition(",")
+        # Only a base64 data URI carries an inline payload we can measure.
+        # `data:image/png,hello` is a valid data URI but is not base64.
+        if not separator or not header.rstrip().endswith(";base64"):
+            return None
+        return _base64_payload_length(payload)
+
+    if block_type == "image":
+        # MCP shape: {"type": "image", "data": ..., "mimeType": ...}
+        length = _base64_payload_length(block.get("data"))
+        if length is not None:
+            return length
+        # Anthropic transcript shape: {"type": "image", "source": {"data": ...}}
+        source = block.get("source")
+        if isinstance(source, dict):
+            return _base64_payload_length(source.get("data"))
+        return None
+
+    return None
+
+
+def _is_remote_url_image(block: dict) -> bool:
+    """True if the block references an image by URL rather than inlining it.
+
+    Such a block is left exactly as it is: `deepagents` is provider-agnostic and
+    must not decide on a provider's behalf that a URL is unusable.
+    """
+    image_url = block.get("image_url")
+    url = image_url if isinstance(image_url, str) else None
+    if isinstance(image_url, dict):
+        raw_url = image_url.get("url")
+        url = raw_url if isinstance(raw_url, str) else None
+    if url is None:
+        # The Anthropic/MCP `image` shape may also carry a bare `url`.
+        raw_url = block.get("url")
+        url = raw_url if isinstance(raw_url, str) else None
+    return bool(url) and not url.startswith("data:")
+
+
+def _classify_content_blocks(
+    blocks: list,
+) -> tuple[list[tuple[int, object]], list[tuple[int, object]], bool]:
+    """Partition tool-result blocks into preserved images and evictable content.
+
+    Blocks are considered in their original order. An image block is preserved
+    only if it is a well-formed inline payload that passes the per-block cap, the
+    block-count cap and the remaining aggregate budget. The first block that
+    would exceed the budget -- and every image block after it -- is downgraded to
+    a short diagnostic text block carrying no payload bytes, which then follows
+    the normal evictable path. Downgrading is deterministic and order-preserving.
+
+    Args:
+        blocks: The original list content of a ToolMessage.
+
+    Returns:
+        A tuple of (preserved, evictable, transformed):
+        - preserved: (index, block) pairs for image blocks kept verbatim.
+        - evictable: (index, block) pairs for everything else, where a rejected
+          image appears as its replacement diagnostic text block.
+        - transformed: True if any block was downgraded, i.e. the classification
+          was not a no-op. Callers must materialize the result when this is True,
+          even if no text offload is needed, otherwise a rejected payload would
+          be resurrected.
+    """
+    preserved: list[tuple[int, object]] = []
+    evictable: list[tuple[int, object]] = []
+    transformed = False
+    used_budget = 0
+    budget_exhausted = False
+
+    for index, block in enumerate(blocks):
+        if not isinstance(block, dict) or block.get("type") not in _IMAGE_BLOCK_TYPES:
+            evictable.append((index, block))
+            continue
+
+        payload_len = _image_payload_length(block)
+
+        if payload_len is None:
+            if _is_remote_url_image(block):
+                # A remote URL carries no inline payload for us to preserve, but
+                # deepagents is provider-agnostic and must not decide the block
+                # is unusable: a downstream provider may well support URLs. Leave
+                # the original block untouched in the evictable partition and
+                # perform no fetch.
+                evictable.append((index, block))
+                continue
+            # Malformed inline block: downgraded to a payload-free diagnostic so
+            # it cannot masquerade as a usable image downstream.
+            evictable.append((index, {"type": "text", "text": _IMAGE_OMITTED_MALFORMED}))
+            transformed = True
+            continue
+
+        if payload_len > _MAX_PRESERVED_IMAGE_ENCODED_BYTES:
+            notice = _IMAGE_OMITTED_OVERSIZE.format(
+                actual=_format_mb(payload_len),
+                limit=_format_mb(_MAX_PRESERVED_IMAGE_ENCODED_BYTES),
+            )
+            evictable.append((index, {"type": "text", "text": notice}))
+            transformed = True
+            continue
+
+        if len(preserved) >= _MAX_PRESERVED_IMAGE_BLOCKS:
+            notice = _IMAGE_OMITTED_COUNT.format(limit=_MAX_PRESERVED_IMAGE_BLOCKS)
+            evictable.append((index, {"type": "text", "text": notice}))
+            transformed = True
+            continue
+
+        if budget_exhausted or used_budget + payload_len > _MAX_PRESERVED_IMAGE_TOTAL_BYTES:
+            # Latched, per the signed contract: the first block that would
+            # exceed the aggregate budget AND every image block after it are
+            # downgraded. Without the latch a later, smaller image would slip
+            # through, making the preserved prefix depend on block sizes rather
+            # than on position -- non-deterministic and untestable.
+            budget_exhausted = True
+            notice = _IMAGE_OMITTED_BUDGET.format(limit=_format_mb(_MAX_PRESERVED_IMAGE_TOTAL_BYTES))
+            evictable.append((index, {"type": "text", "text": notice}))
+            transformed = True
+            continue
+
+        used_budget += payload_len
+        preserved.append((index, block))
+
+    return preserved, evictable, transformed
+
+
+def _evictable_content_str(content: object, evictable: list[tuple[int, object]]) -> str:
+    """Compute the string form of the evictable portion of a tool result.
+
+    Pinned representation, so that offloaded files do not silently change shape:
+    - `str` content is written verbatim;
+    - exactly one evictable block of type `text` yields its `text` value, which
+      preserves the existing readability special case;
+    - otherwise the stringified list of evictable blocks, i.e. the same form as
+      before, just computed over the evictable subset.
+    """
+    if isinstance(content, str):
+        return content
+
+    blocks = [block for _, block in evictable]
+
+    if len(blocks) == 1 and isinstance(blocks[0], dict):
+        # `blocks` holds opaque content blocks, so the narrowed element is only
+        # known to be *some* mapping; cast to spell out the key/value types.
+        only_block = cast(dict[str, Any], blocks[0])
+        if only_block.get("type") == "text" and "text" in only_block:
+            return str(only_block["text"])
+
+    return str(blocks)
+
+
+def _replace_content(message: ToolMessage, content: str | list) -> ToolMessage:
+    """Return a copy of `message` carrying new content and nothing else changed.
+
+    Rebuilding a ToolMessage from a handful of named fields silently drops
+    everything else the original carried -- `id`, `status`, `artifact`,
+    `response_metadata` and any additional keys. Copying the model instance and
+    overriding only `content` preserves all of them.
+    """
+    updated = message.model_copy(deep=False)
+    updated.content = content
+    return updated
+
+
+def _classified_blocks(
+    preserved: list[tuple[int, object]],
+    evictable: list[tuple[int, object]],
+) -> list:
+    """All blocks in original order, with classification decisions applied."""
+    return [block for _, block in sorted(preserved + evictable, key=lambda item: item[0])]
+
+
+def _rebuild_with_preserved_images(
+    preserved: list[tuple[int, object]],
+    evictable: list[tuple[int, object]],
+    replacement_text: str,
+) -> list:
+    """Rebuild message content after a text offload, keeping images in order.
+
+    Walking the original block positions: the first evictable position becomes
+    the single offload notice, later evictable positions are dropped (their
+    content now lives in the offloaded file), and preserved image blocks are
+    emitted at their original relative positions.
+
+    The contract is relative image *order*, not label association: inline labels
+    are lost, and the notice names the file where they can be read back.
+    """
+    notice_index = evictable[0][0] if evictable else -1
+
+    items: list[tuple[int, object]] = list(preserved)
+    if notice_index >= 0:
+        items.append((notice_index, {"type": "text", "text": replacement_text}))
+
+    items.sort(key=lambda item: item[0])
+    rebuilt = [block for _, block in items]
+
+    if notice_index < 0:
+        rebuilt.insert(0, {"type": "text", "text": replacement_text})
+
+    return rebuilt
 
 
 TOO_LARGE_TOOL_MSG = """Tool result too large, the result of this tool call {tool_call_id} was saved in the filesystem at this path: {file_path}
@@ -1064,44 +1358,52 @@ class FilesystemMiddleware(AgentMiddleware):
             - files_update: Dict of file updates to apply to state, or None if eviction failed
 
         Note:
-            The entire content is converted to string, written to /large_tool_results/{tool_call_id},
-            and replaced with a truncated preview plus file reference. The replacement is always
-            returned as a plain string for consistency, regardless of original content type.
+            Content blocks are partitioned into preserved images and evictable
+            content. Only the evictable portion is measured against the eviction
+            threshold and, if too large, written to
+            /large_tool_results/{tool_call_id} and replaced by a truncated
+            preview plus file reference.
 
-            ToolMessage supports multimodal content blocks (images, audio, etc.), but these are
-            uncommon in tool results. For simplicity, all content is stringified and evicted.
-            The model can recover by reading the offloaded file from the backend.
+            Image blocks are preserved in place, because unlike text the model
+            cannot recover them by reading the offloaded file. They are subject
+            to the per-block, count and aggregate caps defined above; a rejected
+            image is downgraded to a payload-free diagnostic text block, never
+            silently dropped.
         """
         # Early exit if eviction not configured
         if not self._tool_token_limit_before_evict:
             return message, None
 
-        # Convert content to string once for both size check and eviction
-        # Special case: single text block - extract text directly for readability
-        if (
-            isinstance(message.content, list)
-            and len(message.content) == 1
-            and isinstance(message.content[0], dict)
-            and message.content[0].get("type") == "text"
-            and "text" in message.content[0]
-        ):
-            content_str = str(message.content[0]["text"])
-        elif isinstance(message.content, str):
-            content_str = message.content
+        content = message.content
+        if isinstance(content, list):
+            preserved, evictable, transformed = _classify_content_blocks(content)
         else:
-            # Multiple blocks or non-text content - stringify entire structure
-            content_str = str(message.content)
+            preserved, evictable, transformed = [], [], False
 
-        # Check if content exceeds eviction threshold
-        if len(content_str) <= NUM_CHARS_PER_TOKEN * self._tool_token_limit_before_evict:
-            return message, None
+        # Only the evictable portion counts toward the eviction threshold, so an
+        # image never drags its own metadata line over the limit.
+        content_str = _evictable_content_str(content, evictable)
+        needs_offload = len(content_str) > NUM_CHARS_PER_TOKEN * self._tool_token_limit_before_evict
 
-        # Write content to filesystem
+        if not needs_offload:
+            # A cap decision is never conditional on the offload decision: if
+            # classification rejected a payload we must materialize that
+            # rejection, otherwise the rejected bytes would be resurrected.
+            if not transformed:
+                return message, None
+            return _replace_content(message, _classified_blocks(preserved, evictable)), None
+
+        # Write the evictable content to the filesystem
         sanitized_id = sanitize_tool_call_id(message.tool_call_id)
         file_path = f"/large_tool_results/{sanitized_id}"
         result = resolved_backend.write(file_path, content_str)
         if result.error:
-            return message, None
+            # The offload failed, so evictable content must stay in the message.
+            # But returning the original would resurrect payloads the caps
+            # already rejected, so materialize the classification instead.
+            if not transformed:
+                return message, None
+            return _replace_content(message, _classified_blocks(preserved, evictable)), None
 
         # Create preview showing head and tail of the result
         content_sample = _create_content_preview(content_str)
@@ -1111,13 +1413,13 @@ class FilesystemMiddleware(AgentMiddleware):
             content_sample=content_sample,
         )
 
-        # Always return as plain string after eviction
-        processed_message = ToolMessage(
-            content=replacement_text,
-            tool_call_id=message.tool_call_id,
-            name=message.name,
-        )
-        return processed_message, result.files_update
+        if preserved:
+            processed_content: str | list = _rebuild_with_preserved_images(preserved, evictable, replacement_text)
+        else:
+            # No images to carry: return a plain string, exactly as before.
+            processed_content = replacement_text
+
+        return _replace_content(message, processed_content), result.files_update
 
     async def _aprocess_large_message(
         self,
@@ -1133,31 +1435,29 @@ class FilesystemMiddleware(AgentMiddleware):
         if not self._tool_token_limit_before_evict:
             return message, None
 
-        # Convert content to string once for both size check and eviction
-        # Special case: single text block - extract text directly for readability
-        if (
-            isinstance(message.content, list)
-            and len(message.content) == 1
-            and isinstance(message.content[0], dict)
-            and message.content[0].get("type") == "text"
-            and "text" in message.content[0]
-        ):
-            content_str = str(message.content[0]["text"])
-        elif isinstance(message.content, str):
-            content_str = message.content
+        content = message.content
+        if isinstance(content, list):
+            preserved, evictable, transformed = _classify_content_blocks(content)
         else:
-            # Multiple blocks or non-text content - stringify entire structure
-            content_str = str(message.content)
+            preserved, evictable, transformed = [], [], False
 
-        if len(content_str) <= NUM_CHARS_PER_TOKEN * self._tool_token_limit_before_evict:
-            return message, None
+        content_str = _evictable_content_str(content, evictable)
+        needs_offload = len(content_str) > NUM_CHARS_PER_TOKEN * self._tool_token_limit_before_evict
+
+        if not needs_offload:
+            if not transformed:
+                return message, None
+            return _replace_content(message, _classified_blocks(preserved, evictable)), None
 
         # Write content to filesystem using async method
         sanitized_id = sanitize_tool_call_id(message.tool_call_id)
         file_path = f"/large_tool_results/{sanitized_id}"
         result = await resolved_backend.awrite(file_path, content_str)
         if result.error:
-            return message, None
+            # See the sync twin: never resurrect a payload the caps rejected.
+            if not transformed:
+                return message, None
+            return _replace_content(message, _classified_blocks(preserved, evictable)), None
 
         # Create preview showing head and tail of the result
         content_sample = _create_content_preview(content_str)
@@ -1167,13 +1467,12 @@ class FilesystemMiddleware(AgentMiddleware):
             content_sample=content_sample,
         )
 
-        # Always return as plain string after eviction
-        processed_message = ToolMessage(
-            content=replacement_text,
-            tool_call_id=message.tool_call_id,
-            name=message.name,
-        )
-        return processed_message, result.files_update
+        if preserved:
+            processed_content: str | list = _rebuild_with_preserved_images(preserved, evictable, replacement_text)
+        else:
+            processed_content = replacement_text
+
+        return _replace_content(message, processed_content), result.files_update
 
     def _intercept_large_tool_result(self, tool_result: ToolMessage | Command, runtime: ToolRuntime) -> ToolMessage | Command:
         """Intercept and process large tool results before they're added to state.

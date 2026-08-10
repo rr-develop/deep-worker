@@ -96,3 +96,18 @@ def load_session_state(thread_id: str) -> dict[str, Any] | None:
         "sent_count": entry.get("sent_count", 0),
         "session_uuid": entry.get("session_uuid"),
     }
+
+
+def invalidate_session_state(thread_id: str) -> None:
+    """Remove the persisted resume hint for a poisoned Claude session."""
+    try:
+        path = session_state_path(thread_id)
+        all_state = _read_all(thread_id)
+        if thread_id not in all_state:
+            return
+        del all_state[thread_id]
+        tmp = path.with_suffix(f".{thread_id.replace(':', '_')}.tmp")
+        tmp.write_text(json.dumps(all_state, indent=2))
+        tmp.replace(path)
+    except OSError:
+        pass

@@ -1,6 +1,7 @@
 """Agent process implementation for deep_worker."""
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -9,6 +10,7 @@ import socket
 import sqlite3
 import subprocess
 import sys
+import time
 import traceback
 import uuid
 from datetime import UTC, datetime
@@ -572,6 +574,10 @@ class AgentProcess:
         self.backend = None  # Will be initialized in start()
         self.session_manager: SessionManager | None = None
         self.task_manager = None  # Will be initialized in start() if enabled
+        # Token-stats recorder (token-stats design §5.1). Lazily
+        # created on first LLM invocation; writes to
+        # ``<data_dir>/token_stats.jsonl``.
+        self._token_stats_recorder_obj: Any | None = None
         # Invariant (startup) system prompt, captured at agent-build time in
         # start(). Surfaced by the Full Dialog "system_prompt" introspection
         # mode (§9 of DESIGN_FULL_DIALOG_FINAL_RESPONSE_PAIRS.md).
@@ -632,6 +638,26 @@ class AgentProcess:
         # keep them alive until they finish; they self-remove via a done
         # callback. See AgentService.exposed_invoke_agent (decoupling).
         self._detached_invoke_tasks: set[Any] = set()
+
+        # ── Durable inter-agent inbox (DESIGN_DURABLE_INTER_AGENT_DELIVERY.md)
+        # The drain task is held in its own attribute and is NOT managed like
+        # _detached_invoke_tasks: that set only holds references, while this
+        # consumer must be cancelled and awaited before the checkpointer closes
+        # (§3.3.4). Callback injection is a SEPARATE method from task creation
+        # so the idempotence guard can never discard a late callback (§3.3.3).
+        self._inbox_drain_task: Any = None
+        self._inbox_event: asyncio.Event = asyncio.Event()
+        self._inbox_seq_lock = asyncio.Lock()
+        self._inbox_next_seq: int = 0
+        # False until a FULL spool scan has primed _inbox_next_seq. Publishing
+        # against an unprimed counter would allocate seq 0 while records with
+        # higher seqs survive on disk, breaking the
+        # next_seq = max(pending ∪ quarantined) + 1 contract and the attempt
+        # order that depends on it. Enqueue therefore primes on demand and
+        # fails loudly if it cannot (design §3.1.1).
+        self._inbox_seq_primed: bool = False
+        self._inbox_notify: Any = None
+        self._shutting_down: bool = False
 
         # Approval decisions cache (for backward compatibility)
         # Used by AgentService to store approval decisions when not using HITL framework
@@ -1009,6 +1035,21 @@ class AgentProcess:
                 name=f"quarantine-warning-{subscriber_id}",
             )
 
+    @property
+    def _token_stats_recorder(self) -> Any:
+        """Lazy token-stats recorder for this agent.
+
+        Created on first access (i.e. first instrumented LLM invocation);
+        appends to ``<data_dir>/token_stats.jsonl`` (token-stats design
+        §4.2). The same recorder instance is shared with the TaskManager so
+        both write to one file, tagged ``kind="agent"`` / ``kind="tm"``.
+        """
+        if self._token_stats_recorder_obj is None:
+            from deep_worker_cli.stats.token_stats import TokenUsageRecorder
+
+            self._token_stats_recorder_obj = TokenUsageRecorder(self.data_dir)
+        return self._token_stats_recorder_obj
+
     async def start(self) -> None:
         """Start the agent process.
 
@@ -1215,10 +1256,22 @@ class AgentProcess:
                 # Pass user=self.name for KV-cache isolation so the main
                 # agent and its TaskManager (:tm) use separate user_ids
                 # and do not evict each other's DeepSeek prefix-cache.
+                # kind="agent" + factories wire the token-stats recorder
+                # (token-stats design §5.1).
+                from deep_worker_cli.stats.callback import (
+                    make_stats_callback_factory,
+                    make_usage_event_callback_factory,
+                )
+
                 model = create_model(
                     provider=self.config.provider,
                     model_name=self.config.model,
                     user=self.name,
+                    kind="agent",
+                    stats_callback_factory=make_stats_callback_factory(self._token_stats_recorder),
+                    usage_event_callback_factory=make_usage_event_callback_factory(
+                        self._token_stats_recorder
+                    ),
                 )
 
                 # Set working_dir on model for MCP direct tool execution
@@ -1482,6 +1535,7 @@ class AgentProcess:
                         config=self.config,
                         session_manager=self.session_manager,
                         checkpointer=checkpointer,  # Same as main agent
+                        token_stats_recorder=self._token_stats_recorder,
                     )
                     await self.task_manager.start()
 
@@ -1504,6 +1558,17 @@ class AgentProcess:
             sys.stdout.write(msg)
             sys.stdout.flush()
             _logger.info(msg)
+
+            # 4.9 Prime the durable inbox BEFORE the RPyC server can accept an
+            # enqueue. publish() would create the spool lazily, but _next_seq
+            # must be primed from disk first or a surviving record could have
+            # its filename reused. The drain itself is started later
+            # (bring_up_inbox), once the graph and checkpointer are ready.
+            # DESIGN_DURABLE_INTER_AGENT_DELIVERY.md §3.2.1.
+            try:
+                self.init_inbox_spool()
+            except OSError as exc:
+                _logger.exception("[INBOX] could not initialise spool: %s", exc)
 
             # 5. Start RPyC server if port is configured
             msg = f"{_ts()} [AGENT_INIT] About to start RPyC server (port={self.rpyc_port})...\n"
@@ -1575,6 +1640,23 @@ class AgentProcess:
                 startup_task.add_done_callback(
                     self._log_startup_task_result
                 )
+
+            # Bring up the durable inter-agent inbox: create/recover the spool
+            # and start the drain. Owned by AgentProcess (NOT AgentService) so
+            # it runs whenever the process is alive, including the startup edge
+            # that recovers records left by a restart — which happens before
+            # any subscriber attaches. The notify callback is injected
+            # separately via set_inbox_notify.
+            # See DESIGN_DURABLE_INTER_AGENT_DELIVERY.md §3.3.3/§3.3.4.
+            recovered = self.bring_up_inbox()
+            if recovered:
+                msg = (
+                    f"{_ts()} [STARTUP] Recovered {recovered} pending "
+                    f"inter-agent message(s) from the durable inbox; they "
+                    f"will be processed by the drain.\n"
+                )
+                sys.stdout.write(msg)
+                sys.stdout.flush()
 
             # Main event loop: wait for shutdown signal - EVENT DRIVEN, NO POLLING
             # Wait for shutdown event instead of polling self.running
@@ -2338,6 +2420,16 @@ class AgentProcess:
             finally:
                 self._a2a_handle = None
 
+        # 2.2 Stop the durable-inbox drain. Inbound acceptance already stopped
+        # (RPyC server closed above), so no new records can arrive. The flag is
+        # set BEFORE cancelling so the drain can distinguish shutdown from a
+        # user interrupt without depending on timing; the drain cancels and
+        # awaits its active child on the way out, leaving no orphan turn.
+        # MUST run before cleanup() closes the checkpointer.
+        # See DESIGN_DURABLE_INTER_AGENT_DELIVERY.md §3.3.4.
+        self._shutting_down = True
+        await self.stop_inbox_drain()
+
         # 3. Persist state
         if self.session_manager:
             await self.session_manager.set_status(AgentStatus.SHUTDOWN)
@@ -2418,6 +2510,279 @@ class AgentProcess:
             a2a_url=a2a_url,
         )
         self.registry.register(process_info)
+
+    # ================================================================
+    # Durable inter-agent inbox
+    # See docs/DESIGN_DURABLE_INTER_AGENT_DELIVERY.md (signed off, r6) and
+    # a related internal incident analysis (not included here).
+    # ================================================================
+
+    def bring_up_inbox(self) -> int:
+        """Production startup wiring for the durable inbox — ONE entry point.
+
+        Performs, in order:
+
+        1. eager spool creation + ``.tmp-*`` cleanup + ``next_seq`` priming
+           (§3.2.1), which also arms the startup edge if records survived a
+           previous life;
+        2. creation of the single long-lived drain consumer (§3.3.4).
+
+        This exists as a named hook so that an end-to-end test can exercise
+        the REAL startup path instead of re-implementing it. A test that calls
+        ``init_inbox_spool()`` and ``start_inbox_drain()`` by hand would stay
+        green even if ``start()`` stopped calling them — the wiring would be
+        unproven. Everything here must be safe to call once the agent graph
+        and checkpointer are ready; it is idempotent with respect to the drain
+        task.
+
+        Returns the number of pending records recovered from a previous life.
+
+        A broken spool must not stop the agent from starting: ``OSError`` is
+        logged and swallowed here. The counter is then left UNPRIMED, and
+        ``publish_inbox_message`` retries the prime inside its lock before
+        allocating — so a sender either gets a correctly-ordered record or an
+        explicit ``success: false``, never a silently misordered seq 0.
+        """
+        recovered = 0
+        try:
+            recovered = self.init_inbox_spool()
+        except OSError as exc:
+            _logger.exception("[INBOX] could not initialise spool: %s", exc)
+        self.start_inbox_drain()
+        return recovered
+
+    def init_inbox_spool(self) -> int:
+        """Create the spool eagerly and prime the seq counter (§3.2.1).
+
+        Called during startup BEFORE any enqueue can happen, so the per-record
+        fsync chain in ``inbox_spool.publish`` is sufficient on its own and
+        there is no create-race between concurrent first enqueues.
+
+        Priming is ALL-OR-NOTHING: ``_inbox_seq_primed`` is set only after a
+        full successful scan. A partially-failed prime must never leave the
+        counter at its ``0`` default while records with higher seqs survive on
+        disk — that would publish a new arrival *ahead* of them and break the
+        ``next_seq = max(pending ∪ quarantined) + 1`` contract. Any ``OSError``
+        propagates with the flag left False so the enqueue path can retry or
+        refuse loudly.
+
+        Idempotent and safe to call twice (once before the RPyC server starts,
+        once from :meth:`bring_up_inbox`). Once primed it will NOT rescan or
+        reset a live counter, since by then the server may already have
+        allocated seqs.
+
+        Returns the number of pending records recovered from a previous life.
+        """
+        from deep_worker_cli.process import inbox_spool
+
+        inbox_spool.ensure_spool(self.data_dir)
+        if not self._inbox_seq_primed:
+            inbox_spool.cleanup_tmp(self.data_dir)
+            # Assign only after the scan succeeds — an exception here must
+            # leave both the counter and the flag untouched.
+            next_seq = inbox_spool.next_seq(self.data_dir)
+            self._inbox_next_seq = next_seq
+            self._inbox_seq_primed = True
+        pending = inbox_spool.pending_records(self.data_dir)
+        if pending:
+            # Startup edge (§3.4): anything durable from before the restart is
+            # processed now, without waiting for a new arrival.
+            self._inbox_event.set()
+        return len(pending)
+
+    async def publish_inbox_message(self, message: str, reply_back: bool) -> str:
+        """Durably publish an inbound message and wake the drain.
+
+        This is the honest-ack primitive: it returns only after the record is
+        fsynced, so the caller may acknowledge the send. Ordering is strict —
+        publish durably, THEN set the event, THEN let the caller ack.
+
+        FAIL CLOSED on an unprimed counter: if the startup scan failed (it is
+        logged and swallowed so a broken spool cannot stop the agent from
+        booting), we prime here, inside the lock, BEFORE allocating. If that
+        still fails the exception propagates and the sender is told
+        ``success: false``. Allocating against the unprimed default would
+        publish this arrival as seq 0 while records with higher seqs survive
+        on disk — silently reordering it ahead of them while reporting
+        success, which is precisely the class of dishonest ack this whole
+        change removes.
+
+        Returns the record's ``delivery_id``.
+
+        Raises:
+            OSError: the spool could not be primed or written.
+        """
+        from deep_worker_cli.process import inbox_spool
+
+        record = inbox_spool.build_record(message, reply_back)
+        # Allocate+publish under a dedicated short-lived lock (§3.1.1). This is
+        # NOT _invoke_lock: it is held for microseconds and never across a turn.
+        async with self._inbox_seq_lock:
+            if not self._inbox_seq_primed:
+                # Late prime; propagates on failure (no allocation happens).
+                self.init_inbox_spool()
+            seq = self._inbox_next_seq
+            self._inbox_next_seq = seq + 1
+            inbox_spool.publish(self.data_dir, record, seq)
+        # Strictly after durability.
+        self._inbox_event.set()
+        return str(record["delivery_id"])
+
+    def set_inbox_notify(self, notify_callback: Any) -> None:
+        """Inject the subscriber-fanout callback (§3.3.3).
+
+        Assignment ONLY — this never creates a task, so it is safe to call at
+        any time, including long after the drain started. The drain re-reads
+        ``_inbox_notify`` on every record, so a late injection is picked up by
+        the next delivery without restarting anything.
+        """
+        self._inbox_notify = notify_callback
+
+    def start_inbox_drain(self) -> Any:
+        """Start the single long-lived drain consumer (§3.3.4).
+
+        Guarded: a second call is a no-op. Takes no callback argument — that is
+        ``set_inbox_notify``'s job — so this guard can never silently discard a
+        callback.
+        """
+        if self._inbox_drain_task is not None and not self._inbox_drain_task.done():
+            return self._inbox_drain_task
+        self._inbox_drain_task = asyncio.create_task(self._inbox_drain_loop())
+        return self._inbox_drain_task
+
+    async def _inbox_drain_loop(self) -> None:
+        """Consume the spool. Event-driven; no polling, no timed wakeups.
+
+        Protocol (§3.4.1) — ``clear()`` strictly BEFORE reading the directory::
+
+            await event.wait(); event.clear(); drain snapshot
+
+        There is deliberately NO self-rearm on pending entries: combined with
+        "a failed record stays on disk" that would spin forever on a
+        deterministically failing record (§3.3.1a). Re-arming is solely the
+        producer's job, plus the startup edge.
+        """
+        while True:
+            await self._inbox_event.wait()
+            self._inbox_event.clear()
+            try:
+                await self._drain_inbox_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - defensive per-pass guard
+                # An error in the scan/snapshot machinery itself must not kill
+                # the only consumer while durable records are pending. No
+                # re-arm here either — otherwise a reproducible exception is
+                # the same hot loop we just removed.
+                _logger.exception("[INBOX] drain pass failed")
+
+    async def _drain_inbox_once(self) -> None:
+        """One pass over a snapshot of the spool.
+
+        Each record is attempted AT MOST ONCE per wake (§3.3.1a). A retained
+        failure is not re-read within the pass and does not re-arm the event;
+        it is retried on the next arrival or at startup.
+        """
+        from deep_worker_cli.process import inbox_spool
+
+        for path in inbox_spool.pending_records(self.data_dir):
+            record = inbox_spool.read_record(path)
+            if record is None:
+                inbox_spool.quarantine(self.data_dir, path)
+                continue
+            await self._deliver_inbox_record(path, record)
+
+    async def _deliver_inbox_record(
+        self, path: Path, record: dict[str, Any]
+    ) -> None:
+        """Run one queued message as a turn, then apply the delete boundary.
+
+        The turn runs in its own SHORT-LIVED CHILD TASK calling the PUBLIC
+        ``_handle_invoke`` (§3.3.0b). This is load-bearing:
+
+        * ``_handle_invoke_owned`` sets ``current_worker_task =
+          asyncio.current_task()``, and ``exposed_interrupt_agent`` cancels
+          exactly that task. Running the turn inline would make the drain
+          itself the interrupt target, so a routine user interrupt would kill
+          the only consumer permanently — a silent processing outage.
+        * ``_handle_invoke`` (public) acquires ``_invoke_lock`` itself, so the
+          drain holds no lock and there is no recursion/deadlock.
+        """
+        delivery_id = record.get("delivery_id")
+        started = time.monotonic()
+        child = asyncio.create_task(self._handle_invoke(
+            {
+                "command": "invoke",
+                "message": record["message"],
+                "stream": True,
+                "reply_back": record.get("reply_back", True),
+                "inter_agent_delivery": True,
+                "delivery_id": delivery_id,
+            },
+            connection=None,
+            # Re-read per record so a late set_inbox_notify is honoured.
+            notify_callback=self._inbox_notify,
+            approval_callback=None,
+        ))
+        try:
+            result = await child
+        except asyncio.CancelledError:
+            current = asyncio.current_task()
+            drain_cancelled = self._shutting_down or (
+                current is not None and current.cancelling() > 0
+            )
+            if drain_cancelled:
+                # Shutdown: cancel and await the child so no orphan turn
+                # survives into checkpointer teardown, then propagate.
+                child.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await child
+                raise
+            # User interrupt cancelled the TURN, not us. Absorb it, retain the
+            # record, stay alive (§3.3.0b).
+            _logger.info(
+                "[INBOX] delivery %s interrupted; record retained", delivery_id
+            )
+            return
+        except Exception:  # noqa: BLE001 - per-record containment (§3.3.4)
+            # One broken record must not strand the rest of the batch.
+            _logger.exception(
+                "[INBOX] delivery %s failed; record retained", delivery_id
+            )
+            return
+
+        # DELETE BOUNDARY — reached only on a normal return of the await above.
+        # Never in a `finally`: a cancelled or failed turn must keep its record.
+        if isinstance(result, dict) and result.get("success"):
+            try:
+                path.unlink()
+            except OSError:  # pragma: no cover - best effort
+                _logger.warning("[INBOX] could not unlink delivered %s", path)
+            _logger.info(
+                "[INBOX] delivered id=%s arrival=%s in %.3fs",
+                delivery_id, record.get("ts"), time.monotonic() - started,
+            )
+        else:
+            _logger.warning(
+                "[INBOX] delivery %s did not succeed; record retained for retry",
+                delivery_id,
+            )
+
+    async def stop_inbox_drain(self) -> None:
+        """Cancel and await the drain before the checkpointer closes (§3.3.4).
+
+        ``_shutting_down`` is set by the caller BEFORE cancelling so the drain
+        can tell shutdown from a user interrupt without depending on timing.
+        """
+        task = self._inbox_drain_task
+        if task is None:
+            return
+        self._inbox_drain_task = None
+        if task.done():
+            return
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await task
 
     def cancel_current_worker_task(self) -> bool:
         """Interrupt the currently-running agent turn, if any (RC-1).
@@ -3223,6 +3588,8 @@ class AgentProcess:
         stream = command.get("stream", True)  # Default to streaming to match deepagents
         inter_agent_delivery = bool(command.get("inter_agent_delivery", False))
         reply_back = command.get("reply_back", True)  # For inter-agent messaging
+        # Stable id of the durable spool record this turn came from, when any.
+        delivery_id = command.get("delivery_id")
         input_message_id: str | None = None
         last_error_messages: list[Any] = []
 
@@ -3282,6 +3649,11 @@ class AgentProcess:
                             "inter_agent_delivery": True,
                             "reply_back": reply_back,
                         }
+                        # Stable delivery identity, so a duplicate produced by
+                        # a crash between checkpoint and unlink can be linked
+                        # back to its original spool record (DESIGN §3.3.1).
+                        if delivery_id is not None:
+                            extra_kwargs["delivery_id"] = delivery_id
                     return HumanMessage(
                         content=content,
                         id=input_message_id,
@@ -4375,3 +4747,4 @@ class AgentProcess:
             if self.current_worker_task is asyncio.current_task():
                 self.is_running = False
                 self.current_worker_task = None
+

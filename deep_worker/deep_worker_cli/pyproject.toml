@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "deep-worker"
 version = "0.0.19"
-description = "Terminal interface for Deep Agents - interactive AI agent with file operations, shell access, and sub-agent capabilities."
+description = "Terminal interface for Deep Worker - interactive AI agent with file operations, shell access, and sub-agent capabilities."
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.11,<4.0"
@@ -79,6 +79,19 @@ dependencies = [
   "pillow>=10.0.0,<13.0.0",
   "pyyaml>=6.0.0",
   "aiosqlite>=0.19.0,<1.0.0",
+
+  # LSP shared-service (see docs/DESIGN_LSP_SHARED_SERVICE.md).
+  # Pinned to the 1.76.x line: 1.83+ pulls in protobuf 7.x and breaks
+  # grpcio-status / google-api-core / google-cloud-firestore on this
+  # host — see the LSP service README for the full ecosystem
+  # rationale. Runtime dependency of the service process AND
+  # the in-agent MCP↔gRPC bridge (thin adapter under policy §5).
+  "grpcio>=1.76,<1.77",
+  # File-system watcher for the LSP service change-detector (event-
+  # driven, no polling — POLICY_NO_INPROCESS_HEAVY_MCP §3.5). Declared
+  # here so the type checker sees it as early as commit 3, though the
+  # first import site lands in commit 5.
+  "watchfiles>=1.1,<2.0",
 ]
 
 [project.optional-dependencies]
@@ -88,14 +101,6 @@ vertexai = ["langchain-google-vertexai>=3.0.0,<4.0.0"]
 deep-worker = "deep_worker_cli.cli.router:deep_worker_main"
 deep-worker-cli = "deep_worker_cli.cli.router:deep_worker_cli_main"
 dwcli = "deep_worker_cli.cli.router:deep_worker_cli_main"
-
-[project.urls]
-Homepage = "https://docs.langchain.com/oss/python/deepagents/overview"
-Documentation = "https://reference.langchain.com/python/deepagents/"
-Repository = "https://github.com/langchain-ai/deepagents"
-Issues = "https://github.com/langchain-ai/deepagents/issues"
-Changelog = "https://github.com/langchain-ai/deepagents/blob/master/libs/cli/CHANGELOG.md"
-Twitter = "https://x.com/LangChain"
 
 [dependency-groups]
 test = [
@@ -113,6 +118,11 @@ test = [
     "responses>=0.25.0,<1.0.0",
     "twine>=6.0.0,<7.0.0",
     "pyte>=0.8.2,<1.0.0",  # Terminal emulator for UI testing
+    # Regenerating LSP-service gRPC stubs (see the LSP service proto
+    # definition). Kept in `test` group because the pre-commit uv env
+    # pulls it in for the type-check pass — same MAJOR/MINOR as grpcio
+    # (1.76.x) per the ecosystem pin explained in the LSP service README.
+    "grpcio-tools>=1.76,<1.77",
 ]
 
 [tool.hatch.metadata]

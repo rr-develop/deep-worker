@@ -1,5 +1,27 @@
 # Changelog
 
+## Post-fork (deep-worker)
+
+Changes made after the fork from `deepagents-cli`, on top of upstream `0.0.19`:
+
+- **feat(lsp)**: optional LSP code navigation for agents via the Serena MCP backend
+- **feat(dw-hist)**: host-level CLI for browsing agent conversation history
+- **feat(deepworker_a2a)**: full A2A protocol support (inbound server + outbound tools)
+- **feat(agent)**: external MCP tools
+- **feat(storage)**: auto-migrate agents to v4 on restart
+- **feat(codex_provider)**: new Codex CLI provider for deep-worker
+- **feat(deep_worker)**: Delta checkpointer — store only changes, not full state
+- **feat(tools)**: `send_message_to_agent` inter-agent messaging tool
+- **feat**: `read_image` tool + multimodal support in deep_worker
+- **feat**: Settings fields and CLI parameters for summarization
+- **feat**: Claude Code provider for LangChain integration
+- **feat**: complete message streaming in `dwcli`
+- **feat**: semantic search module using LlamaIndex + LanceDB
+- **refactor**: remove Unix socket/IPC infrastructure, migrate to RPyC-only
+  architecture
+- **feat**: daemon mode, `--dir` and `-sp` options
+- **feat**: add `deep_worker` — copy of `deepagents-cli` renamed to `deep-worker`
+
 ## [0.0.19](https://github.com/langchain-ai/deepagents/compare/deepagents-cli==0.0.18...deepagents-cli==0.0.19) (2026-02-06)
 
 
