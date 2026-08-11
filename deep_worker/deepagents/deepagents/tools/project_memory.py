@@ -6,7 +6,6 @@ when a vector index is available.
 
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -15,14 +14,12 @@ from langchain_core.tools import tool
 if TYPE_CHECKING:
     from langchain.tools import ToolRuntime
 
-# Ensure semantic_search package is importable
-# Navigate from deepagents/tools/project_memory.py to project root
-_pkg_path = Path(__file__).parent.parent.parent.parent.parent / "semantic_search"
-if _pkg_path.exists() and str(_pkg_path) not in sys.path:
-    sys.path.insert(0, str(_pkg_path))
-
-# Lazy import — heavy dependencies (llama_index, torch, lancedb)
-# are loaded only on the FIRST real call to project_memory.
+# Lazy import — the heavy dependencies (llama_index, torch, lancedb) are
+# loaded only on the FIRST real call to project_memory.
+# The provider is resolved through deep_worker.providers.semantic_search
+# (see deep_worker_cli/provider_paths.py — source mode puts the source root
+# on sys.path; installed mode is a plain import from the wheel). No
+# sys.path hacks.
 _semantic_search = None  # (search_func, IndexNotFoundError)
 
 
@@ -31,8 +28,8 @@ def _ensure_semantic_search() -> tuple[Any, type[Exception]]:
     global _semantic_search
     if _semantic_search is None:
         # noqa — function-level import, ordering is safe
-        from semantic_search.exceptions import IndexNotFoundError  # noqa: E402
-        from semantic_search.retriever import search  # noqa: E402
+        from deep_worker.providers.semantic_search.exceptions import IndexNotFoundError  # noqa: E402
+        from deep_worker.providers.semantic_search.retriever import search  # noqa: E402
 
         _semantic_search = (search, IndexNotFoundError)
     return _semantic_search
@@ -46,8 +43,8 @@ def _run_project_search(query: str, resolved_dir: "Path", top_k: int) -> str:
     — see ``project_memory`` below). LanceDB bridges to its own background
     event loop with a blocking ``run_coroutine_threadsafe(...).result()``;
     run inline on the agent loop it holds the GIL while waiting and
-    deadlocks LanceDB's loop (cf. the history_memory deadlock observed
-    live on 2026-06-15). See docs/DESIGN_NO_LOOP_BLOCKING_TOOLS.md.
+    deadlocks LanceDB's loop (cf. the mj1_init history_memory deadlock,
+    2026-06-15). See docs/DESIGN_NO_LOOP_BLOCKING_TOOLS.md.
     """
     # Validate top_k
     if not 1 <= top_k <= 20:
@@ -130,7 +127,7 @@ async def project_memory(
         Project Memory: 'semantic search indexing'
 
         --- Result 1 (score=0.892) [python] ---
-        File: <project>/semantic_search/semantic_search/indexer.py
+        File: semantic_search/semantic_search/indexer.py
         Type: parent
 
         def index_repository(
@@ -152,7 +149,7 @@ async def project_memory(
     # ``_run_project_search`` loads a torch embedding model and queries
     # LanceDB (own background event loop, blocking ``.result()`` bridge).
     # Inline on the agent loop it holds the GIL while blocked and deadlocks
-    # LanceDB's loop (cf. the deadlock observed live on 2026-06-15). ``asyncio.to_thread``
+    # LanceDB's loop (cf. mj1_init, 2026-06-15). ``asyncio.to_thread``
     # releases the GIL during the wait. Keep this tool ``async`` and keep
     # the ``to_thread``. See docs/DESIGN_NO_LOOP_BLOCKING_TOOLS.md +
     # tests/test_no_loop_blocking_summarization.py.

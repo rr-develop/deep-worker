@@ -1,39 +1,13 @@
-"""Claude Code Provider for deep-worker.
+"""DEPRECATED shim — migrate to ``deep_worker.providers.claude_code_provider``.
 
-This package provides a LangChain-compatible AI provider that uses Claude Code
-(via ClaudeSDKClient) as the backend, enabling deep-worker to leverage Claude Code's
-pricing model while maintaining full transparency at the LangGraph level.
-
-Key components:
-- ClaudeCodeChatModel: LangChain BaseChatModel wrapper around ClaudeSDKClient
-- ProxyMCPServer: In-process MCP server that delegates tool execution to deep-worker
-- ClientManager: Manages ClaudeSDKClient instances for different thread_ids
-- WebSearchDelegationTool: Universal web search tool that works with any LLM provider
-
-Usage:
-    from claude_code_provider import ClaudeCodeChatModel, WebSearchDelegationTool
-    from claude_agent_sdk import ClaudeAgentOptions
-
-    # Create the model
-    model = ClaudeCodeChatModel(
-        base_options=ClaudeAgentOptions(
-            model="claude-sonnet-4-5-20250929"
-        )
-    )
-
-    # Bind tools (including web search)
-    web_search = WebSearchDelegationTool()
-    model = model.bind_tools([web_search, ...other_tools])
-
-    # Use with LangGraph
-    response = await model.ainvoke(messages, config={"configurable": {"thread_id": "session-1"}})
+This root package exists only for local backward compatibility on this host.
+It is NOT part of the published wheel/sdist. Old submodule imports
+(``import claude_code_provider.web_search``) are NOT supported: use
+``deep_worker.providers.claude_code_provider.web_search`` instead.
 """
+import warnings as _warnings
 
-from claude_code_provider.chat_model import ClaudeCodeChatModel
-from claude_code_provider.client_manager import ClientManager
-from claude_code_provider.proxy_mcp_server import ProxyMCPServer
-from claude_code_provider.web_search import WebSearchDelegationTool
-
+_warned = False
 __all__ = [
     "ClaudeCodeChatModel",
     "ClientManager",
@@ -41,4 +15,17 @@ __all__ = [
     "WebSearchDelegationTool",
 ]
 
-__version__ = "0.1.0"
+
+def __getattr__(name):
+    global _warned
+    if not _warned:
+        _warned = True
+        _warnings.warn(
+            "claude_code_provider is deprecated; use "
+            "deep_worker.providers.claude_code_provider",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+    from deep_worker.providers import claude_code_provider as _canonical
+
+    return getattr(_canonical, name)

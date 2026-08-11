@@ -73,7 +73,7 @@ class TestGetTools:
         monkeypatch.setattr(
             type(proc),
             "_extract_final_tool_metadata",
-            staticmethod(lambda agent: fake_meta),
+            staticmethod(lambda agent, provider=None: fake_meta),
         )
         resp = await proc._handle_get_tools()
         assert resp["success"] is True
@@ -89,7 +89,7 @@ class TestGetTools:
         monkeypatch.setattr(
             type(proc),
             "_extract_final_tool_metadata",
-            staticmethod(lambda agent: []),
+            staticmethod(lambda agent, provider=None: []),
         )
         resp = await proc._handle_get_tools()
         assert resp["success"] is True
@@ -106,7 +106,7 @@ class TestGetTools:
         monkeypatch.setattr(
             type(proc),
             "_extract_final_tool_metadata",
-            staticmethod(lambda agent: meta),
+            staticmethod(lambda agent, provider=None: meta),
         )
         resp = await proc._handle_get_tools()
         assert resp["success"] is True

@@ -1,0 +1,94 @@
+{
+  "_comment": "Two-way provider manifest invariant (DESIGN_PROVIDERS_FROM_WHEEL.md \u00a73.4b): the eligible source set \u2014 every *.py plus py.typed under deep_worker/providers/<pkg>, minus the deny list \u2014 must EXACTLY equal the files below. Regenerate with `python3 hooks/stage_providers.py --update` after any provider source change.",
+  "deny": {},
+  "packages": {
+    "claude_code_provider": {
+      "files": {
+        "__init__.py": "25b1012bcae5a68b74c05c25172f30f8f2fdfbe49cc9003f9fa10b7d514218c4",
+        "api_error_detect.py": "22f75ff8a42408b2eac674103eb6c672d04398f88efc07e579001d5ed8923033",
+        "chat_model.py": "f2bf81ad667f98bd2c39dbfa386b74ad1b92d0ab322e59ebe9e074f5f39cbb4d",
+        "client_manager.py": "54b2b9d92b719c060c5ada0917796c15632d2e687f7c66a6dddc21c5bb2577cc",
+        "custom_types.py": "6b0e7ed1d3eb8649f6ca5c39b348b00e66eb83052a4468a9ae86b43adb6e9576",
+        "delivery_resolve_middleware.py": "5c7112ef24a1a80ea50de6a8bbd98395855c89817e36e30ad9322f41737e96b5",
+        "orphaned_tool_calls.py": "da7325f14a2adba5a178d953502b554db54d85154c47698acf4c96e8c551f49b",
+        "proxy_mcp_server.py": "d70b8b3d5430279ab18e28d217a64ceecb93f41e9a65d331475e95b68df6c5e0",
+        "py.typed": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "session_import.py": "3dd1f5ede21cfb5e428d6319206843b9c53fab49f8a259997b97f337626c939f",
+        "session_restore.py": "5a2878f24423f59cd6e580963a75598c2ac02590c7520e7c5b2b1bae22fb9aa8",
+        "session_state.py": "13d3d9408c0fa98bd1cd8b1fb4727b048a44c109b78fd60f8d2bb90ebbcc0ad0",
+        "session_synthesis.py": "bb37c723b8fa789b6667ca27eb06e4bcd5f6504e8d22e1f369aef7bcf339915d",
+        "session_tail_match.py": "e8d7ce1b2ad47f1eb4f84538a5ee76e450716e52cf769262c27b30c3f119cd35",
+        "web_search/__init__.py": "54072416d6e53075a85ba022c195d1d9836f22aa396dad517d4ab6abb0810e17",
+        "web_search/web_search_delegation.py": "ccbe29f7ed9aa4cb3b654000f3b2a66ebdae770ac430059ede3b880adbb8b003",
+        "web_search/web_search_hooks.py": "5579dfc992145a58d76d8eb14ab32770ffc3c6bac3eab4f7fb1315b787911fa5"
+      },
+      "source_subpath": "deep_worker/providers/claude_code_provider"
+    },
+    "codex_provider": {
+      "files": {
+        "__init__.py": "1da8e7102c36bb27c4f802d6b114eb39152feafbf0a4827367cc9567093f2b21",
+        "chat_model.py": "3d198cc8085f892ff24d3e79109fd3129d3414c3dc73598e8430f1ad5f2d1ae0",
+        "client_state.py": "9b522e61a67730c6d5e54a2133088553853ee9a5b96bc3d154f14f16f24c30b6",
+        "custom_types.py": "6648a794476223a2fbff3b01f83856c13af325c3af3e843ab431d95e9b125f6d",
+        "event_pump.py": "65af5aac366ff0f544da5c3d95362b1eed1a2438f7a379c6d3779710340c4971",
+        "exec_runner.py": "81506a79ec1537f2a64e05b7ef74b3391424d598abd72244e22cd9156d66d369",
+        "native_tools.py": "8f87abbc63d7d6e9684988c3ff961329616b1b542c49e92e7ae9ee33198ba6ad",
+        "proxy_mcp_server.py": "88001da43529340fa7d7b23987bfc9ce2962987769ff87150f8267d0bbd5213a",
+        "py.typed": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "session_state.py": "5f06e0c5193aa76d829a6c6f3ffb46f37815ac5e21d5984798076d01bb1344f7"
+      },
+      "source_subpath": "deep_worker/providers/codex_provider"
+    },
+    "deepworker_a2a": {
+      "files": {
+        "__init__.py": "f9c166eee94d9ec2ab8be78d7088c68f4654005f12482da86a36ce863e42a64e",
+        "bridge.py": "5043dbab8188e66c73d76fc63727c9f8926668ebc40f761cf4f10bab5ee93463",
+        "card.py": "24bf94cb3e420f0ffcb1dbcbd16d6ba7fbe4d8ef931310e9d54c612c0e52f18c",
+        "client.py": "a32d0ac8b18f145ec327b43cce2aae89051bba0603fd133e3df5cc8515da9f5f",
+        "config.py": "d1ee147321b8ad55b09a50e021ab082e1ab336ff956efa121001c5986b908176",
+        "executor.py": "5423408505a9f76d1bbb1a6f21fed1f32fcb267436eabee196c37d87932404d2",
+        "py.typed": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "server.py": "6846bce73f261b275463288fea2f9c58ecda5144dfb0ae1b5a03f738542d27e3",
+        "tools.py": "b283a70ed3a712179fa45aa8fd33a0c7653a5eb8c5d48833c47e877de12cdce3"
+      },
+      "source_subpath": "deep_worker/providers/deepworker_a2a"
+    },
+    "grok_provider": {
+      "files": {
+        "__init__.py": "bfb7d663ff6b9a0505ea453df57ea6c87b1f045f7722220c262a18bb9a9ecaaa",
+        "acp_client.py": "c081620ab25778726b0b6c7210f440db642a59d7906a741d46743e7103dd5c09",
+        "acp_types.py": "c970f3d564af25f379f6f8b780188e81e74db483760c7b71beaadcb647f1de84",
+        "arg_compat.py": "d2d476df5775be5bb62df8f61864c716a111858e51cc8a4e905f308d89ed5646",
+        "builtin_tool_passthrough.py": "123a36e7ccc66cbcbddaaed455aa2ed17e43a57bb1ac3287168a8ee095bab6db",
+        "chat_model.py": "80ee412ba63a9bd58a36cd8870078b7b726a36c5336861f638292cf6fabd5312",
+        "client_state.py": "a49e351896e0975c515b2f547bf6d9e83c710c0ca646a9553c8416d93b3895e9",
+        "custom_types.py": "7a825237728c9ad80fd5e27f5b7ededfe559dd5c722020116ef4fe4784b46125",
+        "limit_errors.py": "f333654be78b6d492881d31ada277b7152c880b630a32886b829df67cffe4c11",
+        "proxy_mcp_server.py": "4fd73c970fbaaa4db9a75408f0778e2eb5b9931bdeda01db09dcc1b491ab1e47",
+        "py.typed": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "session_state.py": "27ec6696b9ee9461ed6463ddb591f2c5c3223e81edeb235d9117a586d44bc012"
+      },
+      "source_subpath": "deep_worker/providers/grok_provider"
+    },
+    "semantic_search": {
+      "files": {
+        "__init__.py": "21012c63d788b3edc2de459f5497e5ac8e880fe574bd460e650d08ea6a085566",
+        "_tokenizer.py": "6214cf97212c85cecc4ae1d95dbe4b3487a7b8c4f405be2c43af281e88c1516f",
+        "config.py": "a7f61eb7f86fac27902abb93d3a454f2e48a2b871649e62bd6b187bc162ed74e",
+        "exceptions.py": "d6d73c5715ec5e86fb713db1df2da58b048509ebbbeb30ce5be79ca7fc3d4929",
+        "history_indexer.py": "8db52c49c7b3ca72dc322a6d0b3fbe40a20916ec3eb5ae329c852941da02b192",
+        "history_retriever.py": "d706ac386e3ca1932646afeddf69c6ae7c424a82aa4bb051a77056fe18835229",
+        "indexer.py": "7f68a00b8429c9961ba4800f407d8fb79f7c812a66126c59f5f85ba4acfc7f64",
+        "long_text_embedding.py": "bd74b5e4e0c53f2101c60978282d09a816d1dc9f0fa0afbfd1faf00d8814e3e7",
+        "message_embedding_store.py": "85621722dab533dc36d3cf8f7ba0e756d5cd33bcf7eaba813a6f998ee29da320",
+        "message_search.py": "b53fe6a7c38eb599337333aab4a7dd4ada25a385b9a6bcad6893689ddee03cc8",
+        "py.typed": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "retriever.py": "09848c5b0c0ba0c710886283c6f8b48b79e442c67f2781f86b60e82104c1ae9f",
+        "scanner.py": "36ed0f7eb07d0d890c28fcdf221dd92caef22d04a484446d0e20fe282d072f72",
+        "search_cli.py": "f841ab09e54e54d72580daf9c8cf53958bbc2b20ceb7c310619ef9d38e9182e8"
+      },
+      "source_subpath": "deep_worker/providers/semantic_search"
+    }
+  },
+  "schema_version": 1
+}

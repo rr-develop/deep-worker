@@ -70,8 +70,8 @@ _REAL_NESTED_402_REPLY = {
 async def test_real_grok_finalize_response_classifies_nested_402() -> None:
     """Layer 1 — the REAL grok terminal path classifies the REAL nested 402
     reply as an account-terminal usage-limit (the trigger for failover)."""
-    from grok_provider.chat_model import GrokChatModel
-    from grok_provider.limit_errors import GrokUsageLimitError
+    from deep_worker.providers.grok_provider.chat_model import GrokChatModel
+    from deep_worker.providers.grok_provider.limit_errors import GrokUsageLimitError
 
     model = GrokChatModel(model="grok-4")
     with pytest.raises(GrokUsageLimitError):
@@ -101,7 +101,7 @@ async def test_real_nested_402_drives_failover_to_deepseek(monkeypatch) -> None:
     the REAL nested reply) flows through the REAL ``_handle_invoke`` failover
     branch and issues the REAL ``deep-worker --restart … --provider deepseek``
     command. Only the OS spawn is captured (boundary), not our logic."""
-    from grok_provider.acp_client import raise_for_error_reply
+    from deep_worker.providers.grok_provider.acp_client import raise_for_error_reply
 
     # Produce the exception via the REAL extractor on the REAL reply — no
     # hand-constructed GrokUsageLimitError. This is what the live agent hit.

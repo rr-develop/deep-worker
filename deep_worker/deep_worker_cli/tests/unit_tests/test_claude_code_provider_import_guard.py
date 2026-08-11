@@ -4,7 +4,7 @@
 <repo-root>/claude_code_provider/) and is NOT vendored into the deep-worker
 wheel. ``deep_worker_cli/cli/agent_command.py`` is imported by the
 ``deep-worker`` entry point (via cli/router.py), so a hard top-level
-``from claude_code_provider...`` import would break EVERY ``deep-worker
+``from deep_worker.providers.claude_code_provider...`` import would break EVERY ``deep-worker
 --help`` invocation on an installed wheel.
 
 The import goes through ``_load_claude_session_imports()`` which:
@@ -49,7 +49,7 @@ def test_claude_code_provider_import_is_optional() -> None:
         "claude_code_provider import must catch ModuleNotFoundError"
     )
     assert re.search(
-        r"from claude_code_provider\.session_import import", src
+        r"from deep_worker.providers.claude_code_provider\.session_import import", src
     ), "missing claude_code_provider.session_import import"
     assert "exc.name" in src, (
         "except clause must validate exc.name (narrow missing-provider case)"
@@ -68,11 +68,13 @@ def test_claude_code_provider_import_is_optional() -> None:
 
 
 def _patch_provider_import(monkeypatch: pytest.MonkeyPatch, exc: Exception) -> None:
-    """Make ``from claude_code_provider...`` raise ``exc`` during import."""
+    """Make ``from deep_worker.providers.claude_code_provider...`` raise ``exc`` during import."""
     real_import = builtins.__import__
 
     def fake_import(name: str, *args: object, **kwargs: object) -> object:
-        if name == "claude_code_provider" or name.startswith("claude_code_provider."):
+        if name == "deep_worker.providers.claude_code_provider" or name.startswith(
+            "deep_worker.providers.claude_code_provider."
+        ):
             raise exc
         return real_import(name, *args, **kwargs)
 

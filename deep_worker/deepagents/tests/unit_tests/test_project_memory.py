@@ -113,7 +113,7 @@ def test_project_memory_tool_success() -> None:
 
 def test_project_memory_tool_index_not_found() -> None:
     """Test project_memory tool when index doesn't exist."""
-    from semantic_search.exceptions import IndexNotFoundError
+    from deep_worker.providers.semantic_search.exceptions import IndexNotFoundError
 
     runtime = SimpleNamespace(
         state={"working_dir": "/path/to/no_index"},

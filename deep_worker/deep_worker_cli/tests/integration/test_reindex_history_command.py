@@ -39,8 +39,8 @@ def embed_model():
 @pytest.mark.asyncio
 async def test_reindex_offline_rebuilds_index_from_jsonl(monkeypatch, tmp_path, embed_model) -> None:
     from deep_worker_cli.cli import agent_command
-    from semantic_search.history_indexer import index_all_history_files
-    from semantic_search.history_indexer import history_index_exists
+    from deep_worker.providers.semantic_search.history_indexer import index_all_history_files
+    from deep_worker.providers.semantic_search.history_indexer import history_index_exists
 
     summaries_dir = tmp_path / Path("~/.deep_worker").name / "ag" / "summaries"
     _write_history_jsonl(summaries_dir / "thread_1.jsonl", "Remember Paris.")
@@ -67,8 +67,8 @@ async def test_reindex_offline_rebuilds_index_from_jsonl(monkeypatch, tmp_path, 
 @pytest.mark.asyncio
 async def test_reindex_offline_fixes_stale_hash_desync(monkeypatch, tmp_path, embed_model) -> None:
     from deep_worker_cli.cli import agent_command
-    from semantic_search.history_indexer import index_all_history_files
-    from semantic_search.history_indexer import history_index_exists
+    from deep_worker.providers.semantic_search.history_indexer import index_all_history_files
+    from deep_worker.providers.semantic_search.history_indexer import history_index_exists
 
     summaries_dir = tmp_path / Path("~/.deep_worker").name / "ag" / "summaries"
     _write_history_jsonl(summaries_dir / "thread_1.jsonl", "Remember Berlin.")

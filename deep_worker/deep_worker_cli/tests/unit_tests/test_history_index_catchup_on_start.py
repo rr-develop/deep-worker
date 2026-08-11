@@ -243,7 +243,7 @@ def test_no_catchup_when_records_contain_u2028(tmp_path: Path) -> None:
       the delta is non-zero, and this test goes RED (as it must).
     """
     from deep_worker_cli.agent import _count_pending_history_lines
-    from semantic_search.history_indexer import _read_jsonl_lines
+    from deep_worker.providers.semantic_search.history_indexer import _read_jsonl_lines
 
     summaries = tmp_path
     index_dir = summaries / ".history_index"

@@ -22,18 +22,20 @@ from deep_worker_cli.history_memory_tool import history_memory
 _append_to_system_message = None
 
 
-# Ensure semantic_search is importable
-_semantic_search_path = (
-    Path(__file__).parent.parent.parent.parent.parent / "semantic_search"
-)
-if _semantic_search_path.exists() and str(_semantic_search_path) not in __import__("sys").path:
-    __import__("sys").path.insert(0, str(_semantic_search_path))
-
-
 def _history_index_exists(summaries_dir: Path) -> bool:
-    """Check if a history index exists under *summaries_dir*."""
+    """Check if a history index exists under *summaries_dir*.
+
+    Auto path (DESIGN_PROVIDERS_FROM_WHEEL §3.6): when the semantic-search
+    extra is unavailable the probe resolves lazily and reports ``False``
+    (no raise) — the middleware simply stays disabled.
+    """
     try:
-        from semantic_search.history_indexer import history_index_exists  # noqa: E402
+        from deep_worker_cli.provider_paths import ensure_provider_importable
+
+        resolution = ensure_provider_importable("deep_worker.providers.semantic_search")
+        if resolution.unavailable:
+            return False
+        from deep_worker.providers.semantic_search.history_indexer import history_index_exists  # noqa: E402
         return history_index_exists(summaries_dir)
     except ImportError:
         return False

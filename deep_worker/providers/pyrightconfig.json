@@ -1,0 +1,32 @@
+{
+  "include": [
+    "claude_code_provider",
+    "codex_provider",
+    "grok_provider"
+  ],
+  "exclude": [
+    "**/__pycache__",
+    "**/.pytest_cache",
+    "**/node_modules"
+  ],
+  "extraPaths": [
+    "../..",
+    "../deepagents",
+    "../deep_worker_cli"
+  ],
+  "typeCheckingMode": "strict",
+  "reportMissingImports": true,
+  "reportMissingTypeStubs": false,
+  "reportUnknownMemberType": false,
+  "reportUnknownArgumentType": false,
+  "reportUnknownVariableType": false,
+  "reportUnknownParameterType": false,
+  "pythonVersion": "3.11",
+  "pythonPlatform": "Linux",
+  "executionEnvironments": [
+    {
+      "root": "../../tests",
+      "reportPrivateUsage": "none"
+    }
+  ]
+}

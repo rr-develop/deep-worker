@@ -282,14 +282,14 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def _load_search_history() -> SearchFunc:
     """Lazy import; only called when an actual search runs."""
-    from semantic_search.history_retriever import search_history  # noqa: PLC0415
+    from deep_worker.providers.semantic_search.history_retriever import search_history  # noqa: PLC0415
 
     return search_history  # type: ignore[return-value]
 
 
 def _load_search_messages() -> SearchMessagesFunc:
     """Lazy import; only called when an actual -qm search runs."""
-    from semantic_search.message_search import search_messages  # noqa: PLC0415
+    from deep_worker.providers.semantic_search.message_search import search_messages  # noqa: PLC0415
 
     return search_messages  # type: ignore[return-value]
 
@@ -583,7 +583,7 @@ def _resolve_flags(names: list[str]) -> int:
     Raises ``KeyError`` for an unknown name (caller → usage error). Uses
     semantic_search's single source of truth for the name→bit mapping.
     """
-    from semantic_search.message_embedding_store import flag_from_name  # noqa: PLC0415
+    from deep_worker.providers.semantic_search.message_embedding_store import flag_from_name  # noqa: PLC0415
 
     mask = 0
     for n in names:
@@ -592,7 +592,7 @@ def _resolve_flags(names: list[str]) -> int:
 
 
 def _valid_flag_names() -> str:
-    from semantic_search.message_embedding_store import FLAG_NAMES  # noqa: PLC0415
+    from deep_worker.providers.semantic_search.message_embedding_store import FLAG_NAMES  # noqa: PLC0415
 
     return ", ".join(FLAG_NAMES)
 

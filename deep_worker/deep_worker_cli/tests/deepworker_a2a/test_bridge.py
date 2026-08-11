@@ -2,7 +2,7 @@
 
 import pytest
 
-from deepworker_a2a.bridge import TurnEventBridge
+from deep_worker.providers.deepworker_a2a.bridge import TurnEventBridge
 
 
 class _RecordingUpdater:

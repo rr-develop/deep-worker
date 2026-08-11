@@ -13,7 +13,7 @@ from typing import Any
 
 import pytest
 
-from deepworker_a2a.executor import DeepWorkerAgentExecutor
+from deep_worker.providers.deepworker_a2a.executor import DeepWorkerAgentExecutor
 
 
 class _FakeAgentProcess:

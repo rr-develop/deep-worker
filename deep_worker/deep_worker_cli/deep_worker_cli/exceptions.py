@@ -266,3 +266,32 @@ def is_provider_api_error(exc: BaseException) -> bool:
     be swallowed into a benign system note or a fleeting toast.
     """
     return type(exc).__name__ in PROVIDER_API_ERROR_TYPES
+
+
+class CapabilityError(DeepWorkerError):
+    """Raised when an explicitly-enabled optional capability is unavailable.
+
+    Used by tri-state capability policies (web-search, semantic-search,
+    provider extras): when the operator EXPLICITLY enables a capability
+    (``--enable-web-search`` / ``pip install deep-worker[semantic-search]``)
+    but the backing dependency/SDK is missing, the agent must fail loudly
+    with an actionable remedy instead of silently skipping the capability.
+
+    Attributes:
+        capability: Machine-readable capability name (e.g. ``"web_search"``).
+        remedy: Human-readable remediation hint (install command / env var).
+    """
+
+    def __init__(
+        self,
+        capability: str,
+        remedy: str | None = None,
+        message: str | None = None,
+    ) -> None:
+        self.capability = capability
+        self.remedy = remedy
+        if message is None:
+            message = f"capability {capability!r} is enabled but unavailable"
+            if remedy:
+                message += f": {remedy}"
+        super().__init__(message)

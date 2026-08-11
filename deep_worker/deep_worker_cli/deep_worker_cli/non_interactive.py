@@ -43,7 +43,6 @@ from deep_worker_cli.config import (
 )
 from deep_worker_cli.file_ops import FileOpTracker
 from deep_worker_cli.sessions import generate_thread_id, get_checkpointer
-from deep_worker_cli.tools import fetch_url, http_request, web_search_delegation_tool
 
 if TYPE_CHECKING:
     from langchain_core.runnables import RunnableConfig
@@ -518,6 +517,26 @@ def _get_thread_url(thread_id: str) -> str | None:
     return f"{project_url.rstrip('/')}/t/{thread_id}"
 
 
+def assemble_non_interactive_web_tools() -> tuple[Any, ...]:
+    """Production non-interactive web-tools assembly (``run_non_interactive``
+    call-site): ``http_request`` + ``fetch_url`` plus the universal web-search
+    delegation tool when the default (auto) tri-state policy resolves it.
+    Extracted so the exact production assembly entry point is directly
+    exercisable (DESIGN §5.5).
+    """
+    from deep_worker_cli.tools import (
+        fetch_url,
+        http_request,
+        resolve_web_search_tool,
+    )
+
+    tools = [http_request, fetch_url]
+    _web_search_avail = resolve_web_search_tool()
+    if _web_search_avail.tool is not None:
+        tools.append(_web_search_avail.tool)
+    return tuple(tools)
+
+
 async def run_non_interactive(
     message: str,
     assistant_id: str = "agent",
@@ -597,9 +616,11 @@ async def run_non_interactive(
 
     try:
         async with get_checkpointer() as checkpointer:
-            # Always include web_search_delegation_tool (works with any provider via Claude Code SDK)
-            # No API key required like Tavily
-            tools = [http_request, fetch_url, web_search_delegation_tool]
+            # Always include the read-only web tools; the universal
+            # web_search delegation tool is resolved lazily under the
+            # default (auto) tri-state policy — skipped with a log when
+            # the Claude Code SDK fork is unavailable.
+            tools = list(assemble_non_interactive_web_tools())
 
             # If an allow-list is provided, enable shell but disable
             # auto-approve so HITL can gate commands. If no allow-list, disable

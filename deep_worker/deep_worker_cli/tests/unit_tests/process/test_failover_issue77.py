@@ -47,7 +47,7 @@ from deep_worker_cli.types import AgentStatus
     ],
 )
 def test_codex_usage_limit_error_marker(line: str, expect_limit: bool | None) -> None:
-    from codex_provider.exec_runner import (
+    from deep_worker.providers.codex_provider.exec_runner import (
         CodexProtocolError,
         CodexUsageLimitError,
         parse_event,
@@ -79,7 +79,7 @@ async def test_codex_usage_limit_error_in_handle_invoke() -> None:
     a clean error message, and sets status=ERROR."""
     agent = _make_agent()
 
-    from codex_provider.exec_runner import CodexUsageLimitError
+    from deep_worker.providers.codex_provider.exec_runner import CodexUsageLimitError
 
     limit = "Codex stream error: You've hit your usage limit. · resets 3am UTC"
     fake_graph = MagicMock()
@@ -104,7 +104,7 @@ async def test_codex_usage_limit_notifies_callback() -> None:
     """CodexUsageLimitError must broadcast an error event to subscribers."""
     agent = _make_agent()
 
-    from codex_provider.exec_runner import CodexUsageLimitError
+    from deep_worker.providers.codex_provider.exec_runner import CodexUsageLimitError
 
     limit = "Codex stream error: You've hit your usage limit."
     fake_graph = MagicMock()

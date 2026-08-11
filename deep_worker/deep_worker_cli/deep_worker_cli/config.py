@@ -17,6 +17,7 @@ import dotenv
 from rich.console import Console
 
 from deep_worker_cli._version import __version__
+from deep_worker_cli.exceptions import CapabilityError
 from deep_worker_cli.model_predicate import (
     model_can_belong_to_provider as _leaf_model_can_belong_to_provider,
 )
@@ -57,6 +58,25 @@ class CharsetMode(StrEnum):
     UNICODE = "unicode"
     ASCII = "ascii"
     AUTO = "auto"
+
+
+class WebSearchPolicy(StrEnum):
+    """Tri-state universal web-search policy (DESIGN_PROVIDERS_FROM_WHEEL §3.3).
+
+    Controls whether the Claude-Code-SDK-backed ``web_search`` delegation
+    tool is resolved and bound into the agent toolset:
+
+    - ``AUTO`` (default): bind the tool when the SDK fork is available;
+      otherwise log once and skip the tool — the agent still starts.
+    - ``ENABLED`` (explicit ``--enable-web-search``): bind the tool, or fail
+      loudly with ``CapabilityError`` (with remedy) when the SDK is missing.
+    - ``DISABLED`` (explicit ``--disable-web-search``): NEVER resolve or
+      import the claude provider / SDK; the tool is never bound.
+    """
+
+    AUTO = "auto"
+    ENABLED = "enabled"
+    DISABLED = "disabled"
 
 
 @dataclass(frozen=True)
@@ -1712,7 +1732,18 @@ def create_model(
             max_tokens=20_000,
         )
     elif provider == "google":
-        from langchain_google_genai import ChatGoogleGenerativeAI
+        try:
+            # Optional dependency; install `langchain-google-genai`
+            # (core dependency of the wheel) to enable Gemini models. The
+            # import is guarded so an environment without the package gets
+            # an actionable CapabilityError instead of a raw
+            # ModuleNotFoundError.
+            from langchain_google_genai import ChatGoogleGenerativeAI
+        except ImportError:
+            raise CapabilityError(
+                capability="google",
+                remedy="pip install langchain-google-genai",
+            )
 
         model = ChatGoogleGenerativeAI(
             model=model_name,
@@ -1750,7 +1781,18 @@ def create_model(
                 max_tokens=20_000,
             )
         else:
-            from langchain_google_genai import ChatGoogleGenerativeAI
+            try:
+                # Optional dependency; the vertexai extra installs
+                # `langchain-google-vertexai` which pulls in
+                # `langchain-google-genai`. The import is guarded so an
+                # environment without the package gets an actionable
+                # CapabilityError instead of a raw ModuleNotFoundError.
+                from langchain_google_genai import ChatGoogleGenerativeAI
+            except ImportError:
+                raise CapabilityError(
+                    capability="vertexai",
+                    remedy="pip install deep-worker[vertexai]",
+                )
 
             model = ChatGoogleGenerativeAI(
                 model=model_name,
@@ -1781,18 +1823,25 @@ def create_model(
         )
     elif provider == "codex":
         # ============================================================================
-        # CODEX provider — sibling of claude-code (see DESIGN_CODEX_PROVIDER.md).
+        # CODEX provider — vendored package + codex CLI (see DESIGN_CODEX_PROVIDER.md).
         # ============================================================================
-        # Local source import, no API key (cached login via ~/.codex/auth.json).
+        # Resolve the provider origin through provider_paths (source root on
+        # sys.path in source mode; no-op in installed mode). See
+        # deep_worker_cli/provider_paths.py and DESIGN_PROVIDERS_FROM_WHEEL §3.1.
         # ``model_name`` may be None — in that case the provider does NOT
         # pass ``--model`` to ``codex exec`` and the CLI picks its own
         # current default (Q2: do not pin model version).
         # ============================================================================
-        _repo_root = Path(__file__).parent.parent.parent.parent
-        if str(_repo_root) not in sys.path:
-            sys.path.insert(0, str(_repo_root))
+        from deep_worker_cli.provider_paths import ensure_provider_importable
 
-        from codex_provider import CodexChatModel
+        resolution = ensure_provider_importable("deep_worker.providers.codex_provider")
+        if resolution.unavailable:
+            raise CapabilityError(
+                capability="codex",
+                remedy=resolution.remedy or resolution.unavailable,
+            )
+
+        from deep_worker.providers.codex_provider import CodexChatModel
 
         model = CodexChatModel(
             model=model_name,            # may be None — Codex picks default
@@ -1801,18 +1850,25 @@ def create_model(
         )
     elif provider == "grok":
         # ============================================================================
-        # GROK provider — sibling of codex (see DESIGN_GROK_PROVIDER.md).
+        # GROK provider — vendored package + grok CLI (see DESIGN_GROK_PROVIDER.md).
         # ============================================================================
-        # Local source import, no API key (supergrok subscription cache via
-        # ~/.grok/auth.json). ``model_name`` may be None — in that case the
-        # provider does NOT pin a model and the grok CLI picks its own current
-        # default. Drives ``grok agent stdio`` over ACP.
+        # Resolve the provider origin through provider_paths (source root on
+        # sys.path in source mode; no-op in installed mode). See
+        # deep_worker_cli/provider_paths.py and DESIGN_PROVIDERS_FROM_WHEEL §3.1.
+        # ``model_name`` may be None — in that case the provider does NOT
+        # pin a model and the grok CLI picks its own current default. Drives
+        # ``grok agent stdio`` over ACP.
         # ============================================================================
-        _repo_root = Path(__file__).parent.parent.parent.parent
-        if str(_repo_root) not in sys.path:
-            sys.path.insert(0, str(_repo_root))
+        from deep_worker_cli.provider_paths import ensure_provider_importable
 
-        from grok_provider import GrokChatModel
+        resolution = ensure_provider_importable("deep_worker.providers.grok_provider")
+        if resolution.unavailable:
+            raise CapabilityError(
+                capability="grok",
+                remedy=resolution.remedy or resolution.unavailable,
+            )
+
+        from deep_worker.providers.grok_provider import GrokChatModel
 
         model = GrokChatModel(
             model=model_name,            # may be None — grok picks default

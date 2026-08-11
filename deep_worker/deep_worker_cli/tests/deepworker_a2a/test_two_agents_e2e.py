@@ -27,8 +27,8 @@ import asyncio
 
 import pytest
 
-from deepworker_a2a.client import A2AOutboundClient
-from deepworker_a2a.tools import make_a2a_tools
+from deep_worker.providers.deepworker_a2a.client import A2AOutboundClient
+from deep_worker.providers.deepworker_a2a.tools import make_a2a_tools
 
 from .two_agents_fixture import two_a2a_agents
 

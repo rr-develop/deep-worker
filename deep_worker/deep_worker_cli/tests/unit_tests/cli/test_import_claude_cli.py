@@ -127,7 +127,7 @@ async def test_claude_code_does_not_seed_session_uuid_hint(
     session_uuid hint must NOT be written (observed 2026-05-24): resuming an
     external ordinary-claude session loses the deepworker MCP tools."""
     monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
-    from claude_code_provider.session_synthesis import session_project_dir
+    from deep_worker.providers.claude_code_provider.session_synthesis import session_project_dir
 
     uuid = "55555555-5555-5555-5555-555555555555"
     cwd = "/path/to/project"
@@ -151,7 +151,8 @@ async def test_claude_code_does_not_seed_session_uuid_hint(
     ), patch(
         "deep_worker_cli.sessions.import_history", side_effect=fake_import
     ), patch(
-        "claude_code_provider.session_state.save_session_state", save_mock
+        "deep_worker.providers.claude_code_provider.session_state.save_session_state",
+        save_mock,
     ):
         rc = await handle_import_claude(args)
 
@@ -186,7 +187,8 @@ async def test_non_claude_provider_does_not_seed_hint(tmp_path: Path) -> None:
     ), patch(
         "deep_worker_cli.sessions.import_history", side_effect=fake_import
     ), patch(
-        "claude_code_provider.session_state.save_session_state", save_mock
+        "deep_worker.providers.claude_code_provider.session_state.save_session_state",
+        save_mock,
     ):
         rc = await handle_import_claude(args)
 

@@ -57,11 +57,16 @@ on every restart. See the 2026-06-15 incident (an observed live hang) and
 """
 from __future__ import annotations
 
+import builtins
+import sys
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from langchain_core.tools import StructuredTool
+
+from deep_worker_cli.exceptions import CapabilityError
+from deep_worker_cli.provider_paths import ProviderOrigin, ProviderResolution
 
 
 # ─── Fake tool node + agent ─────────────────────────────────────────────────
@@ -187,7 +192,9 @@ async def test_prewarm_called_after_create_cli_agent_with_final_tools() -> None:
     fake_agent = _build_fake_agent(final_tools)
     fake_cm = _RecordingClientManager()
 
-    extracted = AgentProcess._extract_final_tool_metadata(fake_agent)
+    extracted = AgentProcess._extract_final_tool_metadata(
+        fake_agent, provider="claude-code"
+    )
     await AgentProcess._prewarm_client_manager(
         client_manager=fake_cm,
         thread_id="test_agent_main",
@@ -218,7 +225,9 @@ def test_extract_tool_metadata_handles_missing_tool_node() -> None:
     fake_agent = MagicMock()
     fake_agent.nodes = {}  # No 'tools' node at all
 
-    extracted = AgentProcess._extract_final_tool_metadata(fake_agent)
+    extracted = AgentProcess._extract_final_tool_metadata(
+        fake_agent, provider="claude-code"
+    )
     assert extracted == [], (
         f"Missing tool_node must yield empty list, got {extracted!r}"
     )
@@ -231,7 +240,9 @@ def test_extract_tool_metadata_preserves_tool_order_and_schema() -> None:
     from deep_worker_cli.process.agent_process import AgentProcess
 
     fake_agent = _build_fake_agent(["alpha", "beta"])
-    extracted = AgentProcess._extract_final_tool_metadata(fake_agent)
+    extracted = AgentProcess._extract_final_tool_metadata(
+        fake_agent, provider="claude-code"
+    )
 
     assert [m["name"] for m in extracted] == ["alpha", "beta"]
     for m in extracted:
@@ -260,3 +271,156 @@ async def test_prewarm_swallows_client_manager_errors() -> None:
         tools_metadata=[{"name": "x", "description": "", "input_schema": {}}],
         working_dir="/tmp",
     )
+
+
+# ─── §3.7 structural import invariant (DESIGN_PROVIDERS_FROM_WHEEL) ─────────
+
+def _unavailable_resolution(pkg: str, remedy: str | None = None) -> ProviderResolution:
+    """A resolution whose ``unavailable`` field is set (provider absent)."""
+    return ProviderResolution(
+        pkg=pkg,
+        mode="auto",
+        origin=ProviderOrigin.INSTALLED,
+        roots=(),
+        reason="not found",
+        unavailable="provider package not installed",
+        remedy=remedy,
+    )
+
+
+def _available_resolution(pkg: str) -> ProviderResolution:
+    """A resolution whose ``unavailable`` is None (provider importable)."""
+    return ProviderResolution(
+        pkg=pkg,
+        mode="source",
+        origin=ProviderOrigin.SOURCE,
+        roots=("/tmp/example-tree/deep_worker",),
+        reason="source root found",
+        unavailable=None,
+        remedy=None,
+    )
+
+
+def test_non_claude_provider_never_imports_claude_code_provider(monkeypatch) -> None:
+    """§3.7 — non-Claude paths MUST NEVER import
+    ``deep_worker.providers.claude_code_provider``.
+
+    A wheel without the Claude SDK fork / claude CLI must still start API
+    providers (deepseek, codex, ...). The guard on
+    ``provider == "claude-code"`` happens BEFORE the import, so a
+    non-Claude provider returns the raw tool inventory without ever
+    touching the claude_code_provider package.
+
+    We assert this two ways:
+      1. the module is not present in ``sys.modules`` after the call;
+      2. a spy on ``builtins.__import__`` records no import attempt for
+         the claude_code_provider package during the call.
+    """
+    from deep_worker_cli.process.agent_process import AgentProcess
+
+    fake_agent = _build_fake_agent(["alpha", "beta"])
+    real_import = builtins.__import__
+    attempted: list[str] = []
+
+    def _spy_import(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name == "deep_worker.providers.claude_code_provider" or name.startswith(
+            "deep_worker.providers.claude_code_provider."
+        ):
+            attempted.append(name)
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _spy_import)
+    # Drop the package from sys.modules so we can prove the call does not
+    # (re)load it. If some earlier test already imported it, dropping the
+    # entry lets us still verify no NEW load is triggered by this path.
+    monkeypatch.delitem(
+        sys.modules,
+        "deep_worker.providers.claude_code_provider",
+        raising=False,
+    )
+
+    extracted = AgentProcess._extract_final_tool_metadata(
+        fake_agent, provider="deepseek"
+    )
+
+    assert attempted == [], (
+        f"Non-Claude path MUST NOT import claude_code_provider, attempted "
+        f"{attempted!r}"
+    )
+    assert "deep_worker.providers.claude_code_provider" not in sys.modules
+    assert [m["name"] for m in extracted] == ["alpha", "beta"]
+    assert extracted[0]["description"] == "desc:alpha"
+
+
+def test_claude_path_missing_capability_raises_capability_error(monkeypatch) -> None:
+    """§3.7 — the Claude path only surfaces a CLASSIFIED missing-capability
+    (actionable ``CapabilityError``), never a raw ModuleNotFoundError.
+
+    When ``ensure_provider_importable`` reports the provider unavailable,
+    ``_extract_final_tool_metadata(provider="claude-code")`` MUST raise
+    ``CapabilityError`` with capability ``"claude-code"`` and the remedy —
+    so start() fails loudly and actionably instead of crashing on an
+    unhelpful import error.
+    """
+    from deep_worker_cli.process.agent_process import AgentProcess
+
+    fake_agent = _build_fake_agent(["alpha"])
+    resolution = _unavailable_resolution(
+        "deep_worker.providers.claude_code_provider",
+        remedy="pip install deep-worker[claude-code]",
+    )
+
+    with patch(
+        "deep_worker_cli.provider_paths.ensure_provider_importable",
+        return_value=resolution,
+    ) as mock_resolve:
+        with pytest.raises(CapabilityError) as exc_info:
+            AgentProcess._extract_final_tool_metadata(
+                fake_agent, provider="claude-code"
+            )
+
+    mock_resolve.assert_called_once_with("deep_worker.providers.claude_code_provider")
+    assert exc_info.value.capability == "claude-code"
+    assert exc_info.value.remedy == "pip install deep-worker[claude-code]"
+    assert "pip install" in str(exc_info.value)
+
+
+def test_claude_path_internal_defect_reraises(monkeypatch) -> None:
+    """§3.7 — the Claude path re-raises INTERNAL defects instead of
+    misclassifying them as missing capabilities.
+
+    If ``ensure_provider_importable`` reports the provider AVAILABLE but
+    the actual ``deep_worker.providers.claude_code_provider`` import fails
+    for an unrelated reason (broken submodule, runtime import error), the
+    original exception MUST propagate — it must NOT be converted to a
+    ``CapabilityError`` (that would lie about the cause) and must NOT be
+    swallowed.
+    """
+    from deep_worker_cli.process.agent_process import AgentProcess
+
+    fake_agent = _build_fake_agent(["alpha"])
+    resolution = _available_resolution("deep_worker.providers.claude_code_provider")
+    real_import = builtins.__import__
+
+    def _broken_import(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name == "deep_worker.providers.claude_code_provider" or name.startswith(
+            "deep_worker.providers.claude_code_provider."
+        ):
+            raise ImportError("simulated internal defect in claude provider")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _broken_import)
+    monkeypatch.delitem(
+        sys.modules,
+        "deep_worker.providers.claude_code_provider",
+        raising=False,
+    )
+
+    with patch(
+        "deep_worker_cli.provider_paths.ensure_provider_importable",
+        return_value=resolution,
+    ):
+        with pytest.raises(ImportError, match="simulated internal defect"):
+            AgentProcess._extract_final_tool_metadata(
+                fake_agent, provider="claude-code"
+            )

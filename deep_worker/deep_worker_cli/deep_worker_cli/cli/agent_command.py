@@ -23,7 +23,7 @@ index_all_history_files = None
 # Claude-session import (DESIGN_IMPORT_CLAUDE_SESSION.md). The provider lives at
 # <repo-root>/claude_code_provider/ and is NOT importable until the repo root is
 # on sys.path — exactly the bootstrap ``tools.py`` does for web_search. A plain
-# top-level ``from claude_code_provider...`` import here breaks EVERY invocation
+# top-level ``from deep_worker.providers.claude_code_provider...`` import here breaks EVERY invocation
 # of ``deep-worker`` (even ``--help``), because the CLI module is imported
 # before any sys.path setup runs. Add the repo root first, THEN import, so the
 # names exist as module globals (tests patch
@@ -65,7 +65,7 @@ def _load_claude_session_imports() -> tuple[
             ``claude_code_provider`` package itself.
     """
     try:
-        from claude_code_provider.session_import import (  # noqa: PLC0415
+        from deep_worker.providers.claude_code_provider.session_import import (  # noqa: PLC0415
             parse_claude_transcript,
             resolve_transcript_path,
         )
@@ -99,6 +99,7 @@ _PARSER_DEFAULTS = {
     "history_memory": False,
     "auto_approve_send_message": False,
     "dev_tree": False,
+    "web_search_policy": "auto",
     "preferred_provider": None,
     "no_update_preferred": False,
     "fork": None,
@@ -261,6 +262,14 @@ def _explicit_cli_flags(argv: list[str] | None = None) -> set[str]:
                           action="store_const", const=False, default=argparse.SUPPRESS)
     detector.add_argument("--no-dev", dest="dev_tree",
                           action="store_const", const=False, default=argparse.SUPPRESS)
+    # Tri-state web-search policy — either explicit flag puts
+    # "web_search_policy" into the explicit-override set.
+    detector.add_argument("--enable-web-search", dest="web_search_policy",
+                          action="store_const", const="enabled",
+                          default=argparse.SUPPRESS)
+    detector.add_argument("--disable-web-search", dest="web_search_policy",
+                          action="store_const", const="disabled",
+                          default=argparse.SUPPRESS)
 
     # parse_known_args: ignore every other flag the real parser owns.
     ns, _ = detector.parse_known_args(argv)
@@ -376,6 +385,9 @@ def merge_restart_config(
         "auto_approve_send_message", False
     )
     effective.dev_tree = saved.get("dev_tree", False)
+    effective.web_search_policy = saved.get(
+        "web_search_policy", _PARSER_DEFAULTS["web_search_policy"]
+    )
     effective.clean = False  # NEVER inherit --clean
 
     # External MCP CLI overrides — restore from saved launch_config so a
@@ -429,6 +441,12 @@ def merge_restart_config(
         _PARSER_DEFAULTS["dev_tree"],
     ):
         effective.dev_tree = args.dev_tree
+    if _is_override(
+        "web_search_policy",
+        getattr(args, "web_search_policy", _PARSER_DEFAULTS["web_search_policy"]),
+        _PARSER_DEFAULTS["web_search_policy"],
+    ):
+        effective.web_search_policy = args.web_search_policy
     mcp_config_paths = list(getattr(args, "mcp_config_paths", None) or [])
     mcp_server_inline = list(getattr(args, "mcp_server_inline", None) or [])
     if _is_override("mcp_config_paths", mcp_config_paths, []):
@@ -695,6 +713,7 @@ def build_launch_config(args: argparse.Namespace) -> dict:
             args, "auto_approve_send_message", False
         ),
         "dev_tree": dev_tree,
+        "web_search_policy": getattr(args, "web_search_policy", "auto"),
         "preferred_provider": getattr(
             args, "preferred_provider", args.provider
         ),
@@ -1013,6 +1032,33 @@ def create_parser() -> argparse.ArgumentParser:
         action="store_const",
         const=False,
         help="Disable auto-approve-send-message (useful with --restart to override a saved True value)",
+    )
+
+    # Tri-state universal web-search policy (DESIGN_PROVIDERS_FROM_WHEEL §3.3).
+    # Mutual exclusion is enforced by a shared dest + mutually exclusive group:
+    # passing both flags is an argparse error.
+    web_search_group = parser.add_mutually_exclusive_group()
+    web_search_group.add_argument(
+        "--enable-web-search",
+        dest="web_search_policy",
+        action="store_const",
+        const="enabled",
+        default="auto",
+        help=(
+            "Force-enable the universal web_search delegation tool. Fails "
+            "loudly with a remedy when the Claude Code SDK fork is missing."
+        ),
+    )
+    web_search_group.add_argument(
+        "--disable-web-search",
+        dest="web_search_policy",
+        action="store_const",
+        const="disabled",
+        default="auto",
+        help=(
+            "Disable the universal web_search delegation tool. Never "
+            "resolves/imports the claude provider or SDK."
+        ),
     )
 
     parser.add_argument(
@@ -1716,6 +1762,7 @@ async def run_agent(args: argparse.Namespace) -> int:
                 model=args.model,
                 working_dir=working_dir,
                 provider=args.provider,
+                web_search_policy=getattr(args, "web_search_policy", "auto"),
             )
 
         # Build launch_config for persistent storage via the single source
@@ -2589,25 +2636,28 @@ def _normalize_status_value(status: object) -> str:
 
 def _history_indexer_funcs():
     global clear_history_index, index_all_history_files
-    # Offline CLI path: no runtime middleware has injected the semantic_search
-    # wrapper dir onto sys.path, so do it here before importing the nested
-    # package. See deep_worker_cli/semantic_search_path.py.
-    from deep_worker_cli.semantic_search_path import (
-        ensure_semantic_search_importable,
-        semantic_search_wrapper_dir,
-    )
+    # Offline CLI path: no runtime middleware is involved; resolve the
+    # semantic_search provider explicitly (source root on sys.path in source
+    # mode). See deep_worker_cli/provider_paths.py.
+    #
+    # Explicit request (--reindex-history) → hard-fail with an actionable
+    # remedy when the semantic-search extra is missing
+    # (DESIGN_PROVIDERS_FROM_WHEEL §3.6).
+    from deep_worker_cli.provider_paths import ensure_provider_importable
+    from deep_worker_cli.exceptions import CapabilityError
 
-    if not ensure_semantic_search_importable():
-        raise ModuleNotFoundError(
-            "semantic_search package not found: expected wrapper dir at "
-            f"{semantic_search_wrapper_dir()}"
+    resolution = ensure_provider_importable("deep_worker.providers.semantic_search")
+    if resolution.unavailable:
+        raise CapabilityError(
+            capability="semantic-search",
+            remedy="pip install deep-worker[semantic-search]",
         )
     if clear_history_index is None:
-        from semantic_search.history_indexer import clear_history_index as _clear
+        from deep_worker.providers.semantic_search.history_indexer import clear_history_index as _clear
 
         clear_history_index = _clear
     if index_all_history_files is None:
-        from semantic_search.history_indexer import index_all_history_files as _index
+        from deep_worker.providers.semantic_search.history_indexer import index_all_history_files as _index
 
         index_all_history_files = _index
     return clear_history_index, index_all_history_files

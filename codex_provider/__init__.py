@@ -1,21 +1,26 @@
-"""Codex provider for deep-worker — sibling of claude_code_provider.
+"""DEPRECATED shim — migrate to ``deep_worker.providers.codex_provider``.
 
-Public surface re-exports CodexChatModel for ``deep_worker_cli/config.py``.
+This root package exists only for local backward compatibility on this host.
+It is NOT part of the published wheel/sdist. Old submodule imports
+(``import codex_provider.native_tools``) are NOT supported: use
+``deep_worker.providers.codex_provider.native_tools`` instead.
 """
-from __future__ import annotations
+import warnings as _warnings
 
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from codex_provider.chat_model import CodexChatModel  # noqa: F401
-
-
-def __getattr__(name: str):
-    if name == "CodexChatModel":
-        from codex_provider.chat_model import CodexChatModel
-        return CodexChatModel
-    raise AttributeError(f"module 'codex_provider' has no attribute {name!r}")
-
-
+_warned = False
 __all__ = ["CodexChatModel"]
-__version__ = "0.1.0"
+
+
+def __getattr__(name):
+    global _warned
+    if not _warned:
+        _warned = True
+        _warnings.warn(
+            "codex_provider is deprecated; use "
+            "deep_worker.providers.codex_provider",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+    from deep_worker.providers import codex_provider as _canonical
+
+    return getattr(_canonical, name)

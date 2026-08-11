@@ -12,7 +12,7 @@ from unittest import mock
 
 import pytest
 
-from deepworker_a2a.config import A2AConfig
+from deep_worker.providers.deepworker_a2a.config import A2AConfig
 
 
 def test_defaults_are_localhost_and_disabled():

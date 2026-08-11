@@ -42,6 +42,7 @@ def _stub_config(provider: str) -> MagicMock:
     cfg.provider = provider
     cfg.model = None
     cfg.working_dir = Path("/tmp")
+    cfg.web_search_policy = "auto"
     return cfg
 
 
@@ -65,7 +66,7 @@ async def test_initialize_manager_for_codex_injects_native_tools() -> None:
     from Codex (apply_patch, update_plan, etc.) — ToolNode would raise
     ``Tool not found`` and the manager would die.
     """
-    from codex_provider.native_tools import NATIVE_TOOLS
+    from deep_worker.providers.codex_provider.native_tools import NATIVE_TOOLS
 
     tm = _make_tm("codex")
 
@@ -108,7 +109,7 @@ async def test_initialize_manager_for_non_codex_does_not_inject_native_tools() -
     matters here is that none of the codex_provider.native_tools
     BaseTool *objects* leak into a non-codex manager.
     """
-    from codex_provider.native_tools import NATIVE_TOOLS
+    from deep_worker.providers.codex_provider.native_tools import NATIVE_TOOLS
 
     tm = _make_tm("deepseek")
 

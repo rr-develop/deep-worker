@@ -591,8 +591,8 @@ def _maybe_add_delivery_resolve_middleware(
     breaking agent construction.
     """
     try:
-        from claude_code_provider import ClaudeCodeChatModel
-        from claude_code_provider.delivery_resolve_middleware import (
+        from deep_worker.providers.claude_code_provider import ClaudeCodeChatModel
+        from deep_worker.providers.claude_code_provider.delivery_resolve_middleware import (
             InterAgentDeliveryResolveMiddleware,
         )
     except Exception:  # noqa: BLE001 — provider optional / import path issue
@@ -646,6 +646,35 @@ def _dedupe_tools_by_name_priority(
 #
 # See ``docs/DESIGN_HISTORY_INDEX_CATCHUP_ON_START.md``.
 
+_semantic_search_warned_once = False
+"""Log-once flag for the automatic catch-up path (DESIGN_PROVIDERS_FROM_WHEEL §3.6)."""
+
+
+def _warn_semantic_search_unavailable_once(resolution: Any, exc: Exception | None = None) -> None:
+    """Log the semantic-search unavailability exactly once (auto path).
+
+    Per DESIGN_PROVIDERS_FROM_WHEEL §3.6 the automatic startup catch-up must
+    NOT raise when the semantic-search extra is missing — it logs once and
+    startup continues (history memory simply stays unavailable). Explicit
+    requests (``--history-memory`` / reindex) raise ``CapabilityError``
+    instead; this warn-once helper covers only the automatic path.
+    """
+    global _semantic_search_warned_once
+    if _semantic_search_warned_once:
+        return
+    _semantic_search_warned_once = True
+    import logging  # noqa: PLC0415
+
+    reason = resolution.unavailable
+    if reason is None and exc is not None:
+        reason = f"import failed: {exc}"
+    remedy = resolution.remedy or "pip install deep-worker[semantic-search]"
+    logging.getLogger(__name__).warning(
+        "semantic-search unavailable (%s); history memory disabled. Remedy: %s",
+        reason,
+        remedy,
+    )
+
 
 def _count_pending_history_lines(
     summaries_dir: Path,
@@ -691,7 +720,21 @@ def _count_pending_history_lines(
     # differently here caused a permanent off-by-N for files whose record
     # content embedded ``U+2028`` etc., which re-indexed the whole history on
     # every start. See semantic_search.history_indexer.count_jsonl_lines.
-    from semantic_search.history_indexer import count_jsonl_lines  # noqa: PLC0415
+    #
+    # Auto catch-up contract (DESIGN_PROVIDERS_FROM_WHEEL §3.6): when the
+    # semantic-search extra is unavailable, do NOT raise — report "nothing
+    # pending" (log-once) so startup continues with history memory disabled.
+    from deep_worker_cli.provider_paths import ensure_provider_importable
+
+    resolution = ensure_provider_importable("deep_worker.providers.semantic_search")
+    if resolution.unavailable:
+        _warn_semantic_search_unavailable_once(resolution)
+        return 0
+    try:
+        from deep_worker.providers.semantic_search.history_indexer import count_jsonl_lines  # noqa: PLC0415
+    except ImportError as exc:  # pragma: no cover - defensive (resolve said available)
+        _warn_semantic_search_unavailable_once(resolution, exc)
+        return 0
 
     pending = 0
     for jsonl in jsonl_files:
@@ -1192,7 +1235,21 @@ def create_cli_agent(
 
     # Wire up history memory indexer as summarization callback
     if enable_history_memory:
-        from semantic_search.history_indexer import index_all_history_files
+        # Explicit request (--history-memory flag) → hard-fail with an
+        # actionable remedy when the semantic-search extra is missing
+        # (DESIGN_PROVIDERS_FROM_WHEEL §3.6).
+        from deep_worker_cli.provider_paths import ensure_provider_importable
+        from deep_worker_cli.exceptions import CapabilityError
+
+        _semantic_resolution = ensure_provider_importable(
+            "deep_worker.providers.semantic_search"
+        )
+        if _semantic_resolution.unavailable:
+            raise CapabilityError(
+                capability="semantic-search",
+                remedy="pip install deep-worker[semantic-search]",
+            )
+        from deep_worker.providers.semantic_search.history_indexer import index_all_history_files
         _on_summarized = lambda path_str: index_all_history_files(summaries_dir)  # noqa: E731
 
         # --- Start-up catch-up of existing history ---
@@ -1207,7 +1264,7 @@ def create_cli_agent(
         # returns ``(False, 0)`` when there's nothing to do, in which
         # case we skip both the embedding-model load AND the progress UI.
         # See ``docs/DESIGN_HISTORY_INDEX_CATCHUP_ON_START.md``.
-        from semantic_search.history_indexer import history_index_exists
+        from deep_worker.providers.semantic_search.history_indexer import history_index_exists
 
         summaries_path = Path(summaries_dir)
         needs_catchup, _pending_lines = _should_catchup_history_index(summaries_path)

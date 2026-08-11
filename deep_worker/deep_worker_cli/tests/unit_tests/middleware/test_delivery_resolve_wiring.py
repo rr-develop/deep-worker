@@ -24,7 +24,7 @@ def _mw_type_names(stack: list[Any]) -> list[str]:
 
 def test_added_for_claude_code_model() -> None:
     """A ClaudeCodeChatModel instance gets the delivery-resolve middleware."""
-    from claude_code_provider import ClaudeCodeChatModel
+    from deep_worker.providers.claude_code_provider import ClaudeCodeChatModel
 
     model = ClaudeCodeChatModel(base_options=None)
     stack: list[Any] = []
@@ -47,7 +47,7 @@ def test_not_added_for_non_claude_model() -> None:
 def test_middleware_bound_to_the_model() -> None:
     """The middleware must hold the exact model instance so resolve_pending_tool
     targets the right ClientManager."""
-    from claude_code_provider import ClaudeCodeChatModel
+    from deep_worker.providers.claude_code_provider import ClaudeCodeChatModel
 
     model = ClaudeCodeChatModel(base_options=None)
     stack: list[Any] = []

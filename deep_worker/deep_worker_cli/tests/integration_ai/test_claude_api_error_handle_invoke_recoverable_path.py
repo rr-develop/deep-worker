@@ -9,7 +9,7 @@ narrower, cheaper slice and is kept only for fast feedback on the
 
 Scope actually exercised here:
 
-  real recorded API-error payload shape
+  real recorded payload shape
     -> real ``api_error_detect.detect_api_error`` (§3.2)
     -> real ``ClaudeApiResponseError`` (§3.1)
     -> real ``AgentProcess._handle_invoke`` catch-all
@@ -51,8 +51,7 @@ from deep_worker_cli.types import AgentStatus
 pytestmark = pytest.mark.integration
 
 
-# VERBATIM payload from a recorded API-error transcript (session transcript
-# jsonl line 523): single TextBlock beginning
+# VERBATIM payload from a recorded transcript: single TextBlock beginning
 # with "API Error:", stop_reason="end_turn", ALL-ZERO usage, NO
 # isApiErrorMessage flag (absent in 8 of 9 recorded cases in that transcript).
 # Reproducing it verbatim is required by POLICIES.md §10 — the earlier grok
@@ -89,12 +88,11 @@ def _make_agent(name: str) -> AgentProcess:
 
 
 @pytest.mark.asyncio
-async def test_real_verbatim_payload_becomes_recoverable_error() -> None:
-    """Layer 1: the REAL detector, on the REAL recorded API-error payload
-    shape, produces a ``ClaudeApiResponseError`` — no hand-constructed
-    exception."""
-    from claude_code_provider.api_error_detect import detect_api_error
-    from claude_code_provider.chat_model import ClaudeApiResponseError
+async def test_real_verbatim_vc15_payload_becomes_recoverable_error() -> None:
+    """Layer 1: the REAL detector, on the REAL recorded payload shape,
+    produces a ``ClaudeApiResponseError`` — no hand-constructed exception."""
+    from deep_worker.providers.claude_code_provider.api_error_detect import detect_api_error
+    from deep_worker.providers.claude_code_provider.chat_model import ClaudeApiResponseError
 
     detected = detect_api_error(
         response_text=_REAL_400_TEXT,
@@ -107,7 +105,7 @@ async def test_real_verbatim_payload_becomes_recoverable_error() -> None:
         usage=_REAL_ZERO_USAGE,     # KNOWN_ZERO (§3.2 rule 4 trigger)
     )
     assert detected is not None, (
-        "verbatim recorded API-error payload must be detected via rule 4 "
+        "verbatim recorded payload must be detected via rule 4 "
         "(marker + KNOWN_ZERO)"
     )
     exc = ClaudeApiResponseError(
@@ -126,8 +124,8 @@ async def test_real_api_error_flows_through_recoverable_path() -> None:
     """Layer 2: REAL ClaudeApiResponseError -> REAL _handle_invoke catch-all
     -> REAL is_provider_api_error registry lookup -> REAL recoverable branch
     (notify type='error', history append, IDLE, success=False)."""
-    from claude_code_provider.api_error_detect import detect_api_error
-    from claude_code_provider.chat_model import ClaudeApiResponseError
+    from deep_worker.providers.claude_code_provider.api_error_detect import detect_api_error
+    from deep_worker.providers.claude_code_provider.chat_model import ClaudeApiResponseError
 
     detected = detect_api_error(
         response_text=_REAL_400_TEXT,

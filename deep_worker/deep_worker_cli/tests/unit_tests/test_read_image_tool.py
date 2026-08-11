@@ -105,14 +105,14 @@ class TestResolveCallMultimodal:
 
     def test_string_content_unchanged(self):
         """String content should produce a single text block (existing behavior)."""
-        from claude_code_provider.chat_model import _build_mcp_content
+        from deep_worker.providers.claude_code_provider.chat_model import _build_mcp_content
 
         result = _build_mcp_content("Hello, world!")
         assert result == [{"type": "text", "text": "Hello, world!"}]
 
     def test_list_with_text_only(self):
         """List with text blocks should pass through."""
-        from claude_code_provider.chat_model import _build_mcp_content
+        from deep_worker.providers.claude_code_provider.chat_model import _build_mcp_content
 
         content = [{"type": "text", "text": "Some text"}]
         result = _build_mcp_content(content)
@@ -120,7 +120,7 @@ class TestResolveCallMultimodal:
 
     def test_list_with_image_url_converted_to_mcp_image(self):
         """image_url block should be converted to MCP image block."""
-        from claude_code_provider.chat_model import _build_mcp_content
+        from deep_worker.providers.claude_code_provider.chat_model import _build_mcp_content
 
         content = [
             {"type": "text", "text": "Image info"},
@@ -137,7 +137,7 @@ class TestResolveCallMultimodal:
         assert result[1]["mimeType"] == "image/png"
 
     def test_list_with_jpeg_image(self):
-        from claude_code_provider.chat_model import _build_mcp_content
+        from deep_worker.providers.claude_code_provider.chat_model import _build_mcp_content
 
         content = [
             {
@@ -151,7 +151,7 @@ class TestResolveCallMultimodal:
 
     def test_mixed_content_all_preserved(self):
         """Multiple text + image blocks should all be preserved."""
-        from claude_code_provider.chat_model import _build_mcp_content
+        from deep_worker.providers.claude_code_provider.chat_model import _build_mcp_content
 
         content = [
             {"type": "text", "text": "First"},

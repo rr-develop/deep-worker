@@ -13,9 +13,9 @@ from uuid import uuid4
 
 import pytest
 
-from deepworker_a2a.config import A2AConfig
-from deepworker_a2a.client import A2AOutboundClient
-from deepworker_a2a.server import start_a2a_server
+from deep_worker.providers.deepworker_a2a.config import A2AConfig
+from deep_worker.providers.deepworker_a2a.client import A2AOutboundClient
+from deep_worker.providers.deepworker_a2a.server import start_a2a_server
 
 
 class _EchoAgentProcess:

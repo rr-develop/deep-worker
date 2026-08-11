@@ -167,8 +167,8 @@ def _agent_subprocess_entry(
 
     from deep_worker_cli.process.registry import ProcessRegistry
     from deep_worker_cli.types import AgentProcessInfo
-    from deepworker_a2a.config import A2AConfig
-    from deepworker_a2a.server import start_a2a_server
+    from deep_worker.providers.deepworker_a2a.config import A2AConfig
+    from deep_worker.providers.deepworker_a2a.server import start_a2a_server
 
     # ProcessRegistry insists the pid be alive AND the cmdline contain one of
     # {deep-worker, deep_worker, pytest, python}. multiprocessing spawn uses

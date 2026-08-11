@@ -46,8 +46,8 @@ if str(_REPO_ROOT) not in sys.path:
 
 from langchain_core.messages import AIMessage, HumanMessage  # noqa: E402
 
-from codex_provider.chat_model import CodexChatModel  # noqa: E402
-from codex_provider.exec_runner import (  # noqa: E402
+from deep_worker.providers.codex_provider.chat_model import CodexChatModel  # noqa: E402
+from deep_worker.providers.codex_provider.exec_runner import (  # noqa: E402
     GenericItem,
     ItemStartedEvent,
     ThreadEvent,
@@ -66,7 +66,7 @@ class _FakeExecHandle:
     ``ainvoke_queue`` and ``native_futures``."""
 
     def __init__(self, events: list[ThreadEvent]) -> None:
-        from codex_provider.event_pump import event_pump
+        from deep_worker.providers.codex_provider.event_pump import event_pump
 
         async def _gen():
             for ev in events:

@@ -91,13 +91,94 @@ source .venv-check/bin/activate
 pip install dist/*.whl
 ```
 
-Smoke-test the entry points (with the environment activated):
+Smoke-test the entry points:
 
 ```bash
 deep-worker --help      # exit 0
 dwcli --help            # exit 0
 deep-worker-cli --help  # exit 0
 ```
+
+## 6. Vendored provider packages (prefixed imports)
+
+The wheel ships the five provider packages **inside** the `deep_worker`
+namespace — they are NOT installed as top-level importable packages:
+
+| Legacy top-level name | Canonical import in the wheel |
+|---|---|
+| `claude_code_provider` | `deep_worker.providers.claude_code_provider` |
+| `codex_provider` | `deep_worker.providers.codex_provider` |
+| `grok_provider` | `deep_worker.providers.grok_provider` |
+| `semantic_search` | `deep_worker.providers.semantic_search` |
+| `deepworker_a2a` | `deep_worker.providers.deepworker_a2a` |
+
+This prefixed scheme avoids collisions with real PyPI distributions that own
+the legacy top-level names (e.g. `claude-code-provider` from Microsoft Agent
+Framework, `semantic-search`). The top-level names are deliberately **not**
+provided by the wheel (`import claude_code_provider` → `ModuleNotFoundError`
+from an installed wheel). In the source checkout the legacy top-level aliases
+still work and emit a `DeprecationWarning` (see §8).
+
+The provider roots are **lazy** (PEP 562): importing
+`deep_worker.providers.semantic_search` does not load llama-index; importing
+`deep_worker.providers.claude_code_provider` does not load the Claude Agent
+SDK. Heavy optional dependencies load only when you actually use the
+capability.
+
+## 7. Capability matrix, extras and environment
+
+### 7.1 Capability matrix
+
+| Capability | Source | Condition | When missing |
+|---|---|---|---|
+| deepseek / openai / anthropic / google | API (langchain-*) | core | — |
+| vertexai | `deep_worker.providers.vertexai_*` | extra `[vertexai]` | `pip install deep-worker[vertexai]` |
+| claude-code | `deep_worker.providers.claude_code_provider` + SDK fork | `claude` CLI + SDK fork (`CLAUDE_AGENT_SDK_SRC`) | set `CLAUDE_AGENT_SDK_SRC=…`; install the claude CLI |
+| codex | `deep_worker.providers.codex_provider` + `codex` CLI | `codex` in PATH + auth | install the codex CLI |
+| grok | `deep_worker.providers.grok_provider` + `grok` CLI | `grok` in PATH + auth | install the grok CLI |
+| web_search (delegation) | `deep_worker.providers.claude_code_provider` + SDK fork | tri-state policy (§7.4) | auto: warn + skip; `--enable-web-search`: `CapabilityError` |
+| semantic-search | `deep_worker.providers.semantic_search` + llama-index | extra `[semantic-search]` | `pip install deep-worker[semantic-search]` |
+| a2a | `deep_worker.providers.deepworker_a2a` + a2a-sdk | extra `[a2a]`; core starts without it | `pip install deep-worker[a2a]` |
+
+### 7.2 Extras
+
+```bash
+pip install "deep-worker[vertexai]"         # Google Vertex AI
+pip install "deep-worker[semantic-search]"  # semantic search (llama-index stack)
+pip install "deep-worker[a2a]"              # A2A protocol server/client
+```
+
+### 7.3 Environment variables
+
+- `DEEP_WORKER_SOURCE_ROOT=<abs path>` — force provider resolution from a
+  trusted source checkout instead of the installed wheel.
+- `DEEP_WORKER_PROVIDER_SOURCE=<pkg>=<abs path>` — per-provider source
+  override (the other providers keep the installed-wheel resolution).
+- `CLAUDE_AGENT_SDK_SRC=<abs path>` — path to the deep-worker **fork** of the
+  Claude Agent SDK. The official `claude_agent_sdk` on PyPI is **not**
+  compatible: the fork-private module `claude_agent_sdk._mcp_context` is
+  required and its absence is reported as `sdk_incompatible`.
+
+### 7.4 Universal web-search tool (tri-state)
+
+The `web_search` delegation tool works with ANY LLM provider and needs no
+extra API key. Its availability is controlled by a tri-state policy:
+
+- `--enable-web-search` — bind the tool, or fail loudly (`CapabilityError`
+  with remedy) when the SDK fork is unavailable;
+- `--disable-web-search` — never resolve or import the claude provider / SDK;
+- default (auto) — bind the tool when the SDK fork is available, otherwise log
+  a single warning and skip the tool; the agent still starts.
+
+## 8. Source checkout aliases (development only)
+
+In the source checkout the legacy top-level names (`claude_code_provider`,
+`codex_provider`, `grok_provider`, `semantic_search`, `deepworker_a2a`) still
+resolve through deprecated alias packages at the repo root. They emit exactly
+one `DeprecationWarning` per process and re-export the canonical API from
+`deep_worker.providers.*` (root identity is preserved — no double loading).
+Old submodule paths (`import claude_code_provider.web_search`,
+`from codex_provider.native_tools import …`) are **not** supported.
 
 And the vendored fork + rpyc API used by the runtime:
 

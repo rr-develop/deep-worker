@@ -10,9 +10,9 @@ import asyncio
 
 import pytest
 
-from deepworker_a2a.config import A2AConfig
-from deepworker_a2a.server import start_a2a_server
-from deepworker_a2a.tools import make_a2a_tools
+from deep_worker.providers.deepworker_a2a.config import A2AConfig
+from deep_worker.providers.deepworker_a2a.server import start_a2a_server
+from deep_worker.providers.deepworker_a2a.tools import make_a2a_tools
 
 
 class _EchoAgentProcess:

@@ -37,6 +37,7 @@ class AgentConfig:
     max_tokens: int = 20000
     temperature: float = 1.0
     api_key: str | None = None
+    web_search_policy: str = "auto"  # "auto" | "enabled" | "disabled" (WebSearchPolicy)
     _dynamic_display_model: str | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -97,6 +98,13 @@ class AgentConfig:
         # Validate max_tokens
         if self.max_tokens <= 0:
             raise ValueError(f"max_tokens must be positive, got {self.max_tokens}")
+
+        # Validate web_search_policy (tri-state, DESIGN_PROVIDERS_FROM_WHEEL §3.3)
+        if self.web_search_policy not in ("auto", "enabled", "disabled"):
+            raise ValueError(
+                f"web_search_policy must be one of 'auto', 'enabled', 'disabled', "
+                f"got '{self.web_search_policy}'"
+            )
 
     @property
     def resolved_model(self) -> str | None:
@@ -185,6 +193,7 @@ class AgentConfig:
                 "max_tokens": data.get("max_tokens", 20000),
                 "temperature": data.get("temperature", 1.0),
                 "api_key": data.get("api_key"),  # Optional, auto-loaded if None
+                "web_search_policy": data.get("web_search_policy", "auto"),
             }
 
             # Validate required fields

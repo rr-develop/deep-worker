@@ -30,6 +30,28 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def assemble_manager_web_tools(config: "AgentConfig") -> list[Any]:
+    """Production TaskManager web-tools assembly (``_initialize_manager`` call-site).
+
+    Returns ``[fetch_url]`` plus the universal web-search delegation tool when
+    the tri-state policy resolves it. Extracted so the exact production
+    assembly entry point is directly exercisable (DESIGN §5.5).
+    """
+    from deep_worker_cli.config import WebSearchPolicy
+    from deep_worker_cli.tools import (
+        fetch_url,
+        resolve_web_search_tool,
+    )
+
+    manager_tools: list[Any] = [fetch_url]
+    _web_search_avail = resolve_web_search_tool(
+        WebSearchPolicy(getattr(config, "web_search_policy", "auto"))
+    )
+    if _web_search_avail.tool is not None:
+        manager_tools.insert(0, _web_search_avail.tool)
+    return manager_tools
+
+
 class TaskManager:
     """
     TaskManager for deep-worker agent task evaluation and correction.
@@ -264,9 +286,10 @@ class TaskManager:
             # subordinate's solution should match an external reference.
             # Two read-only web tools are enough for that:
             #
-            #   web_search_delegation_tool — universal web search via
+            #   web_search (delegation) — universal web search via
             #       Claude Code SDK; no extra API key required, works
-            #       with every provider.
+            #       with every provider. Resolved lazily under the
+            #       tri-state policy (auto/enabled/disabled).
             #   fetch_url                  — fetch a known URL and
             #       return its content as markdown.
             #
@@ -276,14 +299,7 @@ class TaskManager:
             # autonomous peer-to-peer agent messaging, outside its
             # role). The TASK_MANAGER_SYSTEM_PROMPT advertises these
             # tools by name so the model knows to use them when needed.
-            from deep_worker_cli.tools import (
-                fetch_url,
-                web_search_delegation_tool,
-            )
-            manager_tools: list[Any] = [
-                web_search_delegation_tool,
-                fetch_url,
-            ]
+            manager_tools = assemble_manager_web_tools(self.config)
 
             # ---- Provider-specific tool wiring (codex native passthrough) ----
             # Mirrors the main-agent path in ``agent_process.py``: when
@@ -300,7 +316,21 @@ class TaskManager:
             # See codex_provider/docs/DESIGN_NATIVE_TOOL_PASSTHROUGH.md
             # and ``deep_worker_cli/process/agent_process.py:475-477``.
             if self.config.provider == "codex":
-                from codex_provider.native_tools import NATIVE_TOOLS
+                # Resolve the vendored provider through provider_paths (source
+                # root on sys.path in source mode; no-op in installed mode).
+                # See deep_worker_cli/provider_paths.py.
+                from deep_worker_cli.provider_paths import ensure_provider_importable
+                from deep_worker_cli.exceptions import CapabilityError
+
+                resolution = ensure_provider_importable(
+                    "deep_worker.providers.codex_provider"
+                )
+                if resolution.unavailable:
+                    raise CapabilityError(
+                        capability="codex",
+                        remedy=resolution.remedy or resolution.unavailable,
+                    )
+                from deep_worker.providers.codex_provider.native_tools import NATIVE_TOOLS
                 manager_tools.extend(NATIVE_TOOLS)
 
             # Same rationale for grok: its built-ins always run locally and
@@ -309,7 +339,21 @@ class TaskManager:
             # ``Tool '<name>' not found``. See
             # grok_provider/docs/DESIGN_GROK_PROVIDER.md §11A.4.
             if self.config.provider == "grok":
-                from grok_provider.builtin_tool_passthrough import (
+                # Resolve the vendored provider through provider_paths (source
+                # root on sys.path in source mode; no-op in installed mode).
+                # See deep_worker_cli/provider_paths.py.
+                from deep_worker_cli.provider_paths import ensure_provider_importable
+                from deep_worker_cli.exceptions import CapabilityError
+
+                resolution = ensure_provider_importable(
+                    "deep_worker.providers.grok_provider"
+                )
+                if resolution.unavailable:
+                    raise CapabilityError(
+                        capability="grok",
+                        remedy=resolution.remedy or resolution.unavailable,
+                    )
+                from deep_worker.providers.grok_provider.builtin_tool_passthrough import (
                     build_passthrough_tools,
                 )
                 manager_tools.extend(build_passthrough_tools())

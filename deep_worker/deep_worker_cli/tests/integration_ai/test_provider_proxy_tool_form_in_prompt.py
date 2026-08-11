@@ -44,7 +44,7 @@ def _prompt_for(model: object) -> str:
 
 def test_claude_code_real_model_yields_static_mcp_form() -> None:
     try:
-        from claude_code_provider import ClaudeCodeChatModel
+        from deep_worker.providers.claude_code_provider import ClaudeCodeChatModel
     except Exception:  # noqa: BLE001
         pytest.skip("claude_code_provider not importable")
     model = ClaudeCodeChatModel()
@@ -55,7 +55,7 @@ def test_claude_code_real_model_yields_static_mcp_form() -> None:
 
 def test_codex_real_model_yields_pid_prefixed_mcp_form() -> None:
     try:
-        from codex_provider import CodexChatModel
+        from deep_worker.providers.codex_provider import CodexChatModel
     except Exception:  # noqa: BLE001
         pytest.skip("codex_provider not importable")
     model = CodexChatModel()
@@ -67,7 +67,7 @@ def test_codex_real_model_yields_pid_prefixed_mcp_form() -> None:
 
 def test_grok_real_model_has_mcp_note_without_static_prefix() -> None:
     try:
-        from grok_provider import GrokChatModel
+        from deep_worker.providers.grok_provider import GrokChatModel
     except Exception:  # noqa: BLE001
         pytest.skip("grok_provider not importable")
     model = GrokChatModel()

@@ -39,7 +39,7 @@ class TestCreateModelClaudeCode:
         """Should create claude-code model with sonnet."""
         from deep_worker_cli.config import create_model
 
-        with patch("claude_code_provider.ClaudeCodeChatModel") as mock_claude:
+        with patch("deep_worker.providers.claude_code_provider.ClaudeCodeChatModel") as mock_claude:
             mock_model = MagicMock()
             mock_claude.return_value = mock_model
 
@@ -55,7 +55,7 @@ class TestCreateModelClaudeCode:
         """Should create claude-code model with haiku."""
         from deep_worker_cli.config import create_model
 
-        with patch("claude_code_provider.ClaudeCodeChatModel") as mock_claude:
+        with patch("deep_worker.providers.claude_code_provider.ClaudeCodeChatModel") as mock_claude:
             mock_model = MagicMock()
             mock_claude.return_value = mock_model
 
@@ -71,7 +71,7 @@ class TestCreateModelClaudeCode:
         """Should create claude-code model with opus."""
         from deep_worker_cli.config import create_model
 
-        with patch("claude_code_provider.ClaudeCodeChatModel") as mock_claude:
+        with patch("deep_worker.providers.claude_code_provider.ClaudeCodeChatModel") as mock_claude:
             mock_model = MagicMock()
             mock_claude.return_value = mock_model
 
@@ -87,7 +87,7 @@ class TestCreateModelClaudeCode:
         """Should accept full model name with claude-code."""
         from deep_worker_cli.config import create_model
 
-        with patch("claude_code_provider.ClaudeCodeChatModel") as mock_claude:
+        with patch("deep_worker.providers.claude_code_provider.ClaudeCodeChatModel") as mock_claude:
             mock_model = MagicMock()
             mock_claude.return_value = mock_model
 
@@ -106,7 +106,7 @@ class TestCreateModelClaudeCode:
         """Should default to sonnet when model_name=None with claude-code."""
         from deep_worker_cli.config import create_model
 
-        with patch("claude_code_provider.ClaudeCodeChatModel") as mock_claude:
+        with patch("deep_worker.providers.claude_code_provider.ClaudeCodeChatModel") as mock_claude:
             mock_model = MagicMock()
             mock_claude.return_value = mock_model
 
@@ -129,7 +129,7 @@ class TestCreateModelClaudeCode:
 
         from deep_worker_cli.config import create_model
 
-        with patch("claude_code_provider.ClaudeCodeChatModel") as mock_claude:
+        with patch("deep_worker.providers.claude_code_provider.ClaudeCodeChatModel") as mock_claude:
             mock_model = MagicMock()
             mock_claude.return_value = mock_model
 
@@ -144,7 +144,7 @@ class TestCreateModelClaudeCode:
         """Should pass max_tokens to ClaudeCodeChatModel."""
         from deep_worker_cli.config import create_model
 
-        with patch("claude_code_provider.ClaudeCodeChatModel") as mock_claude:
+        with patch("deep_worker.providers.claude_code_provider.ClaudeCodeChatModel") as mock_claude:
             mock_model = MagicMock()
             mock_claude.return_value = mock_model
 
@@ -161,7 +161,7 @@ class TestCreateModelClaudeCode:
         """Should support 'inherit' model name for claude-code."""
         from deep_worker_cli.config import create_model
 
-        with patch("claude_code_provider.ClaudeCodeChatModel") as mock_claude:
+        with patch("deep_worker.providers.claude_code_provider.ClaudeCodeChatModel") as mock_claude:
             mock_model = MagicMock()
             mock_claude.return_value = mock_model
 
@@ -187,7 +187,7 @@ class TestCreateModelClaudeCode:
         ]
 
         for model_name in test_cases:
-            with patch("claude_code_provider.ClaudeCodeChatModel") as mock_claude:
+            with patch("deep_worker.providers.claude_code_provider.ClaudeCodeChatModel") as mock_claude:
                 mock_model = MagicMock()
                 mock_claude.return_value = mock_model
 

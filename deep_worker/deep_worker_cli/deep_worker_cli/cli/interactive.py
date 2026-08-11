@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import subprocess  # S404: subprocess required for user-initiated shell commands via ! prefix
-import sys
 import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, cast
@@ -18,14 +17,13 @@ from textual.message import Message
 from textual.widgets import Static
 
 # ============================================================================
-# CRITICAL: RPYC MUST BE IMPORTED FROM SOURCE CODE, NOT FROM PIP!
+# rpyc-async is a regular PyPI dependency (>=1.0.0) providing the
+# AsyncioServer-based protocol (rpyc_async.core.async_connect). The previous
+# sys.path injection of a local rpyc_async checkout was removed: on a
+# developer machine it shadowed the PyPI package with sources, making
+# "clean env" wheel installs test the wrong code
+# (DESIGN_PROVIDERS_FROM_WHEEL 1 B6).
 # ============================================================================
-# ALWAYS import rpyc from a local rpyc_async source checkout.
-# This ensures we use rpyc_async with AsyncioServer support.
-# ============================================================================
-_rpyc_async_path = Path("/path/to/rpyc_async")
-if _rpyc_async_path.exists() and str(_rpyc_async_path) not in sys.path:
-    sys.path.insert(0, str(_rpyc_async_path))
 
 import rpyc_async as rpyc
 from rpyc_async.core.async_connect import async_connect

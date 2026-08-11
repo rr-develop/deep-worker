@@ -43,6 +43,7 @@ def _stub_config(provider: str) -> MagicMock:
     cfg.provider = provider
     cfg.model = None
     cfg.working_dir = Path("/tmp")
+    cfg.web_search_policy = "auto"
     return cfg
 
 
@@ -185,7 +186,7 @@ async def test_codex_manager_carries_web_tools_AND_native_passthrough() -> None:
     in the same bound list. Regression guard against accidentally
     overwriting one set with the other.
     """
-    from codex_provider.native_tools import NATIVE_TOOLS
+    from deep_worker.providers.codex_provider.native_tools import NATIVE_TOOLS
 
     tm = _make_tm("codex")
     fake_model = MagicMock()

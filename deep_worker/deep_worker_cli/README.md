@@ -29,6 +29,34 @@ PyPI `deepagents` must not be co-installed).
 See [`deep_worker/README.md`](../../deep_worker/README.md) for the no-venv
 runtime model.
 
+## Providers & Capabilities (installed wheel)
+
+The wheel ships its five provider packages **inside** the `deep_worker`
+namespace — never as top-level packages (avoids collisions with real PyPI
+distributions such as `claude-code-provider` / `semantic-search`):
+
+```python
+from deep_worker.providers.claude_code_provider import ClaudeCodeChatModel
+from deep_worker.providers.semantic_search import SemanticSearchIndexer
+```
+
+Optional capabilities are gated behind extras and reported with actionable
+`CapabilityError` remedies when missing:
+
+| Extra / capability | Install | When missing |
+|---|---|---|
+| Vertex AI | `pip install "deep-worker[vertexai]"` | `pip install deep-worker[vertexai]` |
+| Semantic search | `pip install "deep-worker[semantic-search]"` | `pip install deep-worker[semantic-search]` |
+| A2A protocol | `pip install "deep-worker[a2a]"` | `pip install deep-worker[a2a]` |
+| Claude Code / web-search delegation | SDK **fork** via `CLAUDE_AGENT_SDK_SRC` | set `CLAUDE_AGENT_SDK_SRC`; official SDK → `sdk_incompatible` |
+
+The universal `web_search` delegation tool works with any LLM provider
+(tri-state policy): default `auto` skips it with a single warning when the SDK
+fork is absent; `--enable-web-search` fails loudly; `--disable-web-search`
+never touches the SDK. `DEEP_WORKER_SOURCE_ROOT` / `DEEP_WORKER_PROVIDER_SOURCE`
+force source-checkout provider resolution (development). Full details:
+[`docs/BUILD_INSTALL_GUIDE.md`](docs/BUILD_INSTALL_GUIDE.md).
+
 ## Key Features
 
 - 🚀 **Background Agent Processes**: Run agents as daemon processes with `deep-worker`

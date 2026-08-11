@@ -1,27 +1,26 @@
-"""Grok provider for deep-worker — sibling of codex_provider.
+"""DEPRECATED shim — migrate to ``deep_worker.providers.grok_provider``.
 
-Public surface re-exports GrokChatModel for ``deep_worker_cli/config.py``.
-
-The provider drives the xAI Grok CLI in its ``grok agent stdio`` mode,
-which speaks the Agent Client Protocol (ACP) v1 over JSON-RPC. Authn is
-by the user's supergrok subscription cache (``~/.grok/auth.json``); no
-separate API key is needed. See docs/DESIGN_GROK_PROVIDER.md.
+This root package exists only for local backward compatibility on this host.
+It is NOT part of the published wheel/sdist. Old submodule imports
+(``import grok_provider.chat_model``) are NOT supported: use
+``deep_worker.providers.grok_provider.chat_model`` instead.
 """
-from __future__ import annotations
+import warnings as _warnings
 
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from grok_provider.chat_model import GrokChatModel  # noqa: F401
-
-
-def __getattr__(name: str):
-    if name == "GrokChatModel":
-        from grok_provider.chat_model import GrokChatModel
-
-        return GrokChatModel
-    raise AttributeError(f"module 'grok_provider' has no attribute {name!r}")
-
-
+_warned = False
 __all__ = ["GrokChatModel"]
-__version__ = "0.1.0"
+
+
+def __getattr__(name):
+    global _warned
+    if not _warned:
+        _warned = True
+        _warnings.warn(
+            "grok_provider is deprecated; use "
+            "deep_worker.providers.grok_provider",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+    from deep_worker.providers import grok_provider as _canonical
+
+    return getattr(_canonical, name)

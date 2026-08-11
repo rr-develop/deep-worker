@@ -8,7 +8,6 @@ but indexes message-level chunks instead of code.
 from __future__ import annotations
 
 import asyncio
-import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -17,22 +16,26 @@ from langchain_core.tools import tool
 if TYPE_CHECKING:
     from langchain.tools import ToolRuntime
 
-# Ensure semantic_search package is importable
-_pkg_path = (
-    Path(__file__).parent.parent.parent.parent.parent / "semantic_search"
-)
-if _pkg_path.exists() and str(_pkg_path) not in sys.path:
-    sys.path.insert(0, str(_pkg_path))
-
 # Lazy import — heavy dependencies loaded only on first real call
 _history_search = None  # (search_func, FileNotFoundError)
 
 
 def _ensure_history_search() -> tuple[Any, type[Exception]]:
-    """One-time lazy import of history_retriever."""
+    """One-time lazy import of history_retriever.
+
+    Resolves the semantic_search provider through provider_paths (source
+    root on sys.path in source mode; no-op in installed mode) — no sys.path
+    hacks. Raises ImportError when the semantic-search extra is missing; the
+    caller converts that into a user-facing error string.
+    """
     global _history_search
     if _history_search is None:
-        from semantic_search.history_retriever import search_history  # noqa: E402
+        from deep_worker_cli.provider_paths import ensure_provider_importable
+
+        resolution = ensure_provider_importable("deep_worker.providers.semantic_search")
+        if resolution.unavailable:
+            raise ImportError(resolution.remedy or "deep-worker[semantic-search] not installed")
+        from deep_worker.providers.semantic_search.history_retriever import search_history  # noqa: E402
 
         _history_search = (search_history, FileNotFoundError)
     return _history_search
@@ -58,7 +61,7 @@ def _run_history_search(query: str, summaries_dir: str, top_k: int) -> str:
     except ImportError as exc:
         return (
             f"Error: semantic search dependencies not available: {exc}\n"
-            "Install with: pip install semantic-search"
+            "Install with: pip install deep-worker[semantic-search]"
         )
 
     try:

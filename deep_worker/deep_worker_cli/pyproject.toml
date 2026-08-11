@@ -31,7 +31,7 @@ dependencies = [
   # host's system-installed packages. Open ranges produced silent API
   # drift between the type-check uv-venv (which was getting the latest
   # PyPI release) and pytest (running against the system install) —
-  # see a related internal incident analysis (not included here) and the
+  # see ``.githooks/pre-commit`` 2026-04-25 incident note and the
   # subagent recursion_limit bug fixed in
   # deepagents/middleware/subagents.py.
   #
@@ -57,10 +57,15 @@ dependencies = [
   "langgraph-prebuilt==1.0.7",
   # DeepSeek thinking models (deepseek-v4-flash) require reasoning_content to
   # be round-tripped; we build them with ReasoningChatDeepSeek (subclass of
-  # ChatDeepSeek). Pinned exact to match the reference install. See
-  # DEEPSEEK_PROVIDER.md (observed in a past incident).
+  # ChatDeepSeek). Pinned exact to match the host install. See
+  # deepseek_model.py and DEEPSEEK_PROVIDER.md (2026-05-22).
   "langchain-deepseek==1.0.1",
   "langgraph-checkpoint-sqlite==3.0.3",
+  # Google Gemini (API provider, core per capability matrix §4 of
+  # DESIGN_PROVIDERS_FROM_WHEEL.md). The dev tree pins ==4.2.0 via the
+  # vendored deepagents fork; the public wheel uses the same open range as
+  # the public deepagents library.
+  "langchain-google-genai>=4.2.0,<5.0.0",
 
   # UI/Terminal
   "textual>=6.0.0,<8.0.0",
@@ -88,10 +93,10 @@ dependencies = [
   "pyperclip>=1.11.0,<2.0.0",
 
   # IPC/RPC — PyPI package (AsyncioServer-based RPyC fork).
-  # Switched from a local ``file://`` source reference to the public PyPI
-  # package (owner decision 2026-08-11): "rpyc_async has been working
-  # stably lately, and this also lets us test the public version".
-  # First public release may pin ==1.0.0.
+  # Switched from a local file:// direct reference to the public PyPI
+  # package (owner decision 2026-08-11): rpyc_async has been stable for a
+  # while, and this also exercises the published version.
+  # A first public release may pin ==1.0.0.
   "rpyc-async>=1.0.0",
 
   # Utilities
@@ -104,11 +109,18 @@ dependencies = [
   # wcmatch.glob (fork runtime dep moved into deep_worker_cli).
   "wcmatch>=8.5.0,<11.0.0",
 
+  # Vendored provider runtimes (deep_worker/providers/<pkg> ships inside the
+  # wheel/sdist — DESIGN_PROVIDERS_FROM_WHEEL.md §3.4). The codex/grok proxy
+  # MCP servers (streamable HTTP) run uvicorn + Starlette in-process; these
+  # are core deps because codex/grok are core providers.
+  "uvicorn>=0.24.0",
+  "starlette>=0.27.0",
+
   # LSP shared-service (see docs/DESIGN_LSP_SHARED_SERVICE.md).
   # Pinned to the 1.76.x line: 1.83+ pulls in protobuf 7.x and breaks
   # grpcio-status / google-api-core / google-cloud-firestore on this
-  # host — see the LSP service README for the full ecosystem
-  # rationale. Runtime dependency of the service process AND
+  # host — see deep_worker_cli/lsp/service/README.md for the full
+  # ecosystem rationale. Runtime dependency of the service process AND
   # the in-agent MCP↔gRPC bridge (thin adapter under policy §5).
   "grpcio>=1.76,<1.77",
   # File-system watcher for the LSP service change-detector (event-
@@ -120,6 +132,21 @@ dependencies = [
 
 [project.optional-dependencies]
 vertexai = ["langchain-google-vertexai>=3.0.0,<4.0.0"]
+# Vendored semantic-search provider: the heavy llama-index stack stays out of
+# core (DESIGN_PROVIDERS_FROM_WHEEL.md §4). Runtime set mirrors
+# requirements-semantic-search.txt minus the test-only entries.
+semantic-search = [
+    "llama-index-core>=0.10.0",
+    "llama-index-vector-stores-lancedb>=0.4.0",
+    "llama-index-embeddings-huggingface>=0.4.0",
+    "lancedb>=0.20.0",
+    "tree-sitter-language-pack>=0.13.0",
+    "pandas>=2.0.0",
+]
+# Vendored A2A provider: a2a-sdk (1.1.x is the version the protocol support
+# was built and integration-tested against). Core starts without it; the
+# agent's A2A server/client only activates when the extra is installed.
+a2a = ["a2a-sdk[http-server]>=1.1.0"]
 
 [project.scripts]
 deep-worker = "deep_worker_cli.cli.router:deep_worker_main"
@@ -150,10 +177,11 @@ test = [
     # `Requires-Dist: deepagents`. Resolved as editable from
     # ../deepagents via [tool.uv.sources] below.
     "deepagents",
-    # Regenerating LSP-service gRPC stubs (see the LSP service proto
-    # definition). Kept in `test` group because the pre-commit uv env
-    # pulls it in for the type-check pass — same MAJOR/MINOR as grpcio
-    # (1.76.x) per the ecosystem pin explained in the LSP service README.
+    # Regenerating LSP-service gRPC stubs (see
+    # deep_worker_cli/lsp/service/proto/lsp_service.proto). Kept in
+    # `test` group because the pre-commit uv env pulls it in for the
+    # type-check pass — same MAJOR/MINOR as grpcio (1.76.x) per the
+    # ecosystem pin explained in lsp/service/README.md.
     "grpcio-tools>=1.76,<1.77",
 ]
 
@@ -165,13 +193,21 @@ test = [
 #   deep_worker_cli/deepagents  → symlink → ../deepagents/deepagents
 #                                 (the in-tree fork; the symlink makes the
 #                                 same relative path valid inside the
-#                                 extracted sdist)
+#                                 extracted sdist — R1)
 #   deep_worker_cli/LICENSE     → copy of the repo-root MIT LICENSE
 #                                 (drift-guarded by a unit test)
 #
 # `allow-direct-references` is intentionally ABSENT: it was only needed for
-# the old `rpyc-async @ file://...` dependency, which is gone.
+# the old `rpyc-async @ file://...` dependency, which is gone (D5).
 # ---------------------------------------------------------------------------
+# Vendored providers (DESIGN_PROVIDERS_FROM_WHEEL.md §3.4): the five
+# deep_worker/providers/<pkg> packages are staged into the wheel/sdist by a
+# custom hatchling hook (hooks/stage_providers.py). There are NO static
+# force-includes for providers here — all source→dest mappings are set
+# programmatically by the hook, per target.
+[tool.hatch.build.hooks.custom]
+path = "hooks/stage_providers.py"
+
 [tool.hatch.build.targets.wheel]
 packages = ["deep_worker_cli"]
 
@@ -196,7 +232,7 @@ deepagents = { path = "../deepagents", editable = true }
 # them with a working equivalent. In particular:
 #
 #   rpyc_async (previously a local source checkout)
-#       ← Removed 2026-08-11: rpyc-async is now installed from PyPI
+#       ← Removed 2026-08-11 (D5): rpyc-async is now installed from PyPI
 #         (>=1.0.0) as a regular dependency, so `ty` resolves the
 #         AsyncioServer-specific entry points from the installed package:
 #           - `rpyc.core.async_connect.async_connect`  (async client)
@@ -204,23 +240,23 @@ deepagents = { path = "../deepagents", editable = true }
 #           - `Connection.wait_closed()`               (async close wait)
 #           - `Connection.add_close_callback(cb)`
 #         If the PyPI package ever lacks those, fix the package — do NOT
-#         re-add a local source path and do NOT silence with `# ty: ignore`.
+#         re-add a /repos path and do NOT silence with `# ty: ignore`.
 #
 # If you are tempted to bypass type checks: don't. Fix the path here
 # or fix the real type error. There are no third options.
 # ═══════════════════════════════════════════════════════════════════════════
-# Paths are tree-relative (../../  = <repo>/, ../  = the package root).
-# Using ../.. instead of a hard-coded absolute tree path means this file
-# works identically in the production tree and in the development tree.
-# Hard-coding the prod path caused
+# Paths are tree-relative (../../  = <repo>/, ../  = <repo>/deep_worker/).
+# Using ../.. instead of a hard-coded absolute path means this file works
+# identically in the production tree and in a developer tree.
+# Hard-coding the production path caused
 # `ty check` to fail in the dev tree: it would add BOTH the prod
 # deep_worker_cli (via extra-paths) and the dev deep_worker_cli (via cwd)
 # to the module-resolution path, then refuse to resolve relative imports
 # like `from .task_manager import …` because two copies of the same
-# package were visible.
+# package were visible. See docs/DESIGN_DEV_FLAG.md.
 extra-paths = [
     ".",
-    "..",  # ← the package root — exposes `deepworker_a2a` (optional A2A
+    "..",  # ← <repo>/deep_worker — exposes `deepworker_a2a` (optional A2A
            #   protocol package). agent_process.py imports it lazily and
            #   gracefully when A2A is enabled; ty must still resolve the
            #   import to type-check the integration code path.
@@ -228,6 +264,13 @@ extra-paths = [
     "../../claude_code_provider",
     "../../semantic_search",
     "../deepagents",
+    # Source fork of claude_agent_sdk (CLAUDE_AGENT_SDK_SRC contract,
+    # DESIGN_PROVIDERS_FROM_WHEEL.md §3.5): the vendored
+    # claude_code_provider imports `claude_agent_sdk._mcp_context` lazily.
+    # ty needs the fork on the search path to type-check that code path.
+    # Mirrors the Claude SDK source entry already in pyrightconfig.json.
+    # (A sibling checkout of the repository root, in both trees.)
+    "../../../claude_sdk/src",
 ]
 
 [tool.ty.rules]

@@ -7,7 +7,7 @@ interface at the configured localhost URL, and declares streaming capability.
 
 import pytest
 
-from deepworker_a2a.card import build_agent_card, agent_card_to_summary
+from deep_worker.providers.deepworker_a2a.card import build_agent_card, agent_card_to_summary
 
 
 def test_build_card_basic_identity():

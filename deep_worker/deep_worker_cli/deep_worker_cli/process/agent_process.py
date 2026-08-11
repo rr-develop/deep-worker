@@ -54,15 +54,13 @@ def _get_git_commit_info(tree_root: str | None) -> tuple[str, str]:
     return sha, describe
 
 # ============================================================================
-# RPYC_ASYNC — IMPORTED FROM THE INSTALLED PACKAGE (PyPI)
-# ============================================================================
-# rpyc-async is a regular PyPI dependency (>=1.0.0, owner decision
-# 2026-08-11) providing the AsyncioServer-based protocol:
+# rpyc-async is a regular PyPI dependency (>=1.0.0) providing the
+# AsyncioServer-based protocol:
 #   - rpyc.core.async_connect.async_connect  (async client)
 #   - Connection.aclose() / wait_closed()    (async close)
-# The previous source-checkout sys.path injection was removed: on a
-# developer machine it shadowed the PyPI package with sources, which made
-# "clean env" wheel installs test the wrong code.
+# The previous sys.path injection of a local rpyc_async checkout was removed:
+# on a developer machine it shadowed the PyPI package with sources, which
+# made "clean env" wheel installs test the wrong code.
 # ============================================================================
 
 from rpyc_async.core.protocol import DEFAULT_CONFIG
@@ -79,25 +77,27 @@ index_all_history_files = None
 
 def _history_indexer_funcs() -> tuple[Any, Any]:
     global clear_history_index, index_all_history_files
-    # Do not rely on middleware import order having injected the semantic_search
-    # wrapper dir onto sys.path; ensure it explicitly. See
-    # deep_worker_cli/semantic_search_path.py.
-    from deep_worker_cli.semantic_search_path import (
-        ensure_semantic_search_importable,
-        semantic_search_wrapper_dir,
-    )
+    # Resolve the semantic_search provider (source root on sys.path in source
+    # mode; no-op in installed mode). See deep_worker_cli/provider_paths.py.
+    #
+    # Explicit request (reindex command / --reindex-history) → hard-fail with
+    # an actionable remedy when the semantic-search extra is missing
+    # (DESIGN_PROVIDERS_FROM_WHEEL §3.6).
+    from deep_worker_cli.provider_paths import ensure_provider_importable
+    from deep_worker_cli.exceptions import CapabilityError
 
-    if not ensure_semantic_search_importable():
-        raise ModuleNotFoundError(
-            "semantic_search package not found: expected wrapper dir at "
-            f"{semantic_search_wrapper_dir()}"
+    resolution = ensure_provider_importable("deep_worker.providers.semantic_search")
+    if resolution.unavailable:
+        raise CapabilityError(
+            capability="semantic-search",
+            remedy="pip install deep-worker[semantic-search]",
         )
     if clear_history_index is None:
-        from semantic_search.history_indexer import clear_history_index as _clear
+        from deep_worker.providers.semantic_search.history_indexer import clear_history_index as _clear
 
         clear_history_index = _clear
     if index_all_history_files is None:
-        from semantic_search.history_indexer import index_all_history_files as _index
+        from deep_worker.providers.semantic_search.history_indexer import index_all_history_files as _index
 
         index_all_history_files = _index
     return clear_history_index, index_all_history_files
@@ -1242,14 +1242,14 @@ class AgentProcess:
 
                 # Now import AFTER environment is loaded and deepagents is in path
                 from deep_worker_cli.agent import create_cli_agent
-                from deep_worker_cli.config import create_model
+                from deep_worker_cli.config import WebSearchPolicy, create_model
                 from deep_worker_cli import tools as cli_tools
                 from deep_worker_cli.tools import (
                     http_request,
                     fetch_url,
                     make_send_message_to_agent_tool,
-                    web_search_delegation_tool,
                     read_image,
+                    resolve_web_search_tool,
                 )
 
                 # Create model using configuration from AgentConfig
@@ -1368,7 +1368,21 @@ class AgentProcess:
                 # resolves it at item.completed — event-driven, no
                 # polling. See docs/DESIGN_NATIVE_TOOL_PASSTHROUGH.md.
                 if self.config.provider == "codex":
-                    from codex_provider.native_tools import NATIVE_TOOLS
+                    # Resolve the vendored provider through provider_paths
+                    # (source root on sys.path in source mode; no-op in
+                    # installed mode). See deep_worker_cli/provider_paths.py.
+                    from deep_worker_cli.provider_paths import ensure_provider_importable
+                    from deep_worker_cli.exceptions import CapabilityError
+
+                    resolution = ensure_provider_importable(
+                        "deep_worker.providers.codex_provider"
+                    )
+                    if resolution.unavailable:
+                        raise CapabilityError(
+                            capability="codex",
+                            remedy=resolution.remedy or resolution.unavailable,
+                        )
+                    from deep_worker.providers.codex_provider.native_tools import NATIVE_TOOLS
                     web_tools.extend(NATIVE_TOOLS)
 
                 # Grok-specific: register the built-in tool passthroughs.
@@ -1383,7 +1397,21 @@ class AgentProcess:
                 # ``tool_call_update status=completed`` — event-driven, no
                 # polling. See DESIGN_GROK_PROVIDER.md §11A.4.
                 if self.config.provider == "grok":
-                    from grok_provider.builtin_tool_passthrough import (
+                    # Resolve the vendored provider through provider_paths
+                    # (source root on sys.path in source mode; no-op in
+                    # installed mode). See deep_worker_cli/provider_paths.py.
+                    from deep_worker_cli.provider_paths import ensure_provider_importable
+                    from deep_worker_cli.exceptions import CapabilityError
+
+                    resolution = ensure_provider_importable(
+                        "deep_worker.providers.grok_provider"
+                    )
+                    if resolution.unavailable:
+                        raise CapabilityError(
+                            capability="grok",
+                            remedy=resolution.remedy or resolution.unavailable,
+                        )
+                    from deep_worker.providers.grok_provider.builtin_tool_passthrough import (
                         build_passthrough_tools,
                     )
                     web_tools.extend(build_passthrough_tools())
@@ -1489,7 +1517,9 @@ class AgentProcess:
                 #   - claude_code_provider/client_manager.py
                 #     (rotate-on-mismatch — defence in depth).
                 # Both halves of the fix MUST coexist.
-                _final_metadata = self._extract_final_tool_metadata(self.agent)
+                _final_metadata = self._extract_final_tool_metadata(
+                    self.agent, provider=getattr(self.config, "provider", None)
+                )
                 _client_manager = getattr(model, "_client_manager", None)
                 if _client_manager is not None and _final_metadata:
                     await self._prewarm_client_manager(
@@ -1739,7 +1769,7 @@ class AgentProcess:
         return SystemMessage(content=body)
 
     @staticmethod
-    def _extract_final_tool_metadata(agent: Any) -> list[Any]:
+    def _extract_final_tool_metadata(agent: Any, provider: str | None = None) -> list[Any]:
         """Extract the FINAL tool inventory from a compiled LangGraph agent.
 
         ════════════════════════════════════════════════════════════════
@@ -1822,11 +1852,42 @@ class AgentProcess:
         # prewarm-created ProxyMCPServer advertises EXACTLY the same
         # surface a regular turn's ``bind_tools`` would produce. No
         # divergence between prewarm and turn paths.
-        from claude_code_provider.chat_model import ClaudeCodeChatModel  # noqa: PLC0415
-
+        #
+        # Structural invariant (DESIGN_PROVIDERS_FROM_WHEEL §3.7): non-Claude
+        # paths MUST NEVER import ``deep_worker.providers.claude_code_provider``
+        # — a wheel without the SDK fork / claude CLI must still start API
+        # providers. The guard on ``provider == "claude-code"`` happens BEFORE
+        # the import, and the Claude path only surfaces a classified
+        # missing-capability (actionable) or re-raises internal defects.
         tools_list = list(tools_by_name.values())
         if not tools_list:
             return []
+        if provider != "claude-code":
+            # Non-Claude provider: no ClaudeCodeChatModel probe — return the
+            # raw tool names. The prewarm proxy only ever runs for the
+            # claude-code provider (model has no _client_manager otherwise),
+            # and _handle_get_tools only needs names/descriptions.
+            return [
+                {
+                    "name": getattr(t, "name", "?"),
+                    "description": getattr(t, "description", ""),
+                    "input_schema": getattr(t, "args", {}),
+                }
+                for t in tools_list
+            ]
+        from deep_worker_cli.provider_paths import ensure_provider_importable
+        from deep_worker_cli.exceptions import CapabilityError
+
+        resolution = ensure_provider_importable(
+            "deep_worker.providers.claude_code_provider"
+        )
+        if resolution.unavailable:
+            raise CapabilityError(
+                capability="claude-code",
+                remedy=resolution.remedy or resolution.unavailable,
+            )
+        from deep_worker.providers.claude_code_provider.chat_model import ClaudeCodeChatModel  # noqa: PLC0415
+
         try:
             probe = ClaudeCodeChatModel(base_options=None).bind_tools(tools_list)
             return list(probe.tools_metadata)
@@ -2462,8 +2523,8 @@ class AgentProcess:
         ``a2a_port``/``a2a_url`` atomically with the rest of the registration.
         """
         try:
-            from deepworker_a2a.config import A2AConfig
-            from deepworker_a2a.server import maybe_start_a2a_server
+            from deep_worker.providers.deepworker_a2a.config import A2AConfig
+            from deep_worker.providers.deepworker_a2a.server import maybe_start_a2a_server
         except Exception:  # noqa: BLE001 — optional dependency / package
             _logger.info("deepworker_a2a not importable; A2A disabled")
             return
@@ -3241,7 +3302,9 @@ class AgentProcess:
         """
         provider = getattr(getattr(self, "config", None), "provider", None)
         try:
-            metadata = type(self)._extract_final_tool_metadata(self.agent)
+            metadata = type(self)._extract_final_tool_metadata(
+                self.agent, provider=provider
+            )
         except Exception as e:  # noqa: BLE001
             return {"success": False, "error": f"tools unavailable: {e}"}
 
