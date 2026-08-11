@@ -10,17 +10,18 @@ operational detail.
 
 - **Daemon + CLI.** Each agent runs as its own background process
   (`deep-worker <agent>`). You talk to it through the interactive `dwcli`
-  client, which connects to the daemon over **RPyC** on `127.0.0.1`
-  (port `18861` by default). The RPyC service runs a single event loop with
-  no worker threads.
+  client, which connects to the daemon over **rpyc_async** — an
+  AsyncioServer-based RPyC fork — on `127.0.0.1` (port `18861` by default).
+  The rpyc_async service runs a single event loop with no worker threads.
 - **Localhost only.** All network services bind exclusively to `127.0.0.1`
   and carry **no authentication** — the security model is localhost
   isolation on a trusted machine. See
   [`deep_worker/deep_worker_cli/SECURITY.md`](../deep_worker/deep_worker_cli/SECURITY.md).
 - **No virtual environments.** The project runs with the system Python from
-  a source checkout; RPyC is imported from a vendored source tree
-  (`rpyc-async`) rather than PyPI. Using a `.venv` or `pip install rpyc`
-  breaks the proxy layer, so it is deliberately unsupported
+  a source checkout; rpyc_async is imported from a local source checkout
+  (`rpyc-async`, an AsyncioServer-based RPyC fork) rather than from PyPI.
+  Using a `.venv` or `pip install rpyc` breaks the proxy layer, so it is
+  deliberately unsupported
   (see [`deep_worker/README.md`](../deep_worker/README.md)).
 
 ## Components
@@ -119,6 +120,6 @@ modules: `storage_paths.py`, `agent_process.py`, `agent_command.py`,
 
 All services bind to `127.0.0.1` only and are designed for **local trusted
 environments**: no authentication, `allow_public_attrs` and `allow_pickle`
-enabled on the RPyC channel, and no external interfaces. Do not expose the
-daemon port (`18861` by default) to a network. See
+enabled on the rpyc_async channel, and no external interfaces. Do not expose
+the daemon port (`18861` by default) to a network. See
 [`deep_worker/deep_worker_cli/SECURITY.md`](../deep_worker/deep_worker_cli/SECURITY.md).

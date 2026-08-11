@@ -39,8 +39,9 @@ deep-worker my_agent
 dwcli my_agent
 ```
 
-The agent daemon and the CLI communicate over RPyC on `127.0.0.1`. All services
-bind to localhost only and are designed for **local trusted environments** — see
+The agent daemon and the CLI communicate over rpyc_async — an
+AsyncioServer-based RPyC fork — on `127.0.0.1`. All services bind to
+localhost only and are designed for **local trusted environments** — see
 `deep_worker/deep_worker_cli/SECURITY.md`.
 
 ## Notable features
