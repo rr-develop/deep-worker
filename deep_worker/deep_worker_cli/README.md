@@ -9,13 +9,22 @@ infrastructure (see the root [README](../../README.md) for the component map).
 
 ## Quick Install
 
-This repository is used from a source checkout — no `pip install`:
+There are two supported ways to use `deep-worker`:
+
+**1. From a source checkout (recommended for development)** — no `pip install`:
 
 ```bash
 # Point the launchers into your PATH (project policy: no virtual environments)
 ln -sf /path/to/checkout/deep_worker/deep_worker_cli/deep-worker ~/.local/bin/deep-worker
 ln -sf /path/to/checkout/deep_worker/deep_worker_cli/dwcli ~/.local/bin/dwcli
 ```
+
+**2. From a built wheel (`pip install deep-worker`)** — for consuming the
+package without the source tree. See
+[`docs/BUILD_INSTALL_GUIDE.md`](docs/BUILD_INSTALL_GUIDE.md) for build,
+check, and install instructions. Note the wheel's limitations
+(`--import-claude` is unavailable; `deepagents` is vendored, so the official
+PyPI `deepagents` must not be co-installed).
 
 See [`deep_worker/README.md`](../../deep_worker/README.md) for the no-venv
 runtime model.

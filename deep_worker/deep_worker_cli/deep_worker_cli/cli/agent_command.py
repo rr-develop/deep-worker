@@ -9,7 +9,7 @@ from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Protocol
 
 from deep_worker_cli.agent_config_pkg.agent_config import AgentConfig
 from deep_worker_cli.client.agent_client import AgentClient
@@ -31,10 +31,54 @@ index_all_history_files = None
 _repo_root = Path(__file__).resolve().parents[4]  # .../<repo>/  (cli→cli_pkg→pkg→deep_worker→repo)
 if (_repo_root / "claude_code_provider").exists() and str(_repo_root) not in sys.path:
     sys.path.insert(0, str(_repo_root))
-from claude_code_provider.session_import import (  # noqa: E402
-    parse_claude_transcript,
-    resolve_transcript_path,
-)
+
+
+class _ParseClaudeTranscript(Protocol):
+    def __call__(self, path: str | Path) -> list[Any]: ...
+
+
+class _ResolveTranscriptPath(Protocol):
+    def __call__(self, uuid_or_path: str, cwd: str | None) -> Path: ...
+
+
+def _load_claude_session_imports() -> tuple[
+    _ParseClaudeTranscript | None,
+    _ResolveTranscriptPath | None,
+]:
+    """Best-effort import of the claude-code transcript importer.
+
+    ``claude_code_provider`` is a monorepo-only package (NOT vendored into the
+    PyPI wheel). When it is genuinely absent, degrade gracefully: keep this
+    module importable (``--help`` etc.) and let ``--import-claude`` report a
+    clear error at use time. Only the missing-provider case
+    (``ModuleNotFoundError`` on ``claude_code_provider`` itself) is swallowed;
+    any other import defect of an installed/source provider — including a
+    missing/renamed ``claude_code_provider.session_import`` submodule — is
+    re-raised so it is not masked as "package absent".
+
+    Returns:
+        ``(parse_claude_transcript, resolve_transcript_path)``, or
+        ``(None, None)`` when ``claude_code_provider`` is not installed.
+
+    Raises:
+        ModuleNotFoundError: an import defect OTHER than the missing
+            ``claude_code_provider`` package itself.
+    """
+    try:
+        from claude_code_provider.session_import import (  # noqa: PLC0415
+            parse_claude_transcript,
+            resolve_transcript_path,
+        )
+    except ModuleNotFoundError as exc:
+        if exc.name != "claude_code_provider":
+            raise
+        return None, None
+    return parse_claude_transcript, resolve_transcript_path
+
+
+# Module globals, patched by tests (``agent_command.parse_claude_transcript``
+# etc.). None when the monorepo-only provider is absent.
+parse_claude_transcript, resolve_transcript_path = _load_claude_session_imports()
 
 
 # ---------------------------------------------------------------------------
@@ -1459,6 +1503,15 @@ async def handle_import_claude(args: argparse.Namespace) -> int:
     to stderr (this runs pre-daemonize so the user sees them).
     """
     from deep_worker_cli import sessions  # noqa: PLC0415
+
+    if parse_claude_transcript is None or resolve_transcript_path is None:
+        print(
+            "Error: --import-claude requires the claude_code_provider package, "
+            "which is only available in the source checkout (not in the PyPI "
+            "wheel).",
+            file=sys.stderr,
+        )
+        return 2
 
     uuid_or_path = args.import_claude
     cwd = str(args.dir.resolve()) if getattr(args, "dir", None) else None

@@ -54,15 +54,16 @@ def _get_git_commit_info(tree_root: str | None) -> tuple[str, str]:
     return sha, describe
 
 # ============================================================================
-# CRITICAL: RPYC_ASYNC MUST BE IMPORTED FROM SOURCE, NOT FROM PIP!
+# RPYC_ASYNC — IMPORTED FROM THE INSTALLED PACKAGE (PyPI)
 # ============================================================================
-# Add rpyc_async to sys.path to use AsyncioServer from a local rpyc_async source checkout
-# This enables true bidirectional async communication (156x faster!)
-# DO NOT use 'pip install rpyc' - it will use classic RPyC 5.0 without AsyncioServer
+# rpyc-async is a regular PyPI dependency (>=1.0.0, owner decision
+# 2026-08-11) providing the AsyncioServer-based protocol:
+#   - rpyc.core.async_connect.async_connect  (async client)
+#   - Connection.aclose() / wait_closed()    (async close)
+# The previous source-checkout sys.path injection was removed: on a
+# developer machine it shadowed the PyPI package with sources, which made
+# "clean env" wheel installs test the wrong code.
 # ============================================================================
-_rpyc_async_path = Path("/path/to/rpyc_async")
-if _rpyc_async_path.exists() and str(_rpyc_async_path) not in sys.path:
-    sys.path.insert(0, str(_rpyc_async_path))
 
 from rpyc_async.core.protocol import DEFAULT_CONFIG
 from rpyc_async.utils.async_server import AsyncioServer  # AsyncioServer from rpyc_async!

@@ -807,12 +807,15 @@ source = { editable = "." }
 dependencies = [
     { name = "aiosqlite" },
     { name = "daytona" },
-    { name = "deepagents" },
     { name = "grpcio" },
     { name = "langchain" },
+    { name = "langchain-anthropic" },
+    { name = "langchain-core" },
     { name = "langchain-deepseek" },
     { name = "langchain-openai" },
+    { name = "langgraph" },
     { name = "langgraph-checkpoint-sqlite" },
+    { name = "langgraph-prebuilt" },
     { name = "langsmith" },
     { name = "markdownify" },
     { name = "mcp" },
@@ -830,6 +833,7 @@ dependencies = [
     { name = "textual" },
     { name = "textual-autocomplete" },
     { name = "watchfiles" },
+    { name = "wcmatch" },
 ]
 
 [package.optional-dependencies]
@@ -840,6 +844,7 @@ vertexai = [
 [package.dev-dependencies]
 test = [
     { name = "build" },
+    { name = "deepagents" },
     { name = "grpcio-tools" },
     { name = "pyte" },
     { name = "pytest" },
@@ -860,13 +865,16 @@ test = [
 requires-dist = [
     { name = "aiosqlite", specifier = ">=0.19.0,<1.0.0" },
     { name = "daytona", specifier = ">=0.113.0,<1.0.0" },
-    { name = "deepagents", editable = "../deepagents" },
     { name = "grpcio", specifier = ">=1.76,<1.77" },
     { name = "langchain", specifier = "==1.2.9" },
+    { name = "langchain-anthropic", specifier = "==1.3.2" },
+    { name = "langchain-core", specifier = "==1.2.9" },
     { name = "langchain-deepseek", specifier = "==1.0.1" },
     { name = "langchain-google-vertexai", marker = "extra == 'vertexai'", specifier = ">=3.0.0,<4.0.0" },
     { name = "langchain-openai", specifier = "==1.1.7" },
+    { name = "langgraph", specifier = "==1.0.8" },
     { name = "langgraph-checkpoint-sqlite", specifier = "==3.0.3" },
+    { name = "langgraph-prebuilt", specifier = "==1.0.7" },
     { name = "langsmith", specifier = ">=0.6.6,<0.7" },
     { name = "markdownify", specifier = ">=0.13.0,<2.0.0" },
     { name = "mcp", specifier = "==1.17.0" },
@@ -878,18 +886,20 @@ requires-dist = [
     { name = "pyyaml", specifier = ">=6.0.0" },
     { name = "requests", specifier = ">=2.0.0,<3.0.0" },
     { name = "rich", specifier = ">=14.0.0,<15.0.0" },
-    { name = "rpyc-async", directory = "../../../rpyc_async" },
+    { name = "rpyc-async", specifier = ">=1.0.0" },
     { name = "runloop-api-client", specifier = ">=0.69.0" },
     { name = "tavily-python", specifier = ">=0.7.21,<1.0.0" },
     { name = "textual", specifier = ">=6.0.0,<8.0.0" },
     { name = "textual-autocomplete", specifier = ">=3.0.0,<5.0.0" },
     { name = "watchfiles", specifier = ">=1.1,<2.0" },
+    { name = "wcmatch", specifier = ">=8.5.0,<11.0.0" },
 ]
 provides-extras = ["vertexai"]
 
 [package.metadata.requires-dev]
 test = [
     { name = "build", specifier = ">=1.0.0,<2.0.0" },
+    { name = "deepagents", editable = "../deepagents" },
     { name = "grpcio-tools", specifier = ">=1.76,<1.77" },
     { name = "pyte", specifier = ">=0.8.2,<1.0.0" },
     { name = "pytest", specifier = ">=8.3.4,<10.0.0" },
@@ -1930,7 +1940,7 @@ wheels = [
 
 [[package]]
 name = "langgraph"
-version = "1.0.10"
+version = "1.0.8"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "langchain-core" },
@@ -1940,9 +1950,9 @@ dependencies = [
     { name = "pydantic" },
     { name = "xxhash" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/55/92/14df6fefba28c10caf1cb05aa5b8c7bf005838fe32a86d903b6c7cc4018d/langgraph-1.0.10.tar.gz", hash = "sha256:73bd10ee14a8020f31ef07e9cd4c1a70c35cc07b9c2b9cd637509a10d9d51e29", size = 511644, upload-time = "2026-02-27T21:04:38.743Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/ca/49/e9551965d8a44dd9afdc55cbcdc5a9bd18bee6918cc2395b225d40adb77c/langgraph-1.0.8.tar.gz", hash = "sha256:2630fc578846995114fd659f8b14df9eff5a4e78c49413f67718725e88ceb544", size = 498708, upload-time = "2026-02-06T12:31:13.776Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/5d/60/260e0c04620a37ba8916b712766c341cc5fc685dabc6948c899494bbc2ae/langgraph-1.0.10-py3-none-any.whl", hash = "sha256:7c298bef4f6ea292fcf9824d6088fe41a6727e2904ad6066f240c4095af12247", size = 160920, upload-time = "2026-02-27T21:04:35.932Z" },
+    { url = "https://files.pythonhosted.org/packages/9a/72/b0d7fc1007821a08dfc03ce232f39f209aa4aa46414ea3d125b24e35093a/langgraph-1.0.8-py3-none-any.whl", hash = "sha256:da737177c024caad7e5262642bece4f54edf4cba2c905a1d1338963f41cf0904", size = 158144, upload-time = "2026-02-06T12:31:12.489Z" },
 ]
 
 [[package]]
@@ -1974,15 +1984,15 @@ wheels = [
 
 [[package]]
 name = "langgraph-prebuilt"
-version = "1.0.10"
+version = "1.0.7"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "langchain-core" },
     { name = "langgraph-checkpoint" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/fe/c8/01471b1b5601f2e9c9a69c39fc9a2fb8611613ede0002e5a2b81c0acd850/langgraph_prebuilt-1.0.10.tar.gz", hash = "sha256:5a6fc513f8907074563b6218ff991c4ed9db19ac63101314919686e8029ddb07", size = 169769, upload-time = "2026-04-17T17:59:45.373Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/a7/59/711aecd1a50999456850dc328f3cad72b4372d8218838d8d5326f80cb76f/langgraph_prebuilt-1.0.7.tar.gz", hash = "sha256:38e097e06de810de4d0e028ffc0e432bb56d1fb417620fb1dfdc76c5e03e4bf9", size = 163692, upload-time = "2026-01-22T16:45:22.801Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/50/49/d073375beabdc6955df6cbe570ba7786836bd4c817ae998955d35037f2fd/langgraph_prebuilt-1.0.10-py3-none-any.whl", hash = "sha256:e3baa1977d819982e690a357ba5bb77ccc1d4d8d4a029c48e502a3b6d171185f", size = 36086, upload-time = "2026-04-17T17:59:44.395Z" },
+    { url = "https://files.pythonhosted.org/packages/47/49/5e37abb3f38a17a3487634abc2a5da87c208cc1d14577eb8d7184b25c886/langgraph_prebuilt-1.0.7-py3-none-any.whl", hash = "sha256:e14923516504405bb5edc3977085bc9622c35476b50c1808544490e13871fe7c", size = 35324, upload-time = "2026-01-22T16:45:21.784Z" },
 ]
 
 [[package]]
@@ -3869,13 +3879,15 @@ wheels = [
 
 [[package]]
 name = "rpyc-async"
-source = { directory = "../../../rpyc_async" }
+version = "1.0.0"
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "plumbum" },
 ]
-
-[package.metadata]
-requires-dist = [{ name = "plumbum" }]
+sdist = { url = "https://files.pythonhosted.org/packages/32/7c/ba62b9da3790966de7aa81e098db7d397ea5a62bbc79ac864c0b7949f878/rpyc_async-1.0.0.tar.gz", hash = "sha256:6ad2fe44b3c48f183f306906ef956c724147c0810219cdd83bd11b984d2cb60b", size = 123578, upload-time = "2026-08-03T17:41:36.005Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/7a/53/69c79c463b6b219f4d697893daf92ea98f1897eab0b5f0b88e717d7501c0/rpyc_async-1.0.0-py3-none-any.whl", hash = "sha256:1dc3a8af0c9b927cdf62832a7eda860d55c1f6aecf3c0e88facaa9d0eec64b96", size = 139482, upload-time = "2026-08-03T17:41:34.752Z" },
+]
 
 [[package]]
 name = "ruff"

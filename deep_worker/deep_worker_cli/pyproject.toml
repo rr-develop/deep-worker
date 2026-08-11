@@ -34,9 +34,27 @@ dependencies = [
   # see a related internal incident analysis (not included here) and the
   # subagent recursion_limit bug fixed in
   # deepagents/middleware/subagents.py.
-  "deepagents==0.3.12",
+  #
+  # NOTE: `deepagents` is NOT a runtime dependency — the in-tree fork
+  # (deep_worker/deepagents/) is vendored into the wheel/sdist via
+  # [tool.hatch.build.targets.*.force-include] (owner decision
+  # 2026-08-11). Its runtime deps (langchain-core, langchain-anthropic,
+  # wcmatch) are declared here explicitly; the fork itself is kept
+  # importable for local development via [dependency-groups] test +
+  # [tool.uv.sources] (see below).
   "langchain==1.2.9",
+  "langchain-core==1.2.9",
+  "langchain-anthropic==1.3.2",
   "langchain-openai==1.1.7",
+  # langgraph*: pinned to the last versions compatible with langchain 1.2.9.
+  # langgraph-prebuilt>=1.0.9 imports ExecutionInfo from langgraph.runtime,
+  # which does not exist in any langgraph 1.0.x release — a plain
+  # `pip install deep-worker` would resolve prebuilt 1.0.13 + langgraph
+  # 1.0.10 and crash at import time (verified 2026-08-11). The host pair
+  # langgraph 1.0.8 + langgraph-prebuilt 1.0.7 is the last known-good
+  # combination and is pinned here.
+  "langgraph==1.0.8",
+  "langgraph-prebuilt==1.0.7",
   # DeepSeek thinking models (deepseek-v4-flash) require reasoning_content to
   # be round-tripped; we build them with ReasoningChatDeepSeek (subclass of
   # ChatDeepSeek). Pinned exact to match the reference install. See
@@ -69,9 +87,12 @@ dependencies = [
   # Clipboard
   "pyperclip>=1.11.0,<2.0.0",
 
-  # IPC/RPC - MIGRATED TO ASYNCIO SERVER
-  # Using rpyc_async from source (with AsyncioServer support)
-  "rpyc-async @ file:///path/to/rpyc_async",
+  # IPC/RPC — PyPI package (AsyncioServer-based RPyC fork).
+  # Switched from a local ``file://`` source reference to the public PyPI
+  # package (owner decision 2026-08-11): "rpyc_async has been working
+  # stably lately, and this also lets us test the public version".
+  # First public release may pin ==1.0.0.
+  "rpyc-async>=1.0.0",
 
   # Utilities
   "python-dotenv>=1.0.0,<2.0.0",
@@ -79,6 +100,9 @@ dependencies = [
   "pillow>=10.0.0,<13.0.0",
   "pyyaml>=6.0.0",
   "aiosqlite>=0.19.0,<1.0.0",
+  # Vendored deepagents backends/filesystem.py + backends/utils.py use
+  # wcmatch.glob (fork runtime dep moved into deep_worker_cli).
+  "wcmatch>=8.5.0,<11.0.0",
 
   # LSP shared-service (see docs/DESIGN_LSP_SHARED_SERVICE.md).
   # Pinned to the 1.76.x line: 1.83+ pulls in protobuf 7.x and breaks
@@ -118,6 +142,14 @@ test = [
     "responses>=0.25.0,<1.0.0",
     "twine>=6.0.0,<7.0.0",
     "pyte>=0.8.2,<1.0.0",  # Terminal emulator for UI testing
+    # Local-dev seam for the VENDORED deepagents fork (owner decision
+    # 2026-08-11): the fork is NOT a runtime dependency (it ships inside
+    # the wheel via force-include), but local dev / tests / type-check
+    # still need it importable. PEP 735 groups do NOT land in wheel
+    # METADATA, so this keeps `pip install deep-worker` free of any
+    # `Requires-Dist: deepagents`. Resolved as editable from
+    # ../deepagents via [tool.uv.sources] below.
+    "deepagents",
     # Regenerating LSP-service gRPC stubs (see the LSP service proto
     # definition). Kept in `test` group because the pre-commit uv env
     # pulls it in for the type-check pass — same MAJOR/MINOR as grpcio
@@ -125,15 +157,35 @@ test = [
     "grpcio-tools>=1.76,<1.77",
 ]
 
-[tool.hatch.metadata]
-allow-direct-references = true
-
+# ---------------------------------------------------------------------------
+# Packaging (hatchling). The vendored deepagents fork and the LICENSE file
+# are force-included in BOTH wheel and sdist via the `deepagents` / `LICENSE`
+# paths relative to THIS project root:
+#
+#   deep_worker_cli/deepagents  → symlink → ../deepagents/deepagents
+#                                 (the in-tree fork; the symlink makes the
+#                                 same relative path valid inside the
+#                                 extracted sdist)
+#   deep_worker_cli/LICENSE     → copy of the repo-root MIT LICENSE
+#                                 (drift-guarded by a unit test)
+#
+# `allow-direct-references` is intentionally ABSENT: it was only needed for
+# the old `rpyc-async @ file://...` dependency, which is gone.
+# ---------------------------------------------------------------------------
 [tool.hatch.build.targets.wheel]
 packages = ["deep_worker_cli"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"deepagents" = "deepagents"
+"LICENSE" = "LICENSE"
 
 [tool.hatch.build.targets.wheel.shared-data]
 "deep_worker_cli/default_agent_prompt.md" = "deep_worker_cli/default_agent_prompt.md"
 "deep_worker_cli/*.tcss" = "deep_worker_cli/"
+
+[tool.hatch.build.targets.sdist.force-include]
+"deepagents" = "deepagents"
+"LICENSE" = "LICENSE"
 
 [tool.uv.sources]
 deepagents = { path = "../deepagents", editable = true }
@@ -143,20 +195,16 @@ deepagents = { path = "../deepagents", editable = true }
 # extra-paths is SAFETY-CRITICAL. DO NOT REMOVE ENTRIES without replacing
 # them with a working equivalent. In particular:
 #
-#   the local rpyc_async checkout
-#       ← MUST be present. This project talks to agents over
-#         rpyc_async's AsyncioServer and uses rpyc_async-specific
-#         entry points that do not exist in the pip/stub `rpyc`:
+#   rpyc_async (previously a local source checkout)
+#       ← Removed 2026-08-11: rpyc-async is now installed from PyPI
+#         (>=1.0.0) as a regular dependency, so `ty` resolves the
+#         AsyncioServer-specific entry points from the installed package:
 #           - `rpyc.core.async_connect.async_connect`  (async client)
 #           - `Connection.aclose()`                    (async close)
 #           - `Connection.wait_closed()`               (async close wait)
 #           - `Connection.add_close_callback(cb)`
-#         Without this path, `ty` resolves `rpyc` to the pip stub,
-#         fails to find those methods, and the pre-commit type check
-#         blocks the commit. The correct fix is to keep this entry,
-#         NOT to silence the type check with `# ty: ignore[...]` or
-#         `# type: ignore`. Such suppressions are FORBIDDEN by policy
-#         (see the repository's pre-commit hook and CLAUDE.md).
+#         If the PyPI package ever lacks those, fix the package — do NOT
+#         re-add a local source path and do NOT silence with `# ty: ignore`.
 #
 # If you are tempted to bypass type checks: don't. Fix the path here
 # or fix the real type error. There are no third options.
@@ -180,7 +228,6 @@ extra-paths = [
     "../../claude_code_provider",
     "../../semantic_search",
     "../deepagents",
-    "/path/to/rpyc_async",
 ]
 
 [tool.ty.rules]
