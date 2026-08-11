@@ -43,9 +43,27 @@ The agent daemon and the CLI communicate over RPyC on `127.0.0.1`. All services
 bind to localhost only and are designed for **local trusted environments** — see
 `deep_worker/deep_worker_cli/SECURITY.md`.
 
+## Notable features
+
+- **External MCP tools** — attach tools from external MCP servers, layered
+  configuration (user-global → project → per-agent → CLI)
+- **A2A protocol support** — inbound A2A server plus outbound tools for
+  agent-to-agent interoperability
+- **Delta checkpointer** — store only checkpoint changes, not full state
+- **`read_image` tool** — pass image files to vision-capable providers
+- **`send_message_to_agent` tool** — inter-agent messaging with replies
+- **Summarization** — automatic context compaction plus on-demand
+  `deep-worker <agent> --summarize`
+- **Storage auto-migration (v4)** — agents migrate to the current storage
+  format automatically on restart
+
+See [`docs/ARCHITECTURE_OVERVIEW.md`](docs/ARCHITECTURE_OVERVIEW.md) for the
+full architecture map.
+
 ## Documentation
 
 - [`docs/`](docs/) — component documentation, design notes and internal policies
+- [`docs/ARCHITECTURE_OVERVIEW.md`](docs/ARCHITECTURE_OVERVIEW.md) — architecture overview: daemon model, components, storage, notable features
 - [`deep_worker/deep_worker_cli/README.md`](deep_worker/deep_worker_cli/README.md) — CLI usage, storage options, thread management
 - [`dw_hist/README.md`](dw_hist/README.md) — `dw-hist` usage
 - [`lsp/README.md`](lsp/README.md) — LSP code navigation for agents

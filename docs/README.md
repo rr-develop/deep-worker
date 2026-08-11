@@ -7,6 +7,7 @@ and internal design/process notes.
 
 | Document | Purpose |
 |---|---|
+| [`ARCHITECTURE_OVERVIEW.md`](ARCHITECTURE_OVERVIEW.md) | Architecture overview: daemon model, components, storage, notable features |
 | [`deep_worker/deep_worker_cli/README.md`](../deep_worker/deep_worker_cli/README.md) | `deep-worker` / `dwcli` usage: storage, threads, history |
 | [`deep_worker/deep_worker_cli/SECURITY.md`](../deep_worker/deep_worker_cli/SECURITY.md) | Security model (localhost-only) |
 | [`deep_worker/README.md`](../deep_worker/README.md) | Core agent framework notes |
@@ -15,6 +16,7 @@ and internal design/process notes.
 | [`codex_provider/README.md`](../codex_provider/README.md) | Codex CLI provider |
 | [`claude_code_provider/README.md`](../claude_code_provider/README.md) | Claude Code provider |
 | [`grok_provider/README.md`](../grok_provider/README.md) | Grok CLI provider |
+| [`deep_worker_web/README.md`](../deep_worker_web/README.md) | Local web UI |
 
 ## Design and research
 
