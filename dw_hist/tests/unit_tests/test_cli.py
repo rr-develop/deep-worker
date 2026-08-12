@@ -11,6 +11,7 @@ import pytest
 from dw_hist import cli
 
 
+from deep_worker_cli.storage_paths import deep_worker_home
 # -------- argparse / exit-code routing -----------------------------------
 
 
@@ -18,7 +19,6 @@ def _run(argv: list[str], **kwargs: Any) -> tuple[int, str, str]:
     """Invoke cli.main with capsys-like capture; return (code, stdout, stderr)."""
     import io
     import contextlib
-
     out, err = io.StringIO(), io.StringIO()
     with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
         code = cli.main(argv, **kwargs)
@@ -33,7 +33,7 @@ def test_list_with_empty_home_exits_0_no_stdout(tmp_path: Path) -> None:
 
 def test_list_with_two_agents_text_output(tmp_path: Path) -> None:
     for name in ("alpha", "bravo"):
-        (tmp_path / Path("~/.deep_worker").name / name / "summaries" / ".history_index" / "lancedb").mkdir(
+        (deep_worker_home(tmp_path) / name / "summaries" / ".history_index" / "lancedb").mkdir(
             parents=True
         )
     code, stdout, _ = _run(["--list"], home=tmp_path)
@@ -42,7 +42,7 @@ def test_list_with_two_agents_text_output(tmp_path: Path) -> None:
 
 
 def test_list_json_output(tmp_path: Path) -> None:
-    (tmp_path / Path("~/.deep_worker").name / "solo" / "summaries" / ".history_index" / "lancedb").mkdir(
+    (deep_worker_home(tmp_path) / "solo" / "summaries" / ".history_index" / "lancedb").mkdir(
         parents=True
     )
     code, stdout, _ = _run(["--list", "--format", "json"], home=tmp_path)
@@ -52,7 +52,7 @@ def test_list_json_output(tmp_path: Path) -> None:
         "agents": [
             {
                 "name": "solo",
-                "summaries_dir": str(tmp_path / Path("~/.deep_worker").name / "solo" / "summaries"),
+                "summaries_dir": str(deep_worker_home(tmp_path) / "solo" / "summaries"),
             }
         ]
     }
@@ -83,7 +83,7 @@ def test_unknown_agent_exits_2(tmp_path: Path) -> None:
 
 
 def test_agent_without_index_exits_3(tmp_path: Path) -> None:
-    (tmp_path / Path("~/.deep_worker").name / "novice" / "summaries").mkdir(parents=True)
+    (deep_worker_home(tmp_path) / "novice" / "summaries").mkdir(parents=True)
     # No .history_index/lancedb/
     code, _, stderr = _run(["novice", "-q", "anything"], home=tmp_path)
     assert code == 3
@@ -92,7 +92,7 @@ def test_agent_without_index_exits_3(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("bad_k", ["0", "-1", "21", "100"])
 def test_invalid_top_k_exits_2_before_any_search(tmp_path: Path, bad_k: str) -> None:
-    (tmp_path / Path("~/.deep_worker").name / "alpha" / "summaries" / ".history_index" / "lancedb").mkdir(
+    (deep_worker_home(tmp_path) / "alpha" / "summaries" / ".history_index" / "lancedb").mkdir(
         parents=True
     )
     called = []
@@ -111,7 +111,7 @@ def test_invalid_top_k_exits_2_before_any_search(tmp_path: Path, bad_k: str) -> 
 
 
 def test_search_calls_search_history_and_formats_text(tmp_path: Path) -> None:
-    summaries = tmp_path / Path("~/.deep_worker").name / "alpha" / "summaries"
+    summaries = deep_worker_home(tmp_path) / "alpha" / "summaries"
     (summaries / ".history_index" / "lancedb").mkdir(parents=True)
 
     captured: dict[str, Any] = {}
@@ -158,7 +158,7 @@ def test_search_calls_search_history_and_formats_text(tmp_path: Path) -> None:
 
 
 def test_search_json_output(tmp_path: Path) -> None:
-    summaries = tmp_path / Path("~/.deep_worker").name / "alpha" / "summaries"
+    summaries = deep_worker_home(tmp_path) / "alpha" / "summaries"
     (summaries / ".history_index" / "lancedb").mkdir(parents=True)
 
     def fake_search(query: str, summaries_dir: str | Path, top_k: int = 5) -> list:
@@ -195,7 +195,7 @@ def test_search_json_output(tmp_path: Path) -> None:
 def _make_noisy_search() -> Any:
     """Build a fake search_func that splashes the same kind of noise on BOTH
     stdout and stderr that the real semantic_search + transformers + llama_index
-    stack produces on the first index load (see DESIGN §5.2)."""
+    stack produces on the first index load (see DESIGN §5.2 RC-G/H)."""
     import sys as _sys
 
     def noisy_search(query: str, summaries_dir: str | Path, top_k: int = 5) -> list:
@@ -235,7 +235,7 @@ def test_search_silences_both_streams_by_default(
     NOT leak through. stdout carries only dw-hist's formatted output and is
     JSON-parseable; stderr stays empty."""
     monkeypatch.delenv("DW_HIST_VERBOSE", raising=False)
-    summaries = tmp_path / Path("~/.deep_worker").name / "alpha" / "summaries"
+    summaries = deep_worker_home(tmp_path) / "alpha" / "summaries"
     (summaries / ".history_index" / "lancedb").mkdir(parents=True)
 
     code, stdout, stderr = _run(
@@ -266,7 +266,7 @@ def test_search_verbose_lets_noise_through(
     still our formatted output."""
     # Make sure the env-var that --verbose sets does not leak out of this test.
     monkeypatch.delenv("DW_HIST_VERBOSE", raising=False)
-    summaries = tmp_path / Path("~/.deep_worker").name / "alpha" / "summaries"
+    summaries = deep_worker_home(tmp_path) / "alpha" / "summaries"
     (summaries / ".history_index" / "lancedb").mkdir(parents=True)
 
     code, stdout, stderr = _run(
@@ -286,7 +286,7 @@ def test_search_verbose_lets_noise_through(
 
 
 def test_search_zero_results_exit_0(tmp_path: Path) -> None:
-    summaries = tmp_path / Path("~/.deep_worker").name / "alpha" / "summaries"
+    summaries = deep_worker_home(tmp_path) / "alpha" / "summaries"
     (summaries / ".history_index" / "lancedb").mkdir(parents=True)
 
     def fake_search(*a: Any, **kw: Any) -> list:
@@ -300,7 +300,7 @@ def test_search_zero_results_exit_0(tmp_path: Path) -> None:
 
 
 def test_search_runtime_error_exits_4(tmp_path: Path) -> None:
-    summaries = tmp_path / Path("~/.deep_worker").name / "alpha" / "summaries"
+    summaries = deep_worker_home(tmp_path) / "alpha" / "summaries"
     (summaries / ".history_index" / "lancedb").mkdir(parents=True)
 
     def fake_search(*a: Any, **kw: Any) -> list:
@@ -316,7 +316,7 @@ def test_search_runtime_error_exits_4(tmp_path: Path) -> None:
 
 
 def test_search_file_not_found_during_search_maps_to_exit_3(tmp_path: Path) -> None:
-    summaries = tmp_path / Path("~/.deep_worker").name / "alpha" / "summaries"
+    summaries = deep_worker_home(tmp_path) / "alpha" / "summaries"
     (summaries / ".history_index" / "lancedb").mkdir(parents=True)
 
     def fake_search(*a: Any, **kw: Any) -> list:
@@ -331,7 +331,7 @@ def test_search_file_not_found_during_search_maps_to_exit_3(tmp_path: Path) -> N
 
 def _make_message_store(home: Path, agent: str = "alpha") -> Path:
     """Create the minimal per-message store layout the -qm pre-check requires."""
-    summaries = home / Path("~/.deep_worker").name / agent / "summaries"
+    summaries = deep_worker_home(home) / agent / "summaries"
     store = summaries / ".message_embeddings"
     store.mkdir(parents=True)
     (store / "embeddings.npy").write_bytes(b"\x00")
@@ -404,7 +404,7 @@ def test_qm_unknown_flag_exit_2(tmp_path: Path) -> None:
 
 def test_qm_without_store_exit_3(tmp_path: Path) -> None:
     # Agent root exists but no .message_embeddings store.
-    (tmp_path / Path("~/.deep_worker").name / "alpha" / "summaries").mkdir(parents=True)
+    (deep_worker_home(tmp_path) / "alpha" / "summaries").mkdir(parents=True)
     code, _, stderr = _run(
         ["alpha", "-qm", "x"], home=tmp_path, search_messages_func=lambda **kw: []
     )
@@ -514,7 +514,7 @@ def test_isotropy_c_and_w_mutually_exclusive(tmp_path: Path) -> None:
 
 
 def test_isotropy_c_without_qm_exit_2(tmp_path: Path) -> None:
-    (tmp_path / Path("~/.deep_worker").name / "alpha" / "summaries").mkdir(parents=True)
+    (deep_worker_home(tmp_path) / "alpha" / "summaries").mkdir(parents=True)
     called: list[Any] = []
     code, _, stderr = _run(
         ["alpha", "-q", "anything", "-c"],
@@ -526,7 +526,7 @@ def test_isotropy_c_without_qm_exit_2(tmp_path: Path) -> None:
 
 
 def test_isotropy_w_without_qm_exit_2(tmp_path: Path) -> None:
-    (tmp_path / Path("~/.deep_worker").name / "alpha" / "summaries").mkdir(parents=True)
+    (deep_worker_home(tmp_path) / "alpha" / "summaries").mkdir(parents=True)
     code, _, stderr = _run(
         ["alpha", "-q", "x", "-w"], home=tmp_path,
         search_func=lambda **kw: [],
@@ -579,7 +579,7 @@ def test_whitening_eps_non_positive_exit_2(tmp_path: Path) -> None:
 
 
 def test_score_stats_without_qm_exit_2(tmp_path: Path) -> None:
-    (tmp_path / Path("~/.deep_worker").name / "alpha" / "summaries").mkdir(parents=True)
+    (deep_worker_home(tmp_path) / "alpha" / "summaries").mkdir(parents=True)
     code, _, stderr = _run(
         ["alpha", "-q", "x", "--score-stats"], home=tmp_path,
         search_func=lambda **kw: [],

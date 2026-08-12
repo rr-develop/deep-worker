@@ -194,6 +194,62 @@ The `--remove-before DATE` command also prunes summary files:
 
 **Note:** Tests automatically use in-memory storage by default for faster execution and test isolation.
 
+## 🏁 Turn-ending tools
+
+Some tools *are* the agent's answer for a turn: once they succeed there is
+nothing useful left for the model to say, and calling it again only produces
+filler text. `send_message_to_agent` works this way out of the box — an
+outgoing inter-agent message is the agent's response for that turn.
+
+Any tool can be given the same behavior by declaring it explicitly:
+
+```python
+from deep_worker_cli.agent import create_cli_agent
+from deep_worker_cli.middleware import TurnEndingTool
+
+agent, backend = create_cli_agent(
+    model="anthropic:claude-sonnet-4-5-20250929",
+    assistant_id="extractor-42",
+    project_memory_dir=work_dir,
+    tools=[submit_fragments_tool],
+    turn_ending_tools=[
+        TurnEndingTool(
+            tool_name="submit_fragments",
+            is_success=lambda result: result.get("document_closed") is True,
+            echo_field=None,
+        ),
+    ],
+)
+```
+
+`TurnEndingTool` fields:
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `tool_name` | — | Exact tool name, compared with `==` against `ToolMessage.name`. |
+| `is_success` | `result["success"]` is truthy | Predicate over the parsed tool result deciding whether this call ends the turn. |
+| `echo_field` | `"delivered_content"` | Field whose non-empty string value becomes the final assistant message. `None` ends the turn without emitting any message. |
+
+Notes:
+
+- **Registration is explicit — a tool never becomes turn-ending because of its
+  name.** There is no naming convention and no prefix matching, so an MCP
+  server cannot alter an agent's control flow by choosing a suggestive tool
+  name.
+- `send_message_to_agent` is registered automatically; re-declaring it (or any
+  name twice) raises `DuplicateTurnEndingToolError` at startup rather than
+  being silently ignored.
+- With `echo_field=None` the turn ends on the tool result itself and no
+  assistant message is created — appropriate when the tool's output is not
+  conversational. Use `echo_field` when the caller should see an answer.
+- If the model made **parallel** tool calls, the turn is not ended, so it can
+  see every result — including any sibling failure.
+- A failing `is_success` predicate is treated as "not successful" and logged;
+  it never stalls the agent.
+
+See [`docs/DESIGN_TOOL_COMPLETION_MIDDLEWARE.md`](docs/DESIGN_TOOL_COMPLETION_MIDDLEWARE.md)
+for the full contract.
+
 ## 📖 Resources
 
 - Root [README](../../README.md) — component map and quick start

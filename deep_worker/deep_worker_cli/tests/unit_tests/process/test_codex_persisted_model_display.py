@@ -5,7 +5,7 @@ from pathlib import Path
 
 from deep_worker_cli.process.agent_process import _resolve_persisted_codex_display_model
 
-
+from deep_worker_cli.storage_paths import deep_worker_home
 def test_resolve_persisted_codex_display_model_from_saved_session(
     tmp_path: Path,
     monkeypatch,
@@ -15,7 +15,7 @@ def test_resolve_persisted_codex_display_model_from_saved_session(
     monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / ".codex"))
 
-    state_dir = tmp_path / Path("~/.deep_worker").name / thread_id
+    state_dir = deep_worker_home(tmp_path) / thread_id
     state_dir.mkdir(parents=True)
     (state_dir / "codex_session_state.json").write_text(
         json.dumps({thread_id: {"sent_count": 7, "session_uuid": session_uuid}}),
@@ -44,7 +44,7 @@ def test_resolve_persisted_codex_display_model_rejects_unknown(
     monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / ".codex"))
 
-    state_dir = tmp_path / Path("~/.deep_worker").name / thread_id
+    state_dir = deep_worker_home(tmp_path) / thread_id
     state_dir.mkdir(parents=True)
     (state_dir / "codex_session_state.json").write_text(
         json.dumps({thread_id: {"sent_count": 7, "session_uuid": session_uuid}}),

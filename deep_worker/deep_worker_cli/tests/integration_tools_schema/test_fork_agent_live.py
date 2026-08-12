@@ -12,10 +12,10 @@ from pathlib import Path
 
 import pytest
 
-
+from deep_worker_cli.storage_paths import deep_worker_home
 @pytest.fixture
 def fake_source(tmp_path: Path) -> Path:
-    src = tmp_path / Path("~/.deep_worker").name / "source_agent"
+    src = deep_worker_home(tmp_path) / "source_agent"
     src.mkdir(parents=True)
     os.chmod(src, 0o700)
 
@@ -71,7 +71,7 @@ def test_fork_live_creates_dst_structure(fake_source: Path) -> None:
 
     fork_agent_data("source_agent", "new_agent", home=fake_source)
 
-    dst = fake_source / Path("~/.deep_worker").name / "new_agent"
+    dst = deep_worker_home(fake_source) / "new_agent"
     assert dst.is_dir()
 
     assert (dst / "data").is_dir()
@@ -104,7 +104,7 @@ def test_fork_with_from_truncates_summaries(tmp_path: Path) -> None:
     """--from <message_id> truncates summaries; checkpointer stays full."""
     from deep_worker_cli.fork_agent import fork_agent_data
 
-    src = tmp_path / Path("~/.deep_worker").name / "fork_src"
+    src = deep_worker_home(tmp_path) / "fork_src"
     src.mkdir(parents=True)
     os.chmod(src, 0o700)
     (src / "session_metadata.json").write_text(json.dumps({
@@ -133,7 +133,7 @@ def test_fork_with_from_truncates_summaries(tmp_path: Path) -> None:
 
     fork_agent_data("fork_src", "fork_dst", home=tmp_path, message_id="m2")
 
-    dst = tmp_path / Path("~/.deep_worker").name / "fork_dst"
+    dst = deep_worker_home(tmp_path) / "fork_dst"
     assert dst.is_dir()
 
     # summaries truncated at m2

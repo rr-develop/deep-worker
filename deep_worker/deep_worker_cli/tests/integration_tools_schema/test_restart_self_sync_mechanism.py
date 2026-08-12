@@ -24,6 +24,7 @@ from unittest.mock import patch
 import pytest
 
 
+from deep_worker_cli.storage_paths import deep_worker_home
 @pytest.mark.asyncio
 async def test_restart_self_immediately_spawns_subprocess_and_writes_notice(
     tmp_path: Path,
@@ -73,7 +74,7 @@ async def test_restart_self_immediately_spawns_subprocess_and_writes_notice(
     )
 
     # 2. Restart-notice file must exist with {ts, cause:"self"}.
-    notice_path = fake_home / Path("~/.deep_worker").name / agent_name / ".restart_notice.json"
+    notice_path = deep_worker_home(fake_home) / agent_name / ".restart_notice.json"
     assert notice_path.exists(), f"Notice file not at {notice_path}"
     notice = json.loads(notice_path.read_text())
     assert notice["cause"] == "self", notice
@@ -88,7 +89,7 @@ async def test_restart_self_immediately_spawns_subprocess_and_writes_notice(
     assert agent_name in argv, argv
 
     # 4. NO old-style flag-file.
-    flag_path = fake_home / Path("~/.deep_worker").name / agent_name / ".restart_self"
+    flag_path = deep_worker_home(fake_home) / agent_name / ".restart_self"
     assert not flag_path.exists(), (
         f"Old deferred-restart flag should NOT exist at {flag_path}"
     )

@@ -12,6 +12,7 @@ import pytest
 from deep_worker_cli.fork_agent import fork_agent_data
 
 
+from deep_worker_cli.storage_paths import deep_worker_home
 def _create_fake_source(src: Path) -> None:
     """Create a minimal fake agent data directory."""
     src.mkdir(parents=True)
@@ -79,9 +80,9 @@ class TestForkAgentData:
         _create_fake_source(src)
 
         home = tmp_path / "home"
-        # fork_agent_data resolves the agent's data directory under the user's home
-        # So source must be at <data-root>/src/
-        deep_root = home / Path("~/.deep_worker").name
+        # fork_agent_data resolves ~/.deep_worker/<name>/
+        # So source must be at deep_worker_home(home)/src/
+        deep_root = deep_worker_home(home)
         deep_root.mkdir(parents=True)
         os.chmod(deep_root, 0o700)
         src_dw = deep_root / "src_agent"
@@ -112,7 +113,7 @@ class TestForkAgentData:
             fork_agent_data("nonexistent", "dst_agent", home=tmp_path)
 
     def test_dst_already_exists(self, tmp_path: Path) -> None:
-        deep_root = tmp_path / Path("~/.deep_worker").name
+        deep_root = deep_worker_home(tmp_path)
         deep_root.mkdir(parents=True)
         os.chmod(deep_root, 0o700)
 
@@ -130,7 +131,7 @@ class TestForkAgentData:
             fork_agent_data("src_agent", "dst_agent", home=tmp_path)
 
     def test_no_data_dir(self, tmp_path: Path) -> None:
-        deep_root = tmp_path / Path("~/.deep_worker").name
+        deep_root = deep_worker_home(tmp_path)
         deep_root.mkdir(parents=True)
         os.chmod(deep_root, 0o700)
 
@@ -147,7 +148,7 @@ class TestForkAgentData:
         assert not (dst_dw / "data").exists()
 
     def test_no_summaries(self, tmp_path: Path) -> None:
-        deep_root = tmp_path / Path("~/.deep_worker").name
+        deep_root = deep_worker_home(tmp_path)
         deep_root.mkdir(parents=True)
         os.chmod(deep_root, 0o700)
 
@@ -163,7 +164,7 @@ class TestForkAgentData:
         assert not (dst_dw / "summaries").exists()
 
     def test_no_threads_db(self, tmp_path: Path) -> None:
-        deep_root = tmp_path / Path("~/.deep_worker").name
+        deep_root = deep_worker_home(tmp_path)
         deep_root.mkdir(parents=True)
         os.chmod(deep_root, 0o700)
 
@@ -179,7 +180,7 @@ class TestForkAgentData:
         assert not (dst_dw / "threads.db").exists()
 
     def test_no_session_metadata(self, tmp_path: Path) -> None:
-        deep_root = tmp_path / Path("~/.deep_worker").name
+        deep_root = deep_worker_home(tmp_path)
         deep_root.mkdir(parents=True)
         os.chmod(deep_root, 0o700)
 
@@ -198,7 +199,7 @@ class TestForkAgentData:
         _create_fake_source(src)
 
         home = tmp_path / "home"
-        deep_root = home / Path("~/.deep_worker").name
+        deep_root = deep_worker_home(home)
         deep_root.mkdir(parents=True)
         os.chmod(deep_root, 0o700)
         src_dw = deep_root / "src_agent"
@@ -222,7 +223,7 @@ class TestForkAgentData:
         _create_fake_source(src)
 
         home = tmp_path / "home"
-        deep_root = home / Path("~/.deep_worker").name
+        deep_root = deep_worker_home(home)
         deep_root.mkdir(parents=True)
         os.chmod(deep_root, 0o700)
         src.rename(deep_root / "src_agent")
@@ -243,7 +244,7 @@ class TestForkAgentData:
         _create_fake_source(src)
 
         home = tmp_path / "home"
-        deep_root = home / Path("~/.deep_worker").name
+        deep_root = deep_worker_home(home)
         deep_root.mkdir(parents=True)
         os.chmod(deep_root, 0o700)
         src.rename(deep_root / "src_agent")
@@ -253,7 +254,7 @@ class TestForkAgentData:
 
     def test_fork_with_message_id_no_summaries(self, tmp_path: Path) -> None:
         """--from when source has no summaries directory raises ValueError."""
-        deep_root = tmp_path / Path("~/.deep_worker").name
+        deep_root = deep_worker_home(tmp_path)
         deep_root.mkdir(parents=True)
         os.chmod(deep_root, 0o700)
 
@@ -278,7 +279,7 @@ class TestForkAgentData:
         os.chmod(sum_dir, 0o700)
 
         home = tmp_path / "home"
-        deep_root = home / Path("~/.deep_worker").name
+        deep_root = deep_worker_home(home)
         deep_root.mkdir(parents=True)
         os.chmod(deep_root, 0o700)
         src.rename(deep_root / "src_agent")

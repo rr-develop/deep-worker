@@ -15,14 +15,14 @@ import pytest
 from app.services.agent_service import AgentService
 from tests.fixtures.mock_registry import MockProcessRegistry
 
-
+from deep_worker_cli.storage_paths import deep_worker_home
 class _AwaitableValue:
     """Wrap a value so a call returns an awaitable, matching the RPyC
     ``async_(netref_method)()`` -> AsyncResult shape used in production: the
     non-blocking await path (``AsyncResult.__await__`` yields to the loop).
     A bare blocking netref call (``root.method()``) is FORBIDDEN — see
-    ``tests/integration/test_no_blocking_rpyc_in_handlers.py`` and the banner
-    in ``agent_service.get_agent_dialog_formatted``."""
+    ``test_no_blocking_rpyc_in_handlers.py`` and the banner in
+    ``agent_service.get_agent_dialog_formatted``."""
 
     def __init__(self, value: object) -> None:
         self._value = value
@@ -39,7 +39,7 @@ def _patch_rpyc_async(monkeypatch):  # noqa: ANN001, ANN201
     """Model production faithfully: the service MUST reach the introspection
     methods via ``rpyc.async_(root.M)()`` (the non-blocking await path), NOT a
     bare ``await root.M()`` (which blocks the event loop in
-    AsyncResult.value/serve — a past regression). Real ``rpyc.async_``
+    AsyncResult.value/serve — regression 2026-06-23). Real ``rpyc.async_``
     rejects non-netref fakes, so we stub it with the same CONTRACT: given a
     bound method, calling the wrapper returns an awaitable yielding that
     method's value. If the service ever regresses to a bare ``await
@@ -214,7 +214,7 @@ class TestLocalSystemPromptComputation:
         from pathlib import Path
 
         # Fake HOME with a session_metadata.json for agent "demo".
-        agent_dir = tmp_path / Path("~/.deep_worker").name / "demo"
+        agent_dir = deep_worker_home(tmp_path) / "demo"
         agent_dir.mkdir(parents=True)
         (agent_dir / "session_metadata.json").write_text(
             _json.dumps(

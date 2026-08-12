@@ -6,6 +6,8 @@ from pathlib import Path
 
 import pytest
 
+from deep_worker_cli.storage_paths import deep_worker_home
+
 
 def _mk(path: Path, timestamps: list[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -26,8 +28,8 @@ class TestListSummariesCommand:
 
     async def test_lists_multiple_agents_in_text(self, monkeypatch, tmp_path, capsys):
         monkeypatch.setenv("HOME", str(tmp_path))
-        _mk(tmp_path / Path("~/.deep_worker").name / "a1" / "summaries" / "a1.md", ["2026-04-01T00:00:00+00:00"])
-        _mk(tmp_path / Path("~/.deep_worker").name / "b2" / "summaries" / "b2.md", ["2026-04-02T00:00:00+00:00"])
+        _mk(deep_worker_home(tmp_path) / "a1" / "summaries" / "a1.md", ["2026-04-01T00:00:00+00:00"])
+        _mk(deep_worker_home(tmp_path) / "b2" / "summaries" / "b2.md", ["2026-04-02T00:00:00+00:00"])
 
         from deep_worker_cli.cli.agent_command import list_summaries_command
 
@@ -41,8 +43,8 @@ class TestListSummariesCommand:
 
     async def test_filter_by_agent(self, monkeypatch, tmp_path, capsys):
         monkeypatch.setenv("HOME", str(tmp_path))
-        _mk(tmp_path / Path("~/.deep_worker").name / "a1" / "summaries" / "a1.md", ["2026-04-01T00:00:00+00:00"])
-        _mk(tmp_path / Path("~/.deep_worker").name / "b2" / "summaries" / "b2.md", ["2026-04-02T00:00:00+00:00"])
+        _mk(deep_worker_home(tmp_path) / "a1" / "summaries" / "a1.md", ["2026-04-01T00:00:00+00:00"])
+        _mk(deep_worker_home(tmp_path) / "b2" / "summaries" / "b2.md", ["2026-04-02T00:00:00+00:00"])
 
         from deep_worker_cli.cli.agent_command import list_summaries_command
 
@@ -55,7 +57,7 @@ class TestListSummariesCommand:
     async def test_json_format_returns_valid_array(self, monkeypatch, tmp_path, capsys):
         monkeypatch.setenv("HOME", str(tmp_path))
         _mk(
-            tmp_path / Path("~/.deep_worker").name / "a1" / "summaries" / "a1.md",
+            deep_worker_home(tmp_path) / "a1" / "summaries" / "a1.md",
             ["2026-04-01T00:00:00+00:00", "2026-04-02T00:00:00+00:00"],
         )
         from deep_worker_cli.cli.agent_command import list_summaries_command

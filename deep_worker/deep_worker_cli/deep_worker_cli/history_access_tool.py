@@ -1,7 +1,7 @@
 """Tools for accessing pre-summarization history from markdown summary files.
 
 Three tools that give any agent read-only access to its own history stored
-in ``summaries/<thread_id>.md`` files under each agent's local data directory.
+in ``~/.deep_worker/<name>/summaries/<thread_id>.md``.
 
 These tools work for ALL agents — no ``--history-memory`` flag required.
 
@@ -18,6 +18,8 @@ import json
 import re
 from datetime import datetime, timezone
 from pathlib import Path
+
+from deep_worker_cli.storage_paths import deep_worker_home
 from typing import Any
 
 from langchain_core.tools import tool
@@ -38,7 +40,7 @@ def _resolve_path(
     if not assistant_id or not thread_id:
         return None
     home_path = Path(home) if home else Path.home()
-    return home_path / Path("~/.deep_worker").name / assistant_id / "summaries" / f"{thread_id}.md"
+    return deep_worker_home(home_path) / assistant_id / "summaries" / f"{thread_id}.md"
 
 
 def _extract_runtime_info(

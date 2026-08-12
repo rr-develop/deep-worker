@@ -10,8 +10,7 @@ import pytest
 
 from deep_worker_cli.session.session_manager import SessionManager
 from deep_worker_cli.storage_paths import STORAGE_VERSION_AGENT_ROOT
-
-
+from deep_worker_cli.storage_paths import deep_worker_home
 def _run_dw_cli(*args: str, home: Path, timeout: int = 20) -> subprocess.CompletedProcess:
     env = os.environ.copy()
     import pwd
@@ -33,7 +32,7 @@ def test_session_manager_creates_v3_metadata_with_private_permissions(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
-    root = tmp_path / Path("~/.deep_worker").name / "integ_v3_agent"
+    root = deep_worker_home(tmp_path) / "integ_v3_agent"
 
     SessionManager(root, launch_config={"provider": "codex"})
 
@@ -46,7 +45,7 @@ def test_session_manager_creates_v3_metadata_with_private_permissions(
 
 def test_dw_list_reads_v3_threads_db_without_tm_root(tmp_path: Path) -> None:
     agent = "integ_v3_list"
-    root = tmp_path / Path("~/.deep_worker").name / agent
+    root = deep_worker_home(tmp_path) / agent
     root.mkdir(parents=True, mode=0o700)
     (root / "session_metadata.json").write_text(
         json.dumps({"status": "idle", "storage_version": STORAGE_VERSION_AGENT_ROOT})
@@ -74,4 +73,4 @@ def test_dw_list_reads_v3_threads_db_without_tm_root(tmp_path: Path) -> None:
 
     assert result.returncode == 0, result.stderr or result.stdout
     assert f"{agent}:tm" in result.stdout
-    assert not (tmp_path / Path("~/.deep_worker").name / f"{agent}:tm").exists()
+    assert not (deep_worker_home(tmp_path) / f"{agent}:tm").exists()

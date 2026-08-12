@@ -2,7 +2,7 @@
 
 The tool is SYNCHRONOUS and HARD-EXITS the current process after
 spawning the replacement, so the in-flight LangGraph turn is severed
-(see the 2026-06-12 incident). There is no flag-file, no
+(see incident 2026-06-12). There is no flag-file, no
 "already_restarting" state, and no "after the turn completes" semantics.
 
 In production ``os._exit(0)`` is called right after ``subprocess.Popen``
@@ -16,7 +16,7 @@ import json
 import os
 from pathlib import Path
 
-
+from deep_worker_cli.storage_paths import deep_worker_home
 async def _ainvoke(tool, **kwargs):
     return await tool.ainvoke(kwargs)
 
@@ -82,7 +82,7 @@ class TestRestartSelfBehavior:
         tool = make_restart_self_tool(agent_name)
         await _ainvoke(tool)
 
-        notice_path = tmp_path / Path("~/.deep_worker").name / agent_name / ".restart_notice.json"
+        notice_path = deep_worker_home(tmp_path) / agent_name / ".restart_notice.json"
         assert notice_path.exists()
         notice = json.loads(notice_path.read_text())
         assert notice["cause"] == "self"
@@ -133,7 +133,7 @@ class TestRestartSelfBehavior:
         tool = make_restart_self_tool(agent_name)
         await _ainvoke(tool)
 
-        notice_path = tmp_path / Path("~/.deep_worker").name / agent_name / ".restart_notice.json"
+        notice_path = deep_worker_home(tmp_path) / agent_name / ".restart_notice.json"
         assert notice_path.exists()
         mode = notice_path.stat().st_mode & 0o777
         assert mode == 0o600, f"Expected 0o600, got {oct(mode)}"

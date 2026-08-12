@@ -12,7 +12,7 @@ from langchain_core.tools import tool
 from deep_worker_cli.agent import create_cli_agent
 from deep_worker_cli.sessions import get_checkpointer
 
-
+from deep_worker_cli.storage_paths import deep_worker_home
 class _ToolAwareFakeModel(GenericFakeChatModel):
     def bind_tools(self, tools: Any, **kwargs: Any) -> Any:
         return self
@@ -149,7 +149,7 @@ async def test_summarization_markdown_contains_per_message_created_at(
             },
         )
 
-    summary_file = tmp_path / Path("~/.deep_worker").name / agent_name / "summaries" / f"{thread_id}.md"
+    summary_file = deep_worker_home(tmp_path) / agent_name / "summaries" / f"{thread_id}.md"
     assert summary_file.exists()
     content = summary_file.read_text()
 

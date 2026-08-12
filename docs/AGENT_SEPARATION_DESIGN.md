@@ -479,7 +479,7 @@ class AgentProcess:
         # Paths
         self.socket_path = Path(f"/tmp/deep_worker_{name}.sock")
         self.pid_file = Path(f"/tmp/deep_worker_{name}.pid")
-        self.data_dir = Path(f"~/.deep_worker/{name}").expanduser()
+        self.data_dir = deep_worker_home() / name
         self.data_dir.mkdir(parents=True, exist_ok=True)
 
         # Components

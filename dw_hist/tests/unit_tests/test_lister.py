@@ -7,9 +7,10 @@ from pathlib import Path
 from dw_hist.lister import discover_agents
 
 
+from deep_worker_cli.storage_paths import deep_worker_home
 def _make_agent(home: Path, name: str, *, with_index: bool, empty_index_dir: bool = False) -> None:
     """Create ``~/.deep_worker/<name>/summaries/[.history_index/lancedb/]``."""
-    summaries = home / Path("~/.deep_worker").name / name / "summaries"
+    summaries = deep_worker_home(home) / name / "summaries"
     summaries.mkdir(parents=True, exist_ok=True)
     if with_index:
         (summaries / ".history_index" / "lancedb").mkdir(parents=True, exist_ok=True)
@@ -36,8 +37,8 @@ def test_discover_empty_home_returns_empty_list(tmp_path: Path) -> None:
 
 
 def test_discover_skips_non_directory_entries(tmp_path: Path) -> None:
-    (tmp_path / Path("~/.deep_worker").name).mkdir()
-    (tmp_path / Path("~/.deep_worker").name / "stray_file").write_text("ignore me")
+    (deep_worker_home(tmp_path)).mkdir()
+    (deep_worker_home(tmp_path) / "stray_file").write_text("ignore me")
     _make_agent(tmp_path, "real", with_index=True)
     assert discover_agents(home=tmp_path) == ["real"]
 

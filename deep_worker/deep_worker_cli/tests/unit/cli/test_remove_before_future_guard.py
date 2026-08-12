@@ -8,7 +8,7 @@ everything" and is almost always a bug. The opt-out is the explicit
 ``--force`` flag.
 
 These tests are pure-sync over ``monkeypatched HOME`` in ``tmp_path`` —
-no real agents data directory is touched, no subprocess, no RPyC, no LLM.
+no real ``~/.deepagents`` is touched, no subprocess, no RPyC, no LLM.
 """
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-
+from deep_worker_cli.storage_paths import deep_worker_home
 @pytest.mark.asyncio
 class TestFutureCutoffGuard:
     async def test_future_cutoff_without_force_is_blocked(
@@ -25,8 +25,8 @@ class TestFutureCutoffGuard:
         """`remove_before_command("2030-01-01", force=False)` must return 2."""
         monkeypatch.setenv("HOME", str(tmp_path))
         # Seed a fake summary file so we can assert it was NOT touched.
-        (tmp_path / Path("~/.deep_worker").name / "a" / "summaries").mkdir(parents=True)
-        survivor = tmp_path / Path("~/.deep_worker").name / "a" / "summaries" / "a.md"
+        (deep_worker_home(tmp_path) / "a" / "summaries").mkdir(parents=True)
+        survivor = deep_worker_home(tmp_path) / "a" / "summaries" / "a.md"
         survivor.write_text(
             "## Summarized at 2026-01-01T00:00:00+00:00\n\nbody\n\n"
         )

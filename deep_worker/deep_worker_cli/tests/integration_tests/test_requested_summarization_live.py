@@ -12,6 +12,7 @@ import pytest
 
 from deep_worker_cli.client.agent_client import AgentClient
 from deep_worker_cli.process.registry import ProcessRegistry
+from deep_worker_cli.storage_paths import deep_worker_home
 from deepagents.middleware.summarization_history import (
     deserialize_summarized_messages_jsonl,
 )
@@ -31,7 +32,7 @@ def _require_integration() -> None:
 
 
 def _live_provider_and_model() -> tuple[str, str]:
-    # The design prefers codex/gpt-5.6-sol. When that provider is rate-limited,
+    # Signed design prefers codex/gpt-5.6-sol. When that account is rate-limited,
     # deepseek is the project's default real provider with the same SQLite/RPyC path.
     override = os.environ.get("DEEP_WORKER_SUMMARY_INTEGRATION_PROVIDER")
     if override:
@@ -136,8 +137,7 @@ async def _run_live_scenario(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
             for message in before_messages
         )
         history_file = (
-            isolated_home
-            / Path("~/.deep_worker").name
+            deep_worker_home(isolated_home)
             / agent_name
             / "summaries"
             / f"{agent_name}.jsonl"

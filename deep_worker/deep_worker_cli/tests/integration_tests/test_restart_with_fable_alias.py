@@ -66,6 +66,8 @@ from pathlib import Path
 
 import pytest
 
+from deep_worker_cli.storage_paths import deep_worker_home
+
 
 # Hard budgets. If the assertions can't be reached inside these windows,
 # something is wrong — better to fail loud than let a CI job hang.
@@ -325,7 +327,7 @@ def _seed_launch_config(
     """Write a minimal but real session_metadata.json so ``--restart`` has
     something to merge against. Direct seeding is acceptable for this
     restart-specific integration."""
-    data_dir = agent_home / Path("~/.deep_worker").name / agent_name
+    data_dir = deep_worker_home(agent_home) / agent_name
     data_dir.mkdir(parents=True, exist_ok=True)
     launch_config = {
         "provider": "claude-code",
@@ -467,7 +469,7 @@ def test_restart_with_fable_alias(agent_home: Path, tmp_path: Path) -> None:
         # a write/create/rename happens, then we re-check the file's
         # content (json.load — cheap, only invoked on real fs events).
         meta_path = (
-            agent_home / Path("~/.deep_worker").name / agent_name / "session_metadata.json"
+            deep_worker_home(agent_home) / agent_name / "session_metadata.json"
         )
 
         def _content_shows_fable(p: Path) -> bool:
@@ -482,7 +484,7 @@ def test_restart_with_fable_alias(agent_home: Path, tmp_path: Path) -> None:
             meta_path, _content_shows_fable, timeout=_MERGE_BUDGET_S
         )
         if not merged:
-            log_dir = agent_home / Path("~/.deep_worker").name / "logs"
+            log_dir = deep_worker_home(agent_home) / "logs"
             out_log = log_dir / f"{agent_name}.out.log"
             err_log = log_dir / f"{agent_name}.err.log"
             out_tail = out_log.read_text()[-2000:] if out_log.exists() else "(no out log)"
@@ -573,7 +575,7 @@ def _daemon_pid_for(agent_home: Path, agent_name: str) -> int | None:
             return int(tmp_pid.read_text().strip())
         except (ValueError, OSError):
             pass
-    meta_path = agent_home / Path("~/.deep_worker").name / agent_name / "session_metadata.json"
+    meta_path = deep_worker_home(agent_home) / agent_name / "session_metadata.json"
     if meta_path.exists():
         try:
             meta = json.loads(meta_path.read_text())

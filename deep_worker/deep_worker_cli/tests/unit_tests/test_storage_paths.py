@@ -8,6 +8,7 @@ from deep_worker_cli.storage_paths import (
     STORAGE_VERSION_WITH_PREFERRED_PROVIDER,
     CURRENT_STORAGE_VERSION,
     STORAGE_VERSION_DEEPAGENTS_PER_AGENT,
+    HOME_DIR_NAME,
     agent_root,
     deepagents_data_dir,
     detect_storage_version,
@@ -25,16 +26,16 @@ def test_new_agent_starts_on_v5(tmp_path: Path, monkeypatch) -> None:
     assert CURRENT_STORAGE_VERSION == STORAGE_VERSION_WITH_PREFERRED_PROVIDER
     assert detect_storage_version("new_agent") == CURRENT_STORAGE_VERSION
     assert threads_db_path("new_agent") == (
-        tmp_path / Path("~/.deep_worker").name / "new_agent" / "threads.db"
+        tmp_path / ("." + HOME_DIR_NAME) / "new_agent" / "threads.db"
     )
     assert deepagents_data_dir("new_agent") == (
-        tmp_path / Path("~/.deep_worker").name / "new_agent" / "data"
+        tmp_path / ("." + HOME_DIR_NAME) / "new_agent" / "data"
     )
 
 
 def test_existing_metadata_without_version_stays_v2(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
-    root = tmp_path / Path("~/.deep_worker").name / "old_agent"
+    root = tmp_path / ("." + HOME_DIR_NAME) / "old_agent"
     root.mkdir(parents=True)
     (root / "session_metadata.json").write_text(json.dumps({"status": "idle"}))
 
@@ -55,7 +56,7 @@ def test_existing_v2_db_without_metadata_stays_v2(tmp_path: Path, monkeypatch) -
 
 def test_v3_agent_auto_migrate_to_v4(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
-    root = tmp_path / Path("~/.deep_worker").name / "v3_agent"
+    root = tmp_path / ("." + HOME_DIR_NAME) / "v3_agent"
     root.mkdir(parents=True)
     meta = root / "session_metadata.json"
     meta.write_text(json.dumps({"storage_version": STORAGE_VERSION_AGENT_ROOT}))
@@ -85,7 +86,7 @@ def test_v2_agent_auto_migrate_to_v4(tmp_path: Path, monkeypatch) -> None:
 
     result = migrate_agent_storage_to_v4("mig_agent")
 
-    root = tmp_path / Path("~/.deep_worker").name / "mig_agent"
+    root = tmp_path / ("." + HOME_DIR_NAME) / "mig_agent"
     assert (root / "threads.db").read_bytes() == b"sqlite"
     assert (root / "data" / "AGENTS.md").read_text() == "config"
     metadata = json.loads((root / "session_metadata.json").read_text())
@@ -106,7 +107,7 @@ def test_v2_to_v4_idempotent(tmp_path: Path, monkeypatch) -> None:
     result2 = migrate_agent_storage_to_v4("idem_agent")
 
     assert result2["migrated_from"] == STORAGE_VERSION_AGENT_ROOT_WITH_JSONL
-    root = tmp_path / Path("~/.deep_worker").name / "idem_agent"
+    root = tmp_path / ("." + HOME_DIR_NAME) / "idem_agent"
     metadata = json.loads((root / "session_metadata.json").read_text())
     assert metadata["storage_version"] == STORAGE_VERSION_AGENT_ROOT_WITH_JSONL
 
@@ -114,7 +115,7 @@ def test_v2_to_v4_idempotent(tmp_path: Path, monkeypatch) -> None:
 def test_v3_to_v4_idempotent(tmp_path: Path, monkeypatch) -> None:
     """Second call to migrate_agent_storage_to_v4 should be a no-op."""
     monkeypatch.setenv("HOME", str(tmp_path))
-    root = tmp_path / Path("~/.deep_worker").name / "v3_idem"
+    root = tmp_path / ("." + HOME_DIR_NAME) / "v3_idem"
     root.mkdir(parents=True)
     meta = root / "session_metadata.json"
     meta.write_text(json.dumps({"storage_version": STORAGE_VERSION_AGENT_ROOT}))
@@ -141,7 +142,7 @@ def test_private_permissions_for_agent_dirs_and_files(tmp_path: Path, monkeypatc
     assert oct(data.stat().st_mode & 0o777) == "0o700"
     assert oct(tm.stat().st_mode & 0o777) == "0o700"
     assert oct(db.stat().st_mode & 0o777) == "0o600"
-    assert not (tmp_path / Path("~/.deep_worker").name / "secure_agent:tm").exists()
+    assert not (tmp_path / ("." + HOME_DIR_NAME) / "secure_agent:tm").exists()
 
 
 def test_migrate_agent_storage_to_v3_still_works(tmp_path: Path, monkeypatch) -> None:
@@ -153,7 +154,7 @@ def test_migrate_agent_storage_to_v3_still_works(tmp_path: Path, monkeypatch) ->
 
     result = migrate_agent_storage_to_v3("mig_v3_agent")
 
-    root = tmp_path / Path("~/.deep_worker").name / "mig_v3_agent"
+    root = tmp_path / ("." + HOME_DIR_NAME) / "mig_v3_agent"
     assert Path(result["threads_db"]) == root / "threads.db"
     metadata = json.loads((root / "session_metadata.json").read_text())
     assert metadata["storage_version"] == STORAGE_VERSION_AGENT_ROOT

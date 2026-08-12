@@ -12,12 +12,20 @@ from deep_worker_cli.middleware.send_message_completion import (
     TOOL_NAME,
     SendMessageCompletionMiddleware,
 )
+from deep_worker_cli.middleware.tool_completion import (
+    DuplicateTurnEndingToolError,
+    ToolCompletionMiddleware,
+    TurnEndingTool,
+)
 
 __all__ = [
     "TOOL_NAME",
+    "DuplicateTurnEndingToolError",
     "HistoryAccessMiddleware",
     "HistoryMemoryMiddleware",
     "InterAgentReplyMiddleware",
     "SafeToolCallMiddleware",
     "SendMessageCompletionMiddleware",
+    "ToolCompletionMiddleware",
+    "TurnEndingTool",
 ]

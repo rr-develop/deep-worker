@@ -12,12 +12,13 @@ from deep_worker_cli.process.agent_process import (
     _extract_grok_model_id,
     _resolve_persisted_grok_display_model,
 )
+from deep_worker_cli.storage_paths import deep_worker_home
 
 
 def _write_session(
     home: Path, thread_id: str, session_id: str, cwd_segment: str, files: dict
 ) -> None:
-    state_dir = home / Path("~/.deep_worker").name / thread_id
+    state_dir = deep_worker_home(home) / thread_id
     state_dir.mkdir(parents=True)
     (state_dir / "grok_session_state.json").write_text(
         json.dumps({thread_id: {"sent_count": 5, "session_id": session_id}}),
@@ -90,7 +91,7 @@ def test_returns_none_when_session_dir_missing(tmp_path: Path, monkeypatch) -> N
     thread = "grok-agent"
     sid = "missing-sid"
     monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
-    state_dir = tmp_path / Path("~/.deep_worker").name / thread
+    state_dir = deep_worker_home(tmp_path) / thread
     state_dir.mkdir(parents=True)
     (state_dir / "grok_session_state.json").write_text(
         json.dumps({thread: {"sent_count": 5, "session_id": sid}}),

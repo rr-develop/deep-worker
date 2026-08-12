@@ -26,6 +26,7 @@ from langchain_core.runnables import Runnable
 from langchain_core.tools import BaseTool, tool
 
 from deep_worker_cli.agent import create_cli_agent
+from deep_worker_cli.storage_paths import HOME_DIR_NAME, deep_worker_home
 from deep_worker_cli.summaries import PrivateSummariesBackend
 
 
@@ -211,13 +212,13 @@ class TestDeepAgentsCLIEndToEnd:
             # The injected message MUST quote the new on-disk path.
             synth_content = result["messages"][0].content
             assert isinstance(synth_content, str)
-            assert f"/{Path('~/.deep_worker').name}/test-agent/summaries/" in synth_content, (
+            assert f"/.{HOME_DIR_NAME}/test-agent/summaries/" in synth_content, (
                 f"summary message does not quote new on-disk path: {synth_content!r}"
             )
 
             # And a real file must exist at that path, with at least one
             # `## Summarized at` section matching the new contract.
-            summaries_dir = tmp_path / Path("~/.deep_worker").name / "test-agent" / "summaries"
+            summaries_dir = deep_worker_home(tmp_path) / "test-agent" / "summaries"
             assert summaries_dir.is_dir(), (
                 f"summaries dir was not created at {summaries_dir}"
             )

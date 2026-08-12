@@ -19,6 +19,7 @@ from pathlib import Path
 
 import pytest
 
+from deep_worker_cli.storage_paths import deep_worker_home
 _pkg_root = Path(__file__).resolve().parent.parent.parent
 if str(_pkg_root) not in sys.path:
     sys.path.insert(0, str(_pkg_root))
@@ -39,7 +40,7 @@ def fake_home(tmp_path, monkeypatch):
 class TestPath:
     def test_path_under_agent_data_dir(self, fake_home) -> None:
         p = session_state_path("agent-1")
-        assert p == fake_home / Path("~/.deep_worker").name / "agent-1" / "grok_session_state.json"
+        assert p == deep_worker_home(fake_home) / "agent-1" / "grok_session_state.json"
 
     def test_tm_suffix_shares_agent_dir(self, fake_home) -> None:
         base = session_state_path("agent-1")

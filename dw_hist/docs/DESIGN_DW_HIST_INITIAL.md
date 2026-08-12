@@ -182,7 +182,7 @@ Implementation: a single `argparse.ArgumentParser` where:
 ```python
 def run_search(agent_name, query, top_k) -> tuple[int, str]:
     # 1. Pre-check unknown agent  -> exit 2
-    agent_root = Path.home() / Path("~/.deep_worker").name / agent_name
+    agent_root = deep_worker_home() / agent_name
     if not agent_root.is_dir():
         return 2, f"Unknown agent: '{agent_name}'"
 

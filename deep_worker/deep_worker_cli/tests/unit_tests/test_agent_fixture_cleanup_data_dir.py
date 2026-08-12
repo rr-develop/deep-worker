@@ -78,7 +78,7 @@ class TestCleanupRemovesDataDir:
         from unittest.mock import patch
 
         fake_home = tmp_path
-        data_dir = fake_home / Path("~/.deep_worker").name / "test_cleanup_smoke"
+        data_dir = deep_worker_home(fake_home) / "test_cleanup_smoke"
         data_dir.mkdir(parents=True, exist_ok=True)
         (data_dir / "session_metadata.json").write_text("{}")
         assert data_dir.exists()
@@ -129,7 +129,7 @@ class TestCleanupRemovesDataDir:
         pid_file.write_text("99999")
         try:
             fake_home = tmp_path
-            (fake_home / Path("~/.deep_worker").name / agent_name).mkdir(
+            (deep_worker_home(fake_home) / agent_name).mkdir(
                 parents=True, exist_ok=True
             )
             with patch("pathlib.Path.home", return_value=fake_home):

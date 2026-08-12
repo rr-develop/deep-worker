@@ -7,6 +7,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from deep_worker_cli.storage_paths import deep_worker_home
+
 
 def _has_index(summaries_dir: Path) -> bool:
     return (summaries_dir / ".history_index" / "lancedb").is_dir()
@@ -24,7 +26,7 @@ def discover_agents(home: Path | None = None) -> list[str]:
         Sorted list of agent names. Empty list when ``~/.deep_worker/``
         does not exist or contains no agents with an index.
     """
-    base = (home or Path.home()) / Path("~/.deep_worker").name
+    base = deep_worker_home(home)
     if not base.is_dir():
         return []
     out: list[str] = []
@@ -41,12 +43,12 @@ def discover_agents(home: Path | None = None) -> list[str]:
 
 
 def agent_summaries_dir(agent_name: str, home: Path | None = None) -> Path:
-    """Return the per-agent summaries directory (``<home>/<agent>/summaries``)
-    under ``~/.deep_worker`` (pure path; does NOT check existence)."""
-    return (home or Path.home()) / Path("~/.deep_worker").name / agent_name / "summaries"
+    """Return ``deep_worker_home(home)/<agent>/summaries`` (pure path; does
+    NOT check existence)."""
+    return deep_worker_home(home) / agent_name / "summaries"
 
 
 def agent_root(agent_name: str, home: Path | None = None) -> Path:
-    """Return the per-agent data root ``~/.deep_worker`` (pure path; does NOT
-    check existence)."""
-    return (home or Path.home()) / Path("~/.deep_worker").name / agent_name
+    """Return ``deep_worker_home(home)/<agent>`` (pure path; does NOT
+    check)."""
+    return deep_worker_home(home) / agent_name

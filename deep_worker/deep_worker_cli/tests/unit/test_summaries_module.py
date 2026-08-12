@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 
 
+from deep_worker_cli.storage_paths import deep_worker_home
 # The functions under test (do not exist yet — these are the RED pin).
 from deep_worker_cli.summaries import (
     SummaryFileInfo,
@@ -36,7 +37,7 @@ def _write_summary(path: Path, timestamps: list[str], body_per_ts: str = "body")
 class TestGetSummariesDir:
     def test_returns_home_deep_worker_agent_summaries(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HOME", str(tmp_path))
-        assert get_summaries_dir("foo") == tmp_path / Path("~/.deep_worker").name / "foo" / "summaries"
+        assert get_summaries_dir("foo") == deep_worker_home(tmp_path) / "foo" / "summaries"
 
     def test_does_not_create_directory_on_its_own(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HOME", str(tmp_path))
@@ -52,7 +53,7 @@ class TestIterSummaryFiles:
 
     def test_lists_one_agent_one_thread(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HOME", str(tmp_path))
-        f = tmp_path / Path("~/.deep_worker").name / "agent_a" / "summaries" / "agent_a.md"
+        f = deep_worker_home(tmp_path) / "agent_a" / "summaries" / "agent_a.md"
         _write_summary(f, ["2026-04-22T15:40:18.122420+00:00"])
         items = list(iter_summary_files())
         assert len(items) == 1
@@ -68,15 +69,15 @@ class TestIterSummaryFiles:
     def test_lists_many_agents_and_threads(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HOME", str(tmp_path))
         _write_summary(
-            tmp_path / Path("~/.deep_worker").name / "a1" / "summaries" / "a1.md",
+            deep_worker_home(tmp_path) / "a1" / "summaries" / "a1.md",
             ["2026-04-01T00:00:00+00:00"],
         )
         _write_summary(
-            tmp_path / Path("~/.deep_worker").name / "a1" / "summaries" / "a1:tm.md",
+            deep_worker_home(tmp_path) / "a1" / "summaries" / "a1:tm.md",
             ["2026-04-02T00:00:00+00:00", "2026-04-03T00:00:00+00:00"],
         )
         _write_summary(
-            tmp_path / Path("~/.deep_worker").name / "b2" / "summaries" / "b2.md",
+            deep_worker_home(tmp_path) / "b2" / "summaries" / "b2.md",
             ["2026-04-04T00:00:00+00:00"],
         )
         items = sorted(list(iter_summary_files()), key=lambda i: (i.agent, i.thread))
@@ -90,15 +91,15 @@ class TestIterSummaryFiles:
 
     def test_filter_by_agent(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HOME", str(tmp_path))
-        _write_summary(tmp_path / Path("~/.deep_worker").name / "a1" / "summaries" / "a1.md", ["2026-04-01T00:00:00+00:00"])
-        _write_summary(tmp_path / Path("~/.deep_worker").name / "b2" / "summaries" / "b2.md", ["2026-04-02T00:00:00+00:00"])
+        _write_summary(deep_worker_home(tmp_path) / "a1" / "summaries" / "a1.md", ["2026-04-01T00:00:00+00:00"])
+        _write_summary(deep_worker_home(tmp_path) / "b2" / "summaries" / "b2.md", ["2026-04-02T00:00:00+00:00"])
         items = list(iter_summary_files(agent_name="a1"))
         assert len(items) == 1
         assert items[0].agent == "a1"
 
     def test_silently_skips_non_md_files(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HOME", str(tmp_path))
-        d = tmp_path / Path("~/.deep_worker").name / "a" / "summaries"
+        d = deep_worker_home(tmp_path) / "a" / "summaries"
         d.mkdir(parents=True)
         (d / "a.md").write_text("## Summarized at 2026-04-01T00:00:00+00:00\n\nbody\n\n")
         (d / "stray.txt").write_text("noise")
@@ -109,7 +110,7 @@ class TestIterSummaryFiles:
 
     def test_file_with_no_headers_reports_zero_events_none_latest(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HOME", str(tmp_path))
-        f = tmp_path / Path("~/.deep_worker").name / "a" / "summaries" / "a.md"
+        f = deep_worker_home(tmp_path) / "a" / "summaries" / "a.md"
         f.parent.mkdir(parents=True)
         f.write_text("# not-a-summary\n\ncorrupted\n")
         items = list(iter_summary_files())
@@ -146,7 +147,7 @@ class TestParseSummaryHeaders:
 class TestPruneSummariesBefore:
     def test_dry_run_does_not_write(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HOME", str(tmp_path))
-        f = tmp_path / Path("~/.deep_worker").name / "a" / "summaries" / "a.md"
+        f = deep_worker_home(tmp_path) / "a" / "summaries" / "a.md"
         _write_summary(f, ["2026-01-01T00:00:00+00:00", "2026-05-01T00:00:00+00:00"])
         original = f.read_text()
         cutoff = datetime(2026, 3, 1, tzinfo=UTC)
@@ -159,7 +160,7 @@ class TestPruneSummariesBefore:
 
     def test_deletes_file_when_all_sections_older(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HOME", str(tmp_path))
-        f = tmp_path / Path("~/.deep_worker").name / "a" / "summaries" / "a.md"
+        f = deep_worker_home(tmp_path) / "a" / "summaries" / "a.md"
         _write_summary(f, ["2026-01-01T00:00:00+00:00", "2026-02-01T00:00:00+00:00"])
         cutoff = datetime(2026, 3, 1, tzinfo=UTC)
         result = prune_summaries_before(cutoff, dry_run=False)
@@ -168,7 +169,7 @@ class TestPruneSummariesBefore:
 
     def test_rewrites_file_keeping_only_newer_sections(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HOME", str(tmp_path))
-        f = tmp_path / Path("~/.deep_worker").name / "a" / "summaries" / "a.md"
+        f = deep_worker_home(tmp_path) / "a" / "summaries" / "a.md"
         _write_summary(
             f,
             [
@@ -195,7 +196,7 @@ class TestPruneSummariesBefore:
 
     def test_no_op_when_all_sections_newer(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HOME", str(tmp_path))
-        f = tmp_path / Path("~/.deep_worker").name / "a" / "summaries" / "a.md"
+        f = deep_worker_home(tmp_path) / "a" / "summaries" / "a.md"
         _write_summary(f, ["2026-05-01T00:00:00+00:00", "2026-06-01T00:00:00+00:00"])
         original = f.read_text()
         cutoff = datetime(2026, 3, 1, tzinfo=UTC)
@@ -206,7 +207,7 @@ class TestPruneSummariesBefore:
 
     def test_atomic_rewrite_via_tmp_then_replace(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HOME", str(tmp_path))
-        f = tmp_path / Path("~/.deep_worker").name / "a" / "summaries" / "a.md"
+        f = deep_worker_home(tmp_path) / "a" / "summaries" / "a.md"
         _write_summary(
             f,
             ["2026-01-01T00:00:00+00:00", "2026-05-01T00:00:00+00:00"],

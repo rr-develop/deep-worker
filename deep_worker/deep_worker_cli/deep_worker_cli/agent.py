@@ -6,7 +6,7 @@ import os
 import shutil
 import sys
 import tempfile
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -55,6 +55,7 @@ from deep_worker_cli.prompts.proxy_tool_hints import (
     provider_tool_invocation_note,
     proxy_tool_form,
 )
+from deep_worker_cli.middleware.tool_completion import TurnEndingTool
 from deep_worker_cli.middleware.dangling_tool_calls import (
     DanglingToolCallMiddleware,
 )
@@ -820,6 +821,7 @@ def create_cli_agent(
     enable_history_memory: bool = False,
     external_mcp_tools: Sequence[BaseTool] | None = None,
     external_mcp_auto_approved_names: set[str] | None = None,
+    turn_ending_tools: Iterable[TurnEndingTool] | None = None,
 ) -> tuple[Pregel, CompositeBackend]:
     """Create a CLI-configured agent with flexible options.
 
@@ -872,6 +874,13 @@ def create_cli_agent(
         external_mcp_auto_approved_names: External MCP tool names that bypass
             HITL even when global auto-approve is disabled. Global
             `auto_approve=True` / `-sp` still bypasses all HITL.
+        turn_ending_tools: Additional `TurnEndingTool` declarations. A tool
+            declared here ends the agent's turn when it succeeds, instead of
+            the model being invoked again to produce filler text.
+            `send_message_to_agent` is registered as a turn-ending tool
+            automatically and must not be re-declared. Registration is
+            explicit only — a tool never becomes turn-ending because of its
+            name. See `docs/DESIGN_TOOL_COMPLETION_MIDDLEWARE.md`.
 
     Returns:
         2-tuple of `(agent_graph, backend)`
@@ -991,10 +1000,17 @@ def create_cli_agent(
     # of the graph, skipping the redundant model call that would
     # otherwise produce a pointless filler assistant message.
     # See docs/DESIGN_SEND_MESSAGE_COMPLETION_MIDDLEWARE.md for details.
+    #
+    # The same middleware also carries any additional turn-ending tools the
+    # launcher declared via `turn_ending_tools` — registration is explicit,
+    # a tool never becomes turn-ending because of its name. See
+    # docs/DESIGN_TOOL_COMPLETION_MIDDLEWARE.md.
     from deep_worker_cli.middleware.send_message_completion import (
         SendMessageCompletionMiddleware,
     )
-    agent_middleware.append(SendMessageCompletionMiddleware())
+    agent_middleware.append(
+        SendMessageCompletionMiddleware(turn_ending_tools or ())
+    )
 
     # Inject cognitive hints for incoming inter-agent messages: guides the
     # receiving agent to either reply via send_message_to_agent (reply_back=True)

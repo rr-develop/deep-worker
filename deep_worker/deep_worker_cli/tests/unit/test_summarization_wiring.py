@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-
+from deep_worker_cli.storage_paths import deep_worker_home
 def test_create_deep_agent_accepts_summarization_history_prefix():
     """create_deep_agent must accept an opt-in summarization_history_prefix kwarg."""
     from deepagents.graph import create_deep_agent
@@ -78,7 +78,7 @@ def test_agent_py_passes_per_agent_summaries_prefix_into_create_deep_agent():
 def test_ensure_summaries_dir_enforces_private_permissions(tmp_path, monkeypatch):
     """Summaries directory is per-agent storage and must be owner-only."""
     monkeypatch.setenv("HOME", str(tmp_path))
-    summaries_dir = tmp_path / Path("~/.deep_worker").name / "test_v3" / "summaries"
+    summaries_dir = deep_worker_home(tmp_path) / "test_v3" / "summaries"
     summaries_dir.mkdir(parents=True, mode=0o777)
     summaries_dir.chmod(0o777)
 
@@ -87,7 +87,7 @@ def test_ensure_summaries_dir_enforces_private_permissions(tmp_path, monkeypatch
     result = ensure_summaries_dir("test_v3")
 
     assert result == summaries_dir
-    assert oct((tmp_path / Path("~/.deep_worker").name / "test_v3").stat().st_mode & 0o777) == "0o700"
+    assert oct((deep_worker_home(tmp_path) / "test_v3").stat().st_mode & 0o777) == "0o700"
     assert oct(summaries_dir.stat().st_mode & 0o777) == "0o700"
 
 

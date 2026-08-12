@@ -316,7 +316,7 @@ place, in `agent.py`'s middleware assembly around line 660):
 
 ```python
 # Compute a per-agent summaries directory and ensure it exists:
-summaries_dir = Path("~/.deep_worker").expanduser() / agent_name / "summaries"
+summaries_dir = deep_worker_home() / agent_name / "summaries"
 summaries_dir.mkdir(parents=True, exist_ok=True)
 
 summarization_middleware = SummarizationMiddleware(
@@ -468,7 +468,7 @@ harmless.
 
 1. `test_history_path_prefix_is_per_agent_absolute_path` — construct
    agent with name `"foo"`, assert
-   `middleware._history_path_prefix == f"{Path('~/.deep_worker').expanduser()}/foo/summaries"`.
+   `middleware._history_path_prefix == f"{deep_worker_home()}/foo/summaries"`.
 2. `test_summaries_directory_is_created_before_middleware_runs` —
    assert `.exists() and .is_dir()` after agent construction.
 3. `test_composite_backend_has_no_conversation_history_route` —

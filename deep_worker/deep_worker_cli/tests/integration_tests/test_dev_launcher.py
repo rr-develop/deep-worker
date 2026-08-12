@@ -394,7 +394,7 @@ class TestRestartAutoDetect:
         name: str,
         dev_tree: bool,
     ) -> None:
-        data_dir = home / Path("~/.deep_worker").name / name
+        data_dir = deep_worker_home(home) / name
         data_dir.mkdir(parents=True)
         meta = {
             "status": "idle",

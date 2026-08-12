@@ -95,7 +95,7 @@ class TestGetAgentStats:
     async def test_no_file_created_by_get(self, client: AsyncClient) -> None:
         """GET must NOT create the stats file or the data dir."""
         await client.get("/api/agents/test-agent/stats")
-        data_dir = Path("/tmp/dwweb_test_stats_home") / Path("~/.deep_worker").name / "test-agent"
+        data_dir = deep_worker_home(Path("/tmp/dwweb_test_stats_home")) / "test-agent"
         assert not (data_dir / "token_stats.jsonl").exists()
         assert not data_dir.exists()
 
@@ -119,7 +119,7 @@ class TestGetAgentStats:
         )
         from deep_worker_cli.stats.token_stats import TokenUsageRecorder
 
-        data_dir = Path("/tmp/dwweb_test_stats_home") / Path("~/.deep_worker").name / "test-agent"
+        data_dir = deep_worker_home(Path("/tmp/dwweb_test_stats_home")) / "test-agent"
         data_dir.mkdir(parents=True, exist_ok=True)
 
         recorder = TokenUsageRecorder(data_dir)
@@ -167,7 +167,7 @@ class TestGetAgentStats:
         )
         from deep_worker_cli.stats.token_stats import TokenUsageRecorder
 
-        data_dir = Path("/tmp/dwweb_test_stats_home") / Path("~/.deep_worker").name / "test-agent"
+        data_dir = deep_worker_home(Path("/tmp/dwweb_test_stats_home")) / "test-agent"
         data_dir.mkdir(parents=True, exist_ok=True)
         recorder = TokenUsageRecorder(data_dir)
         await recorder.record(
@@ -198,7 +198,7 @@ class TestGetAgentStats:
         self, client: AsyncClient
     ) -> None:
         """A malformed line is counted in skipped_records, not dropped."""
-        data_dir = Path("/tmp/dwweb_test_stats_home") / Path("~/.deep_worker").name / "test-agent"
+        data_dir = deep_worker_home(Path("/tmp/dwweb_test_stats_home")) / "test-agent"
         data_dir.mkdir(parents=True, exist_ok=True)
         (data_dir / "token_stats.jsonl").write_text("{not-json}\n")
 

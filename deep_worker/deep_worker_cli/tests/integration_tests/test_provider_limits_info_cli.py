@@ -11,7 +11,7 @@ _CLI_ROOT = Path(__file__).resolve().parents[2]
 _DEEP_WORKER_ROOT = _CLI_ROOT.parent
 _TREE_ROOT = _DEEP_WORKER_ROOT.parent
 
-
+from deep_worker_cli.storage_paths import deep_worker_home
 def _env(home: Path) -> dict[str, str]:
     env = os.environ.copy()
     env["HOME"] = str(home)
@@ -28,7 +28,7 @@ def _env(home: Path) -> dict[str, str]:
 
 
 def test_limits_info_reads_persisted_provider_availability(tmp_path: Path) -> None:
-    data_dir = tmp_path / Path("~/.deep_worker").name
+    data_dir = deep_worker_home(tmp_path)
     data_dir.mkdir()
     (data_dir / "provider_availability.json").write_text(json.dumps({
         "grok": {

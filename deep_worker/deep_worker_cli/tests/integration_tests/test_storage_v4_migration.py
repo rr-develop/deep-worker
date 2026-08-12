@@ -13,6 +13,7 @@ from deep_worker_cli.storage_paths import (
     STORAGE_VERSION_AGENT_ROOT,
     STORAGE_VERSION_AGENT_ROOT_WITH_JSONL,
     STORAGE_VERSION_DEEPAGENTS_PER_AGENT,
+    deep_worker_home,
     detect_storage_version,
     migrate_agent_storage_to_v4,
     migrate_agent_storage_to_v3,
@@ -30,7 +31,7 @@ def test_new_agent_starts_on_v4(tmp_path: Path, monkeypatch) -> None:
 def test_v3_agent_migrates_to_v4(tmp_path: Path, monkeypatch) -> None:
     """A v3 agent should auto-migrate to v4 without losing data."""
     monkeypatch.setenv("HOME", str(tmp_path))
-    root = tmp_path / Path("~/.deep_worker").name / "v3_test"
+    root = deep_worker_home(tmp_path) / "v3_test"
     root.mkdir(parents=True)
     meta = root / "session_metadata.json"
     meta.write_text(json.dumps({"storage_version": STORAGE_VERSION_AGENT_ROOT}))
@@ -61,7 +62,7 @@ def test_v2_agent_migrates_to_v4(tmp_path: Path, monkeypatch) -> None:
 
     result = migrate_agent_storage_to_v4("v2_test")
 
-    new_root = tmp_path / Path("~/.deep_worker").name / "v2_test"
+    new_root = deep_worker_home(tmp_path) / "v2_test"
     assert (new_root / "threads.db").read_bytes() == b"legacy_sqlite"
     metadata = json.loads((new_root / "session_metadata.json").read_text())
     assert metadata["storage_version"] == STORAGE_VERSION_AGENT_ROOT_WITH_JSONL
@@ -71,7 +72,7 @@ def test_v2_agent_migrates_to_v4(tmp_path: Path, monkeypatch) -> None:
 def test_idempotent_migration(tmp_path: Path, monkeypatch) -> None:
     """Calling migrate twice should be safe (second call is no-op)."""
     monkeypatch.setenv("HOME", str(tmp_path))
-    root = tmp_path / Path("~/.deep_worker").name / "idem"
+    root = deep_worker_home(tmp_path) / "idem"
     root.mkdir(parents=True)
     meta = root / "session_metadata.json"
     meta.write_text(json.dumps({"storage_version": STORAGE_VERSION_AGENT_ROOT}))
@@ -93,7 +94,7 @@ def test_v3_migration_still_works(tmp_path: Path, monkeypatch) -> None:
 
     result = migrate_agent_storage_to_v3("legacy_agent")
 
-    root = tmp_path / Path("~/.deep_worker").name / "legacy_agent"
+    root = deep_worker_home(tmp_path) / "legacy_agent"
     metadata = json.loads((root / "session_metadata.json").read_text())
     assert metadata["storage_version"] == STORAGE_VERSION_AGENT_ROOT
     assert Path(result["threads_db"]) == root / "threads.db"

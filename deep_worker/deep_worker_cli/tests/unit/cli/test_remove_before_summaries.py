@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-
+from deep_worker_cli.storage_paths import deep_worker_home
 def _mk(path: Path, timestamps: list[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     parts = [f"## Summarized at {ts}\n\nbody\n\n" for ts in timestamps]
@@ -22,7 +22,7 @@ def _mk(path: Path, timestamps: list[str]) -> None:
 class TestRemoveBeforeSummariesExtension:
     async def test_dry_run_does_not_write(self, monkeypatch, tmp_path, capsys):
         monkeypatch.setenv("HOME", str(tmp_path))
-        f = tmp_path / Path("~/.deep_worker").name / "a" / "summaries" / "a.md"
+        f = deep_worker_home(tmp_path) / "a" / "summaries" / "a.md"
         _mk(f, ["2026-01-01T00:00:00+00:00", "2026-05-01T00:00:00+00:00"])
         original = f.read_text()
         from deep_worker_cli.cli.agent_command import remove_before_command
@@ -35,7 +35,7 @@ class TestRemoveBeforeSummariesExtension:
 
     async def test_file_deleted_when_all_older(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HOME", str(tmp_path))
-        f = tmp_path / Path("~/.deep_worker").name / "a" / "summaries" / "a.md"
+        f = deep_worker_home(tmp_path) / "a" / "summaries" / "a.md"
         _mk(f, ["2026-01-01T00:00:00+00:00", "2026-02-01T00:00:00+00:00"])
         from deep_worker_cli.cli.agent_command import remove_before_command
 
@@ -45,7 +45,7 @@ class TestRemoveBeforeSummariesExtension:
 
     async def test_file_rewritten_when_partial(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HOME", str(tmp_path))
-        f = tmp_path / Path("~/.deep_worker").name / "a" / "summaries" / "a.md"
+        f = deep_worker_home(tmp_path) / "a" / "summaries" / "a.md"
         _mk(
             f,
             [

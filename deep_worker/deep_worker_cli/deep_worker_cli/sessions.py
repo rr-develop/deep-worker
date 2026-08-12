@@ -14,6 +14,7 @@ from rich.table import Table
 from deep_worker_cli.config import COLORS, console
 from deep_worker_cli.storage_paths import (
     agent_name_from_thread_id,
+    deep_worker_home,
     ensure_private_file,
     iter_thread_db_paths,
     threads_db_path,
@@ -1027,14 +1028,14 @@ async def clean_agent_history(
             pass
 
     # 3. Remove agent data directory
-    data_dir = home_dir / Path("~/.deep_worker").name / agent_name
+    data_dir = deep_worker_home(home_dir) / agent_name
     data_dir_removed = False
     if data_dir.exists():
         shutil.rmtree(data_dir)
         data_dir_removed = True
 
     # 4. Remove log files
-    log_dir = home_dir / Path("~/.deep_worker").name / "logs"
+    log_dir = deep_worker_home(home_dir) / "logs"
     log_files_removed = 0
     if log_dir.exists():
         for log_file in log_dir.glob(f"{agent_name}.*"):

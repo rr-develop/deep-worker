@@ -3,7 +3,7 @@
 Public API:
     fork_agent_data(source_name, new_name, *, message_id=None, home=None)
 
-Resolves agent names to per-agent data directory paths and copies
+Resolves agent names to ``~/.deep_worker/<name>/`` paths and copies
 all data relevant to the agent: session_metadata.json, threads.db (via
 SQLite backup API — safe for a running source), summaries/, and data/.
 """
@@ -17,6 +17,8 @@ import shutil
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
+
+from deep_worker_cli.storage_paths import deep_worker_home
 
 logger = logging.getLogger(__name__)
 
@@ -44,8 +46,8 @@ def fork_agent_data(
         ValueError: *message_id* not found in any summary file.
     """
     home = home or Path.home()
-    src_dir = home / Path("~/.deep_worker").name / source_name
-    dst_dir = home / Path("~/.deep_worker").name / new_name
+    src_dir = deep_worker_home(home) / source_name
+    dst_dir = deep_worker_home(home) / new_name
 
     if not src_dir.is_dir():
         raise FileNotFoundError(

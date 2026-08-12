@@ -21,11 +21,11 @@ from deep_worker_cli.skills.commands import (
     _validate_skill_path,
     execute_skills_command,
 )
+from deep_worker_cli.storage_paths import deep_worker_home
 
 
 class TestValidateSkillName:
     """Test skill name validation per Agent Skills spec (https://agentskills.io/specification)."""
-
     def test_valid_skill_names(self):
         """Test that spec-compliant skill names are accepted.
 
@@ -291,13 +291,13 @@ class TestCreateSkillPermissions:
 
         _create("private-skill", agent="test_v3", project=False)
 
-        skill_dir = tmp_path / Path("~/.deep_worker").name / "test_v3" / "data" / "skills" / "private-skill"
+        skill_dir = deep_worker_home(tmp_path) / "test_v3" / "data" / "skills" / "private-skill"
         skill_md = skill_dir / "SKILL.md"
         assert skill_dir.is_dir()
         assert skill_md.is_file()
-        assert oct((tmp_path / Path("~/.deep_worker").name / "test_v3").stat().st_mode & 0o777) == "0o700"
-        assert oct((tmp_path / Path("~/.deep_worker").name / "test_v3" / "data").stat().st_mode & 0o777) == "0o700"
-        assert oct((tmp_path / Path("~/.deep_worker").name / "test_v3" / "data" / "skills").stat().st_mode & 0o777) == "0o700"
+        assert oct((deep_worker_home(tmp_path) / "test_v3").stat().st_mode & 0o777) == "0o700"
+        assert oct((deep_worker_home(tmp_path) / "test_v3" / "data").stat().st_mode & 0o777) == "0o700"
+        assert oct((deep_worker_home(tmp_path) / "test_v3" / "data" / "skills").stat().st_mode & 0o777) == "0o700"
         assert oct(skill_dir.stat().st_mode & 0o777) == "0o700"
         assert oct(skill_md.stat().st_mode & 0o777) == "0o600"
 

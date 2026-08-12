@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from deep_worker_cli.storage_paths import deep_worker_home
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 os.environ.setdefault("TQDM_DISABLE", "1")
@@ -42,7 +43,7 @@ async def test_reindex_offline_rebuilds_index_from_jsonl(monkeypatch, tmp_path, 
     from deep_worker.providers.semantic_search.history_indexer import index_all_history_files
     from deep_worker.providers.semantic_search.history_indexer import history_index_exists
 
-    summaries_dir = tmp_path / Path("~/.deep_worker").name / "ag" / "summaries"
+    summaries_dir = deep_worker_home(tmp_path) / "ag" / "summaries"
     _write_history_jsonl(summaries_dir / "thread_1.jsonl", "Remember Paris.")
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setattr(
@@ -70,7 +71,7 @@ async def test_reindex_offline_fixes_stale_hash_desync(monkeypatch, tmp_path, em
     from deep_worker.providers.semantic_search.history_indexer import index_all_history_files
     from deep_worker.providers.semantic_search.history_indexer import history_index_exists
 
-    summaries_dir = tmp_path / Path("~/.deep_worker").name / "ag" / "summaries"
+    summaries_dir = deep_worker_home(tmp_path) / "ag" / "summaries"
     _write_history_jsonl(summaries_dir / "thread_1.jsonl", "Remember Berlin.")
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setattr(

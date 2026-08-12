@@ -604,7 +604,7 @@ An earlier draft claimed the test would point `DEEP_WORKER_HOME` at a
 sandbox. **No such variable exists**: `grep -rn DEEP_WORKER_HOME` over
 `deep_worker_cli` returns zero hits. Agent state is rooted at
 `Path.home()` unconditionally — verified sites include
-`process/agent_process.py:555` (`data_dir` rooted at `~/.deep_worker/<name>`),
+`process/agent_process.py:555` (`data_dir = deep_worker_home()/name`),
 `process/agent_process.py:123,198` (provider session state),
 `process/agent_stop.py:63`, `config.py:846` (`~/.deepagents`),
 `config.py:1027` (`~/.agents`), and `history_memory_tool.py:151,157`.
@@ -624,8 +624,9 @@ use. Two consequences must be handled explicitly, as those tests do:
   whichever the installed CLI version supports. This is stated as a
   precondition because it determines whether the test can run at all.
 
-The concrete sandbox layout asserted by the test, relative to the sandbox
-`HOME`: `~/.deep_worker/<agent>/session_metadata.json`.
+The concrete sandbox layout asserted by the test:
+`~/.deep_worker/<agent>/session_metadata.json` (the sandbox `HOME` is
+pointed at `<tmp>`).
 
 Sequence:
 1. Genuine first launch (`deep-worker <name> --provider claude-code
@@ -669,7 +670,7 @@ re-read of any file.
 
 **Assertions.** Not just the log text — the test asserts *actual startup
 state*:
-- The persisted `~/.deep_worker/<name>/session_metadata.json` (sandbox `HOME`)
+- The persisted `~/.deep_worker/<name>/session_metadata.json`
   `launch_config.model == "fable"` (proves the merge kept the alias).
 - After the driving query, the `claude` **descendant of this agent's
   daemon PID** has `--model fable` in `/proc/<pid>/cmdline`, proving the

@@ -20,6 +20,7 @@ from deep_worker_cli.history_access_tool import history_at, history_range, histo
 from deep_worker_cli.middleware.history_access import HistoryAccessMiddleware
 
 
+from deep_worker_cli.storage_paths import deep_worker_home
 # ── Helpers ──────────────────────────────────────────────────────────────
 
 def _make_section(timestamp: str, body: str) -> str:
@@ -33,8 +34,8 @@ def _make_md(sections: str) -> str:
 
 
 def _write_summary(base: Path, agent: str, thread: str, content: str) -> Path:
-    """Write a summary .md file under the per-agent data root: <data-root>/<agent>/summaries/<thread>.md."""
-    d = base / Path("~/.deep_worker").name / agent / "summaries"
+    """Write a summary .md file under deep_worker_home(base)/<agent>/summaries/<thread>.md."""
+    d = deep_worker_home(base) / agent / "summaries"
     d.mkdir(parents=True, exist_ok=True)
     os.chmod(d, 0o700)
     p = d / f"{thread}.md"

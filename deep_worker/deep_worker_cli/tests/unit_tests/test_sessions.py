@@ -14,9 +14,9 @@ from deep_worker_cli import sessions
 from deep_worker_cli.app import TextualSessionState
 
 
+from deep_worker_cli.storage_paths import deep_worker_home
 class TestGenerateThreadId:
     """Tests for generate_thread_id function."""
-
     def test_length(self):
         """Thread IDs are 8 characters."""
         tid = sessions.generate_thread_id()
@@ -572,7 +572,7 @@ class TestCleanAgentHistory:
         conn.close()
 
         # Create agent data directory
-        data_dir = tmp_path / Path("~/.deep_worker").name / "test_agent1"
+        data_dir = deep_worker_home(tmp_path) / "test_agent1"
         data_dir.mkdir(parents=True)
         metadata_file = data_dir / "session_metadata.json"
         metadata_file.write_text(json.dumps({
@@ -584,7 +584,7 @@ class TestCleanAgentHistory:
         }))
 
         # Create log files
-        log_dir = tmp_path / Path("~/.deep_worker").name / "logs"
+        log_dir = deep_worker_home(tmp_path) / "logs"
         log_dir.mkdir(parents=True)
         (log_dir / "test_agent1.out.log").write_text("stdout log content")
         (log_dir / "test_agent1.err.log").write_text("stderr log content")

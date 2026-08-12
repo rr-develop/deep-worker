@@ -24,7 +24,6 @@ from __future__ import annotations
 import asyncio
 import json
 from datetime import datetime
-from pathlib import Path
 from typing import Any
 
 import pytest
@@ -32,7 +31,7 @@ import pytest
 from app.schemas.agent_schemas import AgentInfo, AgentStatus
 from app.services.agent_service import AgentService
 
-
+from deep_worker_cli.storage_paths import deep_worker_home
 def test_agent_info_accepts_error_message() -> None:
     info = AgentInfo(
         name="a",
@@ -152,7 +151,7 @@ async def test_discover_seeds_error_from_persisted_metadata(tmp_path, monkeypatc
             return [_ProcInfo()]
 
     # Persisted metadata says error with a cause.
-    data_dir = tmp_path / Path("~/.deep_worker").name / "diverged_agent"
+    data_dir = deep_worker_home(tmp_path) / "diverged_agent"
     data_dir.mkdir(parents=True)
     (data_dir / "session_metadata.json").write_text(json.dumps({
         "status": "error",
