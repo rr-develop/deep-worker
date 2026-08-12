@@ -54,13 +54,15 @@ def _get_git_commit_info(tree_root: str | None) -> tuple[str, str]:
     return sha, describe
 
 # ============================================================================
+# RPYC_ASYNC — IMPORTED FROM THE INSTALLED PACKAGE (PyPI)
+# ============================================================================
 # rpyc-async is a regular PyPI dependency (>=1.0.0) providing the
 # AsyncioServer-based protocol:
 #   - rpyc.core.async_connect.async_connect  (async client)
 #   - Connection.aclose() / wait_closed()    (async close)
 # The previous sys.path injection of a local rpyc_async checkout was removed:
-# on a developer machine it shadowed the PyPI package with sources, which
-# made "clean env" wheel installs test the wrong code.
+# on a developer machine it shadowed the PyPI package with sources, which made
+# "clean env" wheel installs test the wrong code.
 # ============================================================================
 
 from rpyc_async.core.protocol import DEFAULT_CONFIG
@@ -574,7 +576,7 @@ class AgentProcess:
         self.backend = None  # Will be initialized in start()
         self.session_manager: SessionManager | None = None
         self.task_manager = None  # Will be initialized in start() if enabled
-        # Token-stats recorder (token-stats design §5.1). Lazily
+        # Token-stats recorder (DESIGN_AGENT_TOKEN_STATS.md §5.1). Lazily
         # created on first LLM invocation; writes to
         # ``<data_dir>/token_stats.jsonl``.
         self._token_stats_recorder_obj: Any | None = None
@@ -1040,7 +1042,7 @@ class AgentProcess:
         """Lazy token-stats recorder for this agent.
 
         Created on first access (i.e. first instrumented LLM invocation);
-        appends to ``<data_dir>/token_stats.jsonl`` (token-stats design
+        appends to ``<data_dir>/token_stats.jsonl`` (DESIGN_AGENT_TOKEN_STATS.md
         §4.2). The same recorder instance is shared with the TaskManager so
         both write to one file, tagged ``kind="agent"`` / ``kind="tm"``.
         """
@@ -1257,7 +1259,7 @@ class AgentProcess:
                 # agent and its TaskManager (:tm) use separate user_ids
                 # and do not evict each other's DeepSeek prefix-cache.
                 # kind="agent" + factories wire the token-stats recorder
-                # (token-stats design §5.1).
+                # (DESIGN_AGENT_TOKEN_STATS.md §5.1).
                 from deep_worker_cli.stats.callback import (
                     make_stats_callback_factory,
                     make_usage_event_callback_factory,
@@ -1323,19 +1325,30 @@ class AgentProcess:
 
                 # Prepare web tools
                 # - http_request and fetch_url work without API keys
-                # - web_search_delegation_tool uses Claude Code SDK for universal web search
+                # - web_search (delegation) uses Claude Code SDK for universal
+                #   web search; resolved lazily under the tri-state policy
+                #   (auto/enabled/disabled).
                 # - send_message_to_agent: inter-agent messaging; sender name
                 #   is baked into the factory from self.name so the LLM
                 #   cannot forge it. See docs/DESIGN_SEND_MESSAGE_TO_AGENT_TOOL.md
                 web_tools: list[Any] = [
                     http_request,
                     fetch_url,
-                    web_search_delegation_tool,
                     read_image,
                     restart_tool_factory(self.name),
                     restart_self_tool_factory(self.name),
                     make_send_message_to_agent_tool(self.name),
                 ]
+
+                # Universal web-search under the agent's tri-state policy.
+                # ``enabled`` raises CapabilityError when the SDK is missing;
+                # ``auto`` logs once and skips; ``disabled`` never resolves.
+                _web_search_policy = WebSearchPolicy(
+                    getattr(self.config, "web_search_policy", "auto")
+                )
+                _web_search_avail = resolve_web_search_tool(_web_search_policy)
+                if _web_search_avail.tool is not None:
+                    web_tools.append(_web_search_avail.tool)
 
                 # A2A outbound tools (a2a_*): only registered when A2A is
                 # enabled for this agent. Lets the LLM initiate A2A protocol
@@ -1343,10 +1356,10 @@ class AgentProcess:
                 # are non-fatal (A2A is optional) — the agent keeps its other
                 # tools. See the A2A protocol design documentation.
                 try:
-                    from deepworker_a2a.config import A2AConfig as _A2AConfig
+                    from deep_worker.providers.deepworker_a2a.config import A2AConfig as _A2AConfig
 
                     if _A2AConfig.from_env(self.name).enabled:
-                        from deepworker_a2a.tools import make_a2a_tools
+                        from deep_worker.providers.deepworker_a2a.tools import make_a2a_tools
 
                         web_tools.extend(make_a2a_tools())
                         _logger.info("Registered outbound a2a_* tools")

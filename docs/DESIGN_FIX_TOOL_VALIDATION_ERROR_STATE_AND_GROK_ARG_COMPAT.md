@@ -15,7 +15,7 @@
 ## 1. User requirement (verbatim)
 
 > Yes, we need to fix at least defects A and B. Follow the procedure
-> add_feature → design → review → implement → commit → ff to master.
+> design → review → implement → commit.
 
 From the previous analysis (see the agent report):
 

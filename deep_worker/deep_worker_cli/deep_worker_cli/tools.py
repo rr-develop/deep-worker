@@ -22,49 +22,135 @@ from tavily import (
 )
 from tavily.errors import ForbiddenError, TimeoutError as TavilyTimeoutError
 
-from deep_worker_cli.config import settings
-from deep_worker_cli.exceptions import AgentNotFoundError, IPCConnectionError
+from deep_worker_cli.config import WebSearchPolicy, settings
+from deep_worker_cli.exceptions import AgentNotFoundError, CapabilityError, IPCConnectionError
 from deep_worker_cli.process.registry import ProcessRegistry
 
 logger = logging.getLogger(__name__)
-
-# ============================================================================
-# CRITICAL: CLAUDE_CODE_PROVIDER MUST BE IMPORTED FROM SOURCE CODE, NOT FROM PIP/VENV!
-# ============================================================================
-# Path calculation: __file__ is at deep_worker/deep_worker_cli/deep_worker_cli/tools.py
-# .parent x4 = repository root
-_repo_root = Path(__file__).parent.parent.parent.parent
-_claude_code_provider_path = _repo_root / "claude_code_provider"
-if not _claude_code_provider_path.exists():
-    raise ImportError(
-        f"CRITICAL: claude_code_provider not found at {_claude_code_provider_path}\n"
-        f"This is required for WebSearchDelegationTool.\n"
-        f"Expected structure: {_repo_root}/claude_code_provider/"
-    )
-# Add REPOSITORY ROOT to sys.path, not the claude_code_provider dir itself
-if str(_repo_root) not in sys.path:
-    sys.path.insert(0, str(_repo_root))
-
-from claude_code_provider.web_search import WebSearchDelegationTool  # noqa: E402
 
 # Initialize Tavily client if API key is available
 tavily_client = (
     TavilyClient(api_key=settings.tavily_api_key) if settings.has_tavily else None
 )
 
+
 # ============================================================================
-# CRITICAL: WebSearch Delegation Tool - DO NOT MODIFY WITHOUT TESTING!
+# Universal web-search delegation tool — lazy, tri-state (DESIGN §3.3)
 # ============================================================================
-# This tool delegates web searches to Claude Code's built-in WebSearch capability.
-# Works with ANY LLM provider (DeepSeek, OpenAI, Gemini, Claude, etc.)
-# NO additional API keys required - uses Claude Code SDK.
+# The tool delegates web searches to Claude Code's built-in WebSearch
+# capability via the Claude Agent SDK fork. It works with ANY LLM provider
+# (DeepSeek, OpenAI, Gemini, Claude, etc.) and needs NO extra API key.
+#
+# The provider package + SDK are resolved LAZILY, under the operator's
+# tri-state policy (auto/enabled/disabled). tools.py must import cleanly
+# even when the claude provider / SDK are absent — the old top-level
+# ``raise ImportError`` + eager ``WebSearchDelegationTool(...)`` made the
+# whole CLI unbootable without the SDK.
+#
+# SDK-error classification (STRICT order, rev 4 precision-fix):
+#   1. ImportError with ``name == "claude_agent_sdk"`` (exactly the root)
+#      -> sdk_missing;
+#   2. the mandatory fork-private module ``claude_agent_sdk._mcp_context``
+#      is absent -> sdk_incompatible (official SDK installed, not the fork);
+#   3. ANYTHING else (SyntaxError, AttributeError, other submodule defects)
+#      -> re-raise (internal defect, not a missing capability).
 #
 # REGRESSION WARNING:
 # - ToolResultBlock is in UserMessage, NOT AssistantMessage!
 # - See web_search_delegation.py:_extract_results() for critical implementation
 # - Always test with: pytest tests/integration_ai/test_websearch_delegation_deepseek.py
-# ============================================================================
-web_search_delegation_tool = WebSearchDelegationTool(verbose=False, timeout=120.0)
+
+
+@dataclass(frozen=True)
+class WebSearchAvailability:
+    """Result of resolving the universal web-search tool under a policy."""
+
+    tool: BaseTool | None
+    reason: str  # "available" | "sdk_missing" | "sdk_incompatible" | "disabled"
+    remedy: str | None
+
+
+_web_search_warned_once = False
+
+
+def _sdk_fork_status() -> tuple[str, str | None]:
+    """Return ``(status, remedy)`` for the Claude Agent SDK fork.
+
+    Status is one of ``"ok"``, ``"sdk_missing"``, ``"sdk_incompatible"``.
+    Re-raises any non-import error (internal defect).
+    """
+    try:
+        import claude_agent_sdk  # noqa: PLC0415
+    except ImportError as exc:
+        if getattr(exc, "name", None) == "claude_agent_sdk":
+            return (
+                "sdk_missing",
+                "Claude Agent SDK not found. Install the SDK fork "
+                "(e.g. CLAUDE_AGENT_SDK_SRC=<path>/claude_sdk/src) or run "
+                "the agent without web search.",
+            )
+        raise  # internal defect, not a missing capability
+
+    try:
+        import claude_agent_sdk._mcp_context  # noqa: PLC0415, F401
+    except ImportError:
+        return (
+            "sdk_incompatible",
+            "Installed claude_agent_sdk is NOT the fork: the mandatory "
+            "private module 'claude_agent_sdk._mcp_context' is missing. "
+            "Install the deep-worker SDK fork (CLAUDE_AGENT_SDK_SRC).",
+        )
+    return "ok", None
+
+
+def resolve_web_search_tool(
+    policy: WebSearchPolicy | str = WebSearchPolicy.AUTO,
+) -> WebSearchAvailability:
+    """Resolve the universal web-search tool under a tri-state policy.
+
+    - ``AUTO``: return the tool when the SDK fork is available; otherwise
+      log exactly once and return ``tool=None`` (the agent still starts).
+    - ``ENABLED``: return the tool, or raise ``CapabilityError`` with the
+      remedy when the SDK is unavailable.
+    - ``DISABLED``: NEVER touch the claude provider or the SDK; return
+      ``tool=None`` without any import attempt.
+
+    The claude provider module is imported lazily, only when the SDK fork
+    is confirmed available and the policy permits resolution.
+    """
+    global _web_search_warned_once
+
+    if isinstance(policy, str):
+        policy = WebSearchPolicy(policy)
+
+    if policy is WebSearchPolicy.DISABLED:
+        return WebSearchAvailability(None, "disabled", None)
+
+    status, remedy = _sdk_fork_status()
+    if status != "ok":
+        if policy is WebSearchPolicy.ENABLED:
+            raise CapabilityError(capability="web_search", remedy=remedy)
+        # AUTO: log once, skip the tool, agent keeps starting.
+        if not _web_search_warned_once:
+            logger.warning(
+                "web_search tool unavailable (%s): %s — skipping. "
+                "Use --enable-web-search to fail loudly instead, or "
+                "--disable-web-search to silence this.",
+                status,
+                remedy,
+            )
+            _web_search_warned_once = True
+        return WebSearchAvailability(None, status, remedy)
+
+    from deep_worker.providers.claude_code_provider.web_search import (  # noqa: PLC0415
+        WebSearchDelegationTool,
+    )
+
+    return WebSearchAvailability(
+        WebSearchDelegationTool(verbose=False, timeout=120.0),
+        "available",
+        None,
+    )
 
 
 def http_request(

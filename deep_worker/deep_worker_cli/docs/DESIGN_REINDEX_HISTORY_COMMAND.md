@@ -259,7 +259,7 @@ Notes:
 
 ## 6. TDD plan
 
-RED tests first, per `add_feature`.
+RED tests first.
 
 ### 6.1 CLI parsing / dispatch (unit)
 - `test_reindex_history_flag_parses`

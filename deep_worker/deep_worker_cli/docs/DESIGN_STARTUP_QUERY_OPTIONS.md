@@ -531,7 +531,7 @@ user-turn marker.
 
 ## 6. TDD plan
 
-Falling tests written BEFORE the implementation, per `add_feature`:
+Failing tests written BEFORE the implementation:
 
 ### 6.1 CLI parsing (unit)
 - `test_startup_query_parses_sum_query_text`

@@ -1803,16 +1803,23 @@ def create_model(
             )
     elif provider == "claude-code":
         # ============================================================================
-        # CRITICAL: CLAUDE_CODE_PROVIDER MUST BE IMPORTED FROM SOURCE CODE!
+        # CLAUDE-CODE provider — vendored package + Claude Agent SDK fork.
         # ============================================================================
-        # Import claude_code_provider from a local source checkout
-        # This is a local package that provides LangChain wrapper for Claude Code SDK
-        # ============================================================================
-        _repo_root = Path(__file__).parent.parent.parent.parent
-        if str(_repo_root) not in sys.path:
-            sys.path.insert(0, str(_repo_root))
+        # Resolve the provider origin through provider_paths (source root on
+        # sys.path in source mode; no-op in installed mode). See
+        # deep_worker_cli/provider_paths.py.
+        from deep_worker_cli.provider_paths import ensure_provider_importable
 
-        from claude_code_provider import ClaudeCodeChatModel
+        resolution = ensure_provider_importable(
+            "deep_worker.providers.claude_code_provider"
+        )
+        if resolution.unavailable:
+            raise CapabilityError(
+                capability="claude-code",
+                remedy=resolution.remedy or resolution.unavailable,
+            )
+
+        from deep_worker.providers.claude_code_provider import ClaudeCodeChatModel
 
         # Claude Code accepts simple model names (sonnet, haiku, opus, inherit)
         # or full model names (claude-sonnet-4-5-20250929)

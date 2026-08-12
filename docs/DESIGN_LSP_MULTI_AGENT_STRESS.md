@@ -249,10 +249,6 @@ Documentation:
 
 - NEW `docs/DESIGN_LSP_MULTI_AGENT_STRESS.md` (this file).
 
-The root `AGENTS.md` is **not touched** (reviewer's note — "a tests-only
-commit shouldn't touch the internal service's AGENTS.md"); the agent's
-memory note is updated outside the commit.
-
 ## §9. Found defect (Serena 1.6 refresh tool)
 
 **Symptom (from a live run of the stress test).**

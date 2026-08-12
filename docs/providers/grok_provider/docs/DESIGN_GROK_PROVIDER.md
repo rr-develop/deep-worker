@@ -1288,7 +1288,6 @@ of codex_provider.
 
 ## 18. Review
 
-The design goes through review per the `add_feature` procedure in
-`AGENTS.md` at the repo root.
+The design goes through review before implementation.
 
 After review sign-off — we move to TDD implementation.
