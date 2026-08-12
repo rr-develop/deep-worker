@@ -753,7 +753,7 @@ async def execute_task_textual(
 
     except asyncio.CancelledError:
         # Clear active message immediately so it won't block pruning
-        # If we don't do this, the store still thinks it's actice and protects
+        # If we don't do this, the store still thinks it's active and protects
         # from pruning, which breaks get_messages_to_prune(), potentially
         # blocking all future pruning
         if adapter._set_active_message:
@@ -795,7 +795,7 @@ async def execute_task_textual(
     except KeyboardInterrupt:
         # Clear active message immediately so it won't block pruning
         # Clear active message immediately so it won't block pruning
-        # If we don't do this, the store still thinks it's actice and protects
+        # If we don't do this, the store still thinks it's active and protects
         # from pruning, which breaks get_messages_to_prune(), potentially
         # blocking all future pruning
         if adapter._set_active_message:

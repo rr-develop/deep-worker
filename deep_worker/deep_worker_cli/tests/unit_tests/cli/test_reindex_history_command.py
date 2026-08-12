@@ -91,8 +91,9 @@ def test_reindex_history_dispatches_command(monkeypatch) -> None:
 @pytest.mark.asyncio
 async def test_reindex_offline_calls_clear_then_index(monkeypatch, tmp_path) -> None:
     from deep_worker_cli.cli import agent_command
+    from deep_worker_cli.storage_paths import deep_worker_home
 
-    summaries = tmp_path / Path("~/.deep_worker").name / "ag" / "summaries"
+    summaries = deep_worker_home(tmp_path) / "ag" / "summaries"
     summaries.mkdir(parents=True)
     (summaries / "one.jsonl").write_text("{}\n", encoding="utf-8")
     calls: list[str] = []
@@ -131,8 +132,9 @@ async def test_reindex_offline_no_summaries_dir_exit_1(monkeypatch, tmp_path, ca
 @pytest.mark.asyncio
 async def test_reindex_offline_no_jsonl_files_exit_0(monkeypatch, tmp_path, capsys) -> None:
     from deep_worker_cli.cli import agent_command
+    from deep_worker_cli.storage_paths import deep_worker_home
 
-    (tmp_path / Path("~/.deep_worker").name / "ag" / "summaries").mkdir(parents=True)
+    (deep_worker_home(tmp_path) / "ag" / "summaries").mkdir(parents=True)
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setattr(agent_command, "ProcessRegistry", lambda: _Registry(None))
 
@@ -145,8 +147,9 @@ async def test_reindex_offline_no_jsonl_files_exit_0(monkeypatch, tmp_path, caps
 @pytest.mark.asyncio
 async def test_reindex_offline_stats_errors_exit_1(monkeypatch, tmp_path) -> None:
     from deep_worker_cli.cli import agent_command
+    from deep_worker_cli.storage_paths import deep_worker_home
 
-    summaries = tmp_path / Path("~/.deep_worker").name / "ag" / "summaries"
+    summaries = deep_worker_home(tmp_path) / "ag" / "summaries"
     summaries.mkdir(parents=True)
     (summaries / "one.jsonl").write_text("{}\n", encoding="utf-8")
     monkeypatch.setenv("HOME", str(tmp_path))

@@ -1,38 +1,29 @@
-"""Test rpyc_async source integration.
+"""Test rpyc_async integration.
 
-This module verifies that rpyc is correctly imported from a local rpyc_async checkout
-and has all required AsyncioServer features.
+``rpyc-async`` is a regular PyPI dependency (>=1.0.0). These tests verify
+that the installed distribution is importable and carries the AsyncioServer
+features this project relies on.
 """
 
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 
 import pytest
 
-# Add rpyc_async to path
-_rpyc_async_path = Path("/path/to/rpyc_async")
-if str(_rpyc_async_path) not in sys.path:
-    sys.path.insert(0, str(_rpyc_async_path))
 
+def test_rpyc_is_importable():
+    """``rpyc_async`` resolves to a real, importable package.
 
-def test_rpyc_imports_from_correct_location():
-    """Test that rpyc is imported from the local rpyc_async checkout."""
+    Deliberately does not assert *where* it comes from: a source checkout on
+    a developer machine and a site-packages install from PyPI are both valid,
+    and pinning either one makes the test a statement about one machine's
+    layout rather than about the dependency.
+    """
     import rpyc_async as rpyc
 
-    rpyc_path = Path(rpyc.__file__).resolve()
-    expected_base = Path("/path/to/rpyc_async")
-
-    # Check if rpyc is from expected location
-    try:
-        rpyc_path.relative_to(expected_base)
-    except ValueError:
-        pytest.fail(
-            f"rpyc imported from wrong location!\n"
-            f"Expected base: {expected_base}\n"
-            f"Actual: {rpyc_path}"
-        )
+    assert rpyc.__file__ is not None
+    assert Path(rpyc.__file__).is_file()
 
 
 def test_asyncio_server_available():
@@ -138,11 +129,6 @@ def _mp_server_entrypoint(
     ready_queue: Any,
 ) -> None:
     """Entry point for a child-process AsyncioServer."""
-    import sys as _sys
-    _rpyc_async = "/path/to/rpyc_async"
-    if _rpyc_async not in _sys.path:
-        _sys.path.insert(0, _rpyc_async)
-
     import rpyc_async as _rpyc_child  # noqa: F401
     from rpyc_async.utils.async_server import AsyncioServer as _AsyncioServer
 
@@ -173,9 +159,9 @@ def _mp_asyncio_server(
 ) -> Iterator[int]:
     """Start `AsyncioServer(service_factory())` in a child process.
 
-    Local copy of `tests/support.py::mp_asyncio_server` from the
-    rpyc_async checkout. The same-process server+client topology is
-    forbidden (`docs/DESIGN_NO_SAME_PROCESS_TESTS.md`).
+    Local copy of `tests/support.py::mp_asyncio_server` from the rpyc-async
+    project. The same-process server+client topology is forbidden by that
+    project's own policy.
     """
     port = _get_free_port()
     ready_queue: Any = multiprocessing.Queue()

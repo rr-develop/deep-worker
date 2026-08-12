@@ -138,7 +138,7 @@
 - ✅ Force option support
 
 ### Type Safety ✅
-- ✅ **0 pyright errors, 0 warnings, 0 informations**
+- ✅ **0 pyright errors, 0 warnings, 0 information items**
 - ✅ All type: ignore comments properly documented
 - ✅ Public API for AgentService (get_root method)
 - ✅ All imports properly typed

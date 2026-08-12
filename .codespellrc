@@ -1,0 +1,29 @@
+[codespell]
+# Generated artifacts, binary blobs and lock files: not prose, and rewriting a
+# word inside a protobuf descriptor or a lock file corrupts it.
+skip = .git,*.pdf,*.svg,*.lock,*.json,*_pb2.py,*_pb2_grpc.py,*.gradle,node_modules,.venv,htmlcov
+
+# Every entry below is a word codespell flags that is correct here. Grouped by
+# why it is correct, because "it is a false positive" is not reviewable.
+#
+# Accepted variant spellings (both forms are dictionary words):
+#   unparseable   - used throughout the inbox/spool code
+#   overrideable  - test seam naming in the LSP supervisor
+#   re-use        - hyphenated form, deliberate in prose
+#   pre-pends     - likewise hyphenated
+#
+# Proper nouns / third-party API names:
+#   iterm         - Apple's iTerm.app, matched via TERM_PROGRAM
+#   uptodate      - Gradle's Task.upToDate API in a vendored init script
+#
+# Deliberate test data - these are the input the test feeds in, so
+# "correcting" them silently removes what the test checks:
+#   pyton         - misspelling fed to validate_language_name's suggester
+#   hel           - prefix fed to the autocomplete controller
+#   te            - grep pattern inside a shell-allow-list fixture
+#   caf           - matches "cafe" with an accent, a unicode round-trip fixture
+#   nd            - ordinal suffix (st/nd/rd/th) and the relative-date form Nd
+#
+# Vendored upstream text we do not edit:
+#   auxilary      - Anthropic's skill-creator SKILL.md, shipped as an example
+ignore-words-list = unparseable,overrideable,re-use,pre-pends,iterm,uptodate,pyton,hel,te,caf,nd,auxilary

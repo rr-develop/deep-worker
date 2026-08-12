@@ -17,7 +17,7 @@ for the FIRST non-empty list. That was wrong on two counts:
    FIRST bind on the model happened to be ``_bind_tools_for_middleware``
    (deepagents/graph.py:252) with the ORIGINAL caller-supplied tools
    list (7 ``web_tools`` only, NOT the final 23 that include
-   filesystem/skills/todo middlware tools). The barrier returned True
+   filesystem/skills/todo middleware tools). The barrier returned True
    on 7 → ``_handle_invoke`` fired → first ``ainvoke`` cached a
    ``ProxyMCPServer`` with the wrong (smaller) tool set in
    ``ClientManager.clients[name]``. From that point on the CLI session
