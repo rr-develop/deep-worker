@@ -18,6 +18,7 @@ import uuid
 from pathlib import Path
 
 import pytest
+from deep_worker_cli.storage_paths import deep_worker_home
 
 
 pytestmark = pytest.mark.skipif(
@@ -60,7 +61,7 @@ def _run(
 
 
 def _cleanup_agent_files(agent_name: str) -> None:
-    shutil.rmtree(Path("~/.deep_worker").expanduser() / agent_name, ignore_errors=True)
+    shutil.rmtree(deep_worker_home() / agent_name, ignore_errors=True)
     db_path = Path.home() / ".deepagents" / f"sessions_{agent_name}.db"
     with contextlib.suppress(FileNotFoundError):
         db_path.unlink()
@@ -83,8 +84,8 @@ def _wait_registered(agent_name: str, env: dict[str, str], timeout: float = 60.0
         if agent_name in last_output:
             return
         time.sleep(0.2)
-    out_log = Path("~/.deep_worker").expanduser() / "logs" / f"{agent_name}.out.log"
-    err_log = Path("~/.deep_worker").expanduser() / "logs" / f"{agent_name}.err.log"
+    out_log = deep_worker_home() / "logs" / f"{agent_name}.out.log"
+    err_log = deep_worker_home() / "logs" / f"{agent_name}.err.log"
     pytest.fail(
         f"agent {agent_name!r} did not register within {timeout}s\n"
         f"last dwcli --list output:\n{last_output[-4000:]}\n"

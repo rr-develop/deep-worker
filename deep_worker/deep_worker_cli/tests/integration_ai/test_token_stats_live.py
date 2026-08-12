@@ -41,6 +41,7 @@ from deep_worker_cli.stats.token_stats import (
     STATUS_OK,
     read_stats_file,
 )
+from deep_worker_cli.storage_paths import deep_worker_home
 
 from .agent_fixture import agent_fixture as _make_agent
 
@@ -50,7 +51,7 @@ _DEEPSEEK_MODEL = "deepseek-chat"
 
 
 def _stats_path(agent_name: str) -> Path:
-    return Path("~/.deep_worker").expanduser() / agent_name / "token_stats.jsonl"
+    return deep_worker_home() / agent_name / "token_stats.jsonl"
 
 
 def _read_records(agent_name: str) -> list[dict]:

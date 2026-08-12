@@ -16,6 +16,7 @@ from deep_worker_cli.client.agent_client import AgentClient
 from deep_worker_cli.process.agent_process import AgentProcess
 from deep_worker_cli.process.registry import ProcessRegistry
 from deep_worker_cli.runtime.availability_tracker import AvailabilityTracker
+from deep_worker_cli.storage_paths import deep_worker_home
 
 clear_history_index = None
 index_all_history_files = None
@@ -174,7 +175,7 @@ def normalize_model_arg(args: argparse.Namespace) -> None:
 
 def _get_agent_data_dir(name: str) -> Path:
     """Return the data directory for an agent."""
-    return Path.home() / Path("~/.deep_worker").name / name
+    return deep_worker_home() / name
 
 
 def load_launch_config(name: str) -> dict | None:
@@ -2036,7 +2037,7 @@ def daemonize(name: str, log_dir: Path | None = None) -> None:
     """
     # Set up log directory
     if log_dir is None:
-        log_dir = Path.home() / Path("~/.deep_worker").name / "logs"
+        log_dir = deep_worker_home() / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     # ``mkdir`` above inherits the CALLER's umask, and the parent process that
     # kicked off ``deep-worker --restart`` may itself run under umask 0
@@ -3264,7 +3265,7 @@ def main() -> int:
         import shutil
         # Remove per-agent data directory (contains session_metadata.json).
         # Fast (a few unlinks); no DB lock involved.
-        data_dir = Path.home() / Path("~/.deep_worker").name / args.name
+        data_dir = deep_worker_home() / args.name
         if data_dir.exists():
             try:
                 shutil.rmtree(data_dir)
@@ -3276,7 +3277,7 @@ def main() -> int:
         # append. If we did this post-daemonize we'd unlink our own
         # active log-fd from the directory entry and silently lose all
         # future agent output.
-        log_dir = Path.home() / Path("~/.deep_worker").name / "logs"
+        log_dir = deep_worker_home() / "logs"
         if log_dir.exists():
             for log_file in log_dir.glob(f"{args.name}.*"):
                 try:

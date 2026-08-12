@@ -6,7 +6,7 @@ Each running agent persists ``session_metadata.json`` and other
 files under ``<agent-data-dir>/<agent_name>/`` (the
 ``SessionManager.data_dir`` default — see
 ``AgentProcess.__init__`` line 204:
-``self.data_dir = data_dir or (Path("~/.deep_worker").expanduser() / name)``).
+``self.data_dir = data_dir or (deep_worker_home() / name)``).
 
 The ``agent_fixture`` context manager cleans up the agent **process**,
 the registry record, the ``/tmp/deep_worker_<name>.pid`` file, and the
@@ -36,6 +36,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from deep_worker_cli.storage_paths import deep_worker_home
 
 # ``agent_fixture`` lives in ``tests/integration_ai/`` and uses
 # relative imports (``from .models import ...``). To resolve those

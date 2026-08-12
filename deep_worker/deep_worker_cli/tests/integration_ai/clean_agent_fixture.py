@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Literal
 
 import pytest
+from deep_worker_cli.storage_paths import deep_worker_home
 
 logger = logging.getLogger(__name__)
 
@@ -133,12 +134,12 @@ def clean_agent(request):
                 )
 
         # 2. Clean up data directories
-        data_dir = Path("~/.deep_worker").expanduser() / name
+        data_dir = deep_worker_home() / name
         if data_dir.exists():
             logger.info(f"Removing data directory: {data_dir}")
             shutil.rmtree(data_dir)
 
-        log_dir = Path("~/.deep_worker").expanduser() / "logs"
+        log_dir = deep_worker_home() / "logs"
         for log_file in log_dir.glob(f"{name}.*"):
             logger.info(f"Removing log file: {log_file}")
             log_file.unlink()

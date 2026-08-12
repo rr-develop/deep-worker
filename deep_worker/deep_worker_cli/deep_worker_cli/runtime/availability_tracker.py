@@ -32,6 +32,7 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dateutil import parser as dtparser
+from deep_worker_cli.storage_paths import deep_worker_home
 
 logger = logging.getLogger(__name__)
 
@@ -180,7 +181,7 @@ class AvailabilityTracker:
 
     def __init__(self, data_dir: Path | None = None) -> None:
         if data_dir is None:
-            data_dir = Path.home() / Path("~/.deep_worker").name
+            data_dir = deep_worker_home()
         self._file = data_dir / "provider_availability.json"
         self._data: dict[str, Any] = self._load()
 

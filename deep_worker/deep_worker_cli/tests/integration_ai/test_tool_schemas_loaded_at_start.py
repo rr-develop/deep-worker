@@ -68,6 +68,7 @@ import uuid
 from pathlib import Path
 
 import pytest
+from deep_worker_cli.storage_paths import deep_worker_home
 
 
 logger = logging.getLogger(__name__)
@@ -234,11 +235,11 @@ def _kill_and_clean(name: str) -> None:
         except OSError:
             pass
 
-    data_dir = Path("~/.deep_worker").expanduser() / name
+    data_dir = deep_worker_home() / name
     if data_dir.exists():
         shutil.rmtree(data_dir, ignore_errors=True)
 
-    log_dir = Path("~/.deep_worker").expanduser() / "logs"
+    log_dir = deep_worker_home() / "logs"
     if log_dir.exists():
         for f in log_dir.glob(f"{name}.*"):
             try:

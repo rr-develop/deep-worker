@@ -1,6 +1,6 @@
 """Reproduce: claude-code agent hangs after a tool_call → text-only final answer.
 
-Live evidence (an observed live hang, 2026-06-14 22:19):
+Live evidence (mj1_init, 2026-06-14 22:19):
 
   ...
   [MCP_DIAG] tool_handler_entry tool=execute call_id=toolu_0195QCQrF7rggXrTLHb6xVty
@@ -15,7 +15,7 @@ the unconditional ``await proxy_mcp.wait_for_any_pending_call()``
 (``claude_code_provider/chat_model.py:1171``).
 
 That ``await`` was wrapped in ``asyncio.wait_for(..., timeout=5.0)`` plus
-``except asyncio.TimeoutError: pass`` before a recent commit. The
+``except asyncio.TimeoutError: pass`` before commit ``012c192``. The
 timeout existed precisely to discriminate between two indistinguishable
 SDK-stream states:
 
@@ -59,6 +59,7 @@ import time
 from pathlib import Path
 
 import pytest
+from deep_worker_cli.storage_paths import deep_worker_home
 
 logger = logging.getLogger(__name__)
 
@@ -107,10 +108,10 @@ def _hang_repro_agent(request: pytest.FixtureRequest):
 
     # Clean state dir + logs so the agent starts from a known empty
     # conversation (otherwise prior history could let it short-circuit).
-    state_dir = Path.home() / Path("~/.deep_worker").name / agent_name
+    state_dir = deep_worker_home() / agent_name
     if state_dir.exists():
         shutil.rmtree(state_dir)
-    log_dir = Path.home() / Path("~/.deep_worker").name / "logs"
+    log_dir = deep_worker_home() / "logs"
     if log_dir.exists():
         for f in log_dir.glob(f"{agent_name}.*"):
             f.unlink(missing_ok=True)
@@ -164,7 +165,7 @@ def _hang_repro_agent(request: pytest.FixtureRequest):
 def test_claude_code_does_not_hang_after_tool_then_text(_hang_repro_agent):
     """Single headless turn: read file → text-only final answer.
 
-    On the post-regression code, ``ainvoke`` inside the second
+    On the post-incident-06-14 code, ``ainvoke`` inside the second
     re-entry (``tool_resolved=True, user_message_sent=False``) parks on
     ``await proxy_mcp.wait_for_any_pending_call()`` forever, because
     Claude has no further ``tools/call`` to send. ``dwcli -p`` therefore
@@ -190,7 +191,7 @@ def test_claude_code_does_not_hang_after_tool_then_text(_hang_repro_agent):
         elapsed = time.monotonic() - started
         pytest.fail(
             f"dwcli -p did not return within {_HEADLESS_TIMEOUT_SECONDS}s "
-            f"(elapsed: {elapsed:.1f}s). This is the 2026-06-14 "
+            f"(elapsed: {elapsed:.1f}s). This is the incident-2026-06-14 "
             f"regression: ``ainvoke`` is parked on the unconditional "
             f"``wait_for_any_pending_call()`` in chat_model.py:1171, with "
             f"Claude having already given a text-only final answer (no "

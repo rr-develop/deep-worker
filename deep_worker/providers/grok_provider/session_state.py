@@ -34,6 +34,7 @@ import json
 import os
 from pathlib import Path
 from typing import Any
+from deep_worker_cli.storage_paths import deep_worker_home
 
 _STATE_FILENAME = "grok_session_state.json"
 _DIR_MODE = 0o700
@@ -59,7 +60,7 @@ def _thread_base(thread_id: str) -> str:
 
 def session_state_path(thread_id: str) -> Path:
     """Path to the state file for the agent owning ``thread_id``."""
-    data_dir = Path.home() / Path("~/.deep_worker").name / _thread_base(thread_id)
+    data_dir = deep_worker_home() / _thread_base(thread_id)
     return data_dir / _STATE_FILENAME
 
 

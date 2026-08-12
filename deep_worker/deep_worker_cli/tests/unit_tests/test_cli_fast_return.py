@@ -26,6 +26,7 @@ import time
 from pathlib import Path
 
 import pytest
+from deep_worker_cli.storage_paths import deep_worker_home
 
 
 # Budget intentionally generous: on a loaded box these subprocess-spawning
@@ -110,10 +111,10 @@ def _kill_agent(name: str) -> None:
 
 
 def _remove_agent_data(name: str) -> None:
-    data_dir = Path("~/.deep_worker").expanduser() / name
+    data_dir = deep_worker_home() / name
     if data_dir.exists():
         shutil.rmtree(data_dir, ignore_errors=True)
-    log_dir = Path("~/.deep_worker").expanduser() / "logs"
+    log_dir = deep_worker_home() / "logs"
     if log_dir.exists():
         for f in log_dir.glob(f"{name}.*"):
             try:

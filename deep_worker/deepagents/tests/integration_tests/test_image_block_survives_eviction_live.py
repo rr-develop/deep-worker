@@ -50,6 +50,8 @@ from deepagents.middleware.filesystem import (
     _evictable_content_str,
 )
 
+from deep_worker_cli.storage_paths import deep_worker_home
+
 # Mirrors the FilesystemMiddleware default for tool_token_limit_before_evict.
 DEFAULT_TOOL_TOKEN_LIMIT = 20000
 
@@ -565,7 +567,7 @@ class TestLiveAgentSeesImage:
         """
         parts: list[str] = []
 
-        log_dir = Path("~/.deep_worker").expanduser() / "logs"
+        log_dir = deep_worker_home() / "logs"
         for suffix in (".out.log", ".err.log"):
             log_path = log_dir / f"{agent_name}{suffix}"
             try:
@@ -597,7 +599,7 @@ class TestLiveAgentSeesImage:
         fixed-interval re-reading -- `select` blocks with the remaining budget as
         its only timeout, so an idle agent costs nothing.
         """
-        log_dir = Path("~/.deep_worker").expanduser() / "logs"
+        log_dir = deep_worker_home() / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
 
         transcript = self._history(agent_name, deadline)

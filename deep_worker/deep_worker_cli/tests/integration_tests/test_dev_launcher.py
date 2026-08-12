@@ -50,6 +50,8 @@ from pathlib import Path
 
 import pytest
 
+from deep_worker_cli.storage_paths import deep_worker_home
+
 
 # Path to the launcher under test — the one that lives in THIS tree.
 # Tests in dev-tree validate the dev-tree launcher; tests in master-tree
@@ -88,10 +90,10 @@ def _kill_real_agent_if_alive(name: str) -> None:
             pid_file.unlink()
         except OSError:
             pass
-    data_dir = Path("~/.deep_worker").expanduser() / name
+    data_dir = deep_worker_home() / name
     if data_dir.exists():
         shutil.rmtree(data_dir, ignore_errors=True)
-    log_dir = Path("~/.deep_worker").expanduser() / "logs"
+    log_dir = deep_worker_home() / "logs"
     if log_dir.exists():
         for f in log_dir.glob(f"{name}.*"):
             try:

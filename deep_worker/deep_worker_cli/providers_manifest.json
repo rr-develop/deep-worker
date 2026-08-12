@@ -1,5 +1,5 @@
 {
-  "_comment": "Two-way provider manifest invariant: the eligible source set — every *.py plus py.typed under deep_worker/providers/<pkg>, minus the deny list — must EXACTLY equal the files below. Regenerate with `python3 hooks/stage_providers.py --update` after any provider source change.",
+  "_comment": "Two-way provider manifest invariant: the eligible source set \u2014 every *.py plus py.typed under deep_worker/providers/<pkg>, minus the deny list \u2014 must EXACTLY equal the files below. Regenerate with `python3 hooks/stage_providers.py --update` after any provider source change.",
   "deny": {},
   "packages": {
     "claude_code_provider": {
@@ -15,7 +15,7 @@
         "py.typed": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         "session_import.py": "3dd1f5ede21cfb5e428d6319206843b9c53fab49f8a259997b97f337626c939f",
         "session_restore.py": "5a2878f24423f59cd6e580963a75598c2ac02590c7520e7c5b2b1bae22fb9aa8",
-        "session_state.py": "13d3d9408c0fa98bd1cd8b1fb4727b048a44c109b78fd60f8d2bb90ebbcc0ad0",
+        "session_state.py": "80b9d61acdfb590369bd20133d9e0c413bc486ea0e5bec5a58088e6fd845f39d",
         "session_synthesis.py": "bb37c723b8fa789b6667ca27eb06e4bcd5f6504e8d22e1f369aef7bcf339915d",
         "session_tail_match.py": "e8d7ce1b2ad47f1eb4f84538a5ee76e450716e52cf769262c27b30c3f119cd35",
         "web_search/__init__.py": "54072416d6e53075a85ba022c195d1d9836f22aa396dad517d4ab6abb0810e17",
@@ -35,7 +35,7 @@
         "native_tools.py": "8f87abbc63d7d6e9684988c3ff961329616b1b542c49e92e7ae9ee33198ba6ad",
         "proxy_mcp_server.py": "88001da43529340fa7d7b23987bfc9ce2962987769ff87150f8267d0bbd5213a",
         "py.typed": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "session_state.py": "5f06e0c5193aa76d829a6c6f3ffb46f37815ac5e21d5984798076d01bb1344f7"
+        "session_state.py": "cb03cfccbf6f9cd255238f1e4fd1300fa232b77cbd50c07ff233770431696789"
       },
       "source_subpath": "deep_worker/providers/codex_provider"
     },
@@ -66,7 +66,7 @@
         "limit_errors.py": "f333654be78b6d492881d31ada277b7152c880b630a32886b829df67cffe4c11",
         "proxy_mcp_server.py": "4fd73c970fbaaa4db9a75408f0778e2eb5b9931bdeda01db09dcc1b491ab1e47",
         "py.typed": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "session_state.py": "27ec6696b9ee9461ed6463ddb591f2c5c3223e81edeb235d9117a586d44bc012"
+        "session_state.py": "694b904d08edc920cf2328d693779e1c09e1d6c28a6d79b96ac43a0042a72ae7"
       },
       "source_subpath": "deep_worker/providers/grok_provider"
     },

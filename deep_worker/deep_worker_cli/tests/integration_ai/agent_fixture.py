@@ -31,6 +31,7 @@ from deep_worker_cli.process.agent_process import AgentProcess
 from deep_worker_cli.process.registry import ProcessRegistry
 
 from .models import AgentFixtureInfo, AgentStatus
+from deep_worker_cli.storage_paths import deep_worker_home
 
 logger = logging.getLogger(__name__)
 
@@ -115,7 +116,7 @@ def _cleanup_agent_files(agent_info: AgentFixtureInfo) -> None:
     1. ``/tmp/deep_worker_<agent_name>.pid`` — the PID lockfile.
     2. ``~/.deep_worker/<agent_name>/`` — the ``SessionManager.data_dir``
        default (see ``AgentProcess.__init__``:
-       ``self.data_dir = data_dir or (Path.home() / Path("~/.deep_worker").name / name)``).
+       ``self.data_dir = data_dir or (deep_worker_home() / name)``).
        Holds ``session_metadata.json`` and conversation summaries.
        Used to be left on disk by every passed test, accumulating
        hundreds of stale directories per machine over time.
@@ -144,7 +145,7 @@ def _cleanup_agent_files(agent_info: AgentFixtureInfo) -> None:
     #    process created this in AgentProcess.__init__ for its
     #    SessionManager. Best-effort: a missing dir is fine (agent
     #    may not have reached the SessionManager init phase).
-    data_dir = Path.home() / Path("~/.deep_worker").name / agent_info.agent_name
+    data_dir = deep_worker_home() / agent_info.agent_name
     if data_dir.exists():
         try:
             shutil.rmtree(data_dir, ignore_errors=False)

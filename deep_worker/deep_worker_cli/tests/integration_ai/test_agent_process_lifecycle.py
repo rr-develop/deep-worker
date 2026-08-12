@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 
 from deep_worker_cli.process.registry import ProcessRegistry
+from deep_worker_cli.storage_paths import deep_worker_home
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +53,7 @@ def test_clean_agent_kills_old_process_and_verifies_death():
         time.sleep(1.0)
 
     # Remove data directory
-    data_dir = Path("~/.deep_worker").expanduser() / agent_name
+    data_dir = deep_worker_home() / agent_name
     if data_dir.exists():
         shutil.rmtree(data_dir)
 
@@ -249,7 +250,7 @@ def test_clean_agent_kills_old_process_and_verifies_death():
                     logger.info(f"  PID {pid} already dead")
 
         # Clean up data directory
-        data_dir = Path("~/.deep_worker").expanduser() / agent_name
+        data_dir = deep_worker_home() / agent_name
         if data_dir.exists():
             shutil.rmtree(data_dir)
             logger.info(f"  Removed data directory: {data_dir}")

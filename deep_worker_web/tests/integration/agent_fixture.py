@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Iterator, Optional
 
 from deep_worker_cli.process.registry import ProcessRegistry  # type: ignore[import-not-found]
+from deep_worker_cli.storage_paths import deep_worker_home
 
 
 @dataclass
@@ -255,7 +256,7 @@ def agent_fixture(
                 # test_agent_<pid>_<ts>/ directories. Safe: agent_name
                 # is the f-string ``test_agent_{pid}_{ts}`` (line 128)
                 # or the caller-supplied name, all under our control.
-                data_dir = Path("~/.deep_worker").expanduser() / agent_name
+                data_dir = deep_worker_home() / agent_name
                 if data_dir.exists():
                     shutil.rmtree(data_dir, ignore_errors=True)
 

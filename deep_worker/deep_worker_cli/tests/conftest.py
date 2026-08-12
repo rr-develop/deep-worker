@@ -133,6 +133,10 @@ except ImportError:
 print(f"✓ Tests will use LOCAL deepagents from: {LOCAL_DEEPAGENTS}")
 print(f"✓ ProjectMemoryMiddleware available from local code")
 
+# Import AFTER the sys.path manipulation above — before it, deep_worker_cli
+# is not importable.
+from deep_worker_cli.storage_paths import deep_worker_home  # noqa: E402
+
 
 def _snapshot_test_agent_artefacts() -> dict[str, set[str]]:
     """Snapshot the ``test_*`` dirs under the agent data directory + ``/tmp/deep_worker_test_*.pid``
@@ -144,7 +148,7 @@ def _snapshot_test_agent_artefacts() -> dict[str, set[str]]:
     predate this session); anything not in the snapshot but present
     afterwards is a leak we created and must clean up.
     """
-    home_dw = Path("~/.deep_worker").expanduser()
+    home_dw = deep_worker_home()
     dirs: set[str] = set()
     if home_dw.exists():
         for child in home_dw.iterdir():
@@ -254,7 +258,7 @@ def pytest_sessionfinish(session, exitstatus) -> None:  # noqa: ARG001
             pass
 
     # 2. ``test_*`` dirs under the agent data directory created during this session.
-    home_dw = Path("~/.deep_worker").expanduser()
+    home_dw = deep_worker_home()
     if home_dw.exists():
         for child in home_dw.iterdir():
             if not (child.is_dir() and child.name.startswith("test_")):

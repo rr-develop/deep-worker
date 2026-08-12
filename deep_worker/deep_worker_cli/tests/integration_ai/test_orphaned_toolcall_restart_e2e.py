@@ -39,6 +39,7 @@ import pytest
 from deep_worker_cli.client.agent_client import AgentClient
 from deep_worker_cli.exceptions import IPCConnectionError
 from deep_worker_cli.process.registry import ProcessRegistry
+from deep_worker_cli.storage_paths import deep_worker_home
 
 
 pytestmark = pytest.mark.integration
@@ -176,7 +177,7 @@ def fresh_agent():
         pytest.skip("deep-worker not on PATH")
 
     _stop_via_cli(_AGENT_NAME)
-    data_dir = Path.home() / Path("~/.deep_worker").name / _AGENT_NAME
+    data_dir = deep_worker_home() / _AGENT_NAME
     if data_dir.exists():
         shutil.rmtree(data_dir, ignore_errors=True)
 
@@ -185,7 +186,7 @@ def fresh_agent():
         yield pid
     finally:
         _stop_via_cli(_AGENT_NAME)
-        d = Path.home() / Path("~/.deep_worker").name / _AGENT_NAME
+        d = deep_worker_home() / _AGENT_NAME
         if d.exists():
             shutil.rmtree(d, ignore_errors=True)
 
@@ -193,7 +194,7 @@ def fresh_agent():
 @pytest.mark.asyncio
 async def test_orphaned_toolcall_does_not_deadlock_after_restart(fresh_agent: int) -> None:
     old_pid = fresh_agent
-    err_log = Path.home() / Path("~/.deep_worker").name / "logs" / f"{_AGENT_NAME}.err.log"
+    err_log = deep_worker_home() / "logs" / f"{_AGENT_NAME}.err.log"
 
     client = AgentClient(_AGENT_NAME)
     await client.connect()

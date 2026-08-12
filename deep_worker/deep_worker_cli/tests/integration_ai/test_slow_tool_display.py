@@ -36,6 +36,7 @@ import pytest
 from .check_reply import verify_screenshot_contains
 from .clean_agent_fixture import clean_agent  # noqa: F401
 from .terminal_emulator import DwcliTerminalSession
+from deep_worker_cli.storage_paths import deep_worker_home
 
 logger = logging.getLogger(__name__)
 
@@ -135,12 +136,12 @@ def slow_tool_agent(request):
             )
 
     # 2. Clean up data directories
-    data_dir = Path("~/.deep_worker").expanduser() / agent_name
+    data_dir = deep_worker_home() / agent_name
     if data_dir.exists():
         logger.info(f"Removing data directory: {data_dir}")
         shutil.rmtree(data_dir)
 
-    log_dir = Path("~/.deep_worker").expanduser() / "logs"
+    log_dir = deep_worker_home() / "logs"
     if log_dir.exists():
         for log_file in log_dir.glob(f"{agent_name}.*"):
             log_file.unlink(missing_ok=True)

@@ -38,6 +38,7 @@ import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Final, Literal
+from deep_worker_cli.storage_paths import deep_worker_home
 
 SCHEMA_VERSION: Final = 1
 _DIR_MODE: Final = 0o700
@@ -113,7 +114,7 @@ def _default_base_dir() -> Path:
     ``slug_dir`` call so tests using tmp_path see no side effects on
     the developer's home.
     """
-    return Path("~/.deep_worker").expanduser() / "lsp"
+    return deep_worker_home() / "lsp"
 
 
 def project_slug(project_root: Path) -> str:

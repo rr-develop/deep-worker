@@ -32,6 +32,7 @@ from app.schemas.agent_schemas import (
     StopTaskManagerRequest,
 )
 from app.services.agent_service import AgentService
+from deep_worker_cli.storage_paths import deep_worker_home
 
 # Provider↔model compatibility. This used to be a hand-copied duplicate of
 # the CLI predicate, kept local because importing ``deep_worker_cli.config``
@@ -729,7 +730,7 @@ def load_launch_config(agent_name: str) -> dict[str, Any] | None:
     """Load launch_config from session_metadata.json."""
     import json
 
-    data_dir = Path.home() / Path("~/.deep_worker").name / agent_name
+    data_dir = deep_worker_home() / agent_name
     metadata_file = data_dir / "session_metadata.json"
 
     if not metadata_file.exists():
@@ -878,7 +879,7 @@ def _spawn_subprocess(
         _redact_next = _arg == "--mcp-server"
     logger.info("Spawning agent: %s", " ".join(_logged_cmd))
 
-    log_dir = Path.home() / Path("~/.deep_worker").name / "logs"
+    log_dir = deep_worker_home() / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     err_log = log_dir / f"{agent_name}.spawn.log"
 

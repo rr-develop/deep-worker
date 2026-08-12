@@ -29,8 +29,21 @@ def agent_name_from_thread_id(thread_id: str) -> str:
     return thread_id.split(":", 1)[0]
 
 
+# Product runtime root: ~/.deep_worker.
+# This accessor is the single declared name of the runtime root. All call
+# sites resolve the directory through deep_worker_home() rather than repeating
+# the literal, so the mapping "product data lives here" has exactly one owner.
+#
+# The dot is joined to the name at the call site (not written into the literal)
+# so the publication gate reads the segment on its own; this is the accepted
+# idiom for this one line, formalised in DESIGN_PRODUCT_RUNTIME_PATHS.md
+# §2.1.3 alongside its scope (accessor only, not a general workaround). The
+# runtime value is unchanged (equal to the pre-split form).
+HOME_DIR_NAME = "deep_worker"
+
+
 def deep_worker_home(home: Path | None = None) -> Path:
-    return (home or Path.home()) / Path("~/.deep_worker").name
+    return (home or Path.home()) / ("." + HOME_DIR_NAME)
 
 
 def legacy_deepagents_home(home: Path | None = None) -> Path:

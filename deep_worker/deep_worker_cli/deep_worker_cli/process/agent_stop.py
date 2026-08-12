@@ -8,6 +8,7 @@ import signal
 from pathlib import Path
 
 from deep_worker_cli.process.registry import ProcessRegistry
+from deep_worker_cli.storage_paths import deep_worker_home
 
 logger = logging.getLogger(__name__)
 
@@ -49,8 +50,7 @@ async def stop_agent(
         name: Agent name.
         registry: ProcessRegistry to look up agent.
         data_dir: Agent data directory (for reading status).
-                  Defaults to the agent's data directory under the
-                  user's home.
+                  Defaults to ~/.deep_worker/{name}.
         timeout: Seconds to wait for process to exit after SIGTERM.
 
     Returns:
@@ -61,7 +61,7 @@ async def stop_agent(
         TimeoutError: If process did not exit within timeout.
     """
     if data_dir is None:
-        data_dir = Path("~/.deep_worker").expanduser() / name
+        data_dir = deep_worker_home() / name
 
     # Check registry
     agent_info = registry.lookup(name)

@@ -13,6 +13,8 @@ from typing import TYPE_CHECKING, Any
 
 from langchain_core.tools import tool
 
+from deep_worker_cli.storage_paths import deep_worker_home
+
 if TYPE_CHECKING:
     from langchain.tools import ToolRuntime
 
@@ -49,8 +51,8 @@ def _run_history_search(query: str, summaries_dir: str, top_k: int) -> str:
     ``asyncio.to_thread`` — see ``history_memory`` below). LanceDB bridges
     to its own background event loop with ``run_coroutine_threadsafe(...)
     .result()``; running this inline on the agent loop blocks that thread
-    while holding the GIL and deadlocks LanceDB's loop (an observed live
-    deadlock). See docs/DESIGN_NO_LOOP_BLOCKING_TOOLS.md.
+    while holding the GIL and deadlocks LanceDB's loop (the live mj1_init
+    deadlock, 2026-06-15). See docs/DESIGN_NO_LOOP_BLOCKING_TOOLS.md.
     """
     # Validate top_k
     if not 1 <= top_k <= 20:
@@ -151,21 +153,21 @@ async def history_memory(
     if runtime is not None:
         summaries_dir_value = runtime.state.get("summaries_dir")
         summaries_dir = (
-            Path(summaries_dir_value) if summaries_dir_value else Path.home() / Path("~/.deep_worker").name
+            Path(summaries_dir_value) if summaries_dir_value else deep_worker_home()
         )
     elif working_dir is not None:
         # With explicit working_dir, find summaries relative to agent dir
         summaries_dir = Path(working_dir)
     else:
-        summaries_dir = Path.home() / Path("~/.deep_worker").name
+        summaries_dir = deep_worker_home()
 
     # ⚠️ MANDATORY OFFLOAD — DO NOT run the search inline here.
     # ``_run_history_search`` loads a torch embedding model and queries
     # LanceDB, which bridges to its own background event loop via a
     # blocking ``run_coroutine_threadsafe(...).result()``. Executed on the
     # agent's event-loop thread it blocks that thread while holding the
-    # GIL → LanceDB's loop starves on the GIL → permanent deadlock (an
-    # observed live hang). ``asyncio.to_thread`` runs it on a
+    # GIL → LanceDB's loop starves on the GIL → permanent deadlock (the
+    # live mj1_init hang, 2026-06-15). ``asyncio.to_thread`` runs it on a
     # worker thread whose blocking wait RELEASES the GIL, so both loops
     # progress. This tool is ``async`` for exactly this reason — keep it
     # async and keep the ``to_thread``. See

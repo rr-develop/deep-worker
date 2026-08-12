@@ -32,6 +32,7 @@ import pytest
 
 from deep_worker_cli.client.agent_client import AgentClient
 from .agent_fixture import agent_fixture as _make_agent
+from deep_worker_cli.storage_paths import deep_worker_home
 
 
 _INTEGRATION_ENABLED = os.environ.get("GROK_INTEGRATION_TESTS", "").lower() in (
@@ -132,7 +133,7 @@ def _cleanup_agent_state(agent_name: str) -> None:
                 pass
             pid_file.unlink(missing_ok=True)
 
-    dw_root = Path.home() / Path("~/.deep_worker").name
+    dw_root = deep_worker_home()
     data_dir = dw_root / agent_name
     if data_dir.exists():
         shutil.rmtree(data_dir, ignore_errors=True)

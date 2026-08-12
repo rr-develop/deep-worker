@@ -20,6 +20,7 @@ import uuid
 from pathlib import Path
 
 import pytest
+from deep_worker_cli.storage_paths import deep_worker_home
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("GROK_INTEGRATION_TESTS") != "1",
@@ -50,7 +51,7 @@ def _run(args: list[str], *, env: dict[str, str], timeout: float):
 
 
 def _cleanup_agent_files(agent_name: str) -> None:
-    shutil.rmtree(Path.home() / Path("~/.deep_worker").name / agent_name, ignore_errors=True)
+    shutil.rmtree(deep_worker_home() / agent_name, ignore_errors=True)
     db_path = Path.home() / ".deepagents" / f"sessions_{agent_name}.db"
     with contextlib.suppress(FileNotFoundError):
         db_path.unlink()

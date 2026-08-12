@@ -57,6 +57,7 @@ import time
 from pathlib import Path
 
 import pytest
+from deep_worker_cli.storage_paths import deep_worker_home
 
 
 pytestmark = pytest.mark.integration
@@ -234,7 +235,7 @@ def _child_diagnostics(proc: subprocess.Popen, agent_name: str) -> str:
     """Full diagnostic block for any readiness/early-exit failure."""
     out, err = _drain_child_output(proc)
     log_tail = ""
-    log_dir = Path("~/.deep_worker").expanduser() / "logs"
+    log_dir = deep_worker_home() / "logs"
     for log_file in sorted(log_dir.glob(f"{agent_name}.*")):
         try:
             text = log_file.read_text(encoding="utf-8", errors="replace")
@@ -425,11 +426,11 @@ def _kill_daemon(agent_name: str, timeout: float) -> None:
 
 def _clean_agent_dir(agent_name: str) -> None:
     for d in (
-        Path("~/.deep_worker").expanduser() / agent_name,
+        deep_worker_home() / agent_name,
     ):
         if d.exists():
             shutil.rmtree(d, ignore_errors=True)
-    log_dir = Path("~/.deep_worker").expanduser() / "logs"
+    log_dir = deep_worker_home() / "logs"
     if log_dir.exists():
         for log_file in log_dir.glob(f"{agent_name}.*"):
             log_file.unlink(missing_ok=True)
@@ -576,7 +577,7 @@ async def _run_e2e(
             result["history"] = history
 
             # 6. Read status via metadata.
-            meta_path = Path("~/.deep_worker").expanduser() / agent_name / "session_metadata.json"
+            meta_path = deep_worker_home() / agent_name / "session_metadata.json"
             try:
                 meta = json.loads(meta_path.read_text(encoding="utf-8"))
             except Exception as e:  # noqa: BLE001

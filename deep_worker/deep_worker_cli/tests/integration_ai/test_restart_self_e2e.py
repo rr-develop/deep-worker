@@ -37,6 +37,7 @@ import pytest
 
 from deep_worker_cli.client.agent_client import AgentClient
 from deep_worker_cli.process.registry import ProcessRegistry
+from deep_worker_cli.storage_paths import deep_worker_home
 
 
 pytestmark = pytest.mark.integration
@@ -128,7 +129,7 @@ def cli_started_agent():
     # Ensure clean state — kill any lingering instance.
     _stop_via_cli(_AGENT_NAME)
     # Wipe data dir so each run is fresh.
-    data_dir = Path.home() / Path("~/.deep_worker").name / _AGENT_NAME
+    data_dir = deep_worker_home() / _AGENT_NAME
     if data_dir.exists():
         import shutil as _sh
         _sh.rmtree(data_dir, ignore_errors=True)

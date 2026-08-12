@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from deepagents.backends.protocol import BackendProtocol
+from deep_worker_cli.storage_paths import deep_worker_home
 
 # Matches exactly the header the middleware writes:
 #   "## Summarized at 2026-04-22T15:40:18.122420+00:00"
@@ -50,7 +51,7 @@ def get_summaries_dir(agent_name: str) -> Path:
     need the directory to exist must use :func:`ensure_summaries_dir` so
     private directory permissions are enforced.
     """
-    return Path("~/.deep_worker").expanduser() / agent_name / "summaries"
+    return deep_worker_home() / agent_name / "summaries"
 
 
 def ensure_summaries_dir(agent_name: str) -> Path:
@@ -161,7 +162,7 @@ class SummaryFileInfo:
     """Metadata for one offloaded summary file.
 
     Attributes:
-        agent: Agent name (directory name under the agent data directory).
+        agent: Agent name (directory name under ``~/.deep_worker/``).
         thread: Thread id (filename stem — ``<agent>`` for main thread,
             ``<agent>:tm`` for the TaskManager thread, or a UUID for
             subagent threads).
@@ -181,11 +182,11 @@ class SummaryFileInfo:
 
 def _deep_worker_root() -> Path:
     """``$HOME/.deep_worker`` — parent of all per-agent dirs."""
-    return Path("~/.deep_worker").expanduser()
+    return deep_worker_home()
 
 
 def iter_summary_files(agent_name: str | None = None) -> Iterator[SummaryFileInfo]:
-    """Walk the per-agent ``summaries/*.md`` files and yield :class:`SummaryFileInfo`.
+    """Walk ``~/.deep_worker/*/summaries/*.md`` and yield :class:`SummaryFileInfo`.
 
     Args:
         agent_name: If given, yield only summaries for this agent. If

@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from deep_worker_cli.storage_paths import deep_worker_home
 
 # Make the source ``codex_provider`` package importable without installing it.
 # The dev tree layout puts the provider at the repository root.
@@ -211,7 +212,7 @@ async def test_codex_provider_does_not_crash_on_user_question() -> None:
         finally:
             await client.disconnect()
 
-        meta_path = Path("~/.deep_worker").expanduser() / agent_name / "session_metadata.json"
+        meta_path = deep_worker_home() / agent_name / "session_metadata.json"
         deadline = time.monotonic() + 30.0
         meta: dict[str, Any] = {}
         while time.monotonic() < deadline:

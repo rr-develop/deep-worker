@@ -62,6 +62,7 @@ from typing import Any
 
 from app.schemas.agent_schemas import AgentInfo, AgentStatus, AgentStatusInfo
 from app.utils.supervisor import supervise
+from deep_worker_cli.storage_paths import deep_worker_home
 
 # ============================================================================
 # CRITICAL: RPYC MUST BE IMPORTED FROM SOURCE CODE, NOT FROM PIP!
@@ -338,7 +339,7 @@ class AgentService:
         import json  # local import — matches this module's convention
         try:
             meta_file = (
-                Path.home() / Path("~/.deep_worker").name / info.name / "session_metadata.json"
+                deep_worker_home() / info.name / "session_metadata.json"
             )
             if not meta_file.exists():
                 return
@@ -1975,7 +1976,7 @@ class AgentService:
         from app.services.dialog_formatter import render_system_prompt
 
         try:
-            data_dir = Path.home() / Path("~/.deep_worker").name / agent_name
+            data_dir = deep_worker_home() / agent_name
             meta_file = data_dir / "session_metadata.json"
             if not meta_file.exists():
                 return None
