@@ -124,7 +124,8 @@ def _resolve_persisted_grok_display_model(agent_name: str) -> str | None:
     :func:`_resolve_persisted_codex_display_model`.
     """
     try:
-        state_path = Path.home() / Path("~/.deep_worker").name / agent_name / "grok_session_state.json"
+        from deep_worker_cli.storage_paths import deep_worker_home
+        state_path = deep_worker_home() / agent_name / "grok_session_state.json"
         state_data = json.loads(state_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError, ValueError):
         return None
@@ -199,7 +200,8 @@ def _extract_grok_model_id(obj: Any) -> str | None:
 
 def _resolve_persisted_codex_display_model(agent_name: str) -> str | None:
     try:
-        state_path = Path.home() / Path("~/.deep_worker").name / agent_name / "codex_session_state.json"
+        from deep_worker_cli.storage_paths import deep_worker_home
+        state_path = deep_worker_home() / agent_name / "codex_session_state.json"
         state_data = json.loads(state_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError, ValueError):
         return None
@@ -561,7 +563,8 @@ class AgentProcess:
 
         # Paths
         self.pid_file = pid_file or Path(f"/tmp/deep_worker_{name}.pid")
-        self.data_dir = data_dir or (Path.home() / Path("~/.deep_worker").name / name)
+        from deep_worker_cli.storage_paths import deep_worker_home
+        self.data_dir = data_dir or (deep_worker_home() / name)
         from deep_worker_cli.storage_paths import (
             detect_storage_version,
             ensure_private_dir,

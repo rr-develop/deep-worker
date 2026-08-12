@@ -9,9 +9,9 @@ AND sdist-derived wheel):
   rebuilt from the sdist passes the same assert again;
 - sdist carries the verified ``vendor_staging/`` payload + ``staging.manifest.json``
   so an extracted-sdist wheel rebuild is self-sufficient (no ``../../``);
-- prefixed imports — from the isolated venv, ``deep_worker.providers.<pkg>``
-  imports resolve under site-packages; top-level alias ``find_spec`` → None;
-- lazy roots — core package imports without any provider extra installed
+- from the isolated venv, ``deep_worker.providers.<pkg>`` imports
+  resolve under site-packages; top-level alias ``find_spec`` → None;
+- core package imports without any provider extra installed
   (lazy roots must not eager-import heavy submodules).
 
 Like ``test_pypi_build.py`` these require network (build isolation downloads

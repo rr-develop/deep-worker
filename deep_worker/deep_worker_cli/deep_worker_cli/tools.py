@@ -622,7 +622,8 @@ def make_restart_self_tool(sender_name: str) -> BaseTool:
           a restart to take effect.
         - Do NOT use for speculative cleanup, housekeeping, or optimization.
         """
-        data_dir = Path.home() / Path("~/.deep_worker").name / sender_name
+        from deep_worker_cli.storage_paths import deep_worker_home
+        data_dir = deep_worker_home() / sender_name
 
         # 1. Write the restart-notice the new process will consume (shared
         #    writer — same format used by provider failover).
