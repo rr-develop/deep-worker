@@ -2453,6 +2453,11 @@ class AgentProcess:
             try:
                 await self._checkpointer_ctx.__aexit__(None, None, None)
             except Exception as e:
+                # Write to stderr AND logger. cleanup() runs during shutdown,
+                # when the logging pipeline may already be partially torn down;
+                # stderr is the last-resort visible channel. Tests assert
+                # visibility via capsys.readouterr().err.
+                print(f"Warning: Error closing checkpointer: {e}", file=sys.stderr)
                 _logger.info(f"Warning: Error closing checkpointer: {e}")
             finally:
                 self._checkpointer_ctx = None
@@ -2463,6 +2468,9 @@ class AgentProcess:
             try:
                 await self._external_mcp_pool.stop()
             except Exception as e:  # noqa: BLE001
+                # Same rationale as the checkpointer branch above: shutdown
+                # path, dual channel for maximal visibility.
+                print(f"Warning: Error stopping external MCP pool: {e}", file=sys.stderr)
                 _logger.info(f"Warning: Error stopping external MCP pool: {e}")
             finally:
                 self._external_mcp_pool = None
@@ -2507,8 +2515,16 @@ class AgentProcess:
         self._shutting_down = True
         await self.stop_inbox_drain()
 
-        # 3. Persist state
-        if self.session_manager:
+        # 3. Persist state.
+        # ERROR is a diagnostic terminal state — set by set_error() when the
+        # agent could not initialise (missing MCP env, unresolved provider,
+        # etc.) or when a turn failed fatally. It carries error_message that
+        # the Web UI renders as a prominent banner. Blindly overwriting it
+        # with SHUTDOWN here would hide the reason the agent died and violate
+        # the "errors must be VISIBLE and PERSISTENT" contract enforced by
+        # TestInitErrorVisibility (see also No-Agent-Error-State policy).
+        # SHUTDOWN is meaningful only as a transition from a live state.
+        if self.session_manager and self.session_manager.status != AgentStatus.ERROR:
             await self.session_manager.set_status(AgentStatus.SHUTDOWN)
 
         # 4. Cleanup checkpointer
