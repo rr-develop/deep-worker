@@ -21,8 +21,7 @@ from textual.widgets import Static
 # AsyncioServer-based protocol (rpyc_async.core.async_connect). The previous
 # sys.path injection of a local rpyc_async checkout was removed: on a
 # developer machine it shadowed the PyPI package with sources, making
-# "clean env" wheel installs test the wrong code
-# (DESIGN_PROVIDERS_FROM_WHEEL 1 B6).
+# "clean env" wheel installs test the wrong code.
 # ============================================================================
 
 import rpyc_async as rpyc

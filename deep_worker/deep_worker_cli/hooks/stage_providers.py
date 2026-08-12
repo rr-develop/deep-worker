@@ -4,10 +4,9 @@ The deep-worker wheel and sdist ship the in-tree providers
 (``deep_worker/providers/<pkg>``) via a custom build hook — there are NO
 static force-include entries for providers in ``pyproject.toml``.  This module
 is that hook, and it is also the maintainer of the two-way provider manifest
-invariant (``providers_manifest.json``, see DESIGN_PROVIDERS_FROM_WHEEL.md
-§3.4b).
+invariant (``providers_manifest.json``).
 
-Design contract (rev 8 of DESIGN_PROVIDERS_FROM_WHEEL.md):
+Design contract:
 
 * Monorepo builds ALWAYS regenerate staging from the current sources into a
   UNIQUE temp directory (``tempfile.mkdtemp(prefix="dw-provider-stage.")``),
@@ -181,8 +180,8 @@ def build_providers_manifest(providers_root: Path) -> dict[str, Any]:
     return {
         "schema_version": SCHEMA_VERSION,
         "_comment": (
-            "Two-way provider manifest invariant (DESIGN_PROVIDERS_FROM_WHEEL.md "
-            "§3.4b): the eligible source set — every *.py plus py.typed under "
+            "Two-way provider manifest invariant: the eligible source set "
+            "— every *.py plus py.typed under "
             "deep_worker/providers/<pkg>, minus the deny list — must EXACTLY "
             "equal the files below. Regenerate with "
             "`python3 hooks/stage_providers.py --update` after any provider "

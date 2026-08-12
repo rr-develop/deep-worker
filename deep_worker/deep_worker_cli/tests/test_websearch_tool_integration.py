@@ -2,7 +2,7 @@
 
 This test verifies that the universal web-search tool is properly integrated
 into the deep_worker CLI agent tools system under the tri-state policy
-(``WebSearchPolicy`` auto/enabled/disabled, DESIGN_PROVIDERS_FROM_WHEEL §3.3),
+(``WebSearchPolicy`` auto/enabled/disabled),
 without requiring a full TUI session.
 
 Run with:

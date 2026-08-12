@@ -1,10 +1,10 @@
 {
-  "_comment": "Two-way provider manifest invariant (DESIGN_PROVIDERS_FROM_WHEEL.md \u00a73.4b): the eligible source set \u2014 every *.py plus py.typed under deep_worker/providers/<pkg>, minus the deny list \u2014 must EXACTLY equal the files below. Regenerate with `python3 hooks/stage_providers.py --update` after any provider source change.",
+  "_comment": "Two-way provider manifest invariant: the eligible source set — every *.py plus py.typed under deep_worker/providers/<pkg>, minus the deny list — must EXACTLY equal the files below. Regenerate with `python3 hooks/stage_providers.py --update` after any provider source change.",
   "deny": {},
   "packages": {
     "claude_code_provider": {
       "files": {
-        "__init__.py": "25b1012bcae5a68b74c05c25172f30f8f2fdfbe49cc9003f9fa10b7d514218c4",
+        "__init__.py": "b39dc577bafda66bd779960b934772bc062815760d9762ab8ff8fd0a61877c14",
         "api_error_detect.py": "22f75ff8a42408b2eac674103eb6c672d04398f88efc07e579001d5ed8923033",
         "chat_model.py": "f2bf81ad667f98bd2c39dbfa386b74ad1b92d0ab322e59ebe9e074f5f39cbb4d",
         "client_manager.py": "54b2b9d92b719c060c5ada0917796c15632d2e687f7c66a6dddc21c5bb2577cc",
@@ -72,7 +72,7 @@
     },
     "semantic_search": {
       "files": {
-        "__init__.py": "21012c63d788b3edc2de459f5497e5ac8e880fe574bd460e650d08ea6a085566",
+        "__init__.py": "bb2e42e09e81acdb9012035e8995cfa4a69399c4d8f76c11fa2ed8317fd39d19",
         "_tokenizer.py": "6214cf97212c85cecc4ae1d95dbe4b3487a7b8c4f405be2c43af281e88c1516f",
         "config.py": "a7f61eb7f86fac27902abb93d3a454f2e48a2b871649e62bd6b187bc162ed74e",
         "exceptions.py": "d6d73c5715ec5e86fb713db1df2da58b048509ebbbeb30ce5be79ca7fc3d4929",

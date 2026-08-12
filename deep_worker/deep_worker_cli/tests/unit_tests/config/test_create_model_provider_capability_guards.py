@@ -1,6 +1,6 @@
 """Tests for the provider capability guards in ``create_model`` (B2).
 
-DESIGN_PROVIDERS_FROM_WHEEL §1 B2: the claude-code / codex / grok branches
+Capability-guard contract: the claude-code / codex / grok branches
 of ``config.create_model`` must resolve the vendored provider through
 ``provider_paths.ensure_provider_importable`` instead of sys.path hacks.
 When the provider package is unavailable (no source root, not installed)

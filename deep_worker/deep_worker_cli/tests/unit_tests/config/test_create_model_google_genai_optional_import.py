@@ -1,7 +1,7 @@
 """Tests for the optional ``langchain_google_genai`` import in
 ``create_model`` (B3).
 
-DESIGN_PROVIDERS_FROM_WHEEL §1 B3: the google branch and the vertexai
+Optional-import contract: the google branch and the vertexai
 else-branch (non-claude gemini models) import
 ``langchain_google_genai.ChatGoogleGenerativeAI``. The package is not a
 hard dependency of every deployment, so the import MUST be optional: when

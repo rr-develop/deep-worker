@@ -1,7 +1,7 @@
 """Structural guards for the provider capability guards in
 ``AgentProcess.start()`` codex/grok passthrough blocks (B2).
 
-DESIGN_PROVIDERS_FROM_WHEEL §1 B2: the codex (``NATIVE_TOOLS``) and grok
+Capability-guard contract: the codex (``NATIVE_TOOLS``) and grok
 (``build_passthrough_tools``) wiring inside ``AgentProcess.start()`` must
 resolve the vendored provider through
 ``provider_paths.ensure_provider_importable`` and raise ``CapabilityError``

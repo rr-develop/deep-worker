@@ -1,6 +1,6 @@
 """B7: lazy provider root packages + root shim contract (DESIGN §3.2/§3.2b/§3.6).
 
-DESIGN_PROVIDERS_FROM_WHEEL rev 8 requires:
+The lazy-root contract requires:
 
 * §3.2 — canonical ``deep_worker.providers.<pkg>`` roots MUST be lazy
   (PEP 562 ``__getattr__``): importing the root must NOT load heavy

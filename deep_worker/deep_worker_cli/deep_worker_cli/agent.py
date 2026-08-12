@@ -647,13 +647,13 @@ def _dedupe_tools_by_name_priority(
 # See ``docs/DESIGN_HISTORY_INDEX_CATCHUP_ON_START.md``.
 
 _semantic_search_warned_once = False
-"""Log-once flag for the automatic catch-up path (DESIGN_PROVIDERS_FROM_WHEEL §3.6)."""
+"""Log-once flag for the automatic catch-up path."""
 
 
 def _warn_semantic_search_unavailable_once(resolution: Any, exc: Exception | None = None) -> None:
     """Log the semantic-search unavailability exactly once (auto path).
 
-    Per DESIGN_PROVIDERS_FROM_WHEEL §3.6 the automatic startup catch-up must
+    The automatic startup catch-up must
     NOT raise when the semantic-search extra is missing — it logs once and
     startup continues (history memory simply stays unavailable). Explicit
     requests (``--history-memory`` / reindex) raise ``CapabilityError``
@@ -721,7 +721,7 @@ def _count_pending_history_lines(
     # content embedded ``U+2028`` etc., which re-indexed the whole history on
     # every start. See semantic_search.history_indexer.count_jsonl_lines.
     #
-    # Auto catch-up contract (DESIGN_PROVIDERS_FROM_WHEEL §3.6): when the
+    # Auto catch-up contract: when the
     # semantic-search extra is unavailable, do NOT raise — report "nothing
     # pending" (log-once) so startup continues with history memory disabled.
     from deep_worker_cli.provider_paths import ensure_provider_importable
@@ -1236,8 +1236,7 @@ def create_cli_agent(
     # Wire up history memory indexer as summarization callback
     if enable_history_memory:
         # Explicit request (--history-memory flag) → hard-fail with an
-        # actionable remedy when the semantic-search extra is missing
-        # (DESIGN_PROVIDERS_FROM_WHEEL §3.6).
+        # actionable remedy when the semantic-search extra is missing.
         from deep_worker_cli.provider_paths import ensure_provider_importable
         from deep_worker_cli.exceptions import CapabilityError
 

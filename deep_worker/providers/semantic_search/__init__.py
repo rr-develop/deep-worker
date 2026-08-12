@@ -1,6 +1,6 @@
 """semantic_search — semantic code search using LlamaIndex + LanceDB.
 
-LAZY SURFACE (DESIGN_PROVIDERS_FROM_WHEEL §3.6, rev 8): importing this root
+LAZY SURFACE: importing this root
 package MUST NOT load the heavy submodules (``indexer``, ``retriever``,
 ``history_indexer``, ``history_retriever``, ``long_text_embedding``) and MUST
 NOT pull llama-index. All exports are resolved lazily via PEP 562

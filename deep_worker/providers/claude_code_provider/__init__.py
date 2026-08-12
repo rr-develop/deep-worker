@@ -25,7 +25,7 @@ Usage:
     # Use with LangGraph
     response = await model.ainvoke(messages, config={"configurable": {"thread_id": "session-1"}})
 
-LAZY SURFACE (DESIGN_PROVIDERS_FROM_WHEEL §3.2): importing this root package
+LAZY SURFACE: importing this root package
 never imports the heavy submodules (``chat_model``, ``client_manager``,
 ``proxy_mcp_server``, ``web_search``) and therefore never pulls
 ``claude_agent_sdk``. Submodules are loaded lazily on first attribute access

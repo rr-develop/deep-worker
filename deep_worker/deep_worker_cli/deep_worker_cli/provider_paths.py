@@ -172,7 +172,7 @@ def _find_source_root() -> Path | None:
 
 
 # ---------------------------------------------------------------------------
-# Optional heavy-extra capability probes (DESIGN_PROVIDERS_FROM_WHEEL §3.6/§4)
+# Optional heavy-extra capability probes
 # ---------------------------------------------------------------------------
 #
 # In the wheel all 5 vendor packages are ALWAYS present, so the real gate for
@@ -515,7 +515,7 @@ def ensure_provider_importable(pkg: str, mode: str = "auto") -> ProviderResoluti
     failure). Callers decide how to surface the failure (log-once vs
     CapabilityError). For providers with an optional heavy extra
     (``_EXTRA_PROBES``), availability also requires the extra stack —
-    regardless of the package origin (DESIGN_PROVIDERS_FROM_WHEEL §3.6/§4).
+    regardless of the package origin.
     """
     resolution = resolve_provider(pkg, mode=mode)
     resolution = _apply_extra_probe(resolution)

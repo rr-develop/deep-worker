@@ -1,4 +1,4 @@
-"""No-network socket-allowlist hook (DESIGN_PROVIDERS_FROM_WHEEL §5.8).
+"""No-network socket-allowlist hook.
 
 Every in-venv assertion script in the provider-from-wheel artifact tests runs
 under an ACTIVE outbound-socket guard: only loopback (127.x / ::1 /

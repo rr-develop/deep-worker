@@ -1,6 +1,6 @@
 """Installed-origin ALL-checks + env source-root trust contract.
 
-Covers DESIGN_PROVIDERS_FROM_WHEEL.md §3.1 (provider_paths.py):
+Covers ``provider_paths.py``:
 
 - ``DEEP_WORKER_SOURCE_ROOT`` is a TRUSTED declaration: when set but invalid
   (relative / missing marker / not a repo layout) resolution must report an

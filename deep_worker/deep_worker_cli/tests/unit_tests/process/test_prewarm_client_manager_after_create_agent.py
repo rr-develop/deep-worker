@@ -273,7 +273,7 @@ async def test_prewarm_swallows_client_manager_errors() -> None:
     )
 
 
-# ─── §3.7 structural import invariant (DESIGN_PROVIDERS_FROM_WHEEL) ─────────
+# ─── structural import invariant ───────────────────────────────────────────
 
 def _unavailable_resolution(pkg: str, remedy: str | None = None) -> ProviderResolution:
     """A resolution whose ``unavailable`` field is set (provider absent)."""

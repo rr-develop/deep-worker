@@ -85,7 +85,7 @@ sys.path.insert(0, deep_worker_dir_str)
 # CRITICAL: repo root on sys.path so `deep_worker.providers.<pkg>` resolves
 # ============================================================================
 # The vendored providers now live under `deep_worker/providers/` (prefixed
-# import scheme, DESIGN_PROVIDERS_FROM_WHEEL §3.1). For `import
+# import scheme). For `import
 # deep_worker.providers.semantic_search` etc. to resolve in the dev tree, the
 # repo ROOT (parent of `deep_worker/`) must be on sys.path. In installed
 # (wheel) mode this is a no-op — the package is found under site-packages.

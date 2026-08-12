@@ -1034,7 +1034,7 @@ def create_parser() -> argparse.ArgumentParser:
         help="Disable auto-approve-send-message (useful with --restart to override a saved True value)",
     )
 
-    # Tri-state universal web-search policy (DESIGN_PROVIDERS_FROM_WHEEL §3.3).
+    # Tri-state universal web-search policy.
     # Mutual exclusion is enforced by a shared dest + mutually exclusive group:
     # passing both flags is an argparse error.
     web_search_group = parser.add_mutually_exclusive_group()
@@ -2641,8 +2641,7 @@ def _history_indexer_funcs():
     # mode). See deep_worker_cli/provider_paths.py.
     #
     # Explicit request (--reindex-history) → hard-fail with an actionable
-    # remedy when the semantic-search extra is missing
-    # (DESIGN_PROVIDERS_FROM_WHEEL §3.6).
+    # remedy when the semantic-search extra is missing.
     from deep_worker_cli.provider_paths import ensure_provider_importable
     from deep_worker_cli.exceptions import CapabilityError
 

@@ -61,7 +61,7 @@ class CharsetMode(StrEnum):
 
 
 class WebSearchPolicy(StrEnum):
-    """Tri-state universal web-search policy (DESIGN_PROVIDERS_FROM_WHEEL §3.3).
+    """Tri-state universal web-search policy.
 
     Controls whether the Claude-Code-SDK-backed ``web_search`` delegation
     tool is resolved and bound into the agent toolset:
@@ -1827,7 +1827,7 @@ def create_model(
         # ============================================================================
         # Resolve the provider origin through provider_paths (source root on
         # sys.path in source mode; no-op in installed mode). See
-        # deep_worker_cli/provider_paths.py and DESIGN_PROVIDERS_FROM_WHEEL §3.1.
+        # deep_worker_cli/provider_paths.py.
         # ``model_name`` may be None — in that case the provider does NOT
         # pass ``--model`` to ``codex exec`` and the CLI picks its own
         # current default (Q2: do not pin model version).
@@ -1854,7 +1854,7 @@ def create_model(
         # ============================================================================
         # Resolve the provider origin through provider_paths (source root on
         # sys.path in source mode; no-op in installed mode). See
-        # deep_worker_cli/provider_paths.py and DESIGN_PROVIDERS_FROM_WHEEL §3.1.
+        # deep_worker_cli/provider_paths.py.
         # ``model_name`` may be None — in that case the provider does NOT
         # pin a model and the grok CLI picks its own current default. Drives
         # ``grok agent stdio`` over ACP.

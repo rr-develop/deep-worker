@@ -61,8 +61,8 @@ dependencies = [
   # deepseek_model.py and DEEPSEEK_PROVIDER.md (2026-05-22).
   "langchain-deepseek==1.0.1",
   "langgraph-checkpoint-sqlite==3.0.3",
-  # Google Gemini (API provider, core per capability matrix §4 of
-  # DESIGN_PROVIDERS_FROM_WHEEL.md). The dev tree pins ==4.2.0 via the
+  # Google Gemini (API provider, core per the capability matrix).
+  # The dev tree pins ==4.2.0 via the
   # vendored deepagents fork; the public wheel uses the same open range as
   # the public deepagents library.
   "langchain-google-genai>=4.2.0,<5.0.0",
@@ -110,7 +110,7 @@ dependencies = [
   "wcmatch>=8.5.0,<11.0.0",
 
   # Vendored provider runtimes (deep_worker/providers/<pkg> ships inside the
-  # wheel/sdist — DESIGN_PROVIDERS_FROM_WHEEL.md §3.4). The codex/grok proxy
+  # wheel/sdist). The codex/grok proxy
   # MCP servers (streamable HTTP) run uvicorn + Starlette in-process; these
   # are core deps because codex/grok are core providers.
   "uvicorn>=0.24.0",
@@ -133,7 +133,7 @@ dependencies = [
 [project.optional-dependencies]
 vertexai = ["langchain-google-vertexai>=3.0.0,<4.0.0"]
 # Vendored semantic-search provider: the heavy llama-index stack stays out of
-# core (DESIGN_PROVIDERS_FROM_WHEEL.md §4). Runtime set mirrors
+# core. Runtime set mirrors
 # requirements-semantic-search.txt minus the test-only entries.
 semantic-search = [
     "llama-index-core>=0.10.0",
@@ -200,7 +200,7 @@ test = [
 # `allow-direct-references` is intentionally ABSENT: it was only needed for
 # the old `rpyc-async @ file://...` dependency, which is gone (D5).
 # ---------------------------------------------------------------------------
-# Vendored providers (DESIGN_PROVIDERS_FROM_WHEEL.md §3.4): the five
+# Vendored providers: the five
 # deep_worker/providers/<pkg> packages are staged into the wheel/sdist by a
 # custom hatchling hook (hooks/stage_providers.py). There are NO static
 # force-includes for providers here — all source→dest mappings are set
@@ -264,8 +264,8 @@ extra-paths = [
     "../../claude_code_provider",
     "../../semantic_search",
     "../deepagents",
-    # Source fork of claude_agent_sdk (CLAUDE_AGENT_SDK_SRC contract,
-    # DESIGN_PROVIDERS_FROM_WHEEL.md §3.5): the vendored
+    # Source fork of claude_agent_sdk (CLAUDE_AGENT_SDK_SRC contract):
+    # the vendored
     # claude_code_provider imports `claude_agent_sdk._mcp_context` lazily.
     # ty needs the fork on the search path to type-check that code path.
     # Mirrors the Claude SDK source entry already in pyrightconfig.json.

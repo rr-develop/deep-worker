@@ -1,17 +1,17 @@
 """Provider-from-wheel artifact positive-path tests (REAL build + clean venv).
 
-Exercises the artifact acceptance gates of DESIGN_PROVIDERS_FROM_WHEEL.md §5
-for BOTH artifacts (monorepo wheel AND sdist-derived wheel):
+Exercises the artifact acceptance gates for BOTH artifacts (monorepo wheel
+AND sdist-derived wheel):
 
-- п.7 (rev 6/7): archive-assert — NO top-level provider dirs
+- archive-assert — NO top-level provider dirs
   (``claude_code_provider/``, ``codex_provider/``, ``grok_provider/``,
   ``semantic_search/``, ``deepworker_a2a/``) in wheel OR sdist; the wheel
   rebuilt from the sdist passes the same assert again;
 - sdist carries the verified ``vendor_staging/`` payload + ``staging.manifest.json``
   so an extracted-sdist wheel rebuild is self-sufficient (no ``../../``);
-- п.13(a): from the isolated venv, ``deep_worker.providers.<pkg>`` imports
-  resolve under site-packages; top-level alias ``find_spec`` → None;
-- п.4/п.6 spirit: core package imports without any provider extra installed
+- prefixed imports — from the isolated venv, ``deep_worker.providers.<pkg>``
+  imports resolve under site-packages; top-level alias ``find_spec`` → None;
+- lazy roots — core package imports without any provider extra installed
   (lazy roots must not eager-import heavy submodules).
 
 Like ``test_pypi_build.py`` these require network (build isolation downloads
@@ -140,7 +140,7 @@ def _sdist_entries(sdist: Path) -> list[str]:
 
 
 def _assert_no_top_level_provider_dirs(entries: list[str], label: str) -> None:
-    """п.7 archive-assert: providers only under their canonical location.
+    """Archive-assert: providers only under their canonical location.
 
     For the wheel that is ``deep_worker/providers/<pkg>/``; for the sdist the
     payload is shipped as ``vendor_staging/`` (mapped into the wheel at build
@@ -214,7 +214,7 @@ for _m in (_dw_mod, _dwc_mod):
 
 
 def test_archive_assert_both_artifacts_and_sdist_rebuild(tmp_path: Path) -> None:
-    """п.7: wheel AND sdist alias-free; sdist-derived wheel passes again."""
+    """Wheel AND sdist alias-free; sdist-derived wheel passes again."""
     dist = tmp_path / "dist"
     dist.mkdir()
     wheel, sdist = _build_dist(dist, cwd=PROJECT_ROOT)
@@ -240,7 +240,7 @@ def test_archive_assert_both_artifacts_and_sdist_rebuild(tmp_path: Path) -> None
 
 
 def test_clean_venv_prefix_imports_and_no_top_level_aliases(tmp_path: Path) -> None:
-    """п.13(a): installed wheel — prefixed imports work, aliases absent."""
+    """Installed wheel — prefixed imports work, aliases absent."""
     dist = tmp_path / "dist"
     dist.mkdir()
     wheel, _ = _build_dist(dist, cwd=PROJECT_ROOT)
@@ -310,7 +310,7 @@ def test_clean_venv_core_import_without_provider_extras(tmp_path: Path) -> None:
 def test_parallel_wheel_builds_no_conflict_and_git_status_clean(
     tmp_path: Path,
 ) -> None:
-    """п.10(б,в) + п.9(д): two concurrent wheel builds from the monorepo.
+    """Two concurrent wheel builds from the monorepo.
 
     - both succeed and produce exactly one wheel each;
     - NO source-tree staging appears (``vendor_staging/`` / ``staging.manifest.json``
@@ -372,8 +372,8 @@ def test_parallel_wheel_builds_no_conflict_and_git_status_clean(
 
 
 # ---------------------------------------------------------------------------
-# п.10(в) real-Hatch staging lifecycle: finalize on success, atexit on
-# failure-after-initialize (DESIGN §3.4 lifetime contract)
+# Real-Hatch staging lifecycle: finalize on success, atexit on
+# failure-after-initialize (staging lifetime contract)
 # ---------------------------------------------------------------------------
 
 
@@ -468,7 +468,7 @@ def _temp_leftovers() -> list[Path]:
 
 
 def test_real_hatch_success_invokes_finalize(tmp_path: Path) -> None:
-    """п.10(д): a SUCCESSFUL real hatch build must call finalize() — proven by
+    """A SUCCESSFUL real hatch build must call finalize() — proven by
     BOTH direct evidence (a canary written from an overridden ``finalize``
     after the real method ran) AND no ``dw-provider-stage.*`` temp surviving
     the build process."""
@@ -499,7 +499,7 @@ def test_real_hatch_success_invokes_finalize(tmp_path: Path) -> None:
 
 
 def test_real_hatch_failure_after_initialize_leaves_no_temp(tmp_path: Path) -> None:
-    """п.10(в): a real hatch build failing in the ARTIFACT phase (after
+    """A real hatch build failing in the ARTIFACT phase (after
     ``initialize()`` succeeded) must leave NO ``dw-provider-stage.*`` temp by
     process exit.
 
@@ -532,7 +532,7 @@ def test_real_hatch_failure_after_initialize_leaves_no_temp(tmp_path: Path) -> N
 
 
 # ---------------------------------------------------------------------------
-# п.14 (rev 7 REQUIRED): coexistence with legacy top-level name owners
+# Coexistence with legacy top-level name owners
 # ---------------------------------------------------------------------------
 
 
@@ -582,7 +582,7 @@ def _make_fixture_wheel(
 
 
 def test_coexistence_with_top_level_name_fixtures(tmp_path: Path) -> None:
-    """п.14: prefixed packages coexist with legacy top-level name owners.
+    """Prefixed packages coexist with legacy top-level name owners.
 
     Deterministic LOCAL fixture wheels own the old top-level names
     ``claude_code_provider`` / ``semantic_search`` (mirroring the real
@@ -680,7 +680,7 @@ def test_coexistence_with_top_level_name_fixtures(tmp_path: Path) -> None:
 
 # ---------------------------------------------------------------------------
 # P0-1 (rev 8 CODE CHANGES REQUESTED): REAL positive-path coverage of
-# DESIGN_PROVIDERS_FROM_WHEEL.md §5.2-§5.5 on BOTH artifacts, no mocks.
+# the artifact acceptance gates on BOTH artifacts, no mocks.
 #
 # The module-scoped fixtures build the artifacts ONCE and install each wheel
 # into its own isolated venv (the two wheels are byte-identical, but the gate

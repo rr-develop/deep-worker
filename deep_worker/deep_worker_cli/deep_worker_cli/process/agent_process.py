@@ -81,8 +81,7 @@ def _history_indexer_funcs() -> tuple[Any, Any]:
     # mode; no-op in installed mode). See deep_worker_cli/provider_paths.py.
     #
     # Explicit request (reindex command / --reindex-history) → hard-fail with
-    # an actionable remedy when the semantic-search extra is missing
-    # (DESIGN_PROVIDERS_FROM_WHEEL §3.6).
+    # an actionable remedy when the semantic-search extra is missing.
     from deep_worker_cli.provider_paths import ensure_provider_importable
     from deep_worker_cli.exceptions import CapabilityError
 
@@ -1853,7 +1852,7 @@ class AgentProcess:
         # surface a regular turn's ``bind_tools`` would produce. No
         # divergence between prewarm and turn paths.
         #
-        # Structural invariant (DESIGN_PROVIDERS_FROM_WHEEL §3.7): non-Claude
+        # Structural invariant: non-Claude
         # paths MUST NEVER import ``deep_worker.providers.claude_code_provider``
         # — a wheel without the SDK fork / claude CLI must still start API
         # providers. The guard on ``provider == "claude-code"`` happens BEFORE

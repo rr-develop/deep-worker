@@ -1,7 +1,6 @@
 """Unit tests for the provider staging hook + two-way manifest invariant.
 
-Covers ``deep_worker_cli/hooks/stage_providers.py``
-(DESIGN_PROVIDERS_FROM_WHEEL.md §3.4 / §3.4b / §5.9-11):
+Covers ``deep_worker_cli/hooks/stage_providers.py``:
 
 - two-way manifest invariant: eligible source set == manifest set EXACTLY
   (new / missing / extra / mismatched / case-collision / symlink-escape /
@@ -526,7 +525,7 @@ def test_resolve_payload_monorepo_creates_temp(tmp_path: Path) -> None:
 
 
 def test_resolve_payload_monorepo_failure_cleans_temp(tmp_path: Path) -> None:
-    """п.10(в): injected staging failure → hard-fail with NO leftover temp.
+    """Injected staging failure → hard-fail with NO leftover temp.
 
     A manifest-listed source file disappears after ``--update``, so
     ``stage_providers_from_source`` fails inside ``_resolve_payload`` (monorepo
@@ -572,7 +571,7 @@ def test_initialize_wheel_force_include(tree: tuple[Path, Path]) -> None:
 
 
 def test_initialize_never_writes_source_tree_staging(tree: tuple[Path, Path]) -> None:
-    """п.10(б)/п.10(д): staging lives ONLY in the temp dir, never in the tree.
+    """Staging lives ONLY in the temp dir, never in the tree.
 
     After ``initialize`` the temp payload is still alive (removal happens in
     ``finalize()``, not in ``initialize()``), and the source tree contains no
@@ -597,7 +596,7 @@ def test_initialize_never_writes_source_tree_staging(tree: tuple[Path, Path]) ->
 
 
 def test_parallel_resolve_payload_no_conflict(tmp_path: Path) -> None:
-    """п.10(б): two concurrent monorepo staging cycles on ONE tree.
+    """Two concurrent monorepo staging cycles on ONE tree.
 
     Each process stages into its own unique ``dw-provider-stage.*`` temp dir —
     no cross-process conflict, no source-tree staging, no leftover temps.

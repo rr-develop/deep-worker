@@ -99,7 +99,7 @@ class AgentConfig:
         if self.max_tokens <= 0:
             raise ValueError(f"max_tokens must be positive, got {self.max_tokens}")
 
-        # Validate web_search_policy (tri-state, DESIGN_PROVIDERS_FROM_WHEEL §3.3)
+        # Validate web_search_policy (tri-state)
         if self.web_search_policy not in ("auto", "enabled", "disabled"):
             raise ValueError(
                 f"web_search_policy must be one of 'auto', 'enabled', 'disabled', "

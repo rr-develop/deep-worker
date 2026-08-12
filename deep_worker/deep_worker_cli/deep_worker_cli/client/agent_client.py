@@ -20,7 +20,7 @@ from deep_worker_cli.process.registry import ProcessRegistry
 # rpyc_async.utils.classic.obtain). The previous sys.path injection of a
 # local rpyc_async checkout was removed: on a developer machine it shadowed
 # the PyPI package with sources, making "clean env" wheel installs test the
-# wrong code (DESIGN_PROVIDERS_FROM_WHEEL 1 B6).
+# wrong code.
 # ============================================================================
 
 import rpyc_async as rpyc

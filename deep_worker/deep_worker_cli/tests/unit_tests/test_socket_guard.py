@@ -1,4 +1,4 @@
-"""No-network socket-allowlist guard canaries (DESIGN_PROVIDERS_FROM_WHEEL §5.8).
+"""No-network socket-allowlist guard canaries.
 
 The guard (``tests/socket_guard.py``) is injected as source into fresh
 interpreters; these canaries prove, in a subprocess (so the test session's

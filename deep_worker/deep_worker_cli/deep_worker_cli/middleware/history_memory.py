@@ -25,7 +25,7 @@ _append_to_system_message = None
 def _history_index_exists(summaries_dir: Path) -> bool:
     """Check if a history index exists under *summaries_dir*.
 
-    Auto path (DESIGN_PROVIDERS_FROM_WHEEL §3.6): when the semantic-search
+    Auto path: when the semantic-search
     extra is unavailable the probe resolves lazily and reports ``False``
     (no raise) — the middleware simply stays disabled.
     """

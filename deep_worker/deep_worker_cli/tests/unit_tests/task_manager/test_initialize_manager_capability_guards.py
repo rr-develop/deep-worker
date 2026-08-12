@@ -1,6 +1,6 @@
 """Tests for the provider capability guards in ``TaskManager._initialize_manager`` (B2).
 
-DESIGN_PROVIDERS_FROM_WHEEL §1 B2: the codex / grok native-tool passthrough
+Capability-guard contract: the codex / grok native-tool passthrough
 wiring in ``task_manager._initialize_manager`` must resolve the vendored
 provider through ``provider_paths.ensure_provider_importable``. When the
 provider is unavailable the manager must raise ``CapabilityError`` BEFORE

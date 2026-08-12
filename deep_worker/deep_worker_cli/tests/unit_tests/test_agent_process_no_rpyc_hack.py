@@ -5,8 +5,7 @@ After switching ``rpyc-async`` to the PyPI package (>=1.0.0), the
 the local-checkout sys.path injection in
 ``deep_worker_cli/process/agent_process.py`` (and the twin copies in
 ``deep_worker_cli/client/agent_client.py`` and
-``deep_worker_cli/cli/interactive.py``, DESIGN_PROVIDERS_FROM_WHEEL §1
-B6) must be gone: on a developer machine the path exists, and the hack
+``deep_worker_cli/cli/interactive.py``) must be gone: on a developer machine the path exists, and the hack
 would shadow the PyPI package with sources — making a "clean env" wheel
 test dishonest.
 """
@@ -68,7 +67,7 @@ def test_no_rpyc_async_syspath_hack_agent_process() -> None:
 
 
 def test_no_rpyc_async_syspath_hack_agent_client() -> None:
-    """DESIGN_PROVIDERS_FROM_WHEEL §1 B6 — agent_client.py:23-25."""
+    """The twin copy in agent_client.py must be gone too."""
     src = AGENT_CLIENT.read_text(encoding="utf-8")
     _assert_no_hack(src, "agent_client.py")
     assert re.search(
@@ -77,7 +76,7 @@ def test_no_rpyc_async_syspath_hack_agent_client() -> None:
 
 
 def test_no_rpyc_async_syspath_hack_interactive() -> None:
-    """DESIGN_PROVIDERS_FROM_WHEEL §1 B6 — cli/interactive.py:26-28."""
+    """The twin copy in cli/interactive.py must be gone too."""
     src = INTERACTIVE.read_text(encoding="utf-8")
     _assert_no_hack(src, "interactive.py")
     assert re.search(
