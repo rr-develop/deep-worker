@@ -148,6 +148,12 @@ semantic-search = [
 # agent's A2A server/client only activates when the extra is installed.
 a2a = ["a2a-sdk[http-server]>=1.1.0"]
 
+[project.urls]
+Homepage = "https://github.com/rr-develop/deep-worker"
+Source = "https://github.com/rr-develop/deep-worker"
+Repository = "https://github.com/rr-develop/deep-worker"
+Issues = "https://github.com/rr-develop/deep-worker/issues"
+
 [project.scripts]
 deep-worker = "deep_worker_cli.cli.router:deep_worker_main"
 deep-worker-cli = "deep_worker_cli.cli.router:deep_worker_cli_main"
