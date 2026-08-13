@@ -16,6 +16,8 @@ from pathlib import Path
 
 import pytest
 
+pytest.importorskip("claude_agent_sdk")  # optional private fork; skip when absent
+
 from deep_worker.providers.claude_code_provider import ClaudeCodeChatModel
 from deep_worker_cli.backends import CLIFilesystemMiddleware, CLIShellBackend
 

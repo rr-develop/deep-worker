@@ -19,6 +19,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+pytest.importorskip("claude_agent_sdk")  # optional private fork; skip when absent
+
 from deep_worker_cli.config import WebSearchPolicy
 from deep_worker_cli.exceptions import CapabilityError
 from deep_worker_cli.tools import (

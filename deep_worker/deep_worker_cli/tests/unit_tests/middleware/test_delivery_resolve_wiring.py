@@ -11,6 +11,10 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
+pytest.importorskip("claude_agent_sdk")  # optional private fork; skip when absent
+
 from deep_worker_cli.agent import _maybe_add_delivery_resolve_middleware
 
 

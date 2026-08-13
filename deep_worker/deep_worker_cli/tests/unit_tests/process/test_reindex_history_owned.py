@@ -6,6 +6,8 @@ from types import SimpleNamespace
 
 import pytest
 
+pytest.importorskip("llama_index")  # semantic-search dep; skip when absent
+
 
 @pytest.mark.asyncio
 async def test_reindex_history_owned_runs_under_invoke_lock(monkeypatch, tmp_path) -> None:

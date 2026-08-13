@@ -6,6 +6,8 @@ from types import SimpleNamespace
 
 import pytest
 
+pytest.importorskip("llama_index")  # semantic-search dep; skip when absent
+
 from deep_worker_cli.types import AgentProcessInfo
 
 

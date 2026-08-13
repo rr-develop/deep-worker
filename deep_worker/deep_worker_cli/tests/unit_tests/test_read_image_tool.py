@@ -7,6 +7,9 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+
+pytest.importorskip("claude_agent_sdk")  # optional dependency; skip when absent
+
 from PIL import Image
 
 

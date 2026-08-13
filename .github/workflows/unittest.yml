@@ -31,7 +31,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e .
-          pip install pytest pytest-asyncio
+          pip install pytest pytest-asyncio responses pytest-mock
 
       # Run from the package directory: a handful of tests resolve fixture
       # paths relative to the repository root via __file__, and pytest's

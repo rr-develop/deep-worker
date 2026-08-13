@@ -71,10 +71,14 @@ def _find_active_recursion_limit(source: str) -> list[str]:
 class TestNoRecursionLimit:
     """Ensure recursion_limit is never actively set in agent configuration."""
 
+    # Repo root: tests/unit_tests/ -> tests/ -> deep_worker_cli/ -> deep_worker/ -> repo root
+    _REPO_ROOT = Path(__file__).resolve().parents[4]
+
     def test_config_py_has_no_recursion_limit(self):
         """config.py must NOT set recursion_limit."""
-        source = Path(
-            "deep_worker/deep_worker_cli/deep_worker_cli/config.py"
+        source = (
+            self._REPO_ROOT
+            / "deep_worker/deep_worker_cli/deep_worker_cli/config.py"
         ).read_text()
         offending = _find_active_recursion_limit(source)
         assert not offending, (
@@ -85,8 +89,9 @@ class TestNoRecursionLimit:
 
     def test_agent_py_has_no_recursion_limit(self):
         """agent.py must NOT set recursion_limit on the graph."""
-        source = Path(
-            "deep_worker/deep_worker_cli/deep_worker_cli/agent.py"
+        source = (
+            self._REPO_ROOT
+            / "deep_worker/deep_worker_cli/deep_worker_cli/agent.py"
         ).read_text()
         offending = _find_active_recursion_limit(source)
         assert not offending, (
@@ -95,8 +100,9 @@ class TestNoRecursionLimit:
 
     def test_agent_process_py_has_no_recursion_limit(self):
         """agent_process.py must NOT set recursion_limit."""
-        source = Path(
-            "deep_worker/deep_worker_cli/deep_worker_cli/process/agent_process.py"
+        source = (
+            self._REPO_ROOT
+            / "deep_worker/deep_worker_cli/deep_worker_cli/process/agent_process.py"
         ).read_text()
         offending = _find_active_recursion_limit(source)
         assert not offending, (
@@ -105,8 +111,8 @@ class TestNoRecursionLimit:
 
     def test_deepagents_graph_py_has_no_recursion_limit(self):
         """deepagents/graph.py must NOT set recursion_limit."""
-        source = Path(
-            "deep_worker/deepagents/deepagents/graph.py"
+        source = (
+            self._REPO_ROOT / "deep_worker/deepagents/deepagents/graph.py"
         ).read_text()
         offending = _find_active_recursion_limit(source)
         assert not offending, (
@@ -125,8 +131,9 @@ class TestNoRecursionLimit:
         ``deepagents/tests/unit_tests/middleware/test_subagents_no_recursion_limit.py``
         for the runtime-level invariant; this test pins the source
         invariant from the deep_worker_cli side."""
-        source = Path(
-            "deep_worker/deepagents/deepagents/middleware/subagents.py"
+        source = (
+            self._REPO_ROOT
+            / "deep_worker/deepagents/deepagents/middleware/subagents.py"
         ).read_text()
         offending = _find_active_recursion_limit(source)
         assert not offending, (

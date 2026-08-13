@@ -16,6 +16,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
+pytest.importorskip("llama_index")  # semantic-search dep; skip when absent
+
 
 # ---------------------------------------------------------------------------
 # Helper: _count_pending_history_lines

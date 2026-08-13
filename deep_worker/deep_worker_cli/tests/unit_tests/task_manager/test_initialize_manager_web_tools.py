@@ -30,6 +30,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+pytest.importorskip("claude_agent_sdk")  # optional private fork; skip when absent
+
 # Make ``codex_provider`` importable without installing it.
 _REPO_ROOT = Path(__file__).resolve().parents[5]
 if str(_REPO_ROOT) not in sys.path:

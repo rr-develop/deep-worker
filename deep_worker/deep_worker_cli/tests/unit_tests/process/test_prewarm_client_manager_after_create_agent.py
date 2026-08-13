@@ -63,6 +63,9 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
+pytest.importorskip("claude_agent_sdk")  # optional dependency; skip when absent
+
 from langchain_core.tools import StructuredTool
 
 from deep_worker_cli.exceptions import CapabilityError

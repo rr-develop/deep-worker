@@ -27,6 +27,10 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
+pytest.importorskip("claude_agent_sdk")  # optional dependency; skip when absent
+
 _REPO_ROOT = Path(__file__).resolve().parents[4]  # repository root
 # OUTER deep_worker_cli dir (contains the deep_worker_cli/ package). The inner
 # package dir must NOT be put on PYTHONPATH: its types.py would shadow the

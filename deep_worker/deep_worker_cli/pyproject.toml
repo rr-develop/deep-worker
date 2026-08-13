@@ -62,10 +62,10 @@ dependencies = [
   "langchain-deepseek==1.0.1",
   "langgraph-checkpoint-sqlite==3.0.3",
   # Google Gemini (API provider, core per the capability matrix).
-  # The dev tree pins ==4.2.0 via the
-  # vendored deepagents fork; the public wheel uses the same open range as
-  # the public deepagents library.
-  "langchain-google-genai>=4.2.0,<5.0.0",
+  # Pinned exact to match the vendored deepagents fork pin and the
+  # host install; a bare range lets pip resolve a newer patch in CI
+  # and trips the pin-drift guard (test_pinned_versions_match_runtime).
+  "langchain-google-genai==4.2.0",
 
   # UI/Terminal
   "textual>=6.0.0,<8.0.0",

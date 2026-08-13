@@ -32,9 +32,11 @@ import pytest
 
 
 # Files whose ``[project] dependencies`` lists we scan.
+# Repo root: tests/unit_tests/ -> tests/ -> deep_worker_cli/ -> deep_worker/ -> repo root
+_REPO_ROOT = Path(__file__).resolve().parents[4]
 _PYPROJECTS = (
-    Path("deep_worker/deep_worker_cli/pyproject.toml"),
-    Path("deep_worker/deepagents/pyproject.toml"),
+    _REPO_ROOT / "deep_worker/deep_worker_cli/pyproject.toml",
+    _REPO_ROOT / "deep_worker/deepagents/pyproject.toml",
 )
 
 
