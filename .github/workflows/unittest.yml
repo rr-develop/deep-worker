@@ -37,6 +37,13 @@ jobs:
       # paths relative to the repository root via __file__, and pytest's
       # rootdir has to be the one pyproject.toml's [tool.pytest.ini_options]
       # belongs to.
+      #
+      # DEEPSEEK_API_KEY is a dummy: AgentConfig (the default provider is
+      # deepseek) validates the key at construction time, and the unit tests
+      # construct configs without one. No unit test makes a real API call, so
+      # a placeholder key satisfies the constructor without any credentials.
       - name: Run unit tests
         working-directory: deep_worker/deep_worker_cli
+        env:
+          DEEPSEEK_API_KEY: test-key-not-used-by-unit-tests
         run: pytest tests/unit_tests -q
