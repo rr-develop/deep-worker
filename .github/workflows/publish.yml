@@ -1,0 +1,42 @@
+name: "Publish to PyPI"
+
+on:
+  push:
+    tags: [ 'v*' ]
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    # Optional but recommended: protects the publish step behind
+    # environment protection rules (and is matched in the PyPI
+    # Trusted Publisher configuration).
+    environment: pypi
+    # Required for Trusted Publishing (OIDC): PyPI must have a pending
+    # publisher for this repository. Note: the PyPI "Workflow name" field
+    # takes the workflow FILENAME "publish.yml" (not the display name),
+    # and the environment "pypi" if configured.
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python 3
+        uses: actions/setup-python@v5
+        with:
+          python-version: 3.12
+      - name: Install Dependencies
+        run: |
+          pip install --upgrade build twine
+      - name: Build sdist and wheel
+        working-directory: deep_worker/deep_worker_cli
+        run: |
+          python -m build
+      - name: Check long description
+        working-directory: deep_worker/deep_worker_cli
+        run: |
+          twine check dist/*
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: deep_worker/deep_worker_cli/dist
