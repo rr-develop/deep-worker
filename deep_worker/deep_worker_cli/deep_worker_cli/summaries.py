@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from deepagents.backends.protocol import BackendProtocol
-from deep_worker_cli.storage_paths import deep_worker_home
+from deep_worker_cli.storage_paths import agent_root, deep_worker_home
 
 # Matches exactly the header the middleware writes:
 #   "## Summarized at 2026-04-22T15:40:18.122420+00:00"
@@ -51,7 +51,7 @@ def get_summaries_dir(agent_name: str) -> Path:
     need the directory to exist must use :func:`ensure_summaries_dir` so
     private directory permissions are enforced.
     """
-    return deep_worker_home() / agent_name / "summaries"
+    return agent_root(agent_name, create=False) / "summaries"
 
 
 def ensure_summaries_dir(agent_name: str) -> Path:

@@ -22,6 +22,38 @@ WRONG ways (DO NOT USE):
 
 See: DEEPSEEK_PROVIDER.md for details on correct usage.
 ============================================================================
+
+============================================================================
+⚠️ THIS IS A DEAD ENTRY POINT — CLI SUBCOMMANDS DO NOT WORK HERE ⚠️
+============================================================================
+This module is NOT executed in a normal launch. The real chain is:
+
+    deep-worker (bash launcher, ~/.local/bin/deep-worker)
+      └─ python3 -m deep_worker_cli.cli.agent_command   ← THE REAL entry point
+           └─ main() → _dispatch_subcommand() → create_parser()
+
+The PRACTICAL RULE that follows from this:
+
+❌ Do NOT register new CLI subcommands in this file — they will end up
+   unavailable to the user, even though the parser unit tests will pass.
+✅ Register them in ``deep_worker_cli/cli/agent_command.py``:
+   * add an entry to ``_build_subcommand_registry()`` (the common contract
+     ``setup_*_parser(subparsers)`` + ``handler(args) -> int``), or a
+     separate ``_dispatch_*_subcommand`` if the signature differs;
+   * add a line to the ``epilog`` of ``create_parser()`` — otherwise the
+     command will not be visible in ``deep-worker --help``;
+   * you MUST cover it with a subprocess test against the REAL launcher
+     (``tests/integration_tests/cli/test_dead_entrypoint_subcommands.py``).
+
+Why you cannot simply ``add_subparsers`` on the main parser: it has a
+positional ``name`` (``nargs='?'``), and subparsers break ALL regular
+launches (``deep-worker myagent`` → ``invalid choice: 'myagent'``).
+
+History: the ``lsp``/``mcp``/``skills``/``threads`` commands were
+registered here and for this reason did not work
+(``deep-worker mcp list`` → ``unrecognized arguments: list``).
+Fixed; analysis — lsp/docs/DESIGN_LSP_MCP_INTEGRATION.md §4.6.
+============================================================================
 """
 
 # ruff: noqa: E402
@@ -216,9 +248,15 @@ def parse_args() -> argparse.Namespace:
     from deep_worker_cli.cli.mcp_command import setup_mcp_parser
     setup_mcp_parser(subparsers, make_help_action=_make_help_action)
 
-    # Optional LSP navigation — see lsp/docs/DESIGN_LSP_MCP_INTEGRATION.md.
-    from deep_worker_cli.cli.lsp_command import setup_lsp_parser
-    setup_lsp_parser(subparsers, make_help_action=_make_help_action)
+    # Bulk migration safety net — see docs/DESIGN_AGENT_DBS_UNDER_AGENTS_SUBDIR.md
+    from deep_worker_cli.cli.migrate_command import setup_migrate_agent_dbs_parser
+    setup_migrate_agent_dbs_parser(subparsers)
+
+    # NB: the ``lsp`` command is intentionally NOT registered HERE.
+    # This module is the OLD (dead) entry point; the real launcher
+    # runs ``python3 -m deep_worker_cli.cli.agent_command``.
+    # Registering CLI subcommands here does not produce a working command —
+    # see lsp/docs/DESIGN_LSP_MCP_INTEGRATION.md §4.6.
 
     threads_parser = subparsers.add_parser(
         "threads",
@@ -335,6 +373,16 @@ def parse_args() -> argparse.Namespace:
         "or 'recommended' for safe defaults. "
         "Applies to both -n and interactive modes.",
     )
+    parser.add_argument(
+        "--tools",
+        metavar="SPEC",
+        help="Restrict which tools the agent may call. Omit for every tool "
+        "(the default). 'none' (or '-*') denies all; 'none,read_file,grep' "
+        "denies all but those; '-execute' removes only those. A spec starting "
+        "with '-' needs the '=' form, e.g. --tools='-execute'. Applies to "
+        "deep-worker tools; a provider's own native tools may be unaffected "
+        "(see docs/DESIGN_TOOL_SELECTION.md).",
+    )
 
     # Summarization configuration
     parser.add_argument(
@@ -449,6 +497,14 @@ async def run_textual_cli_async(
                 sys.exit(1)
 
         try:
+            # Provenance identifies the deep_worker CODE that produced a
+            # report, resolved from the module path — NOT cwd, which for an
+            # installed dwcli is some unrelated project repo.
+            from deep_worker_cli.process.agent_process import (
+                get_code_tree_revision,
+            )
+
+            _commit, _dirty = get_code_tree_revision()
             agent, composite_backend = create_cli_agent(
                 model=model,
                 assistant_id=assistant_id,
@@ -457,6 +513,8 @@ async def run_textual_cli_async(
                 sandbox_type=sandbox_type if sandbox_type != "none" else None,
                 auto_approve=auto_approve,
                 checkpointer=checkpointer,
+                commit=_commit,
+                dirty=_dirty,
             )
         except Exception as e:
             error_text = Text("❌ Failed to create agent: ", style="red")
@@ -532,9 +590,12 @@ def cli_main() -> None:
         elif args.command == "mcp":
             from deep_worker_cli.cli.mcp_command import handle_mcp_command
             sys.exit(handle_mcp_command(args))
-        elif args.command == "lsp":
-            from deep_worker_cli.cli.lsp_command import handle_lsp_command
-            sys.exit(handle_lsp_command(args))
+        elif args.command == "migrate-agent-dbs":
+            from deep_worker_cli.cli.migrate_command import (
+                handle_migrate_agent_dbs_command,
+            )
+            sys.exit(handle_migrate_agent_dbs_command(args))
+
         elif args.command == "threads":
             # "ls" is an argparse alias for "list" — argparse stores the
             # alias as-is in the namespace, so we must match both values.

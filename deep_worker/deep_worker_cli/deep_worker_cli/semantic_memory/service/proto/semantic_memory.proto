@@ -1,0 +1,179 @@
+// Shared semantic-memory service gRPC contract.
+//
+// See docs/DESIGN_SEMANTIC_MEMORY_SHARED_SERVICE.md §4.1 for the
+// authoritative surface.
+//
+// Wire compatibility:
+//   * package is versioned (deep_worker.semantic_memory.v1); breaking
+//     changes MUST bump the version segment and add a new package
+//     alongside the old one for at least one release cycle.
+//   * fields are numbered stably; DO NOT renumber. Deprecated fields keep
+//     their number and get a `reserved` line.
+//
+// Regeneration:
+//   python3 -m grpc_tools.protoc \
+//     -I deep_worker/deep_worker_cli/deep_worker_cli/semantic_memory/service/proto \
+//     --python_out=deep_worker/deep_worker_cli/deep_worker_cli/semantic_memory/service/proto \
+//     --pyi_out=deep_worker/deep_worker_cli/deep_worker_cli/semantic_memory/service/proto \
+//     --grpc_python_out=deep_worker/deep_worker_cli/deep_worker_cli/semantic_memory/service/proto \
+//     semantic_memory.proto
+//   (stubs live next to the .proto and ARE committed — see policy §7)
+
+syntax = "proto3";
+
+package deep_worker.semantic_memory.v1;
+
+// ---------- Common ----------
+
+// A tool result is opaque to the transport: the rendered agent-facing text
+// stays here so the formatting can evolve without breaking the wire schema.
+// Same trick as lsp_service.proto's ToolResult.
+message ToolResult {
+  string content = 1;         // rendered text handed to the agent verbatim
+  bool   is_error = 2;
+  string error_message = 3;   // only set when is_error
+}
+
+// ---------- Administrative ----------
+
+message HealthRequest {}
+
+message HealthReply {
+  // ready is about the SERVICE, not the embedding model: the model loads
+  // lazily on first search (design §4.1), so a ready service may still
+  // have model_loaded=false. Never conflate the two.
+  bool   ready = 1;
+  int32  protocol_version = 2;
+  string service_version = 3;
+  int64  uptime_seconds = 4;
+  int32  attached_clients = 5;
+  bool   model_loaded = 6;
+}
+
+message StatusRequest {}
+
+message StatusReply {
+  int64  pid = 1;
+  string transport_address = 2;
+  int64  uptime_seconds = 3;
+  int32  attached_clients = 4;
+  bool   model_loaded = 5;
+  string embedding_model = 6;
+  int64  searches_total = 7;
+  int64  index_ops_total = 8;
+  int64  last_activity_unix = 9;
+  repeated string warm_tenants = 10;   // tenant slugs with warm caches
+}
+
+// ---------- Session ----------
+
+// Held by each client for the life of the agent. This is the keep-alive
+// that suppresses idle-shutdown while anyone is attached (design §7).
+enum SessionEventType {
+  SESSION_EVENT_UNKNOWN = 0;
+  SESSION_EVENT_ATTACHED = 1;
+  SESSION_EVENT_KEEPALIVE = 2;
+  SESSION_EVENT_SHUTDOWN = 3;
+}
+
+message AttachRequest {
+  string client_id = 1;   // agent name + pid recommended
+}
+
+message SessionEvent {
+  SessionEventType event_type = 1;
+  string message = 2;
+  int64  timestamp_ns = 3;
+}
+
+// ---------- Search ----------
+
+// repo_path / summaries_dir are ALWAYS explicit on the wire. Defaulting to
+// "the agent's own project / own memory" happens client-side, where the
+// working directory and agent name are known (design §5).
+message ProjectSearchRequest {
+  string repo_path = 1;   // absolute realpath
+  string query = 2;
+  int32  top_k = 3;
+}
+
+message ProjectSearchReply {
+  ToolResult result = 1;
+}
+
+message HistorySearchRequest {
+  string summaries_dir = 1;   // absolute realpath of the target agent's summaries
+  string query = 2;
+  int32  top_k = 3;
+}
+
+message HistorySearchReply {
+  ToolResult result = 1;
+}
+
+// ---------- Indexing ----------
+
+message IndexHistoryRequest {
+  string summaries_dir = 1;
+  bool   clear_first = 2;   // --reindex-history
+}
+
+message IndexHistoryReply {
+  ToolResult result = 1;
+  int64 files_indexed = 2;
+  int64 chunks_added = 3;
+  int64 lines_read = 4;
+  int64 errors = 5;
+}
+
+// Index kind, so one RPC answers for both families.
+enum IndexKind {
+  INDEX_KIND_UNKNOWN = 0;
+  INDEX_KIND_PROJECT = 1;   // <repo>/.vector_index
+  INDEX_KIND_HISTORY = 2;   // <summaries>/.history_index
+}
+
+message IndexStatusRequest {
+  IndexKind kind = 1;
+  string path = 2;   // repo root or summaries dir
+}
+
+message IndexStatusReply {
+  // complete is the STRICT three-component check (design §11.3): a
+  // partially deleted index is not usable, and reporting it as present
+  // is how the tool ends up hidden while search still accepts it.
+  bool   exists = 1;
+  bool   complete = 2;
+  int64  pending_lines = 3;   // history only: delta vs line_hashes.json
+  string problem = 4;         // human-readable; empty when healthy
+}
+
+// Tenants that DO have a usable index, for the "no index here, but you can
+// target these" error text (design §5.1).
+message ListTenantsRequest {
+  IndexKind kind = 1;
+  int32 limit = 2;   // 0 = server default (10)
+}
+
+message ListTenantsReply {
+  repeated string tenants = 1;   // repo paths or agent names
+  int64 total = 2;               // may exceed len(tenants) when truncated
+}
+
+// ---------- Service ----------
+
+service SemanticMemory {
+  // Administrative
+  rpc Health(HealthRequest) returns (HealthReply);
+  rpc Status(StatusRequest) returns (StatusReply);
+  rpc AttachSession(AttachRequest) returns (stream SessionEvent);
+
+  // Search
+  rpc SearchProject(ProjectSearchRequest) returns (ProjectSearchReply);
+  rpc SearchHistory(HistorySearchRequest) returns (HistorySearchReply);
+
+  // Indexing
+  rpc IndexHistory(IndexHistoryRequest) returns (IndexHistoryReply);
+  rpc IndexStatus(IndexStatusRequest) returns (IndexStatusReply);
+  rpc ListTenants(ListTenantsRequest) returns (ListTenantsReply);
+}

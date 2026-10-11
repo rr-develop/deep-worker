@@ -19,10 +19,10 @@ class TestRenderSystemPrompt:
     def test_basic_header_and_body(self) -> None:
         out = render_system_prompt(
             "You are agent X.\nBe concise.",
-            provider="claude-code",
+            provider="claude-code-sdk",
             model="opus",
         )
-        assert "--- System Prompt (invariant, provider=claude-code, model=opus) ---" in out
+        assert "--- System Prompt (invariant, provider=claude-code-sdk, model=opus) ---" in out
         assert "You are agent X." in out
         assert "Be concise." in out
 
@@ -31,7 +31,7 @@ class TestRenderSystemPrompt:
         assert out.index("---") < out.index("BODYTEXT")
 
     def test_empty_prompt_has_placeholder(self) -> None:
-        out = render_system_prompt("", provider="claude-code", model="opus")
+        out = render_system_prompt("", provider="claude-code-sdk", model="opus")
         assert "(no system prompt)" in out
 
     def test_none_provider_model_tolerated(self) -> None:
@@ -41,7 +41,7 @@ class TestRenderSystemPrompt:
         assert "provider=" in out
 
     def test_cyrillic_preserved(self) -> None:
-        out = render_system_prompt("You are agent Ro.", provider="claude-code", model="opus")
+        out = render_system_prompt("You are agent Ro.", provider="claude-code-sdk", model="opus")
         assert "You are agent Ro." in out
 
 
@@ -51,13 +51,13 @@ class TestRenderTools:
             {"name": "execute", "description": "Run a shell command"},
             {"name": "read_file", "description": "Read a file"},
         ]
-        out = render_tools(tools, provider="claude-code")
-        assert "--- Available Tools (provider=claude-code, count=2) ---" in out
+        out = render_tools(tools, provider="claude-code-sdk")
+        assert "--- Available Tools (provider=claude-code-sdk, count=2) ---" in out
         assert "- execute: Run a shell command" in out
         assert "- read_file: Read a file" in out
 
     def test_empty_tool_list(self) -> None:
-        out = render_tools([], provider="claude-code")
+        out = render_tools([], provider="claude-code-sdk")
         assert "count=0" in out
         assert "(no tools)" in out
 
@@ -67,7 +67,7 @@ class TestRenderTools:
 
     def test_multiline_description_first_line_only(self) -> None:
         tools = [{"name": "bar", "description": "First line\nSecond line"}]
-        out = render_tools(tools, provider="claude-code")
+        out = render_tools(tools, provider="claude-code-sdk")
         assert "- bar: First line" in out
         assert "Second line" not in out
 

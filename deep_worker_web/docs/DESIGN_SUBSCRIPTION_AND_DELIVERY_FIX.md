@@ -2,7 +2,7 @@
 
 Two independent bugs surfaced from an inter-agent code-review session
 (2026-05-24). Both are fixed here. Bug 1 lives in the web app; Bug 2 lives
-in `claude_code_provider` + the `deep_worker_cli` middleware.
+in `claude_code_sdk_provider` + the `deep_worker_cli` middleware.
 
 ---
 
@@ -96,7 +96,7 @@ agent-side change required, but re-verify after the web fix.
 
 ### Observed
 
-Every `send_message_to_agent` from the sending agent (claude-code) was **delivered**
+Every `send_message_to_agent` from the sending agent (claude-code-sdk) was **delivered**
 (the recipient replied with real reviews), yet Claude reported "The send timed out".
 Measured gap between Claude emitting the tool call and our code returning the
 tool result: **121–268 s every time** (≥120 s). The MCP handler default
@@ -141,9 +141,9 @@ it detects a genuinely dead/unreachable channel — never the recipient's work
 ### Layering constraint
 
 `SendMessageCompletionMiddleware` is provider-agnostic (applied to codex /
-deepseek / claude-code alike, `agent.py:672`); only claude-code has a
+deepseek / claude-code-sdk alike, `agent.py:672`); only claude-code-sdk has a
 proxy-MCP. So the resolve must NOT be hard-wired into the shared middleware
-reaching into claude-code internals.
+reaching into claude-code-sdk internals.
 
 ### Fix — resolve at delivery, inside the provider, decoupled from the round-trip
 
@@ -160,7 +160,7 @@ close that gap **without** changing tool semantics or layering:
   `finally` pops the key (`:144`) — so an early resolve here plus any later
   send-loop resolve cannot double-fire.
 
-* **A claude-code-only delivery-resolve middleware** performs the resolve at
+* **A claude-code-sdk-only delivery-resolve middleware** performs the resolve at
   delivery, using the `awrap_tool_call` seam.
 
   Chosen seam (verified against `langchain.agents.middleware.types`):
@@ -173,8 +173,8 @@ close that gap **without** changing tool semantics or layering:
   `ToolCallRequest` exposes `tool_call` (has `name` + `id`), `state`, and
   `runtime` (LangGraph runtime → `thread_id` via its config). It does NOT
   expose the model, so the middleware resolves via the provider's own singleton
-  `claude_code_provider.get_global_client_manager()` — which is legitimate
-  *because this middleware itself lives in / is gated to claude-code*.
+  `claude_code_sdk_provider.get_global_client_manager()` — which is legitimate
+  *because this middleware itself lives in / is gated to claude-code-sdk*.
 
   Flow inside `awrap_tool_call`:
   1. `result = await handler(request)` — run the tool, get the `ToolMessage`.
@@ -190,7 +190,7 @@ close that gap **without** changing tool semantics or layering:
   Add this middleware to the stack ONLY when
   `isinstance(model, ClaudeCodeChatModel)`. The shared
   `SendMessageCompletionMiddleware` is left untouched and provider-agnostic;
-  all proxy-MCP knowledge stays in the claude-code layer.
+  all proxy-MCP knowledge stays in the claude-code-sdk layer.
 
   `ClaudeCodeChatModel` also gains a small public, idempotent
   `resolve_pending_tool(thread_id, tool_call_id, content)` so the resolve is a
@@ -222,7 +222,7 @@ close that gap **without** changing tool semantics or layering:
   proxy Future **before** the turn-ending jump (Future done immediately, not on
   the next ainvoke); failure ToolMessage does NOT resolve (model must still see
   the error).
-* non-claude-code provider (no `resolve_pending_tool`): the completion path is a
+* non-claude-code-sdk provider (no `resolve_pending_tool`): the completion path is a
   no-op and does not raise.
 * timeout semantics: when delivery confirms, the handler returns the delivered
   result well under 120 s; only a never-confirmed delivery hits the timeout

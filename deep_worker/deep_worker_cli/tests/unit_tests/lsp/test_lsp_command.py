@@ -36,7 +36,7 @@ def test_parser_supports_scope_and_force() -> None:
 
 
 def test_enable_writes_config_to_explicit_path(tmp_path: Path) -> None:
-    cfg = tmp_path / ".deepagents" / "mcp.json"
+    cfg = tmp_path / ".deep_worker" / "mcp.json"
     args = _parse(
         ["lsp", "enable", "--config", str(cfg), "--project-root", str(tmp_path)]
     )
@@ -49,7 +49,7 @@ def test_enable_writes_config_to_explicit_path(tmp_path: Path) -> None:
 
 
 def test_enable_is_idempotent_via_cli(tmp_path: Path) -> None:
-    cfg = tmp_path / ".deepagents" / "mcp.json"
+    cfg = tmp_path / ".deep_worker" / "mcp.json"
     argv = ["lsp", "enable", "--config", str(cfg), "--project-root", str(tmp_path)]
 
     assert handle_lsp_command(_parse(argv)) == 0
@@ -59,7 +59,7 @@ def test_enable_is_idempotent_via_cli(tmp_path: Path) -> None:
 def test_status_reports_disabled_then_enabled(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    cfg = tmp_path / ".deepagents" / "mcp.json"
+    cfg = tmp_path / ".deep_worker" / "mcp.json"
     status_argv = ["lsp", "status", "--config", str(cfg)]
 
     handle_lsp_command(_parse(status_argv))
@@ -76,7 +76,7 @@ def test_status_reports_serena_binary_presence(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """Non-blocking reviewer request: status must check the `serena` binary."""
-    cfg = tmp_path / ".deepagents" / "mcp.json"
+    cfg = tmp_path / ".deep_worker" / "mcp.json"
     handle_lsp_command(_parse(["lsp", "status", "--config", str(cfg)]))
     out = capsys.readouterr().out.lower()
     assert "serena" in out
@@ -107,7 +107,7 @@ def test_enable_installs_gradle_init_script_by_default(
 ) -> None:
     gradle_home = tmp_path / "gradle-home"
     monkeypatch.setenv("GRADLE_USER_HOME", str(gradle_home))
-    cfg = tmp_path / ".deepagents" / "mcp.json"
+    cfg = tmp_path / ".deep_worker" / "mcp.json"
 
     rc = handle_lsp_command(
         _parse(["lsp", "enable", "--config", str(cfg), "--project-root", str(tmp_path)])
@@ -122,7 +122,7 @@ def test_enable_respects_no_gradle_init_flag(
 ) -> None:
     gradle_home = tmp_path / "gradle-home"
     monkeypatch.setenv("GRADLE_USER_HOME", str(gradle_home))
-    cfg = tmp_path / ".deepagents" / "mcp.json"
+    cfg = tmp_path / ".deep_worker" / "mcp.json"
 
     rc = handle_lsp_command(
         _parse(
@@ -150,7 +150,7 @@ def test_enable_reports_global_scope_of_the_init_script(
     """The file affects ALL of the user's builds — this must not be hidden."""
     gradle_home = tmp_path / "gradle-home"
     monkeypatch.setenv("GRADLE_USER_HOME", str(gradle_home))
-    cfg = tmp_path / ".deepagents" / "mcp.json"
+    cfg = tmp_path / ".deep_worker" / "mcp.json"
 
     handle_lsp_command(
         _parse(["lsp", "enable", "--config", str(cfg), "--project-root", str(tmp_path)])
@@ -165,7 +165,7 @@ def test_disable_removes_gradle_init_script(
 ) -> None:
     gradle_home = tmp_path / "gradle-home"
     monkeypatch.setenv("GRADLE_USER_HOME", str(gradle_home))
-    cfg = tmp_path / ".deepagents" / "mcp.json"
+    cfg = tmp_path / ".deep_worker" / "mcp.json"
     target = gradle_home / "init.d" / GRADLE_INIT_SCRIPT_NAME
 
     handle_lsp_command(
@@ -188,7 +188,7 @@ def test_disable_keeps_foreign_init_script(
     target = init_d / GRADLE_INIT_SCRIPT_NAME
     target.write_text("// somebody else\n", encoding="utf-8")
 
-    cfg = tmp_path / ".deepagents" / "mcp.json"
+    cfg = tmp_path / ".deep_worker" / "mcp.json"
     handle_lsp_command(_parse(["lsp", "disable", "--config", str(cfg)]))
 
     assert target.read_text(encoding="utf-8") == "// somebody else\n"
@@ -201,7 +201,7 @@ def test_status_reports_gradle_init_state(
 ) -> None:
     gradle_home = tmp_path / "gradle-home"
     monkeypatch.setenv("GRADLE_USER_HOME", str(gradle_home))
-    cfg = tmp_path / ".deepagents" / "mcp.json"
+    cfg = tmp_path / ".deep_worker" / "mcp.json"
 
     handle_lsp_command(_parse(["lsp", "status", "--config", str(cfg)]))
     assert "gradle init" in capsys.readouterr().out.lower()
@@ -225,7 +225,7 @@ def test_enable_reports_outdated_script_instead_of_already_installed(
     and that it is fixed with --force."""
     gradle_home = tmp_path / "gradle-home"
     monkeypatch.setenv("GRADLE_USER_HOME", str(gradle_home))
-    cfg = tmp_path / ".deepagents" / "mcp.json"
+    cfg = tmp_path / ".deep_worker" / "mcp.json"
     argv = ["lsp", "enable", "--config", str(cfg), "--project-root", str(tmp_path)]
 
     handle_lsp_command(_parse(argv))
@@ -249,7 +249,7 @@ def test_enable_force_updates_outdated_script(
 ) -> None:
     gradle_home = tmp_path / "gradle-home"
     monkeypatch.setenv("GRADLE_USER_HOME", str(gradle_home))
-    cfg = tmp_path / ".deepagents" / "mcp.json"
+    cfg = tmp_path / ".deep_worker" / "mcp.json"
     argv = ["lsp", "enable", "--config", str(cfg), "--project-root", str(tmp_path)]
 
     handle_lsp_command(_parse(argv))

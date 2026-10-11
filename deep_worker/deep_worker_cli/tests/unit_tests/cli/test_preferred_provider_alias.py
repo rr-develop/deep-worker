@@ -17,9 +17,9 @@ from deep_worker_cli.cli.agent_command import (
 class TestPreferredProviderShortAlias:
     def test_pp_alias_parses_to_preferred_provider(self) -> None:
         args = create_parser().parse_args(
-            ["my_agent", "-pp", "claude-code"]
+            ["my_agent", "-pp", "claude-code-sdk"]
         )
-        assert args.preferred_provider == "claude-code"
+        assert args.preferred_provider == "claude-code-sdk"
 
     def test_long_form_still_works(self) -> None:
         args = create_parser().parse_args(

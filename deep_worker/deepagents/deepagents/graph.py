@@ -32,7 +32,11 @@ from deepagents.middleware.subagents import (
     SubAgent,
     SubAgentMiddleware,
 )
-from deepagents.middleware.summarization import SummarizationMiddleware, _compute_summarization_defaults
+from deepagents.middleware.summarization import (
+    SummarizationMiddleware,
+    _apply_keep_override,
+    _compute_summarization_defaults,
+)
 
 BASE_AGENT_PROMPT = "In order to complete the objective that the user asks of you, you have access to a number of standard tools."
 
@@ -101,8 +105,8 @@ def _bind_tools_for_middleware(
     except Exception:  # noqa: BLE001
         # Never break agent construction over the middleware-binding path.
         # The middleware will still receive `model` and the only loss is
-        # the bug fix — the agent runs exactly as it did before the
-        # 2026-06-13 incident was patched.
+        # the bug fix — the agent runs exactly as it did before incident
+        # 2026-06-13 was patched.
         return model
 
 
@@ -126,6 +130,11 @@ def create_deep_agent(
     cache: BaseCache | None = None,
     summarization_history_prefix: str | None = None,
     summarization_on_summarized: Callable[[str], None] | None = None,
+    summarization_token_counter: Callable[[Any], int] | None = None,
+    context_limit: int | None = None,
+    summarization_hot_cache_ttl: dict[str, int] | None = None,
+    summarization_keep: tuple[str, int | float] | None = None,
+    summarization_provider: str | None = None,
 ) -> CompiledStateGraph:
     """Create a deep agent.
 
@@ -208,7 +217,13 @@ def create_deep_agent(
         model = init_chat_model(model)
 
     # Compute summarization defaults based on model profile
-    summarization_defaults = _compute_summarization_defaults(model)
+    summarization_defaults = _compute_summarization_defaults(
+        model, context_limit=context_limit
+    )
+    if summarization_keep is not None:
+        summarization_defaults = _apply_keep_override(
+            summarization_defaults, summarization_keep
+        )
 
     # Per-caller override for where SummarizationMiddleware offloads
     # evicted conversation history. When None, the middleware's own
@@ -222,10 +237,47 @@ def create_deep_agent(
             kwargs["history_path_prefix"] = summarization_history_prefix
         if summarization_on_summarized is not None:
             kwargs["on_summarized"] = summarization_on_summarized
+        # Provider-reported context floor (2026-08-19): the
+        # caller may hand in a ``token_counter`` that prefers the live
+        # number the provider observed over the chars/4 heuristic. It is
+        # applied to EVERY SummarizationMiddleware site (main, general-
+        # purpose subagent, custom subagents) so the trigger compares the
+        # same number the provider is actually holding.
+        if summarization_token_counter is not None:
+            kwargs["token_counter"] = summarization_token_counter
+        if summarization_hot_cache_ttl:
+            kwargs["hot_cache_ttl_overrides"] = dict(summarization_hot_cache_ttl)
         return kwargs
 
 
     backend = backend if backend is not None else (lambda rt: StateBackend(rt))
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Tool selection must survive delegation.
+    #
+    # A subagent is a SEPARATE graph with its OWN middleware stack and its
+    # OWN FilesystemMiddleware — so a restriction installed on the main
+    # agent does not reach it. Concretely: ``--tools '*,task'`` denies
+    # every tool but ``task``, the model spawns a subagent, and that
+    # subagent gets ``ls``/``read_file``/``write_file``/``execute`` back
+    # from its own filesystem middleware and runs them. Verified before
+    # this fix: the denied tool's body executed inside the subagent while
+    # the main graph refused the identical call.
+    #
+    # That is a straight violation of "nothing beyond the tools named",
+    # and it is the delegation path — the one a restricted agent is most
+    # likely to reach for once its own tools are gone.
+    #
+    # The selection middleware is identified structurally (it declares
+    # ``applies_to_subagents``) rather than by importing it: ``deepagents``
+    # must not depend on the CLI layer, which sits above it. Any
+    # middleware that opts in this way is propagated verbatim — the same
+    # instance, so the selection and its logging stay singular.
+    # ─────────────────────────────────────────────────────────────────────
+    inherited_middleware: list[AgentMiddleware[Any, Any, Any]] = [
+        mw for mw in (middleware or ())
+        if getattr(mw, "applies_to_subagents", False)
+    ]
 
     # ─────────────────────────────────────────────────────────────────────
     # The 2026-06-13 incident — SummarizationMiddleware unbound-model capture.
@@ -251,6 +303,9 @@ def create_deep_agent(
     # a related internal incident analysis (not included here).
     # ─────────────────────────────────────────────────────────────────────
     summarization_model = _bind_tools_for_middleware(model, tools)
+    if summarization_provider:
+        setattr(model, "_deep_worker_provider", summarization_provider)
+        setattr(summarization_model, "_deep_worker_provider", summarization_provider)
 
     # Build general-purpose subagent with default middleware stack
     # Heterogeneous middleware stack — entries specialize StateT differently
@@ -278,8 +333,23 @@ def create_deep_agent(
     ]
     if skills is not None:
         gp_middleware.append(SkillsMiddleware(backend=backend, sources=skills))
+    # Selection goes after the tool-CONTRIBUTING middleware (filesystem,
+    # skills) so its ``wrap_model_call`` sees everything they added, and
+    # AFTER HumanInTheLoop so that its cut runs first.
+    #
+    # The two hooks order OPPOSITELY, which is why the placement looks
+    # backwards: ``wrap_tool_call`` wrappers nest outer-to-inner in list
+    # order, but ``after_model`` GRAPH NODES are chained in REVERSE list
+    # order (verified on the compiled graph: model → HITL.after_model →
+    # ToolSelection.after_model). HITL does its work in such a node, so a
+    # selection placed BEFORE it would have its cut run too late: the user
+    # is asked to authorise a tool the agent is not allowed to have, and
+    # only after they say yes does the barrier refuse it. Observed — one
+    # interrupt raised for a denied `ls`. A forbidden call must be refused
+    # outright, never negotiated.
     if interrupt_on is not None:
         gp_middleware.append(HumanInTheLoopMiddleware(interrupt_on=interrupt_on))
+    gp_middleware.extend(inherited_middleware)
 
     general_purpose_spec: SubAgent = cast(SubAgent, {
         **GENERAL_PURPOSE_SUBAGENT,
@@ -292,7 +362,33 @@ def create_deep_agent(
     processed_subagents: list[SubAgent | CompiledSubAgent] = []
     for spec in subagents or []:
         if "runnable" in spec:
-            # CompiledSubAgent - use as-is
+            # CompiledSubAgent — an already-compiled graph whose middleware
+            # stack was fixed when the caller built it. A selection cannot
+            # be pushed into it, and its tools are outside our reach.
+            #
+            # When a restriction is in force this is fail-CLOSED, not a
+            # warning. Building the agent anyway would produce one that
+            # ANNOUNCES a limit ("only these tools") while shipping a
+            # documented hole in it — and the whole point of the feature is
+            # a measurement you can trust. A log line does not fix that: it
+            # lands in a file nobody reads while the experiment quietly
+            # produces wrong numbers. Refusing to build is the only outcome
+            # that cannot mislead.
+            #
+            # The CLI layer rejects compiled subagents earlier
+            # (``_merge_common_tools_into_subagents``), so no deep-worker
+            # agent reaches this branch; the guard is for the public API.
+            if inherited_middleware:
+                name = spec.get("name", "<unnamed>")
+                raise ValueError(
+                    f"compiled subagent {name!r} cannot be constrained by a "
+                    f"tool selection: its graph was compiled elsewhere and "
+                    f"its middleware stack can no longer be changed. "
+                    f"Refusing to build an agent that claims a restriction "
+                    f"it cannot enforce. Build {name!r} from a SubAgent "
+                    f"spec (name/description/system_prompt) so the "
+                    f"selection applies to it, or drop the tool selection."
+                )
             processed_subagents.append(spec)
         else:
             # SubAgent - fill in defaults and prepend base middleware
@@ -301,8 +397,14 @@ def create_deep_agent(
                 subagent_model = init_chat_model(subagent_model)
 
             # Build middleware: base stack + skills (if specified) + user's middleware
-            subagent_summarization_defaults = _compute_summarization_defaults(subagent_model)
-            # Same fix for the 2026-06-13 incident as the gp_middleware site above:
+            subagent_summarization_defaults = _compute_summarization_defaults(
+                subagent_model, context_limit=context_limit
+            )
+            if summarization_keep is not None:
+                subagent_summarization_defaults = _apply_keep_override(
+                    subagent_summarization_defaults, summarization_keep
+                )
+            # Same incident 2026-06-13 fix as the gp_middleware site above:
             # hand the bind_tools-result to SummarizationMiddleware so the
             # summary call carries the subagent's tool inventory. Per-
             # subagent tools default to the parent's ``tools`` (see the
@@ -332,7 +434,14 @@ def create_deep_agent(
             subagent_skills = spec.get("skills")
             if subagent_skills:
                 subagent_middleware.append(SkillsMiddleware(backend=backend, sources=subagent_skills))
+            # Last, for both reasons that decide the position (see the gp
+            # stack): after any spec middleware that CONTRIBUTES tools, so
+            # ``wrap_model_call`` sees them; and after a spec-provided
+            # HumanInTheLoopMiddleware, so the selection's ``after_model``
+            # node — chained in reverse list order — cuts denied calls
+            # before HITL can raise an approval prompt for them.
             subagent_middleware.extend(spec.get("middleware", []))
+            subagent_middleware.extend(inherited_middleware)
 
             processed_spec: SubAgent = cast(SubAgent, {
                 **spec,
@@ -384,10 +493,14 @@ def create_deep_agent(
             PatchToolCallsMiddleware(),
         ]
     )
-    if middleware:
-        deepagent_middleware.extend(middleware)
+    # HITL first so that caller middleware ends up AFTER it: ``after_model``
+    # nodes are chained in reverse list order, so a ToolSelectionMiddleware
+    # passed in here must sit last for its cut to run before HITL can ask
+    # the user to approve a tool the agent is not allowed to have.
     if interrupt_on is not None:
         deepagent_middleware.append(HumanInTheLoopMiddleware(interrupt_on=interrupt_on))
+    if middleware:
+        deepagent_middleware.extend(middleware)
 
     # Combine system_prompt with BASE_AGENT_PROMPT
     if system_prompt is None:

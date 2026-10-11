@@ -350,7 +350,7 @@ def _resolve_agent_pid(name: str) -> int | None:
 
 
 def _remove_agent_data(name: str) -> None:
-    data_dir = deep_worker_home() / name
+    data_dir = deep_worker_home() / "agents" / name
     if data_dir.exists():
         shutil.rmtree(data_dir, ignore_errors=True)
     log_dir = deep_worker_home() / "logs"

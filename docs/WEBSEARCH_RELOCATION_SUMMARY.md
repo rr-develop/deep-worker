@@ -16,7 +16,7 @@ Successfully reorganized the WebSearch delegation tool from flat structure to de
 
 ### Before (Flat Structure)
 ```
-claude_code_provider/
+claude_code_sdk_provider/
 ├── __init__.py
 ├── chat_model.py
 ├── client_manager.py
@@ -31,7 +31,7 @@ claude_code_provider/
 
 ### After (Organized Structure)
 ```
-claude_code_provider/
+claude_code_sdk_provider/
 ├── __init__.py                       ← Updated imports
 ├── chat_model.py
 ├── client_manager.py
@@ -54,13 +54,13 @@ claude_code_provider/
 
 ### 1. Created New Files
 
-#### `claude_code_provider/web_search/__init__.py`
+#### `claude_code_sdk_provider/web_search/__init__.py`
 ```python
-from claude_code_provider.web_search.web_search_delegation import (
+from claude_code_sdk_provider.web_search.web_search_delegation import (
     WebSearchDelegationTool,
     WebSearchInput,
 )
-from claude_code_provider.web_search.web_search_hooks import (
+from claude_code_sdk_provider.web_search.web_search_hooks import (
     create_enforcement_hook,
     create_logging_hook,
     create_validation_hook,
@@ -75,59 +75,59 @@ __all__ = [
 ]
 ```
 
-#### `claude_code_provider/tests/web_search/__init__.py`
+#### `claude_code_sdk_provider/tests/web_search/__init__.py`
 ```python
 """Tests for WebSearch delegation tool."""
 ```
 
 ### 2. Updated Imports
 
-#### `claude_code_provider/__init__.py`
+#### `claude_code_sdk_provider/__init__.py`
 **Before:**
 ```python
-from claude_code_provider.web_search_delegation import WebSearchDelegationTool
+from claude_code_sdk_provider.web_search_delegation import WebSearchDelegationTool
 ```
 
 **After:**
 ```python
-from claude_code_provider.web_search import WebSearchDelegationTool
+from claude_code_sdk_provider.web_search import WebSearchDelegationTool
 ```
 
-#### `claude_code_provider/web_search/web_search_delegation.py`
+#### `claude_code_sdk_provider/web_search/web_search_delegation.py`
 **Before:**
 ```python
-from claude_code_provider.web_search_hooks import create_enforcement_hook
+from claude_code_sdk_provider.web_search_hooks import create_enforcement_hook
 ```
 
 **After:**
 ```python
-from claude_code_provider.web_search.web_search_hooks import create_enforcement_hook
+from claude_code_sdk_provider.web_search.web_search_hooks import create_enforcement_hook
 ```
 
-#### `claude_code_provider/tests/web_search/test_web_search_delegation.py`
+#### `claude_code_sdk_provider/tests/web_search/test_web_search_delegation.py`
 **Before:**
 ```python
-from claude_code_provider.web_search_delegation import WebSearchDelegationTool
-from claude_code_provider.web_search_hooks import create_enforcement_hook
-with patch("claude_code_provider.web_search_delegation.ClaudeSDKClient")
+from claude_code_sdk_provider.web_search_delegation import WebSearchDelegationTool
+from claude_code_sdk_provider.web_search_hooks import create_enforcement_hook
+with patch("claude_code_sdk_provider.web_search_delegation.ClaudeSDKClient")
 ```
 
 **After:**
 ```python
-from claude_code_provider.web_search.web_search_delegation import WebSearchDelegationTool
-from claude_code_provider.web_search.web_search_hooks import create_enforcement_hook
-with patch("claude_code_provider.web_search.web_search_delegation.ClaudeSDKClient")
+from claude_code_sdk_provider.web_search.web_search_delegation import WebSearchDelegationTool
+from claude_code_sdk_provider.web_search.web_search_hooks import create_enforcement_hook
+with patch("claude_code_sdk_provider.web_search.web_search_delegation.ClaudeSDKClient")
 ```
 
 #### `examples/websearch_delegation_example.py`
 **Before:**
 ```python
-from claude_code_provider import WebSearchDelegationTool
+from claude_code_sdk_provider import WebSearchDelegationTool
 ```
 
 **After:**
 ```python
-from claude_code_provider.web_search import WebSearchDelegationTool
+from claude_code_sdk_provider.web_search import WebSearchDelegationTool
 ```
 
 ---
@@ -138,12 +138,12 @@ Both import styles now work:
 
 ### Direct Import (Recommended)
 ```python
-from claude_code_provider.web_search import WebSearchDelegationTool
+from claude_code_sdk_provider.web_search import WebSearchDelegationTool
 ```
 
 ### Root Import (Backward Compatible)
 ```python
-from claude_code_provider import WebSearchDelegationTool
+from claude_code_sdk_provider import WebSearchDelegationTool
 ```
 
 ---
@@ -152,20 +152,20 @@ from claude_code_provider import WebSearchDelegationTool
 
 ### ✅ Structure Verification
 ```bash
-$ ls claude_code_provider/web_search/
+$ ls claude_code_sdk_provider/web_search/
 __init__.py
 README_WEBSEARCH.md
 web_search_delegation.py
 web_search_hooks.py
 
-$ ls claude_code_provider/tests/web_search/
+$ ls claude_code_sdk_provider/tests/web_search/
 __init__.py
 test_web_search_delegation.py
 ```
 
 ### ✅ Test Status
 ```bash
-$ python3 -m pytest claude_code_provider/tests/web_search/ -v
+$ python3 -m pytest claude_code_sdk_provider/tests/web_search/ -v
 ======================== test session starts =========================
 collected 24 items
 
@@ -199,10 +199,10 @@ test_web_search_delegation.py::test_real_websearch_delegation SKIPPED
 
 ### ✅ Import Verification
 ```bash
-$ python3 -c "from claude_code_provider.web_search import WebSearchDelegationTool; print('✅ Direct import works')"
+$ python3 -c "from claude_code_sdk_provider.web_search import WebSearchDelegationTool; print('✅ Direct import works')"
 ✅ Direct import works
 
-$ python3 -c "from claude_code_provider import WebSearchDelegationTool; print('✅ Root import works')"
+$ python3 -c "from claude_code_sdk_provider import WebSearchDelegationTool; print('✅ Root import works')"
 ✅ Root import works
 ```
 
@@ -237,7 +237,7 @@ $ python3 -c "from claude_code_provider import WebSearchDelegationTool; print('�
 With the new structure, we can easily add:
 
 ```
-claude_code_provider/web_search/
+claude_code_sdk_provider/web_search/
 ├── __init__.py
 ├── web_search_delegation.py
 ├── web_search_hooks.py
@@ -258,23 +258,23 @@ If you have existing code using the old import:
 **Option 1: Update to new import (recommended)**
 ```python
 # Old
-from claude_code_provider import WebSearchDelegationTool
+from claude_code_sdk_provider import WebSearchDelegationTool
 
 # New
-from claude_code_provider.web_search import WebSearchDelegationTool
+from claude_code_sdk_provider.web_search import WebSearchDelegationTool
 ```
 
 **Option 2: Keep existing import (works but discouraged)**
 ```python
 # Still works due to re-export in __init__.py
-from claude_code_provider import WebSearchDelegationTool
+from claude_code_sdk_provider import WebSearchDelegationTool
 ```
 
 ### For New Code
 
 Always use the direct import:
 ```python
-from claude_code_provider.web_search import WebSearchDelegationTool
+from claude_code_sdk_provider.web_search import WebSearchDelegationTool
 ```
 
 ---
@@ -283,7 +283,7 @@ from claude_code_provider.web_search import WebSearchDelegationTool
 
 - [x] All 23 unit tests passing
 - [x] Direct import works (`from .web_search import ...`)
-- [x] Root import works (`from claude_code_provider import ...`)
+- [x] Root import works (`from claude_code_sdk_provider import ...`)
 - [x] Example script updated and functional
 - [x] Mock paths in tests updated
 - [x] Documentation reflects new structure
@@ -296,7 +296,7 @@ from claude_code_provider.web_search import WebSearchDelegationTool
 
 - [WebSearch Design Document](WEBSEARCH_DELEGATION_DESIGN.md)
 - [WebSearch Implementation Summary](WEBSEARCH_IMPLEMENTATION_SUMMARY.md)
-- [Quick Reference](../claude_code_provider/web_search/README_WEBSEARCH.md)
+- [Quick Reference](../claude_code_sdk_provider/web_search/README_WEBSEARCH.md)
 
 ---
 

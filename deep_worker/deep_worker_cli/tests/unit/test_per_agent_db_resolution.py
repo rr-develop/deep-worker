@@ -1,10 +1,15 @@
 """Unit tests for per-agent DB resolution in offline session helpers.
 
 Covers the bug where `deep-worker --history <agent>` (and friends)
-read the legacy global sessions.db instead of the
-per-agent file sessions_<agent>.db.
+read a global sessions DB instead of the agent's own file, which now
+lives at ``~/.deep_worker/agents/<agent>/threads.db``.
 
-See: docs/DESIGN_FIX_DW_HISTORY_PER_AGENT_DB.md
+The v1/v2 layouts these helpers used to fall back to lived in the
+ancestor's ``~/.deepagents`` tree. POLICIES §16 bans that tree for reads
+and writes alike, so the tests naming it here pin the *ban*: seeded data
+there must stay invisible and untouched.
+
+See: docs/DESIGN_FIX_DEEPWORKER_HISTORY_PER_AGENT_DB.md
 """
 from __future__ import annotations
 
@@ -96,11 +101,16 @@ async def _seed_agent_db(
         await cp.aput(config, checkpoint, meta, {})
 
 
+def _agent_db(home: Path, agent_name: str) -> Path:
+    """The per-agent DB under the v3 layout: ``agents/<name>/threads.db``."""
+    return home / ".deep_worker" / "agents" / agent_name / "threads.db"
+
+
 @pytest.fixture
 def fake_home(tmp_path, monkeypatch):
-    """Point the agents data directory at tmp_path/.deepagents for the test."""
+    """Point ~/.deep_worker at tmp_path/home/.deep_worker for the test."""
     home = tmp_path / "home"
-    (home / ".deepagents").mkdir(parents=True)
+    (home / ".deep_worker" / "agents").mkdir(parents=True)
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
     return home
@@ -119,7 +129,7 @@ class TestGetThreadHistoryPerAgentDB:
         from deep_worker_cli.sessions import get_thread_history
 
         agent = "myagent"
-        per_agent_db = fake_home / ".deepagents" / f"sessions_{agent}.db"
+        per_agent_db = _agent_db(fake_home, agent)
         await _seed_agent_db(per_agent_db, thread_id=agent, content="hi from myagent")
 
         # Legacy global file does NOT exist. In the real-world failure it
@@ -136,16 +146,21 @@ class TestGetThreadHistoryPerAgentDB:
         )
 
     @pytest.mark.asyncio
-    async def test_reads_per_agent_db_when_global_empty(self, fake_home):
-        """Global sessions.db exists but has no checkpoints table — exact
-        scenario on the dev machine that produced the bug report."""
+    async def test_reads_per_agent_db_when_foreign_db_is_empty(self, fake_home):
+        """A stray 0-byte DB in the ancestor's tree must not disturb lookup.
+
+        This is the shape seen on the dev machine that produced the original
+        bug report. Under POLICIES §16 that file is never consulted at all,
+        so the per-agent DB must be served regardless.
+        """
         from deep_worker_cli.sessions import get_thread_history
 
-        # Empty legacy file (0 bytes is the shape seen in the bug report).
-        (fake_home / ".deepagents" / "sessions.db").write_bytes(b"")
+        foreign = fake_home / ".deepagents"
+        foreign.mkdir(parents=True, exist_ok=True)
+        (foreign / "sessions.db").write_bytes(b"")
 
         agent = "lc4_test"
-        per_agent_db = fake_home / ".deepagents" / f"sessions_{agent}.db"
+        per_agent_db = _agent_db(fake_home, agent)
         await _seed_agent_db(per_agent_db, thread_id=agent, content="lc4 ping")
 
         result = await get_thread_history(agent)
@@ -163,7 +178,7 @@ class TestGetThreadHistoryPerAgentDB:
         from deep_worker_cli.sessions import get_thread_history
 
         agent = "myagent"
-        per_agent_db = fake_home / ".deepagents" / f"sessions_{agent}.db"
+        per_agent_db = _agent_db(fake_home, agent)
         await _seed_agent_db(per_agent_db, thread_id=f"{agent}:tm", content="tm msg")
 
         result = await get_thread_history(f"{agent}:tm")
@@ -177,20 +192,28 @@ class TestGetThreadHistoryPerAgentDB:
         )
 
     @pytest.mark.asyncio
-    async def test_falls_back_to_global_when_per_agent_missing(self, fake_home):
-        """Legacy installs with only the global DB still work."""
+    async def test_does_not_fall_back_to_the_ancestors_tree(self, fake_home):
+        """POLICIES §16: a DB in ``~/.deepagents`` must never be consulted.
+
+        Previously this asserted the opposite — that a legacy global
+        ``sessions.db`` was read when the per-agent file was missing. Reading
+        the ancestor's tree is now banned on the same terms as writing, so
+        seeded data there must stay invisible: an absent per-agent DB reports
+        as absent rather than silently making foreign state authoritative.
+        """
         from deep_worker_cli.sessions import get_thread_history
 
-        global_db = fake_home / ".deepagents" / "sessions.db"
-        await _seed_agent_db(global_db, thread_id="legacy_agent", content="legacy")
+        foreign_db = fake_home / ".deepagents" / "sessions.db"
+        await _seed_agent_db(foreign_db, thread_id="legacy_agent", content="legacy")
 
         result = await get_thread_history("legacy_agent")
 
-        assert result["success"] is True, result
-        assert any(
+        contents = [
             (m.get("content") if isinstance(m, dict) else getattr(m, "content", ""))
-            == "legacy"
-            for m in result["messages"]
+            for m in result.get("messages") or []
+        ]
+        assert "legacy" not in contents, (
+            "history was served out of ~/.deepagents, which POLICIES §16 bans"
         )
 
     @pytest.mark.asyncio
@@ -203,7 +226,7 @@ class TestGetThreadHistoryPerAgentDB:
         # the explicit one must be the one that's read.
         agent = "myagent"
         await _seed_agent_db(
-            fake_home / ".deepagents" / f"sessions_{agent}.db",
+            _agent_db(fake_home, agent),
             thread_id=agent,
             content="from per-agent",
         )
@@ -243,13 +266,13 @@ class TestListThreadsPerAgentDB:
 
         now = datetime.now(UTC).isoformat()
         await _seed_agent_db(
-            fake_home / ".deepagents" / "sessions_agent_a.db",
+            _agent_db(fake_home, "agent_a"),
             thread_id="agent_a",
             metadata_updated_at=now,
             agent_name_meta="agent_a",
         )
         await _seed_agent_db(
-            fake_home / ".deepagents" / "sessions_agent_b.db",
+            _agent_db(fake_home, "agent_b"),
             thread_id="agent_b",
             metadata_updated_at=now,
             agent_name_meta="agent_b",
@@ -267,13 +290,13 @@ class TestListThreadsPerAgentDB:
 
         now = datetime.now(UTC).isoformat()
         await _seed_agent_db(
-            fake_home / ".deepagents" / "sessions_agent_a.db",
+            _agent_db(fake_home, "agent_a"),
             thread_id="agent_a",
             metadata_updated_at=now,
             agent_name_meta="agent_a",
         )
         await _seed_agent_db(
-            fake_home / ".deepagents" / "sessions_agent_b.db",
+            _agent_db(fake_home, "agent_b"),
             thread_id="agent_b",
             metadata_updated_at=now,
             agent_name_meta="agent_b",
@@ -284,8 +307,13 @@ class TestListThreadsPerAgentDB:
         assert tids == {"agent_a"}
 
     @pytest.mark.asyncio
-    async def test_list_threads_includes_legacy_global(self, fake_home):
-        """Legacy global sessions.db still contributes when it has data."""
+    async def test_list_threads_excludes_the_ancestors_tree(self, fake_home):
+        """POLICIES §16: ``--list`` must not surface threads from ``.deepagents``.
+
+        This asserted the opposite before the ban: that a legacy global
+        ``sessions.db`` still contributed rows. Aggregating the ancestor's
+        tree would put foreign threads in our listing.
+        """
         from deep_worker_cli.sessions import list_threads
 
         now = datetime.now(UTC).isoformat()
@@ -298,7 +326,9 @@ class TestListThreadsPerAgentDB:
 
         threads = await list_threads(limit=20)
         tids = {t["thread_id"] for t in threads}
-        assert "legacy" in tids
+        assert "legacy" not in tids, (
+            "list_threads aggregated ~/.deepagents, which POLICIES §16 bans"
+        )
 
     @pytest.mark.asyncio
     async def test_list_threads_empty_when_no_dbs(self, fake_home):
@@ -320,7 +350,7 @@ class TestCleanAgentHistoryPerAgentDB:
         from deep_worker_cli.sessions import clean_agent_history
 
         agent = "cleanme"
-        per_agent_db = fake_home / ".deepagents" / f"sessions_{agent}.db"
+        per_agent_db = _agent_db(fake_home, agent)
         await _seed_agent_db(per_agent_db, thread_id=agent)
         assert per_agent_db.exists()
 
@@ -331,46 +361,44 @@ class TestCleanAgentHistoryPerAgentDB:
         )
 
     @pytest.mark.asyncio
-    async def test_clean_also_removes_rows_from_legacy_global(self, fake_home):
-        """Backward compat: if the legacy global still has stale rows for this
-        agent, they should be cleaned up too."""
+    async def test_clean_leaves_the_ancestors_tree_untouched(self, fake_home):
+        """POLICIES §16: ``--clean`` must not write into ``.deepagents``.
+
+        This previously asserted the opposite — that stale rows in the legacy
+        global DB were scrubbed too. Deleting rows there is a write to a
+        foreign project's namespace, which the policy bans outright, so the
+        rows must survive while our own per-agent DB is removed.
+        """
         from deep_worker_cli.sessions import clean_agent_history
 
         agent = "bothplaces"
-        # Global still has rows from before migration
+        foreign_db = fake_home / ".deepagents" / "sessions.db"
+        await _seed_agent_db(foreign_db, thread_id=agent, agent_name_meta=agent)
         await _seed_agent_db(
-            fake_home / ".deepagents" / "sessions.db",
-            thread_id=agent,
-            agent_name_meta=agent,
-        )
-        # Per-agent file also has rows
-        await _seed_agent_db(
-            fake_home / ".deepagents" / f"sessions_{agent}.db",
+            _agent_db(fake_home, agent),
             thread_id=agent,
             agent_name_meta=agent,
         )
 
         await clean_agent_history(agent, _home_dir=fake_home)
 
-        # Per-agent file gone
-        assert not (fake_home / ".deepagents" / f"sessions_{agent}.db").exists()
+        # Our own per-agent file is gone.
+        assert not (_agent_db(fake_home, agent)).exists()
 
-        # Global rows for this agent gone
-        async with aiosqlite.connect(
-            str(fake_home / ".deepagents" / "sessions.db")
-        ) as conn:
+        # The foreign tree is left exactly as it was.
+        async with aiosqlite.connect(str(foreign_db)) as conn:
             async with conn.execute(
                 "SELECT COUNT(*) FROM checkpoints WHERE thread_id = ?", (agent,)
             ) as cursor:
                 count = (await cursor.fetchone())[0]
-        assert count == 0
+        assert count >= 1, "clean scrubbed ~/.deepagents, which POLICIES §16 bans"
 
     @pytest.mark.asyncio
     async def test_clean_db_only_deletes_per_agent_db_file(self, fake_home):
         from deep_worker_cli.sessions import clean_agent_history_db_only
 
         agent = "quickclean"
-        per_agent_db = fake_home / ".deepagents" / f"sessions_{agent}.db"
+        per_agent_db = _agent_db(fake_home, agent)
         await _seed_agent_db(per_agent_db, thread_id=agent)
         assert per_agent_db.exists()
 
@@ -395,19 +423,19 @@ class TestRemoveThreadsBeforePerAgentDB:
         recent_ts = datetime.now(UTC).isoformat()
 
         await _seed_agent_db(
-            fake_home / ".deepagents" / "sessions_agent_a.db",
+            _agent_db(fake_home, "agent_a"),
             thread_id="agent_a_old",
             metadata_updated_at=old_ts,
             agent_name_meta="agent_a",
         )
         await _seed_agent_db(
-            fake_home / ".deepagents" / "sessions_agent_b.db",
+            _agent_db(fake_home, "agent_b"),
             thread_id="agent_b_old",
             metadata_updated_at=old_ts,
             agent_name_meta="agent_b",
         )
         await _seed_agent_db(
-            fake_home / ".deepagents" / "sessions_agent_c.db",
+            _agent_db(fake_home, "agent_c"),
             thread_id="agent_c_recent",
             metadata_updated_at=recent_ts,
             agent_name_meta="agent_c",
@@ -421,7 +449,7 @@ class TestRemoveThreadsBeforePerAgentDB:
 
         # Confirm physically deleted
         async with aiosqlite.connect(
-            str(fake_home / ".deepagents" / "sessions_agent_a.db")
+            str(_agent_db(fake_home, "agent_a"))
         ) as conn:
             async with conn.execute(
                 "SELECT COUNT(*) FROM checkpoints WHERE thread_id = ?",
@@ -430,7 +458,7 @@ class TestRemoveThreadsBeforePerAgentDB:
                 assert (await cursor.fetchone())[0] == 0
 
         async with aiosqlite.connect(
-            str(fake_home / ".deepagents" / "sessions_agent_c.db")
+            str(_agent_db(fake_home, "agent_c"))
         ) as conn:
             async with conn.execute(
                 "SELECT COUNT(*) FROM checkpoints WHERE thread_id = ?",
@@ -444,7 +472,7 @@ class TestRemoveThreadsBeforePerAgentDB:
 
         old_ts = (datetime.now(UTC) - timedelta(days=100)).isoformat()
         await _seed_agent_db(
-            fake_home / ".deepagents" / "sessions_agent_a.db",
+            _agent_db(fake_home, "agent_a"),
             thread_id="agent_a_old",
             metadata_updated_at=old_ts,
             agent_name_meta="agent_a",
@@ -456,7 +484,7 @@ class TestRemoveThreadsBeforePerAgentDB:
         assert result["threads_found"] >= 1
 
         async with aiosqlite.connect(
-            str(fake_home / ".deepagents" / "sessions_agent_a.db")
+            str(_agent_db(fake_home, "agent_a"))
         ) as conn:
             async with conn.execute(
                 "SELECT COUNT(*) FROM checkpoints WHERE thread_id = ?",

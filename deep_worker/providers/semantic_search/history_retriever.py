@@ -71,7 +71,6 @@ class HistorySearchResult:
 # Process-wide caches (same pattern as retriever.py)
 # ---------------------------------------------------------------------------
 
-_embedding_cache: dict[str, Any] = {}
 _index_cache: dict[tuple[str, str], tuple[VectorStoreIndex, StorageContext | None]] = {}
 
 
@@ -81,36 +80,27 @@ _index_cache: dict[tuple[str, str], tuple[VectorStoreIndex, StorageContext | Non
 
 
 def _ensure_embed_model(config: IndexConfig, embed_model: Any | None) -> Any:
-    """Resolve embedding model with caching."""
-    if embed_model is not None:
-        return embed_model
+    """Resolve embedding model with caching.
 
-    cached = _embedding_cache.get(config.embedding_model)
-    if cached is not None:
-        return cached
+    Delegates to the process-wide shared cache in ``._embed_cache`` so
+    every semantic-search call site (retriever, this file, history_indexer,
+    indexer) shares one instance per model name. See a related internal
+    incident analysis (not included here): the write path (history_indexer)
+    originally had no cache; hoisting the resolver into a shared module is
+    the fix that prevents the paths from drifting apart again.
 
-    from llama_index.embeddings.huggingface import HuggingFaceEmbedding  # type: ignore[import-untyped]  # noqa: PLC0415
+    KNOWN LIMITATION (unchanged by this delegation): the e5 family
+    (``intfloat/multilingual-e5-*``) was trained with mandatory input
+    prefixes — ``"query: "`` for queries and ``"passage: "`` for indexed
+    text. We currently embed raw text WITHOUT these prefixes here and in
+    ``history_indexer``. Search still works and scores are sensible, but
+    adding the prefixes would better match the model's training distribution.
+    Changing it requires a full re-index, so it is deliberately out of
+    scope.
+    """
+    from ._embed_cache import resolve_embed_model  # noqa: PLC0415
 
-    # ``normalize`` defaults to True in HuggingFaceEmbedding, so the produced
-    # vectors are L2-normalized (norm == 1.0). That is what makes the L2-based
-    # LanceDB ranking equivalent to cosine ranking (see ``HistorySearchResult
-    # .score``).
-    #
-    # KNOWN LIMITATION: the e5 family (``intfloat/multilingual-e5-*``) was
-    # trained with mandatory input prefixes — ``"query: "`` for queries and
-    # ``"passage: "`` for indexed text (``passage`` is the standard
-    # information-retrieval term for an indexed text fragment; it is fixed by
-    # the model authors, not a free-form label). We currently embed raw text
-    # WITHOUT these prefixes here and in ``history_indexer``. Search still
-    # works and scores are sensible, but adding the prefixes would better match
-    # the model's training distribution. Changing it requires a full re-index,
-    # so it is deliberately out of scope of this docs pass.
-    model = HuggingFaceEmbedding(
-        model_name=config.embedding_model,
-        model_kwargs={"local_files_only": True},
-    )
-    _embedding_cache[config.embedding_model] = model
-    return model
+    return resolve_embed_model(config, embed_model)
 
 
 def _load_index(summaries_dir: Path, config: IndexConfig, embed_model: Any) -> VectorStoreIndex:

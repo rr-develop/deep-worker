@@ -321,7 +321,7 @@ await self._register()           # Line 153 - Only register when ready!
 
 **Impact**:
 - Settings initialized with default values (Gemini model)
-- Environment variables from `~/.deepagents/.env` were ignored
+- Environment variables from the user env file (then in the legacy user tree, now `~/.deep_worker/.env` — POLICIES §16) were ignored
 - Agent used wrong model, causing quota errors
 
 **Fix**: Load environment BEFORE importing create_model from config
@@ -439,7 +439,7 @@ elif hasattr(last_msg, "content"):  # LangChain Message
 
 ### Technical Implementation Details
 
-**Model Selection**: Agent now properly loads from `~/.deepagents/.env`:
+**Model Selection**: Agent now properly loads from the user env file (then in the legacy user tree, now `~/.deep_worker/.env` — POLICIES §16):
 ```bash
 OPENAI_API_KEY=sk-xxx
 OPENAI_BASE_URL=https://api.deepseek.com

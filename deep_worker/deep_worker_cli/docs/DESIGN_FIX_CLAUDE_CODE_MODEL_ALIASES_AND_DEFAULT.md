@@ -16,11 +16,11 @@ an operator passes on the CLI:
 
 ### 1.1 `model_can_belong_to_provider` uses an outdated whitelist
 
-`deep_worker_cli/config.py:1382-1418`. For `provider="claude-code"` the
+`deep_worker_cli/config.py:1382-1418`. For `provider="claude-code-sdk"` the
 predicate only accepts these tokens:
 
 ```python
-if provider_name == "claude-code":
+if provider_name == "claude-code-sdk":
     return (
         model_name in ("sonnet", "haiku", "opus", "inherit")
         or "claude" in model_name
@@ -40,7 +40,7 @@ The mirror predicate in the web frontend
 Concrete failure: `--model fable` → predicate returns False → predicate is
 used from `merge_restart_config` (agent_command.py:396-409) to nullify
 `effective.model` → `build_launch_config` falls back to
-`get_default_model_name("claude-code")` → `"sonnet"`. The user got Sonnet
+`get_default_model_name("claude-code-sdk")` → `"sonnet"`. The user got Sonnet
 without asking, without notice.
 
 ### 1.2 Silent fallback (no warning)
@@ -62,14 +62,14 @@ No `logger.warning`, no `print` to stderr, no `sys.exit`. The rejected value
 is discarded silently. Same in the web `_model_can_belong_to_provider` path
 (agents.py:727).
 
-### 1.3 Hardcoded `sonnet` default for `claude-code` is wrong
+### 1.3 Hardcoded `sonnet` default for `claude-code-sdk` is wrong
 
 `config.py:1423-1439`:
 
 ```python
 _PROVIDER_DEFAULT_MODELS = {
     ...
-    "claude-code": (None, "sonnet"),
+    "claude-code-sdk": (None, "sonnet"),
     "codex": ("CODEX_MODEL", None),   # ← let CLI decide
     "grok":  ("GROK_MODEL",  None),   # ← let CLI decide
 }
@@ -102,7 +102,7 @@ Quote (earlier turn):
 
 Derived requirements:
 
-R1. `--model X` for `claude-code` where `X` is a known short alias
+R1. `--model X` for `claude-code-sdk` where `X` is a known short alias
     (`default`, `best`, `fable`, `sonnet`, `opus`, `haiku`, `sonnet[1m]`,
     `opus[1m]`, `opusplan`) or any `claude-*` full ID must NOT be dropped.
 
@@ -113,7 +113,7 @@ R2. When a model reset happens (stale-provider mismatch, unknown token,
     valid alias is not a reset and must stay quiet.
 
 R3. Claude Code's `_PROVIDER_DEFAULT_MODELS` entry must behave exactly
-    like codex/grok: `("CLAUDE_CODE_MODEL", None)`. `None` means the
+    like codex/grok: `("CLAUDE_CODE_SDK_MODEL", None)`. `None` means the
     wrapper does not pass `--model` to `claude` and the CLI resolves its
     own account-type default. No hardcoded `"sonnet"`.
 
@@ -122,7 +122,7 @@ R4. Both call sites of the predicate (CLI `merge_restart_config` and web
     must not diverge again (single source of truth).
 
 R5. All existing tests continue to pass. New TDD tests cover: `fable`
-    accepted, silent-drop replaced by warning, `claude-code` default
+    accepted, silent-drop replaced by warning, `claude-code-sdk` default
     resolves to `None` (like codex).
 
 ## 3. Non-goals
@@ -134,10 +134,10 @@ R5. All existing tests continue to pass. New TDD tests cover: `fable`
 - Do NOT introduce `--strict-model` / fail-fast on unknown tokens. Warning
   is sufficient per R2. (If operator really wants to reject unknown, they
   can grep the log — the message is unambiguous.)
-- Do NOT touch `claude_code_provider/chat_model.py` — it already handles
+- Do NOT touch `claude_code_sdk_provider/chat_model.py` — it already handles
   `model=None` correctly (`ClaudeAgentOptions(model=...)` is only created
   when `model is not None`; a `None` model means the CLI resolves its own
-  default). Verified: `claude_code_provider/chat_model.py:434-436`.
+  default). Verified: `claude_code_sdk_provider/chat_model.py:434-436`.
 - Do NOT touch the local `claude_sdk` source checkout — it's the Anthropic
   Python SDK (`claude_agent_sdk` package). No model-list registry there;
   nothing relevant.
@@ -177,7 +177,7 @@ Review note (review agent): an earlier draft had a second
 been removed. `[1m]`-suffixed full IDs are accepted by the single
 `startswith` test.
 
-### 4.2 Change `claude-code` default entry
+### 4.2 Change `claude-code-sdk` default entry
 
 ```python
 _PROVIDER_DEFAULT_MODELS = {
@@ -187,8 +187,8 @@ _PROVIDER_DEFAULT_MODELS = {
     # / Enterprise PAYG / Bedrock / AWS / GCP; Sonnet 5 on Pro / Team
     # Standard / Enterprise seats; Sonnet 4.5 on Microsoft Foundry — see
     # code.claude.com/docs/en/model-config#default-model-setting).
-    # CLAUDE_CODE_MODEL env var pins it explicitly if the operator wants.
-    "claude-code": ("CLAUDE_CODE_MODEL", None),
+    # CLAUDE_CODE_SDK_MODEL env var pins it explicitly if the operator wants.
+    "claude-code-sdk": ("CLAUDE_CODE_SDK_MODEL", None),
     ...
 }
 ```
@@ -200,7 +200,7 @@ change is transparent to the provider layer.
 
 `build_launch_config` already persists `model=None` correctly for codex
 (comment at agent_command.py:483-490). The same code path now applies to
-claude-code.
+claude-code-sdk.
 
 ### 4.3 Emit a WARNING on any model reset
 
@@ -317,7 +317,7 @@ reported as `unknown-alias`, which is the truth.
 #### 4.3.4 Reporting the real replacement (review point 2)
 
 `replacement=None` with the text "provider default (resolved by CLI)" is
-true for `claude-code` / `codex` / `grok` (all three map to a `None`
+true for `claude-code-sdk` / `codex` / `grok` (all three map to a `None`
 hardcoded default after §4.2) but **false** for `deepseek`, `openai`,
 `anthropic`, `google`, whose `_PROVIDER_DEFAULT_MODELS` entries carry a
 concrete hardcoded string that `build_launch_config` materialises. Saying
@@ -335,7 +335,7 @@ effective.model = None
 ```
 
 so a hardcoded-default provider reset names its concrete model, while a
-`claude-code` reset prints `using provider default (resolved by the
+`claude-code-sdk` reset prints `using provider default (resolved by the
 provider CLI) instead.`
 
 The test must not hardcode the expected string: `_PROVIDER_DEFAULT_MODELS`
@@ -414,7 +414,7 @@ it, and they behave differently with respect to R2:
 | Operator action | Effect on `model` | WARNING? |
 |---|---|---|
 | `--model default` (or `opus`, `fable`, …) | replaced by the typed alias | **No** — `default` is a documented alias (§4.1), the predicate accepts it, nothing is dropped |
-| bare `--provider claude-code` (no `--model`) | reset to `None` → provider default | **Yes** — T1 fires, `sonnet` was dropped |
+| bare `--provider claude-code-sdk` (no `--model`) | reset to `None` → provider default | **Yes** — T1 fires, `sonnet` was dropped |
 
 Review correction (review agent): the draft claimed "Both paths now emit
 WARNING". That was wrong. Passing a valid alias such as `--model default`
@@ -484,17 +484,17 @@ touch the preference belonging to the preferred provider.
 | # | Scenario | `effective.model` | `effective.preferred_model` | WARNING |
 |---|---|---|---|---|
 | C1 | explicit invalid `--model bogusXYZ`, provider == preferred_provider, saved preferred `opus` | `None` (provider default) | `None` — old preference NOT resurrected | 2: `unknown-alias` (for `bogusXYZ`) + `preferred-reset-after-invalid-explicit` (for `opus`) |
-| C2 | explicit valid `--model fable` on claude-code | `"fable"` | `"fable"` (line 465-466 tail) | none |
-| C3 | failover: `--provider codex --no-update-preferred`, saved active model `sonnet` is stale for codex, saved preferred_provider `claude-code` + preferred_model `opus` | `None` (codex default) | `"opus"` — preserved, provider differs from preferred | 1: `stale-provider` |
-| C4 | restore-on-idle: `--provider claude-code --no-update-preferred`, preferred_provider `claude-code`, preferred_model `opus` | `"opus"` via T3 restore | `"opus"` | none (T3 is a restore) |
+| C2 | explicit valid `--model fable` on claude-code-sdk | `"fable"` | `"fable"` (line 465-466 tail) | none |
+| C3 | failover: `--provider codex --no-update-preferred`, saved active model `sonnet` is stale for codex, saved preferred_provider `claude-code-sdk` + preferred_model `opus` | `None` (codex default) | `"opus"` — preserved, provider differs from preferred | 1: `stale-provider` |
+| C4 | restore-on-idle: `--provider claude-code-sdk --no-update-preferred`, preferred_provider `claude-code-sdk`, preferred_model `opus` | `"opus"` via T3 restore | `"opus"` | none (T3 is a restore) |
 | C5 | saved `preferred_model` itself invalid for preferred_provider (legacy poison) | per other rules | `None` — dropped by the existing predicate guard on line 440 | none required (pre-existing silent guard, out of scope) |
-| C6 | bare `--provider claude-code`, saved model `sonnet` | `None` | `None` (RC-1) | 1: `provider-declared` |
+| C6 | bare `--provider claude-code-sdk`, saved model `sonnet` | `None` | `None` (RC-1) | 1: `provider-declared` |
 
 C3 and C4 are exactly the `--no-update-preferred` restore/failover paths
 the reviewer asked to pin down; both get dedicated tests in §5.
 
 **Why C1's second reason is not `unknown-alias` (review R2-4).** In C1
-the dropped preference is `opus` — a perfectly valid claude-code alias.
+the dropped preference is `opus` — a perfectly valid claude-code-sdk alias.
 It is cleared not because the token is bad but because the operator's
 explicit replacement request was invalid, and honouring the *old*
 preference while rejecting the *new* active model would silently
@@ -513,7 +513,7 @@ Production (modified):
   standalone predicate + short-alias set (no heavy deps).
 - `deep_worker/deep_worker_cli/deep_worker_cli/config.py` — rewrite
   `model_can_belong_to_provider` to delegate to `model_predicate`; change
-  `_PROVIDER_DEFAULT_MODELS["claude-code"]` to `("CLAUDE_CODE_MODEL", None)`.
+  `_PROVIDER_DEFAULT_MODELS["claude-code-sdk"]` to `("CLAUDE_CODE_SDK_MODEL", None)`.
 - `deep_worker/deep_worker_cli/deep_worker_cli/cli/agent_command.py` —
   add `_warn_model_reset` helper, wire it at transitions T1/T2 (§4.3.1),
   add `model_reset_cause` and the preferred cascade branch (§4.5.2).
@@ -534,16 +534,16 @@ operator-visible and therefore needs regression coverage.
 
 **`rpyc_service/agent_service.py:913-924`** — filters the model reported
 in agent metadata; a token failing the predicate is hidden from the UI.
-Before this change, a claude-code agent running `fable` would report a
+Before this change, a claude-code-sdk agent running `fable` would report a
 blank/stale model in the web UI. After delegation it reports `fable`.
 No code edit; **regression test added** (§5.2, `test_resolved_model_metadata.py`)
-asserting claude-code + `fable` is surfaced, not suppressed.
+asserting claude-code-sdk + `fable` is surfaced, not suppressed.
 
 **`agent_config_pkg/agent_config.py:123-131`** (`set_dynamic_display_model`)
 — same delegation, same automatic fix. Its docstring at lines 109-116
 currently states that a `None` model is a codex-specific condition. After
 §4.2 that is stale: `None` is now the normal resting state for
-`claude-code` and `grok` too. Docstring updated accordingly; **regression
+`claude-code-sdk` and `grok` too. Docstring updated accordingly; **regression
 test added** asserting `fable` yields a display model rather than being
 discarded.
 
@@ -562,15 +562,15 @@ above.
   fresh subprocess import) — this is the property the web layer relies
   on.
 - `tests/unit_tests/config/test_default_model.py` — extend:
-  `get_default_model_name("claude-code") is None` (line 53 changes from
-  `== "sonnet"`); `CLAUDE_CODE_MODEL=X` env var respected.
+  `get_default_model_name("claude-code-sdk") is None` (line 53 changes from
+  `== "sonnet"`); `CLAUDE_CODE_SDK_MODEL=X` env var respected.
 - `tests/unit_tests/cli/test_model_reset_warning.py` — NEW. Cases:
   - (a) `--model fable` on saved `sonnet` → no reset, **no** warning.
   - (b) `--model bogusXYZ` → reset, warning contains `bogusXYZ` and
     `reason=unknown-alias` (**not** `stale-provider`, even though
-    `saved["model_provider"] == "claude-code"` is truthy — pins review
+    `saved["model_provider"] == "claude-code-sdk"` is truthy — pins review
     point 1).
-  - (c) bare `--provider claude-code` over saved `sonnet` → reset,
+  - (c) bare `--provider claude-code-sdk` over saved `sonnet` → reset,
     warning contains `sonnet` and `reason=provider-declared`.
   - (d) `--model default` → **no** warning (pins §4.4 correction).
   - (e) **hardcoded-default provider**: invalid `--model` on a provider
@@ -586,9 +586,9 @@ above.
     `preferred-reset-after-invalid-explicit` and that the message naming
     `opus` does **not** contain `unknown-alias`.
 - `tests/unit_tests/rpyc_service/test_resolved_model_metadata.py` —
-  extend: claude-code + `fable` is surfaced in metadata, not suppressed.
+  extend: claude-code-sdk + `fable` is surfaced in metadata, not suppressed.
 - `tests/unit_tests/agent_config_pkg/` — extend/add: `set_dynamic_display_model`
-  keeps `fable` for claude-code.
+  keeps `fable` for claude-code-sdk.
 - the web frontend's `tests/unit/test_spawn_subprocess_model.py` — extend
   with `fable` case (spawn must include `--model fable`, no drop, no
   fallback to sonnet).
@@ -606,8 +606,10 @@ sandbox. **No such variable exists**: `grep -rn DEEP_WORKER_HOME` over
 `Path.home()` unconditionally — verified sites include
 `process/agent_process.py:555` (`data_dir = deep_worker_home()/name`),
 `process/agent_process.py:123,198` (provider session state),
-`process/agent_stop.py:63`, `config.py:846` (`~/.deepagents`),
-`config.py:1027` (`~/.agents`), and `history_memory_tool.py:151,157`.
+`process/agent_stop.py:63`, `config.py:846` (at the time of writing, the
+legacy user-config tree that POLICIES §16 has since banned; the call site
+now resolves through `deep_worker_home()`), `config.py:1027` (`~/.agents`),
+and `history_memory_tool.py:151,157`.
 
 Isolation is therefore achieved by running the child with **`HOME=<tmp_path>`**
 in its environment, which relocates `~/.deep_worker/<name>` and the
@@ -629,7 +631,7 @@ The concrete sandbox layout asserted by the test:
 pointed at `<tmp>`).
 
 Sequence:
-1. Genuine first launch (`deep-worker <name> --provider claude-code
+1. Genuine first launch (`deep-worker <name> --provider claude-code-sdk
    --dir <tmp>`) under the sandbox `HOME`, letting the product seed
    `session_metadata.json` + registry entry through its own code path.
 2. Stop that agent.
@@ -637,7 +639,7 @@ Sequence:
 
 **A live `claude` child is not implied by a restart (review R2-2).**
 `ClaudeSDKClient` is constructed and `connect()`ed **lazily** — verified
-at `claude_code_provider/client_manager.py:555-569`, inside the
+at `claude_code_sdk_provider/client_manager.py:555-569`, inside the
 per-thread client-acquisition path. An agent that restarts and sits idle
 has **no** `claude` subprocess, so asserting `/proc/<pid>/cmdline` right
 after startup would inspect a process that does not exist (or, worse,
@@ -713,7 +715,7 @@ Q2. Storage: keep `model: null` (like codex/grok) vs materialise the
    - `--model default` (or `opus`/`fable`/…) — an *explicit replacement*.
      The value changes to what was typed. Nothing is dropped, so **no
      warning**.
-   - bare `--provider claude-code` — a *reset*. `sonnet` is dropped and
+   - bare `--provider claude-code-sdk` — a *reset*. `sonnet` is dropped and
      the provider default applies, **with** a warning.
 3. New agents launched without `--model` on Claude Code start with
    `launch_config.model = null`, and the running `claude` CLI picks
@@ -726,7 +728,7 @@ Q2. Storage: keep `model: null` (like codex/grok) vs materialise the
 ### Round 1 — reviewer, verdict APPROVE WITH CHANGES
 
 Architecture accepted: leaf predicate module, documented alias set,
-`("CLAUDE_CODE_MODEL", None)` default entry, and preserving an existing
+`("CLAUDE_CODE_SDK_MODEL", None)` default entry, and preserving an existing
 persisted `"sonnet"` until the operator acts. All required changes are
 applied in revision 2:
 

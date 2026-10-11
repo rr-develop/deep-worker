@@ -1,7 +1,7 @@
 """Grok provider usage-limit detection for deep-worker failover.
 
 Failover chain (``runtime/provider_chain.py``):
-``claude-code → codex → grok → deepseek``. When a grok agent hits an
+``claude-code-sdk → codex → grok → deepseek``. When a grok agent hits an
 account-level cap, ``GrokUsageLimitError`` triggers ``_schedule_failover``
 to advance to ``deepseek``.
 

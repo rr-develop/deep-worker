@@ -50,6 +50,7 @@ pattern that detaches the service without forking us.
 """
 from __future__ import annotations
 
+import contextlib
 import errno
 import fcntl
 import json
@@ -58,6 +59,7 @@ import select
 import signal
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -345,6 +347,29 @@ class _slug_lock:
                 self._fd = None
 
 
+def _blocking_waitpid(pid: int) -> None:
+    """Block in a worker thread until ``pid`` exits.
+
+    Used as the no-pidfd fallback for child-death detection on CPython
+    builds where ``os.pidfd_open`` is unavailable (it needs
+    ``<sys/pidfd.h>`` at compile time — uv-installed CPython 3.11.14
+    ships without it).  Runs to completion once the kernel reaps the
+    child; ``WNOHANG`` is NOT used, so we never busy-loop.  Idempotent
+    against ECHILD: by the time this is called, the child has either
+    been reaped by its real parent (and the call raises
+    ``ChildProcessError``, which we swallow) or still belongs to us
+    and we block until it dies.
+    """
+    while True:
+        try:
+            waited_pid, _status = os.waitpid(pid, 0)
+        except ChildProcessError:
+            # Already reaped (e.g. by a previous test teardown).
+            return
+        if waited_pid == pid:
+            return
+
+
 def _wait_pid_exit(pid: int, timeout_s: float) -> bool:
     """Block until ``pid`` exits, or ``timeout_s`` elapses.
 
@@ -357,15 +382,78 @@ def _wait_pid_exit(pid: int, timeout_s: float) -> bool:
     try:
         pidfd = os.pidfd_open(pid, 0)
     except (OSError, AttributeError):
-        # ESRCH → already dead. Anything else (very old kernel) means
-        # we cannot observe it; report "gone" so the caller proceeds
-        # to its SIGKILL path rather than hanging.
-        return True
+        # ``os.pidfd_open`` is unavailable on some CPython builds (it
+        # needs <sys/pidfd.h> at compile time — uv-installed CPython
+        # 3.11.14 ships without it).  Fall back to a blocking
+        # ``waitpid`` running in a worker thread — that is
+        # event-driven from the caller's point of view (one wakeup
+        # exactly when the child dies) and complies with the
+        # no-polling policy enforced by ``test_no_polling_policy``.
+        pidfd = None
+
+    if pidfd is not None:
+        try:
+            readable, _, _ = select.select([pidfd], [], [], timeout_s)
+            return bool(readable)
+        finally:
+            os.close(pidfd)
+
+    # No pidfd: probe ``waitpid`` with ``WNOHANG`` to find out whether
+    # we are actually the parent of ``pid``.  When the launcher
+    # double-forked to detach the service, the service is the
+    # launcher's child (now an orphan of init), not ours, and any
+    # blocking ``waitpid`` would raise ``ChildProcessError`` instantly
+    # — which would falsely tell the caller that the child died the
+    # moment we asked.  In that case we cannot observe death from here
+    # at all and the caller must rely on its own timeout.
     try:
-        readable, _, _ = select.select([pidfd], [], [], timeout_s)
-        return bool(readable)
-    finally:
-        os.close(pidfd)
+        probed_pid, _ = os.waitpid(pid, os.WNOHANG)
+    except ChildProcessError:
+        owns_child = False
+    else:
+        # ``waitpid(WNOHANG)`` either returns ``(pid, status)`` (the
+        # child has exited and we just reaped it) or ``(0, 0)``
+        # (the child is still alive).  Either way the call
+        # succeeded, which proves we are the parent.  Only
+        # ``ChildProcessError`` (``ECHILD``) means the PID is not
+        # our child.
+        owns_child = True
+    if not owns_child:
+        return False
+
+    # We are the parent: block on ``waitpid`` in a worker thread, wake
+    # the caller via a pipe so the outer ``select`` returns immediately.
+    read_fd, write_fd = os.pipe()
+    try:
+        def _wait_and_signal() -> None:
+            try:
+                _blocking_waitpid(pid)
+            finally:
+                # Single byte is enough; the caller only checks
+                # readability of ``read_fd``.
+                try:
+                    os.write(write_fd, b"\x00")
+                except OSError:
+                    pass
+
+        thread = threading.Thread(target=_wait_and_signal, daemon=True)
+        thread.start()
+        try:
+            readable, _, _ = select.select([read_fd], [], [], timeout_s)
+            return bool(readable)
+        finally:
+            os.close(read_fd)
+            # ``write_fd`` is closed when the thread exits (or now if
+            # the thread is already done — the close is harmless).
+            os.close(write_fd)
+    except BaseException:
+        # Best-effort cleanup if anything raised before we owned both
+        # ends of the pipe.
+        with contextlib.suppress(OSError):
+            os.close(read_fd)
+        with contextlib.suppress(OSError):
+            os.close(write_fd)
+        raise
 
 
 def _wait_socket_or_exit(
@@ -375,7 +463,7 @@ def _wait_socket_or_exit(
 
     Returns ``"ready"``, ``"exited"`` or ``"timeout"``.
 
-    Event-driven on both edges:
+    Event-driven on both edges when supported by the build:
 
     * a ``pidfd`` becomes readable the moment the child dies;
     * ``watchfiles`` (inotify) fires the moment the socket is created.
@@ -383,6 +471,13 @@ def _wait_socket_or_exit(
     ``select`` blocks on both descriptors at once, so this function
     consumes no CPU while waiting and reacts immediately to whichever
     happens first. No polling loop.
+
+    On builds without ``os.pidfd_open`` (it needs ``<sys/pidfd.h>`` at
+    compile time — uv-installed CPython 3.11.14 ships without it), the
+    child-death edge is served by a worker thread that blocks on
+    ``waitpid`` and signals via a pipe; ``select`` watches the pipe
+    alongside the inotify fd, so the function remains event-driven and
+    no-polling-compliant.
     """
     # The child may have won the race before we even got here.
     if socket_path.exists():
@@ -390,11 +485,6 @@ def _wait_socket_or_exit(
 
     watch_dir = socket_path.parent
     watch_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-
-    try:
-        pidfd = os.pidfd_open(pid, 0)
-    except (OSError, AttributeError):
-        return "ready" if socket_path.exists() else "exited"
 
     inotify_fd = -1
     try:
@@ -412,46 +502,133 @@ def _wait_socket_or_exit(
             if wd < 0:
                 raise OSError(ctypes.get_errno(), "inotify_add_watch failed")
         except (OSError, AttributeError):
-            # Without inotify we can still react to child death, and
+            inotify_fd = -1
+
+        # Pick the child-death descriptor: a pidfd when available,
+        # otherwise a pipe that a worker thread writes to when the
+        # blocking ``waitpid`` returns.
+        try:
+            pidfd: int | None = os.pidfd_open(pid, 0)
+        except (OSError, AttributeError):
+            pidfd = None
+
+        death_fd: int | None = pidfd
+        death_write_fd: int | None = None
+        death_thread: threading.Thread | None = None
+        if pidfd is None:
+            # No pidfd.  Try ``waitpid`` in a worker thread — but only
+            # if we are actually the parent of ``pid``.  When the
+            # launcher double-forked to detach the service, the service
+            # is the launcher's child (now an orphan of init), not ours,
+            # so ``waitpid`` raises ``ChildProcessError`` immediately and
+            # the thread would signal death before the service has a
+            # chance to start — racing us straight to "exited".  Probe
+            # with ``WNOHANG`` once: ``ECHILD`` means the process is not
+            # ours, so we skip the pipe and rely on inotify + timeout
+            # alone for readiness (and accept that we cannot detect
+            # death before the timeout fires for an orphan).
+            try:
+                probed_pid, _ = os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                owns_child = False
+            else:
+                # ``waitpid(WNOHANG)`` either returns ``(pid, status)``
+                # (the child has exited and we just reaped it) or
+                # ``(0, 0)`` (the child is still alive).  Either way
+                # the call succeeded, which proves we are the parent.
+                # Only ``ChildProcessError`` (``ECHILD``) means the
+                # PID is not our child.
+                owns_child = True
+            if owns_child:
+                death_read_fd, death_write_fd = os.pipe()
+                death_fd = death_read_fd
+
+                def _wait_and_signal() -> None:
+                    try:
+                        _blocking_waitpid(pid)
+                    finally:
+                        try:
+                            os.write(death_write_fd, b"\x00")
+                        except OSError:
+                            pass
+
+                death_thread = threading.Thread(
+                    target=_wait_and_signal, daemon=True
+                )
+                death_thread.start()
+            else:
+                # Orphan: ``death_fd`` stays None and the select below
+                # watches only the inotify fd.  When the inotify fd is
+                # also unavailable we cannot observe anything event-
+                # driven and we end up in the ``inotify_fd < 0`` branch
+                # below, which sleeps on the empty fd list until the
+                # timeout fires — that branch only fires on truly
+                # ancient Linux builds that lack both pidfd and inotify.
+                death_fd = None
+
+        try:
+            # Without inotify we can only react to child death, and
             # fall back to a single bounded wait for the socket.
-            readable, _, _ = select.select([pidfd], [], [], timeout_s)
-            if socket_path.exists():
-                return "ready"
-            return "exited" if readable else "timeout"
-
-        # Re-check after arming the watch: the file may have been
-        # created between the first check and inotify_add_watch.
-        if socket_path.exists():
-            return "ready"
-
-        deadline = time.monotonic() + timeout_s
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return "ready" if socket_path.exists() else "timeout"
-            readable, _, _ = select.select(
-                [pidfd, inotify_fd], [], [], remaining
-            )
-            if not readable:
-                return "ready" if socket_path.exists() else "timeout"
-            if inotify_fd in readable:
-                try:
-                    os.read(inotify_fd, 4096)  # drain; content unused
-                except OSError:
-                    pass
+            if inotify_fd < 0:
+                if death_fd is None:
+                    # No event source at all: we cannot observe either
+                    # readiness or death.  Wait out the timeout and
+                    # report whatever we see — this branch only fires
+                    # on ancient Linux builds that lack both pidfd and
+                    # inotify.
+                    time.sleep(timeout_s)
+                    return "ready" if socket_path.exists() else "timeout"
+                readable, _, _ = select.select(
+                    [death_fd], [], [], timeout_s
+                )
                 if socket_path.exists():
                     return "ready"
-                # A sibling file (e.g. the lock) was created — keep
-                # blocking on the same descriptors, no timer involved.
-                continue
-            if pidfd in readable:
-                # Child died. It may still have created the socket
-                # microseconds earlier, so check before reporting.
-                return "ready" if socket_path.exists() else "exited"
+                return "exited" if readable else "timeout"
+
+            # Re-check after arming the watch: the file may have been
+            # created between the first check and inotify_add_watch.
+            if socket_path.exists():
+                return "ready"
+
+            watch_fds: list[int] = (
+                [inotify_fd] if death_fd is None else [death_fd, inotify_fd]
+            )
+            deadline = time.monotonic() + timeout_s
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return "ready" if socket_path.exists() else "timeout"
+                readable, _, _ = select.select(
+                    watch_fds, [], [], remaining
+                )
+                if not readable:
+                    return "ready" if socket_path.exists() else "timeout"
+                if inotify_fd in readable:
+                    try:
+                        os.read(inotify_fd, 4096)  # drain; content unused
+                    except OSError:
+                        pass
+                    if socket_path.exists():
+                        return "ready"
+                    # A sibling file (e.g. the lock) was created — keep
+                    # blocking on the same descriptors, no timer involved.
+                    continue
+                if death_fd is not None and death_fd in readable:
+                    # Child died. It may still have created the socket
+                    # microseconds earlier, so check before reporting.
+                    return "ready" if socket_path.exists() else "exited"
+        finally:
+            if death_fd is not None and death_fd != pidfd:
+                with contextlib.suppress(OSError):
+                    os.close(death_fd)
+            if death_write_fd is not None:
+                with contextlib.suppress(OSError):
+                    os.close(death_write_fd)
     finally:
         if inotify_fd >= 0:
             os.close(inotify_fd)
-        os.close(pidfd)
+        if pidfd is not None:
+            os.close(pidfd)
 
 
 def _kill_quiet(pid: int, sig: int) -> None:

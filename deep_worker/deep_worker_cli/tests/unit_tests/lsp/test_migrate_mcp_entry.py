@@ -50,7 +50,7 @@ def _read(path: Path) -> dict:
 
 
 def test_legacy_entry_is_rewritten_to_bridge(tmp_path: Path):
-    cfg = tmp_path / ".deepagents" / "mcp.json"
+    cfg = tmp_path / ".deep_worker" / "mcp.json"
     _write(cfg, {"serena": dict(_LEGACY)})
 
     assert migrate_mcp_config(cfg) is True
@@ -63,7 +63,7 @@ def test_legacy_entry_is_rewritten_to_bridge(tmp_path: Path):
 
 
 def test_migration_leaves_a_backup(tmp_path: Path):
-    cfg = tmp_path / ".deepagents" / "mcp.json"
+    cfg = tmp_path / ".deep_worker" / "mcp.json"
     _write(cfg, {"serena": dict(_LEGACY)})
     migrate_mcp_config(cfg)
 
@@ -73,7 +73,7 @@ def test_migration_leaves_a_backup(tmp_path: Path):
 
 
 def test_migration_is_idempotent(tmp_path: Path):
-    cfg = tmp_path / ".deepagents" / "mcp.json"
+    cfg = tmp_path / ".deep_worker" / "mcp.json"
     _write(cfg, {"serena": dict(_LEGACY)})
 
     assert migrate_mcp_config(cfg) is True
@@ -96,7 +96,7 @@ def test_backup_is_never_overwritten_by_a_later_migration(tmp_path: Path):
     with this newer, less-original content — otherwise the true
     rollback target is silently lost.
     """
-    cfg = tmp_path / ".deepagents" / "mcp.json"
+    cfg = tmp_path / ".deep_worker" / "mcp.json"
     _write(cfg, {"serena": dict(_LEGACY), "keepme": {"command": "x", "args": []}})
     assert migrate_mcp_config(cfg) is True
 
@@ -114,7 +114,7 @@ def test_backup_is_never_overwritten_by_a_later_migration(tmp_path: Path):
 
 
 def test_other_servers_are_preserved(tmp_path: Path):
-    cfg = tmp_path / ".deepagents" / "mcp.json"
+    cfg = tmp_path / ".deep_worker" / "mcp.json"
     other = {"type": "stdio", "command": "some-other", "args": ["--x"]}
     _write(cfg, {"serena": dict(_LEGACY), "other": other})
 
@@ -125,7 +125,7 @@ def test_other_servers_are_preserved(tmp_path: Path):
 
 
 def test_config_without_serena_is_untouched(tmp_path: Path):
-    cfg = tmp_path / ".deepagents" / "mcp.json"
+    cfg = tmp_path / ".deep_worker" / "mcp.json"
     other = {"type": "stdio", "command": "some-other", "args": []}
     _write(cfg, {"other": other})
     before = cfg.read_text()
@@ -140,7 +140,7 @@ def test_missing_config_is_a_noop(tmp_path: Path):
 
 
 def test_permissions_are_preserved(tmp_path: Path):
-    cfg = tmp_path / ".deepagents" / "mcp.json"
+    cfg = tmp_path / ".deep_worker" / "mcp.json"
     _write(cfg, {"serena": dict(_LEGACY)})
 
     migrate_mcp_config(cfg)

@@ -36,6 +36,7 @@ import asyncio
 import sys
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -70,11 +71,16 @@ _REAL_NESTED_402_REPLY = {
 async def test_real_grok_finalize_response_classifies_nested_402() -> None:
     """Layer 1 — the REAL grok terminal path classifies the REAL nested 402
     reply as an account-terminal usage-limit (the trigger for failover)."""
+    from deep_worker.providers.acp.limit_errors import AcpUsageLimitError
     from deep_worker.providers.grok_provider.chat_model import GrokChatModel
-    from deep_worker.providers.grok_provider.limit_errors import GrokUsageLimitError
 
+    # Since 2026-08-24 grok runs on the SHARED ACP client, so the real
+    # classification is ``AcpUsageLimitError`` — the class names the transport,
+    # not the account. Attribution to grok happens from ``config.provider`` in
+    # the handler (see layer 2 below), which is what keeps the failover target
+    # correct now that claude-code and grok raise the same class.
     model = GrokChatModel(model="grok-4")
-    with pytest.raises(GrokUsageLimitError):
+    with pytest.raises(AcpUsageLimitError):
         await model._finalize_response(dict(_REAL_NESTED_402_REPLY), ["partial"])
 
 
@@ -101,22 +107,31 @@ async def test_real_nested_402_drives_failover_to_deepseek(monkeypatch) -> None:
     the REAL nested reply) flows through the REAL ``_handle_invoke`` failover
     branch and issues the REAL ``deep-worker --restart … --provider deepseek``
     command. Only the OS spawn is captured (boundary), not our logic."""
-    from deep_worker.providers.grok_provider.acp_client import raise_for_error_reply
+    # The SHARED ACP client's extractor — grok's own was deleted on 2026-08-24
+    # when the provider moved onto the shared layer.
+    from deep_worker.providers.acp.acp_client import raise_for_error_reply
 
     # Produce the exception via the REAL extractor on the REAL reply — no
-    # hand-constructed GrokUsageLimitError. This is what the live agent hit.
+    # hand-constructed error. This is what the live agent hit.
     real_exc: BaseException | None = None
     try:
         raise_for_error_reply("session/prompt", dict(_REAL_NESTED_402_REPLY))
     except BaseException as e:  # noqa: BLE001 — capturing the real classification
         real_exc = e
     assert real_exc is not None
-    assert type(real_exc).__name__ == "GrokUsageLimitError", (
+    assert type(real_exc).__name__ == "AcpUsageLimitError", (
         f"the REAL extractor must classify the nested 402 as a usage limit; "
         f"got {type(real_exc).__name__}"
     )
 
     agent = _make_agent("test_nested402_agent")
+    # THE load-bearing line. ``AcpUsageLimitError`` is raised by claude-code
+    # and grok alike, so the handler must attribute the cap from config. With
+    # the pre-2026-08-24 hardcoded ``_schedule_failover("claude-code")`` this
+    # test spawns ``--provider codex`` (the head of
+    # ``failover_candidates("claude-code")``) and the assertion below fails —
+    # which is exactly the regression this file's name promises to catch.
+    agent.config = SimpleNamespace(provider="grok")
 
     # Real graph that fails exactly as the live provider did.
     fake_graph = MagicMock()
@@ -139,8 +154,22 @@ async def test_real_nested_402_drives_failover_to_deepseek(monkeypatch) -> None:
     # failure as recordable, WITHOUT touching global on-disk state.
     # ``_schedule_failover`` imports ``AvailabilityTracker`` late from the
     # source module, so patching it there is sufficient.
+    # ``record_failure`` is captured, not just stubbed: the provider recorded
+    # as FAILED is the attribution, and it is the half of this behaviour the
+    # destination assertion cannot see. Because ``is_available`` below admits
+    # only deepseek, EVERY chain collapses to deepseek — so a wrong
+    # attribution ("claude-code") still spawns ``--provider deepseek`` and the
+    # destination assertion alone stays green while the tracker poisons a
+    # healthy provider. Verified by mutation: reverting the handler to the
+    # hardcoded ``_schedule_failover("claude-code")`` left this file passing
+    # until this capture was added.
+    recorded_failures: list[str] = []
+
     class _FakeTracker:
         def record_failure(self, **kwargs) -> bool:
+            provider = kwargs.get("provider")
+            if provider is not None:
+                recorded_failures.append(str(provider))
             return True
 
         def is_available(self, candidate: str) -> bool:
@@ -181,6 +210,16 @@ async def test_real_nested_402_drives_failover_to_deepseek(monkeypatch) -> None:
     assert "--provider" in argv
     assert argv[argv.index("--provider") + 1] == "deepseek", (
         f"grok 402 must fail over to deepseek; argv={argv}"
+    )
+
+    # ATTRIBUTION — the half the destination cannot prove (see _FakeTracker).
+    # The cap must be recorded against grok, the provider that actually hit it.
+    # Recording it against claude-code marks a provider that never failed as
+    # unavailable, and would additionally offer grok itself as a failover
+    # candidate on a real tracker.
+    assert recorded_failures == ["grok"], (
+        "the usage cap must be attributed to the provider from config "
+        f"(grok), not to the ACP transport's default; got {recorded_failures}"
     )
 
 

@@ -1,5 +1,39 @@
 # Design: Grok provider for deep-worker
 
+> **⚠️ PARTLY SUPERSEDED — 2026-08-24: grok has been moved to the shared ACP layer.**
+>
+> This document describes grok's **own** ACP implementation inside `grok_provider`
+> (its own `acp_client.py`, `proxy_mcp_server.py`, `client_state.py`, …). It was
+> written BEFORE the shared `providers/acp/` layer existed and was a fork of it.
+>
+> `GrokChatModel` is now a thin subclass of `AcpChatModel` (~76 lines instead of
+> ~1550), and everything grok-specific lives in `grok_provider/profile.py` as
+> data (`AcpProfile`). The package shrank from 3535 to 478 lines.
+>
+> Sections §7-§11 (transport, client, proxy MCP, session state) should be read in
+> [`acp/docs/DESIGN_ACP_PROVIDER_LAYER.md`](../../acp/docs/DESIGN_ACP_PROVIDER_LAYER.md);
+> they are kept below as historical context.
+>
+> The fork was a **strict subset** of the shared layer (not a single method and
+> not a single private attribute beyond `AcpChatModel`, while 29 methods were
+> missing), so the move required no compromises. What grok gained with it:
+> `SummarizerPort` (`asummarize`/`areset_after_summary`), the
+> `session_new_validator` mechanism (a post-session gate from the 2026-08-15
+> model-pin incident) on `session/new` **and** `session/load` — but **without a
+> concrete validator**: grok takes its model from its own CLI configuration,
+> there is no operator pin, there is nothing to check, and a validator would be
+> dead code (only claude-code wires one up, because its pin travels via
+> `ANTHROPIC_MODEL` and can be silently dropped by the adapter). Also gained:
+> idempotent `initialize`/`authenticate`, a shared pool of CLI processes
+> (previously an agent and its `:tm` each started their own `grok`), recovery
+> after EOF (the `_acp_started` flag latched and wedged the model forever), and
+> **fail-closed** permissions — the fork auto-approved ANY request, falling back
+> to `offered[0]` (including a deny option) with no tie to `-sp`.
+>
+> Kept deliberately: the name `GrokBuiltin` and the key `_grok_original_title` —
+> `bounded_tool_call` matches them literally to give image generation a 600s
+> budget instead of 120s; they are also already recorded in checkpoints.
+
 **Status:** 📐 DESIGN (rev 1, ready for review)
 **Date:** 2026-06-17
 **Companion:** [`RESEARCH_GROK_PROVIDER.md`](./RESEARCH_GROK_PROVIDER.md) — live findings
@@ -58,7 +92,7 @@ extended with the new provider:
 | 3b | `config.py:1475` | skip API-key validation |
 | 3c | `config.py:1739-` | factory branch `elif provider == "grok":` |
 | 4 | `runtime/availability_tracker.py:11` | `"grok": null` |
-| 5 | `runtime/provider_chain.py:4` | `["claude-code", "codex", "grok", "deepseek"]` |
+| 5 | `runtime/provider_chain.py:4` | `["claude-code-sdk", "codex", "grok", "deepseek"]` |
 
 `process/agent_process.py` and `task_manager/task_manager.py` — do NOT require
 edits (grok has no non-resettable native tools analogous to codex's
@@ -170,7 +204,7 @@ Grok has 12+ built-in tools (`Shell`, `Read`, `Write`, `Edit`, `MultiEdit`, `Glo
 
 ---
 
-## 5. What the `claude-code`/`codex` providers do (slot we mirror)
+## 5. What the `claude-code-sdk`/`codex` providers do (slot we mirror)
 
 Distilled lessons (unchanged from codex §5):
 
@@ -220,7 +254,7 @@ Distilled lessons (unchanged from codex §5):
   - **Summarization** (`sent_count > len(messages)`): new `session/new`,
     discard the old `sessionId`. **Do NOT touch `agent_thread_id`.**
 
-  `sent_count` is updated BEFORE waiting for the response (as with claude-code),
+  `sent_count` is updated BEFORE waiting for the response (as with claude-code-sdk),
   so a retry does not duplicate.
 
   **Persistence across restarts.** `(grok_session_id, sent_count)`
@@ -354,7 +388,7 @@ class GrokChatModel(BaseChatModel):
 
     def bind_tools(self, tools, **kwargs) -> "GrokChatModel":
         # 1. Extract MCP-compatible metadata from BaseTool list — same algorithm
-        #    as claude_code_provider/chat_model.py:_extract_tool_schema
+        #    as claude_code_sdk_provider/chat_model.py:_extract_tool_schema
         #    (Pydantic schema first, fallback inspect.signature).
         # 2. Ensure proxy MCP HTTP server is initialized with this tool set.
         # 3. Server starts lazily on first ainvoke (NOT here — keep side-effect-free).
@@ -592,7 +626,7 @@ async def ainvoke(self, input, config=None, **kwargs) -> AIMessage:
             )
         # AIMessage / SystemMessage — already in grok session or delivered separately
 
-    # 8. Persist sent_count BEFORE awaiting response (mirror codex/claude-code)
+    # 8. Persist sent_count BEFORE awaiting response (mirror codex/claude-code-sdk)
     state.sent_count = len(messages)
     self._client_state.persist(agent_thread_id)
 
@@ -1150,17 +1184,27 @@ Deep-worker tool contract:
 
 ## 14. Provider failover integration
 
-`deep_worker_cli/runtime/provider_chain.py`:
-```python
-PROVIDER_FAILOVER_CHAIN: list[str] = ["claude-code", "codex", "grok", "deepseek"]
+Failover chains are defined by the operator in configuration and addressed by
+name; hardcoding a chain in Python is forbidden (owner directive, 2026-09-03).
+See `deep_worker_cli/docs/DESIGN_CONFIGURABLE_FAILOVER_CHAINS.md`.
+
+The `default` chain:
+
+```
+claude-code → codex → grok → deepseek
 ```
 
-(Order: claude-code → codex → grok → deepseek, by decreasing quality/cost.)
+(Order by decreasing quality/cost.) `grok` takes part in it as an ordinary step:
+when its limit is exhausted the agent moves on to `deepseek`, and when the
+preceding providers are exhausted it arrives at `grok`. `claude-code-sdk` is
+absent from the chain deliberately: it is the second form of the same
+`claude-code` provider with the same subscription, so switching between them
+would land on an already exhausted account.
 
 `deep_worker_cli/runtime/availability_tracker.py`:
 ```python
 {
-  "claude-code": {...},
+  "claude-code-sdk": {...},
   "codex": null,
   "grok": null,
   "deepseek": null,

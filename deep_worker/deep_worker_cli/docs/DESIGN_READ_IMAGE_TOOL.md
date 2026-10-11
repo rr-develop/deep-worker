@@ -4,7 +4,7 @@
 
 ## Problem
 
-Agents using the `claude-code` provider cannot analyze images stored on disk.
+Agents using the `claude-code-sdk` provider cannot analyze images stored on disk.
 Claude models natively support vision (image analysis), but there is no tool
 in deep_worker that reads an image file and passes it to the model as visual
 content.

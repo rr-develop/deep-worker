@@ -20,8 +20,10 @@ from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
+_COMPAT_SCHEMA_VERSIONS = frozenset({4, 5})
 KIND = "deepagents.summarization_history.message"
+SEGMENT_KIND = "deepagents.summarization_history.segment"
 _DEPRECATED_ENCODING = "langgraph_jsonplus"
 _DEPRECATED_SERDE = JsonPlusSerializer()
 
@@ -58,23 +60,74 @@ def _decode_message(entry_message: dict[str, Any]) -> dict[str, Any]:
     return entry_message
 
 
+def _usable_origin(origin: Any) -> dict[str, Any] | None:
+    if not isinstance(origin, dict):
+        return None
+    provider = str(origin.get("provider") or "").strip().lower()
+    if not provider or provider == "unknown":
+        return None
+    out = dict(origin)
+    out["provider"] = provider
+    return out
+
+
+def _effective_origin_from_messages(messages: list[AnyMessage]) -> dict[str, Any] | None:
+    """Nearest origin stamp on or before the first message of this batch."""
+    for message in messages:
+        meta = getattr(message, "response_metadata", None) or {}
+        found = _usable_origin(meta.get("deep_worker_origin"))
+        if found is not None:
+            return found
+        extra = getattr(message, "additional_kwargs", None) or {}
+        found = _usable_origin(extra.get("deep_worker_origin"))
+        if found is not None:
+            return found
+    return None
+
+
 def serialize_summarized_messages_jsonl(
     messages: list[AnyMessage],
     *,
     summarized_at: str | None = None,
+    thread_id: str | None = None,
+    origin: dict[str, Any] | None = None,
+    reason: str | None = None,
+    provider_session_id: str | None = None,
 ) -> str:
     """Serialize a list of messages into JSONL format (one JSON object per line).
+
+    Schema v5 prepends a segment header (``kind=…segment``) carrying the
+    effective provider/model origin so it survives offload. Message lines
+    follow. ``deserialize_summarized_messages_jsonl`` still returns only
+    messages and accepts both v4 (no header) and v5.
 
     Args:
         messages: The messages to serialize.
         summarized_at: Optional ISO-8601 timestamp for the summarization event.
             If ``None``, the current UTC time is used.
+        thread_id: Optional LangGraph thread id for the segment header.
+        origin: Effective origin of the first message; resolved from
+            ``messages`` when omitted.
+        reason: ``hot`` / ``cold`` / ``requested``.
+        provider_session_id: CLI/API session id of the summarizer call.
 
     Returns:
-        A string where each line is a JSON object representing one message.
+        A string where each line is a JSON object.
     """
     event_timestamp = summarized_at or _utc_now()
-    lines: list[str] = []
+    resolved_origin = origin if origin is not None else _effective_origin_from_messages(messages)
+    header = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": SEGMENT_KIND,
+        "summarized_at": event_timestamp,
+        "thread_id": thread_id,
+        "origin": resolved_origin,
+        "reason": reason,
+        "provider_session_id": provider_session_id,
+    }
+    lines: list[str] = [
+        json.dumps(header, cls=_SummarizationJSONEncoder, ensure_ascii=False, separators=(",", ":"))
+    ]
     for index, message in enumerate(messages):
         entry = {
             "schema_version": SCHEMA_VERSION,
@@ -86,7 +139,7 @@ def serialize_summarized_messages_jsonl(
             "message": _encode_message(message),
         }
         lines.append(json.dumps(entry, cls=_SummarizationJSONEncoder, ensure_ascii=False, separators=(",", ":")))
-    return "\n".join(lines) + ("\n" if lines else "")
+    return "\n".join(lines) + "\n"
 
 
 def deserialize_summarized_messages_jsonl(content: str) -> list[AnyMessage]:
@@ -106,11 +159,15 @@ def deserialize_summarized_messages_jsonl(content: str) -> list[AnyMessage]:
         if not line.strip():
             continue
         entry = json.loads(line)
-        if entry.get("schema_version") != SCHEMA_VERSION:
-            msg = f"Unsupported summarization history schema at line {line_number}: {entry.get('schema_version')!r}"
+        version = entry.get("schema_version")
+        if version not in _COMPAT_SCHEMA_VERSIONS:
+            msg = f"Unsupported summarization history schema at line {line_number}: {version!r}"
             raise ValueError(msg)
-        if entry.get("kind") != KIND:
-            msg = f"Unsupported summarization history kind at line {line_number}: {entry.get('kind')!r}"
+        kind = entry.get("kind")
+        if kind == SEGMENT_KIND:
+            continue
+        if kind != KIND:
+            msg = f"Unsupported summarization history kind at line {line_number}: {kind!r}"
             raise ValueError(msg)
         raw = entry.get("message")
         if not isinstance(raw, dict):

@@ -4,7 +4,7 @@ CRITICAL SECURITY:
 ==================
 This application MUST ONLY run on 127.0.0.1, on the port that matches
 the active checkout — 7887 for /path/to/production, 7888 for
-/path/to/dev. Security validation happens at config import
+/path/to/dev.Security validation happens at config import
 and startup (see app/config.py).
 
 ARCHITECTURE:
@@ -49,7 +49,7 @@ class NoStaleStaticFiles(StaticFiles):
         return response
 
 from app.config import settings
-from app.routers import agents_router, websocket_router
+from app.routers import agents_router, mcp_router, websocket_router
 from app.routers.server import router as server_router
 from app.services.agent_service import AgentService
 from app.utils import uptime
@@ -283,6 +283,7 @@ install_exception_handlers(app)
 app.include_router(agents_router)
 app.include_router(websocket_router)
 app.include_router(server_router)
+app.include_router(mcp_router)
 
 # Mount static files
 static_dir = Path(__file__).parent.parent / "static"

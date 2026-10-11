@@ -34,7 +34,9 @@ SUBAGENT_TOOLS = {"task"}
 # Tool provided by TodoListMiddleware
 TODO_TOOLS = {"write_todos"}
 
-# All tools expected when project_memory is NOT available (no index in /tmp)
+# Tools every local agent gets, excluding project_memory.
+# project_memory is tracked separately because these tests assert on its
+# presence directly; it is registered unconditionally (see the tests below).
 # NOTE: send_message_to_agent is NOT included here — it is created by
 # AgentProcess.make_send_message_to_agent_tool() and only added when
 # running inside the process manager, not in create_cli_agent().
@@ -50,7 +52,7 @@ EXPECTED_TOOLS_NO_PROJECT_MEMORY = (
 
 @pytest.fixture
 def tmp_working_dir() -> Iterator[Path]:
-    """Provide a clean /tmp subdirectory with no semantic index."""
+    """Provide a clean /tmp subdirectory; tests that need an index create it."""
     import tempfile
 
     with tempfile.TemporaryDirectory(prefix="dw_agent_tools_test_") as tmpdir:
@@ -142,10 +144,16 @@ class TestAgentToolsSchema:
             f"  actual:   {sorted(tool_names)}"
         )
 
-    def test_project_memory_absent_without_index(
+    def test_project_memory_present_without_index(
         self, tmp_working_dir: Path,
     ) -> None:
-        """project_memory tool should NOT appear when no .vector_index."""
+        """project_memory is registered even with no .vector_index present.
+
+        The tool is repo-agnostic: it can be pointed at another repository,
+        so its availability no longer depends on the working directory having
+        been indexed. An unindexed project simply yields no results, which is
+        the tool's own concern rather than a reason to hide it from the model.
+        """
         from langchain.chat_models import init_chat_model
         from deep_worker_cli.agent import create_cli_agent
 
@@ -165,6 +173,8 @@ class TestAgentToolsSchema:
 
         tool_names = self._tool_names_from_graph(agent)
 
-        assert "project_memory" not in tool_names, (
-            "project_memory tool registered despite no semantic index being present"
+        assert "project_memory" in tool_names, (
+            "project_memory tool missing without an index; it is repo-agnostic "
+            "and must be offered regardless of whether the working directory "
+            "has been indexed"
         )

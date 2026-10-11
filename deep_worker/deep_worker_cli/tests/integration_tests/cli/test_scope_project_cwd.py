@@ -95,7 +95,7 @@ def test_mcp_list_project_scope_uses_invocation_dir(repo: Path) -> None:
     # Checking "absence of some foreign path" is not enough — under the
     # regression the path moves to the installation directory, which
     # differs between trees, and a negative assert silently passes.
-    expected = repo.resolve() / ".deepagents" / "mcp.json"
+    expected = repo.resolve() / ".deep_worker" / "mcp.json"
     assert str(expected) in combined, (
         f"project-scope does not resolve from the invocation directory.\n"
         f"expected: {expected}\noutput:\n{combined}"
@@ -120,7 +120,7 @@ def test_mcp_add_project_scope_writes_into_invocation_repo(repo: Path) -> None:
     combined = res.stdout + res.stderr
     assert res.returncode == 0, combined
 
-    written = repo / ".deepagents" / "mcp.json"
+    written = repo / ".deep_worker" / "mcp.json"
     assert written.is_file(), (
         f"config not written to the invocation repository ({written}).\n{combined}"
     )
@@ -141,7 +141,7 @@ def test_lsp_enable_project_scope_writes_into_invocation_repo(repo: Path) -> Non
         pytest.skip(f"serena unavailable in this environment: {combined[:200]}")
 
     assert res.returncode == 0, combined
-    written = repo / ".deepagents" / "mcp.json"
+    written = repo / ".deep_worker" / "mcp.json"
     assert written.is_file(), (
         f"lsp enable wrote the config outside the invocation repository.\n{combined}"
     )

@@ -28,10 +28,12 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Literal
 
 Verbosity = Literal["final", "text", "full"]
 HumanKind = Literal["user", "taskmanager", "agent_echo", "summarization"]
+TimestampMode = Literal["local", "utc"]
 
 NO_HISTORY_TEXT = "No conversation history yet."
 NO_RESPONSE_TEXT = "(no response yet)"
@@ -52,6 +54,45 @@ _SUMMARIZATION_INLINE_MARKER = "Context Extraction Assistant"
 # ---------------------------------------------------------------------------
 # Pure helpers
 # ---------------------------------------------------------------------------
+
+
+def format_timestamp(raw: Any, mode: TimestampMode = "local") -> str:
+    """Render a message's ``created_at`` for a block header.
+
+    Messages carry ``created_at`` as ISO-8601 UTC (stamped once and never
+    rewritten, see ``deepagents.middleware.message_timestamps``). Readers work
+    in wall-clock time, so ``local`` converts to the host timezone; ``utc``
+    keeps it as-is.
+
+    The zone is ALWAYS spelled out — ``+02:00`` for local, ``UTC`` for UTC —
+    because a bare wall-clock time next to a log line in another zone is how
+    incident timelines get misread. Seconds are kept, microseconds dropped.
+
+    Returns ``""`` when there is no usable timestamp: old checkpoints predate
+    the stamping middleware, and a missing time must degrade to "no time
+    shown" rather than to a fabricated or bogus one.
+    """
+    if not isinstance(raw, str) or not raw.strip():
+        return ""
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return ""
+    if parsed.tzinfo is None:
+        # Stamps are documented UTC; a naive value means an older writer.
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    if mode == "utc":
+        return parsed.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    local = parsed.astimezone()
+    offset = local.strftime("%z")
+    pretty_offset = f"{offset[:3]}:{offset[3:]}" if len(offset) == 5 else offset
+    return f"{local.strftime('%Y-%m-%d %H:%M:%S')} {pretty_offset}"
+
+
+def _stamped(label: str, raw: Any, mode: TimestampMode) -> str:
+    """``--- Assistant 2026-08-29 14:29:22 +02:00 ---``, or plain when unknown."""
+    ts = format_timestamp(raw, mode)
+    return f"--- {label} {ts} ---" if ts else f"--- {label} ---"
 
 
 def classify_human(content: str) -> HumanKind:
@@ -130,17 +171,22 @@ def _agent_echo_sender(content: str) -> str:
     return rest[:end]
 
 
-def _user_header(kind: HumanKind, content: str) -> str:
+def _user_header(
+    kind: HumanKind,
+    content: str,
+    created_at: Any = None,
+    mode: TimestampMode = "local",
+) -> str:
     if kind == "user":
-        return "--- User ---"
+        return _stamped("User", created_at, mode)
     if kind == "taskmanager":
-        return "--- TaskManager ---"
+        return _stamped("TaskManager", created_at, mode)
     if kind == "agent_echo":
-        return f"--- From agent:{_agent_echo_sender(content)} ---"
+        return _stamped(f"From agent:{_agent_echo_sender(content)}", created_at, mode)
     if kind == "summarization":
-        return "--- Summarization ---"
+        return _stamped("Summarization", created_at, mode)
     # defensive; classify_human exhaustively covers HumanKind
-    return "--- (unknown) ---"
+    return _stamped("(unknown)", created_at, mode)
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +198,13 @@ def _user_header(kind: HumanKind, content: str) -> str:
 # precedes any real HumanMessage (e.g. the agent's base system prompt).
 # Such a block has no user line — only the system content(s).
 _SYSTEM_PREAMBLE_TYPE = "SystemPreamble"
+
+#: Set by the agent runtime on the SystemMessage it appends for a
+#: recoverable failure, and forwarded through ``serialize_message``.
+#: Matching on this rather than on the ``[runtime]`` text prefix: the flag
+#: is structured data put there for the purpose, the prefix is prose that
+#: can be reworded without anyone noticing the rendering broke.
+RECOVERABLE_ERROR_KEY = "recoverable_error"
 
 
 @dataclass
@@ -177,6 +230,18 @@ class Turn:
     stream: list[tuple[str, Any]] = field(default_factory=list)
     # entries: ("text", str) | ("tool_call", dict) | ("system", str)
     system_messages: list[str] = field(default_factory=list)
+    # ``created_at`` of each entry, positionally parallel to the lists above.
+    # Kept alongside rather than inside them so the existing payload shapes
+    # (and every consumer of ``stream``) stay exactly as they were.
+    ai_text_timestamps: list[Any] = field(default_factory=list)
+    stream_timestamps: list[Any] = field(default_factory=list)
+    system_timestamps: list[Any] = field(default_factory=list)
+    # Positionally parallel to ``system_messages``: True where the runtime
+    # stamped the message as a recoverable failure. Those are the only
+    # system messages shown at ``final`` — the base prompt and routine
+    # middleware hints stay hidden there, which is the point of that
+    # verbosity. See docs/DESIGN_RECOVERABLE_ERROR_VISIBILITY.md §5.
+    system_error_flags: list[bool] = field(default_factory=list)
 
 
 def _extract_system_content(msg: dict[str, Any]) -> str:
@@ -220,6 +285,8 @@ def split_into_turns(history: list[dict[str, Any]]) -> list[Turn]:
             continue
         if msg_type == "SystemMessage":
             content = _extract_system_content(msg)
+            created = msg.get("created_at")
+            is_error = msg.get(RECOVERABLE_ERROR_KEY) is True
             if current is None:
                 # Leading system block (base prompt) — accumulate into a
                 # synthetic preamble turn so it renders before the first
@@ -228,23 +295,37 @@ def split_into_turns(history: list[dict[str, Any]]) -> list[Turn]:
                     preamble = Turn(human={"type": _SYSTEM_PREAMBLE_TYPE, "content": ""})
                     turns.append(preamble)
                 preamble.system_messages.append(content)
+                preamble.system_timestamps.append(created)
+                preamble.system_error_flags.append(is_error)
                 preamble.stream.append(("system", content))
+                preamble.stream_timestamps.append(created)
             else:
                 current.system_messages.append(content)
+                current.system_timestamps.append(created)
+                current.system_error_flags.append(is_error)
                 current.stream.append(("system", content))
+                current.stream_timestamps.append(created)
             continue
         if current is None:
             # AIMessage / ToolMessage before any HumanMessage — skip
             continue
         if msg_type == "AIMessage":
+            created = msg.get("created_at")
             text = extract_text(msg)
             if text and text.strip():
                 current.ai_text_messages.append(text)
+                current.ai_text_timestamps.append(created)
                 current.stream.append(("text", text))
+                current.stream_timestamps.append(created)
             tool_calls = msg.get("tool_calls") or []
             for tc in tool_calls:
                 if isinstance(tc, dict):
                     current.stream.append(("tool_call", tc))
+                    # A tool call carries its own stamp; fall back to the
+                    # message's when the provider did not supply one.
+                    current.stream_timestamps.append(
+                        tc.get("created_at") or created
+                    )
         # ToolMessage payloads are not rendered (noisy, redundant with the
         # corresponding tool_call line in full mode).
     if current is not None:
@@ -257,23 +338,57 @@ def split_into_turns(history: list[dict[str, Any]]) -> list[Turn]:
 # ---------------------------------------------------------------------------
 
 
-def _render_assistant_block_final(turn: Turn) -> str:
+def _stream_stamp(turn: Turn, index: int) -> Any:
+    """``created_at`` for ``turn.stream[index]``, tolerant of a short list."""
+    if index < len(turn.stream_timestamps):
+        return turn.stream_timestamps[index]
+    return None
+
+
+def _render_assistant_block_final(turn: Turn, mode: TimestampMode = "local") -> str:
+    # A recoverable failure is shown even here. ``final`` hides system
+    # messages by design — but hiding THIS one made a failed turn read as
+    # a finished one: the model's last musing was rendered as the answer
+    # while the runtime error was dropped entirely. Reported by the owner
+    # 2026-09-04 ("it just looked like the model's final answer").
+    # See docs/DESIGN_RECOVERABLE_ERROR_VISIBILITY.md §5.
+    failures = [
+        (content, turn.system_timestamps[index] if index < len(turn.system_timestamps) else None)
+        for index, content in enumerate(turn.system_messages)
+        if index < len(turn.system_error_flags) and turn.system_error_flags[index]
+    ]
+
+    parts: list[str] = []
     if turn.ai_text_messages:
-        return f"--- Assistant ---\n{turn.ai_text_messages[-1]}"
-    return f"--- Assistant ---\n{NO_RESPONSE_TEXT}"
+        stamp = (
+            turn.ai_text_timestamps[-1]
+            if turn.ai_text_timestamps
+            else None
+        )
+        parts.append(
+            f"{_stamped('Assistant', stamp, mode)}\n{turn.ai_text_messages[-1]}"
+        )
+    elif not failures:
+        return f"--- Assistant ---\n{NO_RESPONSE_TEXT}"
+
+    parts.extend(
+        f"{_stamped('System', stamp, mode)}\n{content}" for content, stamp in failures
+    )
+    return "\n\n".join(parts)
 
 
-def _render_assistant_block_text(turn: Turn) -> str:
+def _render_assistant_block_text(turn: Turn, mode: TimestampMode = "local") -> str:
     # ``text`` mode shows every text-bearing AIMessage AND every
     # SystemMessage in this turn, in chronological order. System messages
     # (base prompt / middleware hints) are first-class — omitting them
     # would make the rendering misleading (forbidden by policy).
     parts: list[str] = []
-    for kind, payload in turn.stream:
+    for index, (kind, payload) in enumerate(turn.stream):
+        stamp = _stream_stamp(turn, index)
         if kind == "text":
-            parts.append(f"--- Assistant ---\n{payload}")
+            parts.append(f"{_stamped('Assistant', stamp, mode)}\n{payload}")
         elif kind == "system":
-            parts.append(f"--- System ---\n{payload}")
+            parts.append(f"{_stamped('System', stamp, mode)}\n{payload}")
     if not turn.ai_text_messages and not turn.system_messages:
         return f"--- Assistant ---\n{NO_RESPONSE_TEXT}"
     if not turn.ai_text_messages:
@@ -283,23 +398,28 @@ def _render_assistant_block_text(turn: Turn) -> str:
     return "\n\n".join(parts)
 
 
-def _render_assistant_block_full(turn: Turn) -> str:
+def _render_assistant_block_full(turn: Turn, mode: TimestampMode = "local") -> str:
     if not turn.stream:
         return f"--- Assistant ---\n{NO_RESPONSE_TEXT}"
     parts: list[str] = []
-    for kind, payload in turn.stream:
+    for index, (kind, payload) in enumerate(turn.stream):
+        stamp = _stream_stamp(turn, index)
         if kind == "text":
-            parts.append(f"--- Assistant ---\n{payload}")
+            parts.append(f"{_stamped('Assistant', stamp, mode)}\n{payload}")
         elif kind == "system":
-            parts.append(f"--- System ---\n{payload}")
+            parts.append(f"{_stamped('System', stamp, mode)}\n{payload}")
         elif kind == "tool_call":
             tc_name = payload.get("name", "?") if isinstance(payload, dict) else "?"
             line = format_tool_call(payload) if isinstance(payload, dict) else str(payload)
-            parts.append(f"--- Assistant (tool: {tc_name}) ---\n{line}")
+            parts.append(
+                f"{_stamped(f'Assistant (tool: {tc_name})', stamp, mode)}\n{line}"
+            )
     return "\n\n".join(parts)
 
 
-def _render_system_preamble(turn: Turn, verbosity: Verbosity) -> str | None:
+def _render_system_preamble(
+    turn: Turn, verbosity: Verbosity, mode: TimestampMode = "local"
+) -> str | None:
     """Render a leading SystemMessage block (base prompt) that precedes any
     HumanMessage. Visible at ``text``/``full``; omitted at ``final``.
     Returns None when there is nothing to show at this verbosity.
@@ -308,23 +428,35 @@ def _render_system_preamble(turn: Turn, verbosity: Verbosity) -> str | None:
         return None
     if not turn.system_messages:
         return None
-    blocks = [f"--- System ---\n{content}" for content in turn.system_messages]
+    blocks: list[str] = []
+    for index, content in enumerate(turn.system_messages):
+        stamp = (
+            turn.system_timestamps[index]
+            if index < len(turn.system_timestamps)
+            else None
+        )
+        blocks.append(f"{_stamped('System', stamp, mode)}\n{content}")
     return "\n\n".join(blocks)
 
 
-def _render_turn(turn: Turn, kind: HumanKind, verbosity: Verbosity) -> str:
+def _render_turn(
+    turn: Turn,
+    kind: HumanKind,
+    verbosity: Verbosity,
+    mode: TimestampMode = "local",
+) -> str:
     raw_content = turn.human.get("content", "")
     if not isinstance(raw_content, str):
         raw_content = str(raw_content)
     body = _strip_prefix(raw_content, kind)
-    header = _user_header(kind, raw_content)
+    header = _user_header(kind, raw_content, turn.human.get("created_at"), mode)
 
     if verbosity == "final":
-        ai_block = _render_assistant_block_final(turn)
+        ai_block = _render_assistant_block_final(turn, mode)
     elif verbosity == "text":
-        ai_block = _render_assistant_block_text(turn)
+        ai_block = _render_assistant_block_text(turn, mode)
     elif verbosity == "full":
-        ai_block = _render_assistant_block_full(turn)
+        ai_block = _render_assistant_block_full(turn, mode)
     else:  # pragma: no cover - validated upstream
         raise ValueError(f"Unknown verbosity: {verbosity!r}")
 
@@ -375,17 +507,29 @@ def render_tools(tools: list[dict[str, Any]], provider: str | None) -> str:
     return header + "\n" + "\n".join(lines)
 
 
-def render_dialog(turns: list[Turn], verbosity: str = "final") -> str:
-    """Render a list of Turns to a plain-text dialog at the requested verbosity."""
+def render_dialog(
+    turns: list[Turn],
+    verbosity: str = "final",
+    timestamps: str = "local",
+) -> str:
+    """Render a list of Turns to a plain-text dialog at the requested verbosity.
+
+    ``timestamps`` selects the zone of the per-message stamp in each block
+    header: ``local`` (host time, default) or ``utc``. Either way the zone is
+    printed, so a rendering can never be misread as the wrong clock.
+    """
     if verbosity not in ("final", "text", "full"):
         raise ValueError(f"Unknown verbosity: {verbosity!r}")
+    if timestamps not in ("local", "utc"):
+        raise ValueError(f"Unknown timestamps mode: {timestamps!r}")
+    mode: TimestampMode = "utc" if timestamps == "utc" else "local"
 
     blocks: list[str] = []
     for turn in turns:
         # A leading SystemMessage block (base prompt) has no user line.
         # Render it as a standalone System block at text/full; skip at final.
         if turn.human.get("type") == _SYSTEM_PREAMBLE_TYPE:
-            rendered = _render_system_preamble(turn, verbosity)
+            rendered = _render_system_preamble(turn, verbosity, mode)
             if rendered is not None:
                 blocks.append(rendered)
             continue
@@ -395,7 +539,7 @@ def render_dialog(turns: list[Turn], verbosity: str = "final") -> str:
         kind = classify_human(raw)
         # Summarization turns are labelled, not filtered (see
         # DESIGN_SUMMARIZATION_VISIBLE.md).
-        blocks.append(_render_turn(turn, kind, verbosity))
+        blocks.append(_render_turn(turn, kind, verbosity, mode))
 
     if not blocks:
         return NO_HISTORY_TEXT

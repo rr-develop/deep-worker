@@ -8,12 +8,13 @@ immediately known to all others.
 Schema::
 
     {
-      "claude-code": {
+      "claude-code-sdk": {
         "available_after_utc": "2026-06-04T18:10:00+00:00",   # null if unparseable
         "last_failure_marker": "You've hit your session limit · resets 7pm (Europe/Amsterdam)",
         "last_failure_at_utc": "2026-06-04T13:55:11+00:00",
         "last_failure_agent": "<agent-name>"
       } | null,
+      "claude-code": null,
       "codex": null,
       "grok": null,
       "deepseek": null
@@ -36,10 +37,22 @@ from deep_worker_cli.storage_paths import deep_worker_home
 
 logger = logging.getLogger(__name__)
 
+#: Rough recovery window per provider, used ONLY when the provider's own
+#: message carries no reset time. Keyed by provider name (not account group):
+#: two wrappers on one account can still word their errors differently.
+#:
+#: ``minimax`` (owner directive 2026-08-17): its cap message is
+#: ``Token Plan usage limit reached … (2056)`` with no time, it exposes no
+#: quota endpoint (every candidate 404s) and returns no ``x-ratelimit-*`` /
+#: ``retry-after`` header — verified against the live API. So a fallback is
+#: the only signal available, and 3h is the operator's choice. This table is
+#: the single place that number lives.
 _PROVIDER_FALLBACK_HOURS: dict[str, int] = {
+    "claude-code-sdk": 6,
     "claude-code": 6,
     "codex": 6,
     "grok": 24,
+    "minimax": 3,
 }
 
 _RESET_PATTERNS = (
@@ -177,13 +190,37 @@ def _has_date_component(text: str) -> bool:
 
 
 class AvailabilityTracker:
-    """Tracks per-provider availability based on observed failure markers."""
+    """Tracks availability per BILLING ACCOUNT, keyed by account group.
+
+    Records are keyed by ``account_group_for(provider)``, not by the
+    provider name: a usage cap belongs to the account, so ``claude-code``
+    and ``claude-code-sdk`` — two implementations of one Claude
+    subscription — must share a single verdict (owner directive
+    2026-08-17). Keying by provider let a cap seen through one wrapper
+    leave the other looking available, and failover then hopped straight
+    back into the exhausted account.
+
+    No migration is provided for records written under the older
+    provider-keyed scheme. The data is short-lived (a cap resolves within
+    a day), so a stale key simply stops matching and ages out; unrelated
+    records are untouched. Writing a migration for data that expires on
+    its own would be more code and more risk than the problem warrants.
+    """
 
     def __init__(self, data_dir: Path | None = None) -> None:
         if data_dir is None:
             data_dir = deep_worker_home()
         self._file = data_dir / "provider_availability.json"
         self._data: dict[str, Any] = self._load()
+
+    @staticmethod
+    def _key(provider: str) -> str:
+        """Account-group key for ``provider`` (see class docstring)."""
+        from deep_worker_cli.runtime.provider_chain import (  # noqa: PLC0415
+            account_group_for,
+        )
+
+        return account_group_for(provider)
 
     # ------------------------------------------------------------------
     # Public API
@@ -215,7 +252,7 @@ class AvailabilityTracker:
         now = datetime.now(timezone.utc)
         was_available = self.is_available(provider)
 
-        self._data[provider] = {
+        self._data[self._key(provider)] = {
             "available_after_utc": (
                 available_after_utc.isoformat() if available_after_utc else None
             ),
@@ -237,7 +274,7 @@ class AvailabilityTracker:
         auto-restore to a provider with unknown reset (see
         ``is_restore_eligible``).
         """
-        record = self._data.get(provider)
+        record = self._data.get(self._key(provider))
         if record is None:
             return True
         raw = record.get("available_after_utc")
@@ -257,7 +294,7 @@ class AvailabilityTracker:
         record and no confirmed past reset is NOT eligible — including
         when ``available_after_utc`` is unknown (``None``).
         """
-        record = self._data.get(provider)
+        record = self._data.get(self._key(provider))
         if record is None:
             return True
         raw = record.get("available_after_utc")
@@ -277,7 +314,7 @@ class AvailabilityTracker:
         a return of None means "don't auto-restore, the reset window is
         unknown".
         """
-        record = self._data.get(provider)
+        record = self._data.get(self._key(provider))
         if record is None:
             return None
         raw = record.get("available_after_utc")
@@ -290,7 +327,7 @@ class AvailabilityTracker:
 
     def limit_info(self, provider: str) -> dict[str, Any] | None:
         """Return the raw persisted limit record for readonly CLI/UI surfaces."""
-        record = self._data.get(provider)
+        record = self._data.get(self._key(provider))
         if record is None:
             return None
         return dict(record)
@@ -300,8 +337,13 @@ class AvailabilityTracker:
 
         Called when an invocation succeeds on that provider (proving it
         is back), or when restore-on-idle completes.
+
+        Keyed by account group like every other accessor: a success on one
+        wrapper proves the shared subscription recovered, so it must lift
+        the block for its sibling too — otherwise the record would outlive
+        the outage and keep a healthy provider fenced off.
         """
-        self._data.pop(provider, None)
+        self._data.pop(self._key(provider), None)
         self._persist()
 
     # ------------------------------------------------------------------

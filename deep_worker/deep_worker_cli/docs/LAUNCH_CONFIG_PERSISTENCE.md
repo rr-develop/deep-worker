@@ -9,7 +9,7 @@ terminated**.
 
 ## Problem
 
-Previously, launch parameters (e.g. `--provider claude-code --model opus -sp -tm`)
+Previously, launch parameters (e.g. `--provider claude-code-sdk --model opus -sp -tm`)
 were only available at runtime:
 
 - In-memory via `AgentConfig` and `AgentProcess` attributes
@@ -53,7 +53,7 @@ agent_command.py::run_agent()
   "error_message": null,
   "last_activity": "2026-04-11T22:00:55.651807",
   "launch_config": {
-    "provider": "claude-code",
+    "provider": "claude-code-sdk",
     "model": "opus",
     "working_dir": "/path/to/project",
     "skip_permissions": true,
@@ -63,7 +63,7 @@ agent_command.py::run_agent()
     "clean": true,
     "started_at": "2026-04-11T16:59:41.692129",
     "pid": 3726921,
-    "cli_args": "myagent -sp -tm --dir /path/to/project --provider claude-code --model opus --clean"
+    "cli_args": "myagent -sp -tm --dir /path/to/project --provider claude-code-sdk --model opus --clean"
   }
 }
 ```
@@ -72,7 +72,7 @@ agent_command.py::run_agent()
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `provider` | string | AI provider (`deepseek`, `claude-code`, `gemini`, `openai`) |
+| `provider` | string | AI provider (`deepseek`, `claude-code-sdk`, `gemini`, `openai`) |
 | `model` | string | Resolved model name (e.g. `opus`, `deepseek-chat`) |
 | `working_dir` | string | Agent working directory (absolute path) |
 | `skip_permissions` | bool | Whether `-sp` / `--skip-permissions` was passed |

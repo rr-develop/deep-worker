@@ -46,10 +46,10 @@ NEVER becomes `is_error`.
 
 ### 1.1 Many providers, of two types
 `config.py:1602-1742`: deepseek, openai, anthropic, google, vertexai,
-claude-code, codex (+ grok in development).
+claude-code-sdk, codex (+ grok in development).
 - **Type 1 (regular LangChain models):** deepseek/openai/anthropic/google/
   vertexai. LangGraph ToolNode executes tools directly.
-- **Type 2 (CLI via MCP-proxy):** claude-code, codex, (grok). Each carries its
+- **Type 2 (CLI via MCP-proxy):** claude-code-sdk, codex, (grok). Each carries its
   OWN copy of `ProxyMCPServer` with its own wait.
 
 ### 1.2 A single tool-execution point ALREADY exists

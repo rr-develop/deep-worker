@@ -12,13 +12,18 @@ along with its scope, file location, and the code that defines it.
 |---|---|
 | **Version constant** | `STORAGE_VERSION_GLOBAL_DB = 1` |
 | **Source** | `storage_paths.py:10` |
-| **Status** | Deprecated |
-| **Location** | `~/.deepagents/sessions.db` |
+| **Status** | Removed — unreachable |
+| **Location** | Legacy ancestor tree (removed 2026-08-31; see POLICIES §16) |
 | **Format** | SQLite database shared by all agents |
 
-Single database file that stores thread/session state for every agent. Replaced
+Single database file that stored thread/session state for every agent. Replaced
 by v2 because concurrent agents on the same host serialised writes through one
 SQLite connection.
+
+The directory it lived in is banned for both reads and writes, so this format is
+no longer reachable: `legacy_global_db_path()` raises `DeepagentsPathForbiddenError`
+rather than returning a path. The version constant survives only so that
+`detect_storage_version()` can name what it found.
 
 ---
 
@@ -28,19 +33,21 @@ SQLite connection.
 |---|---|
 | **Version constant** | `STORAGE_VERSION_DEEPAGENTS_PER_AGENT = 2` |
 | **Source** | `storage_paths.py:11` |
-| **Status** | Legacy (still in use by some agents) |
-| **Location** | `~/.deepagents/sessions_<name>.db` |
+| **Status** | Removed — unreachable |
+| **Location** | Legacy ancestor tree (removed 2026-08-31; see POLICIES §16) |
 | **Format** | SQLite database per agent |
 
-One SQLite database per agent, still in the legacy `~/.deepagents/` directory.
-Version 2 exists when `session_metadata.json` is missing, has a bad format, or
-explicitly carries `"storage_version": 2`.
+One SQLite database per agent, kept in the ancestor project's config directory.
+Version 2 is still *reported* when `session_metadata.json` is missing, has a bad
+format, or explicitly carries `"storage_version": 2`.
 
 The `session_metadata.json` record, when present, pins the version on restart
 because `detect_storage_version()` reads the persisted `storage_version` field
 and returns it verbatim, never upgrading automatically.
 
-**Upgrade path:** `deep-worker migrate <name>` re-reads old DB and writes v3.
+**Upgrade path:** none remains. The source directory is banned, so
+`legacy_per_agent_db_path()` raises `DeepagentsPathForbiddenError` and no
+migration can read the old file. An agent reporting v2 has no recoverable data.
 
 ---
 
@@ -139,8 +146,8 @@ to detect incompatible snapshots.
 
 | # | Name | Location | Status | Defined In |
 |---|---|---|---|---|
-| 1 | Global sessions.db | `~/.deepagents/sessions.db` | Deprecated | `storage_paths.py` |
-| 2 | Per-agent sessions.db | `~/.deepagents/sessions_<name>.db` | Legacy | `storage_paths.py` |
+| 1 | Global sessions.db | Legacy ancestor tree (removed) | Unreachable | `storage_paths.py` |
+| 2 | Per-agent sessions.db | Legacy ancestor tree (removed) | Unreachable | `storage_paths.py` |
 | 3 | Agent-root threads.db | `~/.deep_worker/<name>/threads.db` | **Current** | `storage_paths.py` |
 | 4 | Summarization history JSONL | `~/.deep_worker/<name>/summaries/<name>.jsonl` | **Current** | `summarization_history.py` |
 | Δ2 | Delta checkpointer | Inside checkpoint store | **Current** | `delta_checkpointer.py` |

@@ -17,7 +17,7 @@ deep-worker <agent_name> --clean [other options]
 deep-worker myagent --dir /path/to/your/project --clean
 
 # With custom provider
-deep-worker myagent --provider claude-code --clean
+deep-worker myagent --provider claude-code-sdk --clean
 ```
 
 ## What Gets Removed
@@ -25,7 +25,7 @@ deep-worker myagent --provider claude-code --clean
 When you use `--clean`, the following data is deleted:
 
 1. **Conversation History**
-   - All conversation threads from `~/.deepagents/sessions.db`
+   - All conversation threads from the agent's thread database
    - All checkpoints and messages for this agent
 
 2. **Session Data**
@@ -41,15 +41,15 @@ When you use `--clean`, the following data is deleted:
 The `--clean` option **does NOT** remove your custom configuration:
 
 1. **User Configuration**
-   - `~/.deepagents/{agent_name}/AGENTS.md` - Your custom agent instructions
+   - `~/.deep_worker/agents/{agent_name}/AGENTS.md` - Your custom agent instructions
    - Agent personality and custom prompts
 
 2. **Custom Skills**
-   - `~/.deepagents/{agent_name}/skills/` - All your custom skills
+   - `~/.deep_worker/agents/{agent_name}/skills/` - All your custom skills
    - Reusable workflow definitions
 
 3. **Custom Subagents**
-   - `~/.deepagents/{agent_name}/agents/` - Your specialized subagents
+   - `~/.deep_worker/agents/{agent_name}/agents/` - Your specialized subagents
 
 ## Requirements
 
@@ -125,7 +125,7 @@ The `--clean` option provides detailed feedback:
   - Removed 42 writes from database
   - Removed data directory: ~/.deep_worker/myagent
   - Removed 2 log file(s)
-  - Preserved user config: ~/.deepagents/myagent/
+  - Preserved user config: ~/.deep_worker/agents/myagent/
 ```
 
 ## Technical Details

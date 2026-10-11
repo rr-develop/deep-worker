@@ -1,14 +1,14 @@
-"""Codex-provider analogue of the claude-code inter-agent messaging test.
+"""Codex-provider analogue of the claude-code-sdk inter-agent messaging test.
 
 The scenario is exactly the same as in test_claude_code_inter_agent_send_and_reply.py,
-but agent A runs on the ``codex`` provider (instead of ``claude-code``).
-Agent B is ``deepseek`` (the same as in the claude-code test).
+but agent A runs on the ``codex`` provider (instead of ``claude-code-sdk``).
+Agent B is ``deepseek`` (the same as in the claude-code-sdk test).
 
 Why a SEPARATE test is needed for codex:
 
-  Codex is a provider with its own quirks. Unlike claude-code, it does
+  Codex is a provider with its own quirks. Unlike claude-code-sdk, it does
   NOT use ``InterAgentDeliveryResolveMiddleware`` (that middleware lives
-  in claude_code_provider because it is specific to the in-process proxy
+  in claude_code_sdk_provider because it is specific to the in-process proxy
   MCP CLI). Codex uses its own JSONL-stream machinery plus native tools
   passthrough, in which the echo from ``SendMessageCompletionMiddleware``
   and the delivery from ``InterAgentReplyMiddleware`` must also work

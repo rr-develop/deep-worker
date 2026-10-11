@@ -5,9 +5,9 @@ This test file verifies the CLI commands work end-to-end:
 - deep-worker --history <thread-id>
 - deep-worker --remove-before <date>
 
-Tests run against an isolated agent data directory (HOME-override) so they
+Tests run against an isolated ~/.deep_worker (HOME-override) so they
 exercise the per-agent DB layout that is now the primary storage.  They
-do not touch the developer's real agent data directory.
+do not touch the developer's real ~/.deep_worker.
 """
 from __future__ import annotations
 
@@ -21,6 +21,13 @@ from pathlib import Path
 
 import aiosqlite
 import pytest
+
+
+def _agent_db(home: Path, agent_name: str) -> Path:
+    """The per-agent DB under the v3 layout: ``agents/<name>/threads.db``."""
+    db = home / ".deep_worker" / "agents" / agent_name / "threads.db"
+    db.parent.mkdir(parents=True, exist_ok=True)
+    return db
 
 
 CHECKPOINT_SCHEMA_SQL = """
@@ -53,13 +60,13 @@ CREATE TABLE IF NOT EXISTS writes (
 
 @pytest.fixture
 def isolated_home(tmp_path):
-    """Give the subprocess a private agent data directory."""
+    """Give the subprocess a private ~/.deep_worker."""
     home = tmp_path / "home"
-    (home / ".deepagents").mkdir(parents=True)
+    (home / ".deep_worker" / "agents").mkdir(parents=True)
     yield home
 
 
-def _run_dw_cli(*args: str, home: Path, timeout: int = 20) -> subprocess.CompletedProcess:
+def _run_deep_worker(*args: str, home: Path, timeout: int = 20) -> subprocess.CompletedProcess:
     env = os.environ.copy()
     real_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
     env["HOME"] = str(home)
@@ -131,7 +138,7 @@ async def _seed_checkpoint(
 def test_remove_thread_cli(isolated_home):
     """Test deep-worker -rm command against a per-agent DB file."""
     thread_id = "test_rm_cli"
-    per_agent_db = isolated_home / ".deepagents" / f"sessions_{thread_id}.db"
+    per_agent_db = _agent_db(isolated_home, thread_id)
 
     asyncio.run(
         _seed_checkpoint(
@@ -142,7 +149,7 @@ def test_remove_thread_cli(isolated_home):
     )
 
     # Dry run
-    result = _run_dw_cli("-rm", thread_id, "--dry-run", home=isolated_home)
+    result = _run_deep_worker("-rm", thread_id, "--dry-run", home=isolated_home)
     assert result.returncode == 0, result.stderr
     assert "Dry run" in result.stdout
     assert thread_id in result.stdout
@@ -157,7 +164,7 @@ def test_remove_thread_cli(isolated_home):
 
     assert asyncio.run(count()) > 0
 
-    result = _run_dw_cli("-rm", thread_id, home=isolated_home)
+    result = _run_deep_worker("-rm", thread_id, home=isolated_home)
     assert result.returncode == 0, result.stderr
     assert ("Removed thread" in result.stdout) or ("\u2713" in result.stdout)
 
@@ -167,7 +174,7 @@ def test_remove_thread_cli(isolated_home):
 def test_history_cli(isolated_home):
     """Test deep-worker --history command."""
     thread_id = "test_history_cli"
-    per_agent_db = isolated_home / ".deepagents" / f"sessions_{thread_id}.db"
+    per_agent_db = _agent_db(isolated_home, thread_id)
 
     asyncio.run(
         _seed_checkpoint(
@@ -178,13 +185,13 @@ def test_history_cli(isolated_home):
         )
     )
 
-    result = _run_dw_cli("--history", thread_id, home=isolated_home)
+    result = _run_deep_worker("--history", thread_id, home=isolated_home)
     assert result.returncode == 0, result.stderr
     assert thread_id in result.stdout
     assert "Hello" in result.stdout
     assert "Hi there" in result.stdout
 
-    result = _run_dw_cli(
+    result = _run_deep_worker(
         "--history", thread_id, "--format", "json", home=isolated_home
     )
     assert result.returncode == 0, result.stderr
@@ -197,8 +204,8 @@ def test_remove_before_cli(isolated_home):
     """Test deep-worker --remove-before command."""
     old_thread = "test_old_cli"
     recent_thread = "test_recent_cli"
-    old_db = isolated_home / ".deepagents" / f"sessions_{old_thread}.db"
-    recent_db = isolated_home / ".deepagents" / f"sessions_{recent_thread}.db"
+    old_db = _agent_db(isolated_home, old_thread)
+    recent_db = _agent_db(isolated_home, recent_thread)
 
     asyncio.run(
         _seed_checkpoint(
@@ -213,7 +220,7 @@ def test_remove_before_cli(isolated_home):
         )
     )
 
-    result = _run_dw_cli(
+    result = _run_deep_worker(
         "--remove-before", "2026-03-01", "--dry-run", home=isolated_home
     )
     assert result.returncode == 0, result.stderr
@@ -230,7 +237,7 @@ def test_remove_before_cli(isolated_home):
     assert asyncio.run(count(old_db, old_thread)) == 1
     assert asyncio.run(count(recent_db, recent_thread)) == 1
 
-    result = _run_dw_cli(
+    result = _run_deep_worker(
         "--remove-before", "2026-03-01", home=isolated_home
     )
     assert result.returncode == 0, result.stderr
@@ -243,12 +250,12 @@ def test_remove_before_cli(isolated_home):
 def test_remove_before_relative_date_cli(isolated_home):
     """Test deep-worker --remove-before with relative date format."""
     thread_id = "test_very_old_cli"
-    per_agent_db = isolated_home / ".deepagents" / f"sessions_{thread_id}.db"
+    per_agent_db = _agent_db(isolated_home, thread_id)
 
     old_ts = (datetime.now(UTC) - timedelta(days=100)).isoformat()
     asyncio.run(_seed_checkpoint(per_agent_db, thread_id, updated_at=old_ts))
 
-    result = _run_dw_cli("--remove-before", "30d", home=isolated_home)
+    result = _run_deep_worker("--remove-before", "30d", home=isolated_home)
     assert result.returncode == 0, result.stderr
 
     async def check_gone() -> bool:

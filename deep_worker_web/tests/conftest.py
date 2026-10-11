@@ -1,5 +1,7 @@
 """Pytest configuration and shared fixtures."""
 
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -9,8 +11,46 @@ import pytest
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-# Add rpyc_async to path for RPyC AsyncioServer
-rpyc_async_path = Path("rpyc_async")
+def _resolve_rpyc_async() -> Path:
+    """Pick the rpyc_async checkout this tree should test against.
+
+    rpyc_async is a SEPARATE repository with a single production checkout,
+    referenced by a fixed path in app code, so it has no dev isolation of its
+    own: an edit there is visible to every tree at once.
+    A dev tree must therefore test against the rpyc_async *dev worktree*, not
+    prod — otherwise dev silently validates production code.
+
+    The dev worktree is discovered by ASKING GIT which worktree holds branch
+    ``dev`` (no hard-coded worktree path, so renaming or recreating it does
+    not break the tests). Falls back to prod when there is no dev worktree.
+    Override explicitly with DEEP_WORKER_RPYC_ASYNC=<path>.
+    """
+    override = os.environ.get("DEEP_WORKER_RPYC_ASYNC")
+    if override:
+        return Path(override)
+
+    prod = Path("rpyc_async")
+    if "_dev" not in str(Path(__file__).resolve()):
+        return prod
+
+    try:
+        out = subprocess.run(
+            ["git", "worktree", "list", "--porcelain"],
+            cwd=prod, capture_output=True, text=True, timeout=10, check=True,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return prod
+
+    current = None
+    for line in out.splitlines():
+        if line.startswith("worktree "):
+            current = line[len("worktree "):]
+        elif line.strip() == "branch refs/heads/dev" and current:
+            return Path(current)
+    return prod
+
+
+rpyc_async_path = _resolve_rpyc_async()
 if rpyc_async_path.exists():
     sys.path.insert(0, str(rpyc_async_path))
 

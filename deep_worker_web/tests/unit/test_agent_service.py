@@ -521,6 +521,25 @@ class TestAgentServiceSendMessageFireAndForget:
         assert "not connected" in result["error"].lower()
 
 
+async def _drain_background_tasks() -> None:
+    """Let fire_and_forget_async's background task run to completion.
+
+    ``send_message`` returns as soon as the task is scheduled: since the
+    netref call moved INSIDE the task (a known event-loop blocking issue — it used to be evaluated
+    eagerly in the argument, on the event loop), the RPC no longer happens
+    before ``send_message`` returns. Tests asserting on the endpoint call
+    must therefore yield to the loop first.
+    """
+    from rpyc_async.utils.helpers import _INFLIGHT
+
+    for _ in range(50):
+        pending = [t for t in _INFLIGHT if not t.done()]
+        if not pending:
+            break
+        await asyncio.gather(*pending, return_exceptions=True)
+    await asyncio.sleep(0)
+
+
 class TestAgentServiceSendMessageSumQuery:
     """send_message forwards the optional ``sum_query`` to the RPyC
     ``exposed_invoke_agent`` endpoint (offload→wipe→inject cycle for a
@@ -545,6 +564,8 @@ class TestAgentServiceSendMessageSumQuery:
         )
         assert result["success"] is True
 
+        await _drain_background_tasks()
+
         # The RPyC endpoint must receive the sum_query verbatim.
         mock_root.invoke_agent.assert_called_once_with(
             "hello", stream=False, sum_query="prior context summary"
@@ -567,6 +588,8 @@ class TestAgentServiceSendMessageSumQuery:
         agent_service._connections["test-agent-1"] = mock_conn
 
         await agent_service.send_message("test-agent-1", "hello")
+
+        await _drain_background_tasks()
 
         mock_root.invoke_agent.assert_called_once_with(
             "hello", stream=False, sum_query=None
@@ -596,6 +619,8 @@ class TestAgentServiceSendMessageSumQuery:
             "Draft a response to the recruiter id=XYZ",
             sum_query="STABLE_PREFIX",
         )
+
+        await _drain_background_tasks()
 
         # message is the first positional arg; sum_query is a kwarg. Neither
         # is dropped on the web side.

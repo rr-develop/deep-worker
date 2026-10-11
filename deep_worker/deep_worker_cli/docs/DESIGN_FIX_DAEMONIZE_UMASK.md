@@ -146,7 +146,7 @@ Two related edits in `daemonize()`:
 
 ## Documentation update
 
-* `IMPLEMENTATION_NOTES.md` (claude_code_provider/docs) — a short note about
+* `IMPLEMENTATION_NOTES.md` (provider docs) — a short note about
   the daemon's umask policy.
 * A comment in the code itself at the `os.umask(...)` call site explaining
   why `022` and not `0`.

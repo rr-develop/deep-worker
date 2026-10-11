@@ -67,7 +67,7 @@ def test_error_panel_shows_on_select_for_errored_agent(page: Page) -> None:
         """(err) => {
             handleAgentDiscovered({type: 'agent_discovered', agent: {
                 name: 'test_err_agent', pid: 7777, status: 'error',
-                provider: 'claude-code', model: 'opus', rpyc_port: 1,
+                provider: 'claude-code-sdk', model: 'opus', rpyc_port: 1,
                 working_dir: '/tmp', started_at: new Date().toISOString(),
                 error_message: err,
             }});

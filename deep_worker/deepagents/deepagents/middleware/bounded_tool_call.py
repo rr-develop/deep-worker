@@ -5,7 +5,7 @@ the agent forever, and the bound is enforced in EXACTLY ONE function —
 ``BoundedToolCallMiddleware.awrap_tool_call`` — that wraps tool execution in
 LangGraph's ToolNode. Because middleware lives on the agent graph (see
 ``deepagents/graph.py``), this hook wraps EVERY tool of EVERY provider
-(deepseek / openai / anthropic / google / vertexai / claude-code / codex /
+(deepseek / openai / anthropic / google / vertexai / claude-code-sdk / codex /
 …) identically. No provider, and no other code path, may wait on a tool.
 
 Contract on the wait elapsing (default 120s, env
@@ -191,18 +191,20 @@ class BoundedToolCallMiddleware(AgentMiddleware):
     def __init__(self, wait_seconds: float | None = None) -> None:
         super().__init__()
         self.wait_seconds = resolve_tool_wait_seconds(wait_seconds)
-        # Parked jobs keyed by tool_call_id; the work continues here after the
-        # bound fires so it is never lost.
+        # Parked jobs keyed by canonical ``job_N`` (NOT tool_call_id — that is
+        # the alias, and conflating the two was an internal defect); the work
+        # continues here after the bound fires so it is never lost.
         self._jobs: dict[str, _ParkedToolJob] = {}
 
     def get_job_registry(self) -> dict[str, _ParkedToolJob]:
         """Snapshot of this middleware's parked tool jobs, keyed by canonical
         ``job_N``.
 
-        A COPY on purpose: a parked job removes itself the moment its work
-        settles (``add_done_callback``), so handing out the live dict would
-        let a caller iterating it hit "dictionary changed size during
-        iteration". The shared ``ParkedJobRegistry`` is the source of truth;
+        A COPY on purpose: an entry disappears the moment its result is served
+        to a caller, so handing out the live dict would let a caller iterating
+        it hit "dictionary changed size during iteration". (Completion alone no
+        longer removes anything — a finished job stays reachable until someone
+        collects it.) The shared ``ParkedJobRegistry`` is the source of truth;
         this accessor exists for diagnostics and tests.
         """
         return dict(self._jobs)
@@ -243,23 +245,11 @@ class BoundedToolCallMiddleware(AgentMiddleware):
             # drift apart again. NOTE: a thread cannot be cancelled, so
             # ``kill_job`` on such a job can only report that it is still
             # running — see ``ParkedJob.handle`` (a concurrent Future).
-            registry = get_parked_job_registry()
-            existing = (
-                registry.resolve_by_alias(tool_call_id)
-                if tool_call_id
-                else None
-            )
-            job_id = (
-                existing.job_id if existing is not None else registry.allocate()
-            )
-            registry.register(
-                job_id,
-                kind="tool",
-                handle=future,
+            job_id = get_parked_job_registry().park(
+                future,
                 alias=tool_call_id or None,
                 tool_name=tool_name,
-            )
-            future.add_done_callback(lambda _f: registry.drop(job_id))
+            ).job_id
             return ToolMessage(
                 content=build_in_progress_notice(
                     tool_name, job_id, wait_seconds
@@ -341,35 +331,26 @@ class BoundedToolCallMiddleware(AgentMiddleware):
         return that id. The originating ``tool_call_id`` is recorded as an
         alias so a model that echoes it still reaches the job.
 
-        The job drops itself from the registry when the work finishes —
-        event-driven via ``add_done_callback``, never polled.
+        When the work finishes the job is RETIRED, not dropped — event-driven
+        via ``add_done_callback``, never polled. It stays reachable so a caller
+        returning after completion still gets the result; the entry is erased
+        only once that result has been served.
         """
-        registry = get_parked_job_registry()
-        # If the other parking layer (the shell backend) already parked work
-        # for this very tool call, reuse its id instead of minting a second.
-        existing = (
-            registry.resolve_by_alias(tool_call_id) if tool_call_id else None
-        )
-        job_id = existing.job_id if existing is not None else registry.allocate()
-
         parked = _ParkedToolJob(
-            job_id=job_id,
+            job_id="",
             tool_name=tool_name,
             task=task,
             tool_call_id=tool_call_id,
         )
-        self._jobs[job_id] = parked
-        registry.register(
-            job_id,
-            kind="tool",
-            handle=parked,
+        def _forget(jid: str) -> None:
+            self._jobs.pop(jid, None)
+
+        job = get_parked_job_registry().park(
+            parked,
             alias=tool_call_id or None,
             tool_name=tool_name,
+            on_release=_forget,
         )
-
-        def _drop(_fut: "asyncio.Future[Any]") -> None:
-            registry.drop(job_id)
-            self._jobs.pop(job_id, None)
-
-        task.add_done_callback(_drop)
-        return job_id
+        parked.job_id = job.job_id
+        self._jobs[job.job_id] = parked
+        return job.job_id

@@ -12,12 +12,24 @@ CRITICAL ARCHITECTURAL PRINCIPLES:
 2. DIRECT RPyC: Connect directly to agents (no DwSession abstraction)
 3. AGENT IS SOURCE OF TRUTH: All messages come from agent via callbacks
 4. LOCALHOST ONLY: Only connect to 127.0.0.1 (security requirement)
-5. NO SYNCHRONOUS BLOCKING: ALL RPyC calls MUST use fire_and_forget_async
-   with callbacks. NEVER call rpyc methods synchronously — it blocks the
-   event loop and freezes the entire web UI. Connections are opened via
-   ``await async_connect(host, port, ...)`` (natively non-blocking) and
-   closed via ``await conn.aclose()``. Status queries, message sends, and
-   all other RPyC operations MUST go through fire_and_forget_async.
+5. NO SYNCHRONOUS BLOCKING: every RPyC call MUST be written as
+   ``fire_and_forget_call(lambda: async_call(root, "method", args), ...)``.
+
+   The lambda is not a style preference. ``root.method(...)`` in an argument
+   position is evaluated BEFORE the call, so the RPC — including the
+   synchronous HANDLE_GETATTR that resolves ``.method`` — runs on the event
+   loop, outside the task and outside ``timeout``. A peer that is merely slow
+   then freezes the whole web UI until SIGKILL. That is not hypothetical: it
+   happened on 2026-07-10, 2026-08-27 and 2026-08-29, and this rule in its
+   previous wording ("must use fire_and_forget_async") was formally satisfied
+   by all thirteen offending call sites each time.
+
+   Because a rule that can only be broken semantically does get broken, it is
+   now enforced by tests/unit/test_no_blocking_netref_in_async_wrappers.py
+   rather than by this docstring alone.
+
+   Connections are opened via ``await async_connect(host, port, ...)``
+   (natively non-blocking) and closed via ``await conn.aclose()``.
 6. ONE CONNECTION PER (CLIENT, AGENT) PAIR — NO DUPLICATES.
    The rule is about *duplicate* connections, NOT about how many
    distinct clients may talk to one agent.
@@ -56,13 +68,24 @@ import asyncio
 import logging
 import os
 import sys
+import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
 from app.schemas.agent_schemas import AgentInfo, AgentStatus, AgentStatusInfo
 from app.utils.supervisor import supervise
-from deep_worker_cli.storage_paths import deep_worker_home
+from deep_worker_cli.storage_paths import (
+    agent_root,
+    deep_worker_home,
+    read_agent_file,
+)
+from deep_worker_cli.stats.token_stats import (
+    ContextSnapshot,
+    STATS_FILE_NAME,
+    latest_context_by_kind,
+    read_stats_file,
+)
 
 # ============================================================================
 # CRITICAL: RPYC MUST BE IMPORTED FROM SOURCE CODE, NOT FROM PIP!
@@ -77,6 +100,16 @@ import rpyc_async as rpyc  # type: ignore[import-not-found]
 from rpyc_async.core.async_connect import async_connect  # type: ignore[import-not-found]
 
 logger = logging.getLogger(__name__)
+
+
+class AgentRefusedError(ValueError):
+    """The agent answered, and its answer was a refusal.
+
+    Distinct from a server-side bug: the web layer worked, the peer declined.
+    Callers map this to 502 rather than 500 so operators are not sent hunting
+    a fault in this process. Subclasses ``ValueError`` to stay compatible with
+    existing handlers that catch the broader type.
+    """
 
 
 def _decode_subscriber_payload(msg: Any) -> Any:
@@ -145,8 +178,7 @@ class AgentService:
     # only covers ``sock_connect``; the handshake is otherwise unbounded
     # and parks forever against a deadlocked peer. This bound lives in the
     # BACKGROUND connect task only — never in an HTTP handler — so it does
-    # not block the UI. See a related internal incident analysis (not
-    # included here).
+    # not block the UI. See a related internal incident analysis (not included here).
     _CONNECT_TIMEOUT: float = 5.0
     # Reconnect backoff: first failure waits this long before another
     # attempt is allowed, doubling each consecutive failure up to the cap.
@@ -175,7 +207,7 @@ class AgentService:
             # docs/DESIGN_DEV_FLAG.md.
             #
             # __file__ here =
-            #   <TREE>/<web-package>/app/services/agent_service.py
+            #   <TREE>/deep_worker_web/app/services/agent_service.py
             # parent x3 = <TREE>.
             _tree_root = Path(__file__).resolve().parent.parent.parent.parent
             deep_worker_path = (
@@ -253,6 +285,18 @@ class AgentService:
         # failure up to ``_RECONNECT_BACKOFF_MAX``.
         self._reconnect_backoff: dict[str, float] = {}
 
+        # ── Context status bar cache (DESIGN_AGENT_CONTEXT_STATUS_BAR.md)
+        # Disk I/O is expensive; debounce per-agent reads by TTL.
+        # 100 broadcasts inside the window collapse to <=1 read_stats_file.
+        self._CONTEXT_CACHE_TTL_SEC: float = 1.0
+        # agent_name -> (monotonic_deadline, snapshots_dict).
+        # snapshots_dict keys are ``"agent"`` / ``"tm"`` -> ContextSnapshot.
+        self._context_cache: dict[str, tuple[float, dict[str, ContextSnapshot]]] = {}
+        # Latest-model cache used by ``_latest_model_from_token_stats``.
+        # Same TTL as ``_context_cache``; kept separate because the
+        # value is just a string, not a snapshot dict.
+        self._context_model_cache: dict[str, tuple[float, str | None]] = {}
+
         # Lazily initialised lifecycle orchestrator (requires a running
         # event loop to spawn tasks — created on first access via
         # ``get_lifecycle()``). Routers depend on this to schedule
@@ -328,6 +372,14 @@ class AgentService:
             # blank on the error cause.
             self._seed_status_from_metadata(agent_info)
             self._agents[proc_info.name] = agent_info
+            # Page-load seed: fill context snapshot so /api/agents returns
+            # the 6 context fields synchronously. No broadcast — the page
+            # itself reads them straight from the REST response.
+            self._fill_context_fields(agent_info)
+            # Same path for the operator-set LIMIT (observed in a past incident
+            # — the UI must show what the operator asked
+            # for, not the provider default).
+            self._fill_context_limit_fields(agent_info)
             logger.debug(f"Registered agent: {proc_info.name} (PID {proc_info.pid}, port {proc_info.rpyc_port})")
 
     def _seed_status_from_metadata(self, info: AgentInfo) -> None:
@@ -338,12 +390,10 @@ class AgentService:
         """
         import json  # local import — matches this module's convention
         try:
-            meta_file = (
-                deep_worker_home() / info.name / "session_metadata.json"
-            )
-            if not meta_file.exists():
+            raw = read_agent_file(info.name, "session_metadata.json")
+            if raw is None:
                 return
-            data = json.loads(meta_file.read_text())
+            data = json.loads(raw)
             status_str = data.get("status")
             if status_str:
                 try:
@@ -365,6 +415,358 @@ class AgentService:
                 info.status_metadata = None
         except Exception:  # noqa: BLE001 — disk read must never break discover
             logger.debug("could not seed status from metadata for %s", info.name, exc_info=True)
+
+    # ── Context LIMIT mirror (DESIGN_AGENT_CONTEXT_STATUS_BAR.md §1) ────
+    def _fill_context_limit_fields(self, info: AgentInfo) -> None:
+        """Fill ``info.context_limit`` from ``launch_config.context_limit``.
+
+        The web UI's status bar renders the operator-set limit
+        (``-l 400k``) alongside the live usage so the operator can
+        visually verify the guard is holding the limit they asked
+        for. Without this mirror the UI cannot tell apart "the
+        guard is holding 400k" from "the guard is letting the
+        provider's default win" — the very bug seen in a past incident.
+
+        Source of truth: ``<deep_worker_home>/<name>/session_metadata.json``
+        → ``launch_config.context_limit``. Same disk file as the
+        ``status`` and ``error_message`` mirror above, so a single
+        round-trip is enough.
+
+        Never raises — a missing/corrupt file leaves the field at
+        its previous value (default ``None``). The fill helper runs
+        on the hot path of ``_update_agent_status`` and must not
+        crash a status update.
+        """
+        import json  # local import — matches this module's convention
+        try:
+            raw = read_agent_file(info.name, "session_metadata.json")
+            if raw is None:
+                return
+            data = json.loads(raw)
+            cfg = data.get("launch_config")
+            if not isinstance(cfg, dict):
+                return
+            raw_limit = cfg.get("context_limit")
+            if raw_limit is None:
+                # Operator didn't set -l (default behaviour). Leave None
+                # so the UI can render "no limit" instead of "limit 0".
+                return
+            # Persisted value is always int (parse_context_limit
+            # normalises 400k → 400000). Coerce defensively in case
+            # a future code path stores it as str.
+            try:
+                info.context_limit = int(raw_limit)
+            except (TypeError, ValueError):
+                logger.debug(
+                    "context_limit value %r for %s is not int-coercible",
+                    raw_limit, info.name,
+                )
+        except Exception:  # noqa: BLE001 — disk read must never break status update
+            logger.debug(
+                "could not seed context_limit from metadata for %s",
+                info.name, exc_info=True,
+            )
+
+    @staticmethod
+    def _task_manager_state_fields(
+        response: dict[str, Any],
+    ) -> dict[str, bool | None]:
+        """Derive the two added TaskManager state fields from an agent reply.
+
+        ``task_manager_active`` alone cannot answer whether a TaskManager
+        is attached or switched on: it only says whether the loop is
+        working on a task AT THIS MOMENT. Reporting just that field is
+        what let "operator switched it off", "enabled but sleeping
+        between tasks" and "no TaskManager at all" collapse into one
+        indistinguishable ``false``.
+
+        Attachment is read from the agent's explicit
+        ``task_manager_attached`` when present, and otherwise inferred
+        from the legacy encoding — the agent omitted both
+        ``task_manager_*`` keys iff it had no TaskManager. The fallback
+        is deliberate: a long-running agent process started before that
+        field existed keeps reporting the old shape, and must still be
+        described correctly without being restarted.
+
+        Null semantics follow the WorkControl contract
+        (the WorkControl API): ``None`` means
+        UNKNOWN / not applicable and must NOT be rendered as ``False``.
+        With nothing attached there is no switch at all, so ``disabled``
+        is ``None`` — ``False`` there would assert "enabled".
+        """
+        attached = response.get("task_manager_attached")
+        if attached is None:
+            attached = (
+                "task_manager_active" in response
+                or "task_manager_disabled" in response
+            )
+        attached = bool(attached)
+
+        disabled = response.get("task_manager_disabled")
+        return {
+            "task_manager_attached": attached,
+            "task_manager_disabled": bool(disabled) if attached and disabled is not None else None,
+        }
+
+    # ── Context status bar (DESIGN_AGENT_CONTEXT_STATUS_BAR.md) ─────────
+    def _fill_context_fields(self, info: AgentInfo) -> None:
+        """Fill the 6 context fields on ``info`` from the agent's ``token_stats.jsonl``.
+
+        Sources / semantics (see design §1):
+
+          * Reads ``<deep_worker_home>/agents/<info.name>/token_stats.jsonl``
+            (JSONL), with a transparent fallback to the legacy
+            ``<deep_worker_home>/<info.name>/`` location for hosts
+            that haven't completed the layout migration yet.
+          * Filters ``kind ∈ {"agent", "tm"}`` (kind="other" excluded) and
+            skips both empty records AND malformed snapshots.
+          * Cache is per-agent, TTL ~1s (M12): 100 broadcasts in the window
+            collapse to <=1 ``read_stats_file`` disk read.
+          * Never raises — a missing/corrupt file leaves all 6 fields at
+            their previous values (defaults to None on first call).
+          * ``tm_*`` fields stay ``None`` when ``info.has_task_manager is
+            False`` even if the JSONL contains legacy ``kind="tm"`` records
+            (M13 backend gate).
+
+        Also patches ``info.model`` (and only ``info.model``, not
+        ``info.provider`` — provider comes from the agent's get_metadata and
+        is authoritative) from the most recent ``token_stats.jsonl`` record
+        when the agent was started without an explicit ``--model`` flag.
+        Without this fallback the per-agent info bar would render
+        ``Model: unknown`` forever for every agent that does not pass
+        ``--model`` at start time — see a related internal incident analysis (not included here)
+        (the "Provider: minimax / Model: unknown" regression).
+        """
+        # Build snapshots from disk (cached).
+        snapshots = self._load_context_snapshots(info.name)
+
+        agent_snap = snapshots.get("agent")
+        tm_snap = snapshots.get("tm")
+
+        info.agent_context_used = agent_snap.context_used if agent_snap else None
+        info.agent_context_size = agent_snap.context_size if agent_snap else None
+        info.agent_context_semantics = agent_snap.usage_semantics if agent_snap else None
+        # Per-turn total from the SAME snapshot record — surfaced as a
+        # separate ``Last turn: Xk`` UI row.  Do NOT reuse it as
+        # ``agent_context_used`` (that field must be comparable to
+        # ``context_limit``).  Observed in a past incident.
+        info.agent_last_turn_tokens = (
+            getattr(agent_snap, "total_tokens", None) if agent_snap else None
+        )
+
+        if info.has_task_manager is False:
+            # M13 backend gate: never surface tm_* when the agent
+            # EXPLICITLY reported no TaskManager — keeps the REST
+            # snapshot consistent with the UI's ``has_task_manager is
+            # True`` gate.  We intentionally distinguish the
+            # explicit-False case from the unknown / not-yet-fetched
+            # case (``has_task_manager is None``) so that an agent
+            # whose TM status hasn't been queried yet can still have
+            # its cached TM context visible the moment the UI learns
+            # the agent actually has a TM (e.g. via the next status
+            # poll that flips ``has_task_manager`` to True).  This is
+            # what prevents the ``TM: -`` regression: previously the
+            # gate cleared tm_* on first sight and then the next
+            # status poll ran AFTER the clear, so even if the JSONL
+            # had a TM record, the UI never saw it.
+            info.tm_context_used = None
+            info.tm_context_size = None
+            info.tm_context_semantics = None
+            info.tm_last_turn_tokens = None
+        else:
+            # has_task_manager is True OR None (not yet queried).
+            # Either way the JSONL data, if present, is the
+            # authoritative answer and we surface it.
+            info.tm_context_used = tm_snap.context_used if tm_snap else None
+            info.tm_context_size = tm_snap.context_size if tm_snap else None
+            info.tm_context_semantics = tm_snap.usage_semantics if tm_snap else None
+            info.tm_last_turn_tokens = (
+                getattr(tm_snap, "total_tokens", None) if tm_snap else None
+            )
+
+        # Patch model from the latest token_stats record when the agent
+        # reported ``unknown``.  We do NOT touch ``provider`` because the
+        # agent's get_metadata is the authoritative source for it (and it
+        # already returns the correct value via RPyC on connect).
+        if info.model in (None, "", "unknown", "unavailable", "error"):
+            latest_model = self._latest_model_from_token_stats(info.name)
+            if latest_model:
+                info.model = latest_model
+
+    def _load_context_snapshots(self, agent_name: str) -> dict[str, ContextSnapshot]:
+        """Per-agent cached ``latest_context_by_kind`` reader.
+
+        Returns ``{}`` on any error (missing file, corrupt JSONL, etc).
+        Cache window: ``self._CONTEXT_CACHE_TTL_SEC`` seconds.
+        """
+        now = time.monotonic()
+        cached = self._context_cache.get(agent_name)
+        if cached is not None and cached[0] >= now:
+            return cached[1]
+        try:
+            # Resolve the stats file path.  Two facts collide here:
+            #   * The agent stores its file at ``~/.deep_worker/<name>/``.
+            #   * The existing ``agent_root(name, home=...)`` helper adds
+            #     the ``.deep_worker`` basename again when ``home`` is
+            #     already ``~/.deep_worker``, producing the non-existent
+            #     ``~/.deep_worker/.deep_worker/<name>/token_stats.jsonl``.
+            #   * The integration tests in
+            #     ``tests/integration/test_context_status_bar_e2e.py``
+            #     ``monkeypatch`` ``storage_paths.deep_worker_home`` and
+            #     then call ``agent_root(name, home=mock_home)`` — that
+            #     monkeypatch is looked up at call time inside
+            #     ``agent_root``, so the helper honours the test fixture
+            #     but in PRODUCTION (where ``mock_home`` is not in scope)
+            #     the helper resolves to the wrong nested path.
+            # Solution: look up ``deep_worker_home`` from the module at
+            # call time (``import_module(...).deep_worker_home``) so the
+            # monkeypatch AND the production location both work, AND
+            # compose the path manually to avoid the duplication.
+            # See a related internal incident analysis (not included here).
+            import importlib
+            import tempfile
+            sp = importlib.import_module("deep_worker_cli.storage_paths")
+            # DESIGN_AGENT_DBS_UNDER_AGENTS_SUBDIR §4.5: read_agent_file
+            # transparently prefers the new ``agents/<name>/`` layout and
+            # falls back to the legacy top-level location.
+            raw = sp.read_agent_file(agent_name, STATS_FILE_NAME)
+            if raw is None:
+                snapshots = {}
+                self._context_cache[agent_name] = (
+                    now + self._CONTEXT_CACHE_TTL_SEC,
+                    snapshots,
+                )
+                return snapshots
+            # write to a tmp file with private permissions because
+            # read_stats_file() takes a Path. Cleanup after use.
+            with tempfile.NamedTemporaryFile(
+                prefix=f"deep-worker-ts-{agent_name}-",
+                delete=False,
+            ) as tmp:
+                tmp.write(raw)
+                tmp_path = tmp.name
+            try:
+                os.chmod(tmp_path, 0o600)
+                read_stats = read_stats_file(Path(tmp_path))
+            finally:
+                Path(tmp_path).unlink(missing_ok=True)
+            records = [r for r in read_stats.records]
+            snapshots = latest_context_by_kind(records)
+        except Exception:  # noqa: BLE001 — disk read must never break polling
+            logger.debug(
+                "could not load token_stats for %s", agent_name, exc_info=True,
+            )
+            snapshots = {}
+        self._context_cache[agent_name] = (now + self._CONTEXT_CACHE_TTL_SEC, snapshots)
+        return snapshots
+
+    def _latest_model_from_token_stats(self, agent_name: str) -> str | None:
+        """Return the most recent non-empty ``model`` field from the
+        agent's ``token_stats.jsonl``.
+
+        Used by ``_fill_context_fields`` as a fallback when the agent was
+        started without an explicit ``--model`` flag and the RPyC
+        ``get_metadata`` call returned ``None``.  The JSONL is append-only
+        with newest entries at the tail, so we read the last 64 KB
+        (≈thousands of records) and walk lines in reverse until we find
+        a non-empty model.
+
+        Cache TTL mirrors ``_load_context_snapshots`` (≈1s) so repeated
+        status polls inside the window do not re-read the disk.
+        """
+        now = time.monotonic()
+        cached = self._context_model_cache.get(agent_name)
+        if cached is not None and cached[0] >= now:
+            return cached[1]
+        result: str | None = None
+        try:
+            # Same path-resolution as ``_load_context_snapshots``: look up
+            # ``deep_worker_home`` at call time so the test monkeypatch
+            # (and the production location) both resolve correctly.
+            # See ``_load_context_snapshots`` for the full rationale.
+            import importlib
+            sp = importlib.import_module("deep_worker_cli.storage_paths")
+            # DESIGN_AGENT_DBS_UNDER_AGENTS_SUBDIR §4.5: read via the
+            # helper so the lookup walks ``agents/<name>/`` first, then
+            # the legacy top-level location.
+            raw_bytes = sp.read_agent_file(agent_name, STATS_FILE_NAME)
+            if raw_bytes is not None:
+                data = raw_bytes.decode("utf-8", errors="replace")
+                # Only look at the trailing 64 KB (≈thousands of records) —
+                # JSONL is append-only with newest entries at the tail.
+                if len(data) > 64 * 1024:
+                    data = data[-64 * 1024:]
+                import json as _json
+                for raw in reversed(data.splitlines()):
+                    line = raw.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = _json.loads(line)
+                    except Exception:  # noqa: BLE001 — skip malformed
+                        continue
+                    model = rec.get("model")
+                    if isinstance(model, str) and model.strip():
+                        result = model.strip()
+                        break
+        except Exception:  # noqa: BLE001 — disk read must never break polling
+            logger.debug(
+                "could not read token_stats model for %s", agent_name,
+                exc_info=True,
+            )
+            result = None
+        self._context_model_cache[agent_name] = (
+            now + self._CONTEXT_CACHE_TTL_SEC, result,
+        )
+        return result
+
+    def _context_snapshot_signature(self, info: AgentInfo) -> tuple[int | None, ...]:
+        """Diff key for the context fields + the operator-set limit (used by the broadcast diff-check).
+
+        Includes ``*_last_turn_tokens`` so the UI's Last-turn row
+        re-paints when a new turn finishes but the observed snapshot
+        is unchanged (e.g. very small turn that does not move the
+        cumulative context number).
+        """
+        return (
+            info.agent_context_used,
+            info.agent_context_size,
+            info.agent_context_semantics,
+            info.agent_last_turn_tokens,
+            info.tm_context_used,
+            info.tm_context_size,
+            info.tm_context_semantics,
+            info.tm_last_turn_tokens,
+            info.context_limit,
+        )
+
+    async def _maybe_broadcast_context_changed(
+        self, info: AgentInfo, prev_signature: tuple[int | None, ...] | None
+    ) -> None:
+        """Broadcast ``agent_context_changed`` iff the fields actually changed.
+
+        Avoids WS noise on every status poll when nothing context-related
+        has moved (the cache TTL already collapses disk reads; this
+        collapses the broadcasts too). The signature includes
+        ``context_limit`` so the UI re-renders when the operator
+        restarts the agent with a new ``-l`` value.
+        """
+        new_signature = self._context_snapshot_signature(info)
+        if prev_signature is not None and new_signature == prev_signature:
+            return
+        await self._broadcast_message({
+            "type": "agent_context_changed",
+            "agent_name": info.name,
+            "agent_context_used": info.agent_context_used,
+            "agent_context_size": info.agent_context_size,
+            "agent_context_semantics": info.agent_context_semantics,
+            "agent_last_turn_tokens": info.agent_last_turn_tokens,
+            "tm_context_used": info.tm_context_used,
+            "tm_context_size": info.tm_context_size,
+            "tm_context_semantics": info.tm_context_semantics,
+            "tm_last_turn_tokens": info.tm_last_turn_tokens,
+            "context_limit": info.context_limit,
+        })
 
     async def list_agents(self) -> list[AgentInfo]:
         """Get list of all known agents.
@@ -395,8 +797,8 @@ class AgentService:
         polling needed). Treat such a Connection as not-connected and
         evict it from ``_connections`` so the next caller triggers a
         clean reconnect instead of pumping more
-        ``fire_and_forget_async(root.method())`` calls onto a dead
-        channel.
+        ``fire_and_forget_call(lambda: async_call(root, "method"))``
+        calls onto a dead channel.
 
         Eviction is limited to the local dict; we never call
         ``aclose`` from a probe path because rpyc's own teardown is
@@ -733,8 +1135,7 @@ class AgentService:
             logger.error(f"Failed to connect to agent {agent_name}: {e}")
             # Cleanup partial connection. Use _evict_connection so any
             # armed asyncio reader is unregistered before we drop the
-            # last ref (see a related internal incident analysis, not
-            # included here).
+            # last ref (see a related internal incident analysis, not included here).
             self._evict_connection(agent_name)
             return False
 
@@ -747,7 +1148,8 @@ class AgentService:
         if not await self.is_connected(agent_name):
             return
 
-        from rpyc_async.utils.helpers import fire_and_forget_async
+        from rpyc_async.core.netref import async_call
+        from rpyc_async.utils.helpers import fire_and_forget_call
 
         try:
             # Unsubscribe via fire-and-forget (don't block on cleanup)
@@ -781,8 +1183,8 @@ class AgentService:
                     # Don't fail disconnect on unsubscribe error
 
                 # Fire and forget with short timeout (cleanup)
-                fire_and_forget_async(
-                    root.unsubscribe_messages(callback),
+                fire_and_forget_call(
+                    lambda: async_call(root, "unsubscribe_messages", callback),
                     timeout=2.0,
                     success_callback=on_success,
                     error_callback=on_error,
@@ -836,7 +1238,8 @@ class AgentService:
             agent_name: Name of the agent.
             root: RPyC root proxy for the agent.
         """
-        from rpyc_async.utils.helpers import fire_and_forget_async
+        from rpyc_async.core.netref import async_call
+        from rpyc_async.utils.helpers import fire_and_forget_call
 
         # Create callback service for this agent
         agent_service = self
@@ -888,8 +1291,8 @@ class AgentService:
                 del self._callback_services[agent_name]
 
         # Fire and forget with 10s timeout
-        fire_and_forget_async(
-            root.subscribe_messages(callback),
+        fire_and_forget_call(
+            lambda: async_call(root, "subscribe_messages", callback),
             timeout=10.0,
             success_callback=on_success,
             error_callback=on_error,
@@ -903,7 +1306,8 @@ class AgentService:
             agent_name: Name of the agent.
             root: RPyC root proxy for the agent.
         """
-        from rpyc_async.utils.helpers import fire_and_forget_async
+        from rpyc_async.core.netref import async_call
+        from rpyc_async.utils.helpers import fire_and_forget_call
 
         async def on_success(response_str: str) -> None:
             import json
@@ -945,8 +1349,8 @@ class AgentService:
             logger.error(f"Error fetching metadata for {agent_name}: {exc}")
 
         try:
-            fire_and_forget_async(
-                root.get_metadata(),
+            fire_and_forget_call(
+                lambda: async_call(root, "get_metadata"),
                 timeout=5.0,
                 success_callback=on_success,
                 error_callback=on_error,
@@ -962,7 +1366,8 @@ class AgentService:
             agent_name: Name of the agent.
             root: RPyC root proxy for the agent.
         """
-        from rpyc_async.utils.helpers import fire_and_forget_async
+        from rpyc_async.core.netref import async_call
+        from rpyc_async.utils.helpers import fire_and_forget_call
 
         async def on_success(response_str: str) -> None:
             """Handle successful status query.
@@ -1021,11 +1426,35 @@ class AgentService:
                         broadcast_msg["task_manager_active"] = tm_active
                         info.task_manager_active = tm_active
                         info.has_task_manager = True
-                    if "task_manager_disabled" in response:
-                        tm_disabled = bool(response["task_manager_disabled"])
-                        broadcast_msg["task_manager_disabled"] = tm_disabled
-                        info.task_manager_disabled = tm_disabled
-                        info.has_task_manager = True
+                    # Attachment and the operator switch are published
+                    # on every poll so this push and the REST
+                    # ``detailed_status_response`` describe the same
+                    # agent identically — a WS client and an MCP client
+                    # disagreeing about one agent is its own bug class.
+                    tm_fields = self._task_manager_state_fields(response)
+                    broadcast_msg.update(tm_fields)
+                    # The CACHED mirror is only overwritten when this
+                    # reply actually carried TM information. A reply
+                    # that mentions no TM at all cannot downgrade a
+                    # previously known True/True to False/None — that
+                    # would replace knowledge with a guess, which is
+                    # the same flattening ``null`` must never do.
+                    if (
+                        "task_manager_attached" in response
+                        or "task_manager_active" in response
+                        or "task_manager_disabled" in response
+                    ):
+                        info.has_task_manager = tm_fields["task_manager_attached"]
+                        info.task_manager_disabled = tm_fields[
+                            "task_manager_disabled"
+                        ]
+                    # Refresh context from token_stats.jsonl (cache TTL ~1s).
+                    prev_ctx_sig = self._context_snapshot_signature(info)
+                    self._fill_context_fields(info)
+                    # Mirror the operator-set -l value so the UI status
+                    # bar stays in sync after status polls.
+                    self._fill_context_limit_fields(info)
+                    await self._maybe_broadcast_context_changed(info, prev_ctx_sig)
                     await self._broadcast_message(broadcast_msg)
 
         async def on_error(exc: BaseException) -> None:
@@ -1037,8 +1466,8 @@ class AgentService:
                 self._agents[agent_name].model = "unavailable"
 
         # Fire and forget with 5s timeout (status queries should be fast)
-        fire_and_forget_async(
-            root.get_status(),
+        fire_and_forget_call(
+            lambda: async_call(root, "get_status"),
             timeout=5.0,
             success_callback=on_success,
             error_callback=on_error,
@@ -1054,7 +1483,8 @@ class AgentService:
                 "success": False,
                 "error": "Agent not connected (connecting…)",
             }
-        from rpyc_async.utils.helpers import fire_and_forget_async
+        from rpyc_async.core.netref import async_call
+        from rpyc_async.utils.helpers import fire_and_forget_call
 
         request_id = uuid.uuid4().hex
         root = self._roots[agent_name]
@@ -1110,8 +1540,8 @@ class AgentService:
                 }
             )
 
-        fire_and_forget_async(
-            root.summarize(),
+        fire_and_forget_call(
+            lambda: async_call(root, "summarize"),
             timeout=None,
             success_callback=on_success,
             error_callback=on_error,
@@ -1166,7 +1596,8 @@ class AgentService:
                 "request_id": request_id,
             }
 
-        from rpyc_async.utils.helpers import fire_and_forget_async
+        from rpyc_async.core.netref import async_call
+        from rpyc_async.utils.helpers import fire_and_forget_call
 
         root = self._roots[agent_name]
 
@@ -1223,6 +1654,16 @@ class AgentService:
                 "success": True,
                 "response": response_text,  # Send only serializable text
             })
+            # Refresh context after each completed turn (cache TTL ~1s).
+            if agent_name in self._agents:
+                _info = self._agents[agent_name]
+                prev_ctx_sig = self._context_snapshot_signature(_info)
+                self._fill_context_fields(_info)
+                # Mirror operator-set -l value (cheap disk read; lives in
+                # the same session_metadata.json we already open for the
+                # context mirror — see _fill_context_limit_fields).
+                self._fill_context_limit_fields(_info)
+                await self._maybe_broadcast_context_changed(_info, prev_ctx_sig)
 
         async def on_error(exc: BaseException) -> None:
             """Handle RPC errors (timeout, connection, remote exception)."""
@@ -1251,8 +1692,8 @@ class AgentService:
         # Connection errors (agent crash, network) are already handled
         # by RPyC raising EOFError/ConnectionError → on_error callback.
         # ================================================================
-        fire_and_forget_async(
-            root.invoke_agent(message, stream=False, sum_query=sum_query),
+        fire_and_forget_call(
+            lambda: async_call(root, "invoke_agent", message, stream=False, sum_query=sum_query),
             timeout=None,
             success_callback=on_success,
             error_callback=on_error,
@@ -1302,7 +1743,8 @@ class AgentService:
             self._auto_approve_agents.add(agent_name)
 
         try:
-            from rpyc_async.utils.helpers import fire_and_forget_async
+            from rpyc_async.core.netref import async_call
+            from rpyc_async.utils.helpers import fire_and_forget_call
 
             async def on_success(response: Any) -> None:
                 logger.info(f"Approval sent for {agent_name}: {decision}")
@@ -1310,8 +1752,8 @@ class AgentService:
             async def on_error(exc: BaseException) -> None:
                 logger.error(f"Error sending approval for {agent_name}: {exc}")
 
-            fire_and_forget_async(
-                root.respond_to_approval(approval_id, decision_dict),
+            fire_and_forget_call(
+                lambda: async_call(root, "respond_to_approval", approval_id, decision_dict),
                 timeout=5.0,
                 success_callback=on_success,
                 error_callback=on_error,
@@ -1336,7 +1778,8 @@ class AgentService:
 
         root = self._roots[agent_name]
         try:
-            from rpyc_async.utils.helpers import fire_and_forget_async
+            from rpyc_async.core.netref import async_call
+            from rpyc_async.utils.helpers import fire_and_forget_call
 
             async def on_success(response_str: str) -> None:
                 import json
@@ -1346,8 +1789,8 @@ class AgentService:
             async def on_error(exc: BaseException) -> None:
                 logger.error(f"Error toggling TaskManager for {agent_name}: {exc}")
 
-            fire_and_forget_async(
-                root.set_task_manager_enabled(enabled),
+            fire_and_forget_call(
+                lambda: async_call(root, "set_task_manager_enabled", enabled),
                 timeout=5.0,
                 success_callback=on_success,
                 error_callback=on_error,
@@ -1396,7 +1839,8 @@ class AgentService:
 
         root = self._roots[agent_name]
         try:
-            from rpyc_async.utils.helpers import fire_and_forget_async
+            from rpyc_async.core.netref import async_call
+            from rpyc_async.utils.helpers import fire_and_forget_call
 
             async def on_success(response_str: str) -> None:
                 logger.info(f"TaskManager reset for {agent_name}")
@@ -1404,8 +1848,8 @@ class AgentService:
             async def on_error(exc: BaseException) -> None:
                 logger.error(f"Error resetting TaskManager for {agent_name}: {exc}")
 
-            fire_and_forget_async(
-                root.reset_task_manager(),
+            fire_and_forget_call(
+                lambda: async_call(root, "reset_task_manager"),
                 timeout=10.0,
                 success_callback=on_success,
                 error_callback=on_error,
@@ -1441,7 +1885,8 @@ class AgentService:
 
         root = self._roots[agent_name]
         try:
-            from rpyc_async.utils.helpers import fire_and_forget_async
+            from rpyc_async.core.netref import async_call
+            from rpyc_async.utils.helpers import fire_and_forget_call
 
             async def on_success(response_str: str) -> None:
                 """Handle successful interrupt RPC.
@@ -1475,8 +1920,8 @@ class AgentService:
                     "error": str(exc),
                 })
 
-            fire_and_forget_async(
-                root.interrupt_agent(),
+            fire_and_forget_call(
+                lambda: async_call(root, "interrupt_agent"),
                 timeout=5.0,
                 success_callback=on_success,
                 error_callback=on_error,
@@ -1517,7 +1962,8 @@ class AgentService:
         if not await self.ensure_connecting(agent_name):
             return {"success": False, "error": "Agent not connected (connecting…)"}
 
-        from rpyc_async.utils.helpers import fire_and_forget_async
+        from rpyc_async.core.netref import async_call
+        from rpyc_async.utils.helpers import fire_and_forget_call
         import uuid
 
         # Generate request ID if not provided
@@ -1536,6 +1982,18 @@ class AgentService:
             except (json.JSONDecodeError, TypeError):
                 logger.error(f"Failed to parse history response: {response_str}")
                 await on_error(Exception(f"Invalid response format: {response_str}"))
+                return
+
+            # A refusal from the agent is NOT an empty history. Without this
+            # check `{"success": false, "error": ...}` was broadcast as a
+            # successful empty result, and the UI rendered a blank dialog for
+            # an agent whose conversation was intact on disk — a silent lie,
+            # worse than a visible error. Mirrors the guard already present on
+            # the detailed-status path.
+            if not response.get("success", False):
+                await on_error(
+                    Exception(response.get("error", "Agent returned success=False"))
+                )
                 return
 
             logger.info(f"Got history for {agent_name}: {len(response.get('history', []))} messages")
@@ -1559,8 +2017,8 @@ class AgentService:
             })
 
         # Fire and forget with 15s timeout (history can be large)
-        fire_and_forget_async(
-            root.get_history(limit, offset),
+        fire_and_forget_call(
+            lambda: async_call(root, "get_history", limit, offset),
             timeout=15.0,
             success_callback=on_success,
             error_callback=on_error,
@@ -1596,7 +2054,8 @@ class AgentService:
         if not await self.ensure_connecting(agent_name):
             return {"success": False, "error": "Agent not connected (connecting…)"}
 
-        from rpyc_async.utils.helpers import fire_and_forget_async
+        from rpyc_async.core.netref import async_call
+        from rpyc_async.utils.helpers import fire_and_forget_call
         import uuid
 
         req_id = request_id or str(uuid.uuid4())
@@ -1610,6 +2069,14 @@ class AgentService:
             except (json.JSONDecodeError, TypeError):
                 logger.error(f"Failed to parse last response: {response_str}")
                 await on_error(Exception(f"Invalid response format: {response_str}"))
+                return
+
+            # Same rule as history: a refusal must not be dressed up as
+            # "no response yet".
+            if not response.get("success", False):
+                await on_error(
+                    Exception(response.get("error", "Agent returned success=False"))
+                )
                 return
 
             logger.info(f"Got last response for {agent_name}")
@@ -1633,8 +2100,8 @@ class AgentService:
             })
 
         try:
-            fire_and_forget_async(
-                root.get_last_response(),
+            fire_and_forget_call(
+                lambda: async_call(root, "get_last_response"),
                 timeout=5.0,
                 success_callback=on_success,
                 error_callback=on_error,
@@ -1673,7 +2140,8 @@ class AgentService:
         if not await self.ensure_connecting(agent_name):
             return {"success": False, "error": "Agent not connected (connecting…)"}
 
-        from rpyc_async.utils.helpers import fire_and_forget_async
+        from rpyc_async.core.netref import async_call
+        from rpyc_async.utils.helpers import fire_and_forget_call
         import uuid
 
         req_id = request_id or str(uuid.uuid4())
@@ -1696,27 +2164,63 @@ class AgentService:
                 await on_error(Exception("Agent returned success=False"))
                 return
 
-            session_info = response.get("session_info", {})
+            # The agent's ``exposed_get_status`` returns a FLAT minimal
+            # payload — there is no ``session_info`` sub-dict and has not been
+            # since that response was slimmed down. Reading one yielded an
+            # empty dict, so every field taken from it silently fell back to
+            # its default: status became a hardcoded "idle" even while the
+            # agent was mid-turn, and message_count a constant 0. Read the
+            # flat keys the agent actually sends.
             agent = self._agents.get(agent_name)
 
             if not agent:
                 await on_error(Exception("Agent not found in tracking"))
                 return
 
+            # Same source as the ``agent_status`` broadcast in
+            # ``_update_agent_status``: one status, one meaning, whichever
+            # way the caller asked for it.
+            status_value = self._convert_status(response.get("status", "idle")).value
+
+            # The agent stamps this on every turn boundary. Falling back to
+            # ``started_at`` (as this code used to do unconditionally) is what
+            # made a 12-day-old process look like it had just acted.
+            last_activity = response.get("last_activity")
+
             # Build status info dict
             status_info = {
                 "name": agent.name,
                 "pid": agent.pid,
-                "status": self._convert_status(session_info.get("status", "idle")).value,
-                "provider": session_info.get("provider", agent.provider),
-                "model": session_info.get("model", agent.model),
+                "status": status_value,
+                "provider": agent.provider,
+                "model": agent.model,
                 "rpyc_port": agent.rpyc_port,
                 "working_dir": agent.working_dir,
                 "started_at": agent.started_at.isoformat(),
-                "current_thread_id": session_info.get("current_thread_id"),
-                "message_count": session_info.get("message_count", 0),
-                "last_activity": agent.started_at.isoformat(),
-                "task_manager_active": session_info.get("task_manager_active", False),
+                "current_thread_id": response.get("current_thread_id"),
+                "message_count": response.get("message_count", 0),
+                "last_activity": last_activity,
+                # Published only when the agent actually reported it —
+                # the same rule ``_update_agent_status`` applies to its
+                # ``agent_status`` push. Defaulting the key to ``False``
+                # (as this did) asserts "the loop is idle right now"
+                # about an agent that said nothing about its loop, which
+                # is the UNKNOWN-flattened-into-false error the other two
+                # fields below exist to prevent.
+                **(
+                    {"task_manager_active": bool(response["task_manager_active"])}
+                    if "task_manager_active" in response
+                    else {}
+                ),
+                # The three TM states are independent questions, and
+                # publishing only ``active`` left "switched off",
+                # "enabled but sleeping between tasks" and "no TM at
+                # all" indistinguishable to every consumer — which is
+                # how a running, enabled TaskManager got reported as
+                # off. Names and null semantics are fixed by the
+                # WorkControl contract (the WorkControl API):
+                # ``null`` means UNKNOWN and must not be read as False.
+                **self._task_manager_state_fields(response),
             }
 
             logger.info(f"Got detailed status for {agent_name}")
@@ -1740,8 +2244,8 @@ class AgentService:
             })
 
         # Fire-and-forget: actual status arrives via WebSocket in on_success.
-        fire_and_forget_async(
-            root.get_status(),
+        fire_and_forget_call(
+            lambda: async_call(root, "get_status"),
             timeout=10.0,
             success_callback=on_success,
             error_callback=on_error,
@@ -1758,6 +2262,7 @@ class AgentService:
         self,
         agent_name: str,
         verbosity: str = "final",
+        timestamps: str = "local",
     ) -> str:
         """Get formatted dialog text for an agent at the requested verbosity.
 
@@ -1770,6 +2275,9 @@ class AgentService:
         Args:
             agent_name: Name of the agent.
             verbosity: ``"final"`` (default) | ``"text"`` | ``"full"``.
+            timestamps: ``"local"`` (default, host timezone) | ``"utc"``.
+                Each block header carries the message's own ``created_at``
+                with its zone spelled out.
 
         Returns:
             Formatted dialog text as plain string in format:
@@ -1859,7 +2367,7 @@ class AgentService:
             payload = json.loads(raw) if isinstance(raw, str) else raw
             if not payload.get("success"):
                 error_msg = str(payload.get("error", "Unknown error"))
-                raise ValueError(f"Agent returned error: {error_msg}")
+                raise AgentRefusedError(f"Agent returned error: {error_msg}")
             return render_system_prompt(
                 payload.get("system_prompt", ""),
                 provider=payload.get("provider"),
@@ -1887,7 +2395,7 @@ class AgentService:
             payload = json.loads(raw) if isinstance(raw, str) else raw
             if not payload.get("success"):
                 error_msg = str(payload.get("error", "Unknown error"))
-                raise ValueError(f"Agent returned error: {error_msg}")
+                raise AgentRefusedError(f"Agent returned error: {error_msg}")
             return render_tools(
                 payload.get("tools", []),
                 provider=payload.get("provider"),
@@ -1939,14 +2447,14 @@ class AgentService:
                         logger.error(
                             f"Legacy fallback for '{agent_name}' also failed: {error_msg2}"
                         )
-                        raise ValueError(f"Agent returned error: {error_msg2}")
+                        raise AgentRefusedError(f"Agent returned error: {error_msg2}")
                 else:
                     logger.error(f"Failed to get history for '{agent_name}': {error_msg}")
-                    raise ValueError(f"Agent returned error: {error_msg}")
+                    raise AgentRefusedError(f"Agent returned error: {error_msg}")
 
             history = payload.get('history', [])
             turns = split_into_turns(history)
-            return render_dialog(turns, verbosity)
+            return render_dialog(turns, verbosity, timestamps)
 
         except asyncio.TimeoutError:
             logger.error(f"Timeout getting history for '{agent_name}' after 30s")
@@ -1976,11 +2484,10 @@ class AgentService:
         from app.services.dialog_formatter import render_system_prompt
 
         try:
-            data_dir = deep_worker_home() / agent_name
-            meta_file = data_dir / "session_metadata.json"
-            if not meta_file.exists():
+            raw = read_agent_file(agent_name, "session_metadata.json")
+            if raw is None:
                 return None
-            data = json.loads(meta_file.read_text())
+            data = json.loads(raw)
             cfg = data.get("launch_config")
             if not isinstance(cfg, dict):
                 return None
@@ -2059,6 +2566,35 @@ class AgentService:
 
         msg_type = plain_msg.get("type")
 
+        if msg_type == "model_context_changed":
+            info = self._agents.get(agent_name)
+            if info is None:
+                return
+            kind = plain_msg.get("kind")
+            semantics = plain_msg.get("usage_semantics")
+            context_used = plain_msg.get("context_used")
+            if context_used is None and semantics == "tokens":
+                context_used = plain_msg.get("prompt_tokens")
+                if context_used is None:
+                    context_used = plain_msg.get("total_tokens")
+            context_size = plain_msg.get("context_size")
+            total_tokens = plain_msg.get("total_tokens")
+            if kind == "agent":
+                info.agent_context_used = context_used
+                info.agent_context_size = context_size
+                info.agent_context_semantics = semantics
+                info.agent_last_turn_tokens = total_tokens
+            elif kind == "tm":
+                info.tm_context_used = context_used
+                info.tm_context_size = context_size
+                info.tm_context_semantics = semantics
+                info.tm_last_turn_tokens = total_tokens
+            else:
+                return
+            self._fill_context_limit_fields(info)
+            await self._maybe_broadcast_context_changed(info, None)
+            return
+
         if msg_type == "status_change":
             status_str = plain_msg.get("status", "idle")
             broadcast: dict[str, Any] = {
@@ -2112,16 +2648,26 @@ class AgentService:
                 if info is not None:
                     info.task_manager_active = val
                     info.has_task_manager = True
-            if "task_manager_disabled" in plain_msg:
-                val = bool(plain_msg["task_manager_disabled"])
-                broadcast["task_manager_disabled"] = val
+            # Attachment and the switch are forwarded when the push
+            # carries ANY TaskManager information, so this path agrees
+            # field-for-field with the status poll and the REST
+            # snapshot. Unlike the full ``get_status`` reply, a
+            # ``status_change`` event is a PARTIAL payload: omitting the
+            # TM keys here does not mean "no TaskManager", so absence
+            # must stay unknown instead of being flattened to False.
+            if any(
+                key in plain_msg
+                for key in (
+                    "task_manager_attached",
+                    "task_manager_active",
+                    "task_manager_disabled",
+                )
+            ):
+                tm_fields = self._task_manager_state_fields(plain_msg)
+                broadcast.update(tm_fields)
                 if info is not None:
-                    info.task_manager_disabled = val
-                    info.has_task_manager = True
-
-            # If the agent told us it has no TM at all (both flags
-            # absent) we deliberately leave ``has_task_manager`` as
-            # ``None`` / existing — we don't invent a False.
+                    info.has_task_manager = tm_fields["task_manager_attached"]
+                    info.task_manager_disabled = tm_fields["task_manager_disabled"]
 
             error_message = plain_msg.get("error_message")
             if error_message is not None:
@@ -2292,6 +2838,8 @@ class AgentService:
                 started_at=proc_info.started_at,
             )
             self._agents[name] = agent_info
+            self._fill_context_fields(agent_info)
+            self._fill_context_limit_fields(agent_info)
 
             await self._broadcast_message({
                 "type": "agent_discovered",

@@ -89,7 +89,7 @@ def _run(
 def test_lsp_status_runs_via_real_binary(tmp_path: Path) -> None:
     """``deep-worker lsp status`` must work, not fail with
     ``unrecognized arguments``. This is exactly that wiring defect."""
-    cfg = tmp_path / ".deepagents" / "mcp.json"
+    cfg = tmp_path / ".deep_worker" / "mcp.json"
 
     res = _run(["lsp", "status", "--config", str(cfg)], gradle_home=tmp_path / "gh")
 
@@ -103,7 +103,7 @@ def test_lsp_status_runs_via_real_binary(tmp_path: Path) -> None:
 
 def test_lsp_enable_then_status_via_real_binary(tmp_path: Path) -> None:
     """Full user path through the real binary."""
-    cfg = tmp_path / ".deepagents" / "mcp.json"
+    cfg = tmp_path / ".deep_worker" / "mcp.json"
 
     enabled = _run(
         ["lsp", "enable", "--config", str(cfg), "--project-root", str(tmp_path)],
@@ -179,7 +179,7 @@ def test_enable_without_flags_targets_the_invocation_dir(tmp_path: Path) -> None
     res = _run(["lsp", "enable"], cwd=user_dir, gradle_home=tmp_path / "gh")
     assert res.returncode == 0, res.stdout + res.stderr
 
-    cfg = user_dir / ".deepagents" / "mcp.json"
+    cfg = user_dir / ".deep_worker" / "mcp.json"
     assert cfg.exists(), (
         f"config must land in the invocation dir; stdout={res.stdout}"
     )
@@ -213,7 +213,7 @@ def test_status_without_flags_reports_invocation_dir(tmp_path: Path) -> None:
 
 def test_enable_installs_gradle_init_script_via_real_binary(tmp_path: Path) -> None:
     gradle_home = tmp_path / "gradle-home"
-    cfg = tmp_path / ".deepagents" / "mcp.json"
+    cfg = tmp_path / ".deep_worker" / "mcp.json"
 
     res = _run(
         ["lsp", "enable", "--config", str(cfg), "--project-root", str(tmp_path)],
@@ -235,7 +235,7 @@ def test_enable_installs_gradle_init_script_via_real_binary(tmp_path: Path) -> N
 
 def test_enable_no_gradle_init_flag_via_real_binary(tmp_path: Path) -> None:
     gradle_home = tmp_path / "gradle-home"
-    cfg = tmp_path / ".deepagents" / "mcp.json"
+    cfg = tmp_path / ".deep_worker" / "mcp.json"
 
     res = _run(
         [
@@ -257,7 +257,7 @@ def test_enable_no_gradle_init_flag_via_real_binary(tmp_path: Path) -> None:
 
 def test_disable_removes_gradle_init_script_via_real_binary(tmp_path: Path) -> None:
     gradle_home = tmp_path / "gradle-home"
-    cfg = tmp_path / ".deepagents" / "mcp.json"
+    cfg = tmp_path / ".deep_worker" / "mcp.json"
     script = gradle_home / "init.d" / "deep-worker-kotlin-android-source-sets.gradle"
 
     _run(

@@ -192,10 +192,10 @@ async def test_shell_and_middleware_job_ids_never_collide() -> None:
     assert len(ids) == 3, f"job ids must be unique across layers, got {ids}"
 
 
-# ── 5. a finished tool job leaves no leak ────────────────────────────────
+# ── 5. a served tool job leaves no leak ──────────────────────────────────
 
 
-async def test_finished_tool_job_is_dropped_from_registry() -> None:
+async def test_served_tool_job_is_dropped_from_registry() -> None:
     from deepagents.middleware.parked_job_registry import (
         get_parked_job_registry,
     )
@@ -236,15 +236,26 @@ async def test_finished_tool_job_is_dropped_from_registry() -> None:
     registry = get_parked_job_registry()
     assert registry.resolve(job_id) is not None
 
-    # Let the parked work finish; the registry must drop it event-driven
-    # (done callback), with no polling.
+    # Let the parked work finish. Completion alone must NOT erase the entry:
+    # a job whose result nobody has collected yet still owes it to the caller,
+    # and dropping here is what made a finished job unreachable (incident of
+    # 2026-08-28 — "no background job with id" instead of the result).
+    parked = registry.resolve(job_id)
+    assert parked is not None
+    settled = asyncio.Event()
+    parked.handle.task.add_done_callback(lambda _t: settled.set())
     release.set()
-    for _ in range(50):
-        await asyncio.sleep(0.01)
-        if registry.resolve(job_id) is None:
-            break
+    await asyncio.wait_for(settled.wait(), timeout=5.0)
+
+    assert registry.resolve(job_id) is not None, (
+        "a finished job must stay reachable until its result has been served"
+    )
+
+    # Serving the result is what erases it — entry AND alias together, so no
+    # stale alias and no leak.
+    registry.complete(job_id)
     assert registry.resolve(job_id) is None, (
-        "a finished parked job must be dropped from the registry — and its "
+        "a served parked job must be dropped from the registry — and its "
         "alias with it (no stale alias, no leak)"
     )
     assert registry.resolve(tool_call_id) is None

@@ -153,6 +153,11 @@ ignore-var-parameters = true
 extra-paths = [
     "../..",
     "../../semantic_search",
+    # The CLI package is an OPTIONAL runtime dependency of the summarization
+    # middleware (hot/cold origin + decide()), guarded by try/except ImportError
+    # so deepagents still runs standalone. ty has no notion of that guard, so
+    # without this path it reports the import as unresolved.
+    "../deep_worker_cli",
 ]
 
 [tool.pytest.ini_options]

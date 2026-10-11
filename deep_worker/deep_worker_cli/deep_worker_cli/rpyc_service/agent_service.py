@@ -43,6 +43,7 @@ import json
 import logging
 from typing import TYPE_CHECKING, Any
 
+import deep_worker_cli.rpyc_async_source  # noqa: F401  (import for side effect)
 import rpyc_async as rpyc
 
 if TYPE_CHECKING:
@@ -114,8 +115,8 @@ Use memory when the knowledge is:
 - Something to always keep in mind
 - A simple rule or pattern
 
-**Global** (`~/.deepagents/agent/AGENTS.md`): Universal preferences across all projects
-**Project** (`.deepagents/AGENTS.md`): Project-specific conventions and decisions
+**Global** (`~/.deep_worker/agents/<agent>/AGENTS.md`): Universal preferences across all projects
+**Project** (`.deep_worker/AGENTS.md`): Project-specific conventions and decisions
 
 ### → Skill for reusable workflows and methodologies
 **Create a skill when** we developed:
@@ -133,7 +134,7 @@ If we established best practices around a workflow or process, capture them in a
 **Example:** If we discussed best practices for code review, create a `code-review` skill that encodes those practices into a reusable workflow.
 
 ### Skill Location
-`~/.deepagents/agent/skills/<skill-name>/SKILL.md`
+`~/.deep_worker/agents/<agent>/skills/<skill-name>/SKILL.md`
 
 ### Skill Structure
 ```
@@ -197,6 +198,82 @@ List what you captured and where you stored it:
 - Skills created (with key best practices encoded)
 - Memory entries added (with location)
 """  # noqa: E501
+
+
+def select_reported_model(
+    config: Any, launch_config: Any = None
+) -> str | None:
+    """Return the model the agent is actually running on, or ``None``.
+
+    Three candidate sources, in order of how much they are *worth*:
+
+    1. ``dynamic_display_model`` — what the provider itself reported for
+       THIS session, via the resolved-model callback. An observed fact.
+    2. ``config.model`` — the model written into launch_config at start.
+       An intention, which a later failover onto another provider can
+       silently invalidate.
+    3. ``resolved_model`` — ``config.model`` or, when unset, the
+       provider's registered default. A guess about an unpinned agent.
+
+    The observed fact must outrank the recorded intention. The previous
+    order put ``config.model`` first, so after a failover restart the
+    stale launch_config model beat the live provider answer and the UI
+    named a model from a provider the agent had already left — the
+    ``or-nemotron-ultra / z-ai/glm-5.2:free`` report.
+
+    Every candidate is filtered through ``model_can_belong_to_provider``,
+    which also rejects the legacy ``"unknown"`` poison sentinel. That
+    predicate is deliberately permissive for config-declared providers
+    (the vendor validates the model, not us), so it cannot be relied on
+    alone to catch a stale value; the ordering is what does the work.
+
+    ``launch_config`` is the persisted launch record, consulted only for
+    its ``model_provider`` field — see below.
+
+    Returns ``None`` when no candidate survives. ``None`` means "we do
+    not know", and the caller falls through to a further source
+    (``token_stats.jsonl``, which records what each turn actually ran on)
+    rather than inventing a name: reporting a guessed model as fact is the
+    defect being fixed, and ``"unknown"`` is a display-layer placeholder
+    that must never be presented as a real model name.
+    """
+    from deep_worker_cli.config import model_can_belong_to_provider
+
+    provider = getattr(config, "provider", None)
+
+    # The observed fact, if the provider has given us one, needs no further
+    # scrutiny — it came from the provider now serving this session.
+    observed = getattr(config, "dynamic_display_model", None)
+    if model_can_belong_to_provider(provider, observed):
+        return observed
+
+    # Nothing observed yet, so all that is left is what was recorded at
+    # launch. ``model_provider`` names the provider that model was chosen
+    # for; when it disagrees with the provider actually in use, the record
+    # describes a provider the agent has already left and is a guess about
+    # the current one. ``model_can_belong_to_provider`` cannot catch this
+    # on its own: for config-declared providers it accepts any model by
+    # design (the vendor validates, not us), which is exactly how
+    # ``or-nemotron-ultra / z-ai/glm-5.2:free`` reached the UI. The same
+    # mismatch test already gates the restart path
+    # (``merge_restart_config``'s ``provider_mismatch``).
+    if isinstance(launch_config, dict):
+        model_provider = launch_config.get("model_provider")
+        if (
+            isinstance(model_provider, str)
+            and model_provider
+            and provider
+            and model_provider != provider
+        ):
+            return None
+
+    for candidate in (
+        getattr(config, "model", None),
+        getattr(config, "resolved_model", None),
+    ):
+        if model_can_belong_to_provider(provider, candidate):
+            return candidate
+    return None
 
 
 class AgentService(rpyc.Service):
@@ -279,7 +356,8 @@ class AgentService(rpyc.Service):
         """Get agent status (async for AsyncioServer).
 
         Returns minimal status response for high-frequency polling.
-        Only includes status + optional error message.
+        Only includes status, optional error message, and the few scalar
+        activity fields the session manager already owns.
 
         IMPORTANT: Returns JSON-serialized string to eliminate RPyC netref overhead.
         Client must json.loads() the response. This reduces RPyC messages from 24 to 2
@@ -287,6 +365,15 @@ class AgentService(rpyc.Service):
 
         This optimization reduces response size from 10-100 KB to < 200 bytes,
         eliminating unnecessary serialization overhead on every status check.
+
+        ``last_activity`` is part of that minimal payload on purpose. When the
+        full ``session_info`` dict was dropped from this response, the web
+        layer kept reading the old shape and silently substituted
+        ``started_at`` for it, so every consumer saw the process start time as
+        "last activity" — 12 days stale on a busy agent. The authoritative
+        value lives here (``SessionManager.set_status`` stamps it on every
+        turn boundary), so it travels with the status it describes rather than
+        being reconstructed by a consumer that cannot know it.
         """
         if not self._agent_process:
             result = {"success": False, "error": "Agent not initialized"}
@@ -300,21 +387,42 @@ class AgentService(rpyc.Service):
             from deep_worker_cli.basesession.session_adapter import map_agent_status
 
             # Get status directly from session manager (no full SessionInfo needed)
-            status = map_agent_status(self._agent_process.session_manager.status)
-            error_message = self._agent_process.session_manager.error_message
+            session_manager = self._agent_process.session_manager
+            status = map_agent_status(session_manager.status)
+            error_message = session_manager.error_message
 
             result: dict[str, Any] = {
                 "success": True,
                 "status": status.value,  # SessionStatus enum value
                 "error": error_message,  # Only if status == "error"
+                # Stamped by ``set_status`` on every turn boundary, so it is
+                # the real "last time this agent did something". Always a
+                # datetime — the session manager sets it in every
+                # constructor branch and never clears it.
+                "last_activity": session_manager.last_activity.isoformat(),
+                "message_count": session_manager.message_count,
+                "tasks_completed": session_manager.tasks_completed,
             }
 
-            # Include task_manager fields only if TaskManager is configured
-            if self._agent_process.task_manager is not None:
-                result["task_manager_active"] = (
-                    self._agent_process.task_manager.state != "inactive"
-                )
-                result["task_manager_disabled"] = self._agent_process.task_manager.disabled
+            # Three DIFFERENT TaskManager states, reported separately
+            # because no one of them can be derived from another:
+            #   attached — a TaskManager is wired to this agent at all;
+            #   disabled — the operator's on/off switch;
+            #   active   — the loop is not ``inactive`` right now.
+            # Attachment used to be encoded by the ABSENCE of the two
+            # keys below, which a consumer reading the parsed payload
+            # cannot distinguish from "unknown" — and that ambiguity
+            # produced the false report "TaskManager is off" about a
+            # running, enabled one. It is now an explicit field; a
+            # detached agent has no switch, so ``disabled`` stays None
+            # rather than claiming False ("enabled").
+            task_manager = self._agent_process.task_manager
+            result["task_manager_attached"] = task_manager is not None
+            if task_manager is not None:
+                result["task_manager_active"] = task_manager.state != "inactive"
+                result["task_manager_disabled"] = task_manager.disabled
+            else:
+                result["task_manager_disabled"] = None
 
             return json.dumps(result)
         except Exception as e:
@@ -407,13 +515,12 @@ class AgentService(rpyc.Service):
             # Two client conventions reach this endpoint:
             #   * CLI send-through (agent_command._send_startup_query_to_running)
             #     sends message="" and puts the plain request in `query`.
-            #   * Web (the web layer's AgentService.send_message) puts the plain
+            #   * Web (web client's send_message) puts the plain
             #     request in `message` and, historically, could not send `query`
             #     at all — so a call with sum_query + a real `message` arrived
             #     here as (message=<request>, sum_query=<prefix>, query=None).
             # In the second case the request lived in `message` and was silently
-            # dropped (only the summary-shape reached the model — a reported bug
-            # affecting 0/11 drafts). Normalise: if `query` was not
+            # dropped (only the summary-shape reached the model). Normalise: if `query` was not
             # given explicitly but a non-empty `message` was, treat `message` as
             # the plain query so it becomes the second sequential turn. CLI is
             # unaffected (it sends message="" → falsy → no override).
@@ -583,7 +690,7 @@ class AgentService(rpyc.Service):
             #    broadcast ``agent_interrupted``. Return a clean structured
             #    *interrupted* result instead of letting CancelledError cross
             #    the RPyC boundary as a remote exception (which the web side
-            #    would mis-render as an error — per a user report).
+            #    would mis-render as an error).
             _invoke_task = locals().get("invoke_task")
             if _invoke_task is not None and not _invoke_task.cancelled():
                 # Channel drain — agent keeps working, no interrupt reported.
@@ -634,6 +741,8 @@ class AgentService(rpyc.Service):
 
         agent_process = self._agent_process
 
+        from deep_worker_cli.process.inbox_spool import InboxDuplicateMessageError
+
         try:
             # 1. Durable publish. Returns only after the record is fsynced and
             #    its directory entry is durable. 2. The publish itself sets the
@@ -646,6 +755,17 @@ class AgentService(rpyc.Service):
                 "success": True,
                 "delivered_content": message,
                 "delivery_id": delivery_id,
+            })
+        except InboxDuplicateMessageError as e:
+            # A deliberate policy refusal, not a fault: this message is already
+            # in the recipient's context. Reported as its own error code and
+            # WITHOUT a traceback — but still loudly, because a caller resending
+            # automatically is a defect that must stay visible.
+            logger.warning("Refused duplicate message: %s", e)
+            return json.dumps({
+                "success": False,
+                "error": "duplicate_message",
+                "message": str(e),
             })
         except Exception as e:
             # Loss must be LOUD: if we could not persist, the sender has to
@@ -705,8 +825,8 @@ class AgentService(rpyc.Service):
     async def exposed_get_system_prompt(self) -> str:
         """Get the invariant (startup) system prompt (async for AsyncioServer).
 
-        Backs Full Dialog verbosity mode ``system_prompt`` (§9 of the
-        web layer's Full Dialog / final-response-pairs design notes).
+        Backs Full Dialog verbosity mode ``system_prompt`` (§9 of
+        an internal design document).
 
         IMPORTANT: Returns JSON-serialized string to eliminate RPyC netref
         overhead. Client must json.loads() the response.
@@ -762,7 +882,31 @@ class AgentService(rpyc.Service):
         else:
             self._agent_process.task_manager.disable()
 
-        return json.dumps({"success": True, "enabled": enabled})
+        # Persist the operator's decision. Without this the switch lived only
+        # in this process and every restart resurrected the manager as enabled
+        # (observed in a past incident). Reported as part of the result so a caller
+        # is never told the setting is durable when the write failed.
+        persisted = False
+        session_manager = getattr(self._agent_process, "session_manager", None)
+        setter = getattr(session_manager, "set_task_manager_disabled", None)
+        if setter is not None:
+            try:
+                await setter(not enabled)
+                persisted = True
+            except Exception as exc:  # noqa: BLE001 — never fail the toggle
+                # Loud, not silent: the in-memory flag did flip, so the caller's
+                # intent is honoured for this process, but the operator must be
+                # able to see that it will not outlive a restart.
+                logger.exception(
+                    "TaskManager toggle applied in memory but NOT persisted "
+                    "for '%s': %s",
+                    getattr(self._agent_process, "name", "<unknown>"),
+                    exc,
+                )
+
+        return json.dumps(
+            {"success": True, "enabled": enabled, "persisted": persisted}
+        )
 
     async def exposed_reset_task_manager(self) -> str:
         """Reset TaskManager to initial state.
@@ -877,8 +1021,8 @@ class AgentService(rpyc.Service):
                 # Evict by identity (no __hash__ on the netref). Graceful
                 # unsubscribe normally happens on a live channel, but a client
                 # racing disconnect+unsubscribe could present a dead netref,
-                # and ``discard`` would then re-raise EOFError (observed in
-                # a past incident). Identity eviction is always safe.
+                # and ``discard`` would then re-raise EOFError (observed
+                # in a past incident). Identity eviction is always safe.
                 evict_subscriber_by_identity(
                     self._agent_process._message_subscribers, callback
                 )
@@ -925,20 +1069,23 @@ class AgentService(rpyc.Service):
             model = None
             provider = None
             if config:
-                from deep_worker_cli.config import model_can_belong_to_provider
                 provider = config.provider
-                dynamic_model = getattr(config, "dynamic_display_model", None)
-                if not model_can_belong_to_provider(provider, dynamic_model):
-                    dynamic_model = None
-                config_model = (
-                    config.model
-                    if model_can_belong_to_provider(provider, config.model)
-                    else None
+                model = select_reported_model(
+                    config, getattr(self._agent_process, "launch_config", None)
                 )
-                resolved_model = config.resolved_model
-                if not model_can_belong_to_provider(provider, resolved_model):
-                    resolved_model = None
-                model = config_model or dynamic_model or resolved_model
+                # Fallback chain exhausted and we still have nothing.
+                # The agent was started without an explicit ``--model``
+                # and the provider registry's ``default_model`` was not
+                # populated at construction time (e.g. ``minimax`` has
+                # ``default_model=MiniMax-M3`` in providers.json but the
+                # config object only sees it lazily).  The authoritative
+                # source for "what model am I actually talking to?" is
+                # the most recent ``token_stats.jsonl`` record — read
+                # the last few lines and pick the latest non-empty model.
+                # This is what makes the web UI status bar show a real
+                # model name instead of ``unknown``.
+                if model is None:
+                    model = self._latest_model_from_token_stats()
 
             status_metadata = None
             session_manager = getattr(self._agent_process, "session_manager", None)
@@ -967,6 +1114,86 @@ class AgentService(rpyc.Service):
             logger.exception("Error getting metadata: %s", e)
             result = {"success": False, "error": str(e)}
             return json.dumps(result)
+
+    def _latest_model_from_token_stats(self) -> str | None:
+        """Return the model name from the most recent ``token_stats.jsonl`` line.
+
+        Used as a final fallback by ``exposed_get_metadata`` when the agent
+        was started without an explicit ``--model`` flag and ``config.model``,
+        ``resolved_model`` and ``dynamic_display_model`` are all empty.
+
+        The JSONL is append-only with newest entries at the tail, so we read
+        the last 256 lines and pick the most recent non-empty ``model`` value.
+        Skipping empty / malformed lines keeps the read O(1) in practice.
+
+        Returns ``None`` when the file is missing, unreadable, or every line
+        has an empty model. Never raises — a broken stats file must not
+        break metadata retrieval.
+        """
+        try:
+            from pathlib import Path
+
+            deep_worker_dir = Path.home() / ".deep_worker"
+            if not deep_worker_dir.is_dir():
+                return None
+            # Find the agent's subdirectory by walking parents of the
+            # registry file or by matching our own working directory.
+            # We pick the single agent dir whose ``token_stats.jsonl``
+            # exists (this rpyc service runs INSIDE the agent process,
+            # so ``Path.cwd()`` is the agent's working dir and the
+            # stats file lives one level up at
+            # ``~/.deep_worker/<name>/token_stats.jsonl``).
+            stats_path = deep_worker_dir / self._agent_name() / "token_stats.jsonl"
+            if not stats_path.is_file():
+                # Fallback: search by pid-file proximity.  The agent's
+                # PID file lives at ``~/.deep_worker/<name>/<name>.pid``
+                # and the stats file sits next to it.
+                for candidate in deep_worker_dir.iterdir():
+                    if (candidate / "token_stats.jsonl").is_file():
+                        stats_path = candidate / "token_stats.jsonl"
+                        break
+            if not stats_path.is_file():
+                return None
+            # Read the tail of the file (last 256 lines is more than
+            # enough — token_stats fires once per LLM call, so even a
+            # long-running agent only has a few hundred lines per
+            # session before we re-rotate).
+            with stats_path.open("rb") as fh:
+                fh.seek(0, 2)
+                size = fh.tell()
+                fh.seek(max(0, size - 64 * 1024))
+                data = fh.read().decode("utf-8", errors="replace")
+            # Walk lines in reverse so the newest record wins.
+            for raw in reversed(data.splitlines()):
+                line = raw.strip()
+                if not line:
+                    continue
+                try:
+                    import json as _json
+                    rec = _json.loads(line)
+                except Exception:  # noqa: BLE001 — any parser error → skip
+                    continue
+                model = rec.get("model")
+                if isinstance(model, str) and model.strip():
+                    return model.strip()
+            return None
+        except Exception:  # noqa: BLE001 — must never break get_metadata
+            logger.exception("latest_model_from_token_stats fallback failed")
+            return None
+
+    def _agent_name(self) -> str:
+        """Return the agent's registered name (used for token_stats lookup).
+
+        Falls back to an empty string when the agent name is not yet known
+        (start-up race) so callers can still build a path without raising.
+        """
+        try:
+            ap = getattr(self, "_agent_process", None)
+            if ap is None:
+                return ""
+            return getattr(ap, "name", "") or ""
+        except Exception:
+            return ""
 
     async def exposed_handle_command(self, command: str) -> str:
         """
@@ -1478,8 +1705,8 @@ class AgentService(rpyc.Service):
         # hung (e.g. its broadcast queue was full or its WS client was
         # dead), the agent's whole ``_handle_invoke`` flow blocked on the
         # very first pre-flight broadcast and no user message ever
-        # reached ``ainvoke``. Production incident: a >60 min hang with
-        # 3 parked ``_dispatch_request_async`` tasks.
+        # reached ``ainvoke``. Production incident: a >60 min hang
+        # with 3 parked ``_dispatch_request_async`` tasks.
         #
         # The fix: hand each ``on_message`` call to
         # ``fire_and_forget_async`` which:
@@ -1503,8 +1730,8 @@ class AgentService(rpyc.Service):
         # Why serialise once on the agent side: a netref payload forces
         # the subscriber's async loop to walk it via ``sync_request``,
         # which RPyC blocks with the "sync_request() from asyncio loop"
-        # guard and leaks the remote ref. See the web layer's
-        # agent-service memory-fix design notes (F2).
+        # guard and leaks the remote ref. See
+        # an internal design document on the agent service memory fix.
         # ════════════════════════════════════════════════════════════════
 
         try:

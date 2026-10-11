@@ -29,7 +29,7 @@ cd "$SCRIPT_DIR" && DEEP_WORKER_ORIGINAL_CWD="$ORIGINAL_CWD" \
   exec python3 -m deep_worker_cli.cli.agent_command "$@"
 ```
 
-`SCRIPT_DIR` always points at the directory where the script itself physically lives — i.e. `<prod-tree>/deep_worker/deep_worker_cli`. `PYTHONPATH` is built from the parent directories of *the same* copy. Consequently, no matter which directory the user passes to `--dir`, **the agent code always executes from `<prod-tree>`** (including `deep_worker_cli`, `deepagents`, `claude_code_provider`). `--dir` only changes the process working directory (what `os.getcwd()` sees), not the codebase.
+`SCRIPT_DIR` always points at the directory where the script itself physically lives — i.e. `<prod-tree>/deep_worker/deep_worker_cli`. `PYTHONPATH` is built from the parent directories of *the same* copy. Consequently, no matter which directory the user passes to `--dir`, **the agent code always executes from `<prod-tree>`** (including `deep_worker_cli`, `deepagents`, `claude_code_sdk_provider`). `--dir` only changes the process working directory (what `os.getcwd()` sees), not the codebase.
 
 ### 1.2 What the user wants
 
@@ -64,10 +64,10 @@ These locations use `Path(__file__).parent...` and **automatically pick up the c
 | --- | --- |
 | `deep_worker/deep_worker_cli/deep_worker_cli/process/agent_process.py:20–22` | Adds `rpyc_async` (external repository, shared) |
 | `deep_worker/deep_worker_cli/deep_worker_cli/agent.py:15–17` | Walks up to `deep_worker/deepagents` via `__file__.parent.parent.parent.parent` |
-| `deep_worker/deep_worker_cli/deep_worker_cli/config.py:1654–1656` | Walks up to `<TREE>/` and adds it so that `claude_code_provider` can be imported |
-| `deep_worker/deep_worker_cli/deep_worker_cli/tools.py:31–41` | Similarly — walks up to `<TREE>/` to import `claude_code_provider.web_search` |
+| `deep_worker/deep_worker_cli/deep_worker_cli/config.py:1654–1656` | Walks up to `<TREE>/` and adds it so that `claude_code_sdk_provider` can be imported |
+| `deep_worker/deep_worker_cli/deep_worker_cli/tools.py:31–41` | Similarly — walks up to `<TREE>/` to import `claude_code_sdk_provider.web_search` |
 
-These locations are resilient to a checkout switch: it is enough for the bash launcher to start Python from the right tree — all of them will automatically find "their own" `deepagents` and "their own" `claude_code_provider`.
+These locations are resilient to a checkout switch: it is enough for the bash launcher to start Python from the right tree — all of them will automatically find "their own" `deepagents` and "their own" `claude_code_sdk_provider`.
 
 ### 2.3 Hardcoded absolute paths on `<prod-tree>` (do NOT work for `--dev`)
 
@@ -93,7 +93,7 @@ This is the "dirt" that `--dev` either bypasses or requires fixing. Full list (i
 
 * `/tmp/deep_worker_registry.json` — single process registry (see `process/registry.py:27`). Agent names are global. This is **intentional**: `dwcli` must see both kinds of agents in one list.
 * `~/.deep_worker/<name>/` — a given agent's data; does not depend on the tree.
-* `~/.deepagents/<name>/skills/` — the user's skills.
+* `~/.deep_worker/agents/<name>/skills/` — the user's skills.
 * `rpyc_async`, `claude_sdk` — external dependencies, mounted identically by both trees.
 
 ### 2.5 What must NOT be substituted
@@ -132,7 +132,7 @@ No other Python code **requires** the flag, because after the `PYTHONPATH` switc
 #### 3.3.1 Without `--dev` (current behaviour, unchanged)
 
 ```
-user $ deep-worker foo --provider claude-code --model opus
+user $ deep-worker foo --provider claude-code-sdk --model opus
         │
         ▼
 ~/.local/bin/deep-worker  →  symlink  →
@@ -150,7 +150,7 @@ The Python agent runs on prod code from <prod-tree>
 #### 3.3.2 With `--dev` (new behaviour)
 
 ```
-user $ deep-worker foo --dev --provider claude-code --model opus
+user $ deep-worker foo --dev --provider claude-code-sdk --model opus
         │
         ▼
 ~/.local/bin/deep-worker  →  symlink  →
@@ -402,7 +402,7 @@ deepagents_path = Path(__file__).parent.parent.parent.parent / "deepagents"
 1. **Unit**: parsing `--dev` in argparse, persisting to `launch_config`, restoring via `merge_restart_config`.
 2. **Integration (bash)**:
    * `deep-worker dummy --dev --dir /tmp --help` — must show help (or some meaningful reaction), using the dev launcher. Can be checked via `DEEP_WORKER_TREE_ROOT` (exported into the shell after exec).
-   * `deep-worker dummy_dev --dev --provider claude-code -sp --dir /tmp` (kill quickly with `pkill`): verify that `~/.deep_worker/dummy_dev/session_metadata.json` records `"dev_tree": true`.
+   * `deep-worker dummy_dev --dev --provider claude-code-sdk -sp --dir /tmp` (kill quickly with `pkill`): verify that `~/.deep_worker/dummy_dev/session_metadata.json` records `"dev_tree": true`.
    * `deep-worker dummy_dev --restart` (without `--dev`) — the launcher must switch to the dev tree on its own.
 3. **Smoke**: both variants (`--dev` and without) live in parallel, names do not conflict — the registry in `/tmp/deep_worker_registry.json` contains both.
 

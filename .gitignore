@@ -96,6 +96,7 @@ tests/screenshots/
 # Contains absolute paths of this machine and may contain ${env:...} references
 # to secrets — not committed to the repository. Modes: directory 0700, file 0600.
 .deepagents/
+.deep_worker/
 
 # Serena internal directory (LSP navigation): project.yml, symbol cache,
 # memories. Created by Serena itself in the project root. See lsp/README.md.

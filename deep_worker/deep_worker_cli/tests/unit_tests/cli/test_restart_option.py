@@ -28,7 +28,7 @@ def temp_data_dir():
 def saved_launch_config():
     """A realistic saved launch_config."""
     return {
-        "provider": "claude-code",
+        "provider": "claude-code-sdk",
         "model": "opus",
         "working_dir": "/path/to/project",
         "skip_permissions": True,
@@ -38,7 +38,7 @@ def saved_launch_config():
         "clean": True,  # was True in the original launch
         "started_at": "2026-04-11T16:59:41.692129",
         "pid": 3726921,
-        "cli_args": "myagent -sp -tm --dir /path/to/project --provider claude-code --model opus --clean",
+        "cli_args": "myagent -sp -tm --dir /path/to/project --provider claude-code-sdk --model opus --clean",
     }
 
 
@@ -97,13 +97,37 @@ class TestMergeRestartConfig:
 
         result = merge_restart_config(saved_launch_config, default_args)
 
-        assert result.provider == "claude-code"
+        assert result.provider == "claude-code-sdk"
         assert result.model == "opus"
         assert result.dir == Path("/path/to/project")
         assert result.skip_permissions is True
         assert result.task_manager is True
         assert result.memory_only is False
         assert result.use_sqlite is False
+
+    def test_explicit_tools_replaces_saved_selection(
+        self, saved_launch_config, default_args
+    ):
+        from deep_worker_cli.cli.agent_command import merge_restart_config
+
+        saved_launch_config["tools"] = ["-execute"]
+        default_args.tools = "*,read_file"
+        result = merge_restart_config(
+            saved_launch_config, default_args, explicit={"tools"}
+        )
+        assert result.tools == "*,read_file"
+
+    def test_explicit_empty_tools_clears_saved_selection(
+        self, saved_launch_config, default_args
+    ):
+        from deep_worker_cli.cli.agent_command import merge_restart_config
+
+        saved_launch_config["tools"] = ["*"]
+        default_args.tools = ""
+        result = merge_restart_config(
+            saved_launch_config, default_args, explicit={"tools"}
+        )
+        assert result.tools == ""
 
     def test_clean_never_inherited(self, saved_launch_config, default_args):
         """--clean from saved config must NOT be inherited."""
@@ -187,7 +211,7 @@ class TestMergeRestartConfig:
         assert default_args.provider == "deepseek"  # parser default
         # No explicit flags passed on the CLI.
         result = merge_restart_config(saved_launch_config, default_args, explicit=set())
-        assert result.provider == "claude-code"  # from saved
+        assert result.provider == "claude-code-sdk"  # from saved
 
 
 # ===========================================================================
@@ -213,14 +237,14 @@ class TestProviderSwitchRegression:
     """Explicit --provider must win and must not drag the old model along."""
 
     def test_explicit_provider_equal_to_parser_default_is_honored(self, saved_launch_config):
-        """`--restart a --provider deepseek` over a saved claude-code config.
+        """`--restart a --provider deepseek` over a saved claude-code-sdk config.
 
         The reported bug: deepseek equals the parser default, so it was treated
-        as 'not passed' and the saved claude-code provider was kept.
+        as 'not passed' and the saved claude-code-sdk provider was kept.
         """
         from deep_worker_cli.cli.agent_command import merge_restart_config
 
-        assert saved_launch_config["provider"] == "claude-code"
+        assert saved_launch_config["provider"] == "claude-code-sdk"
         args = _parse(["myagent", "--restart", "--provider", "deepseek"])
         explicit = {"provider"}
 
@@ -231,7 +255,7 @@ class TestProviderSwitchRegression:
     def test_provider_switch_drops_stale_saved_model(self, saved_launch_config):
         """Switching provider without --model must NOT inherit the old model.
 
-        saved = claude-code/opus ; restart with --provider deepseek (no --model).
+        saved = claude-code-sdk/opus ; restart with --provider deepseek (no --model).
         The opus model is a claude model and must not leak onto deepseek.
         """
         from deep_worker_cli.cli.agent_command import merge_restart_config
@@ -244,14 +268,14 @@ class TestProviderSwitchRegression:
 
         assert result.provider == "deepseek"
         assert result.model != "opus", (
-            "Stale claude-code model 'opus' leaked onto the new deepseek provider"
+            "Stale claude-code-sdk model 'opus' leaked onto the new deepseek provider"
         )
 
     @pytest.mark.parametrize(
         "argv, exp_provider, exp_model",
         [
             # No override at all: saved provider/model both win.
-            (["myagent", "--restart"], "claude-code", "opus"),
+            (["myagent", "--restart"], "claude-code-sdk", "opus"),
             # provider only (== parser default): new provider, model reset.
             (["myagent", "--restart", "--provider", "deepseek"], "deepseek", None),
             # provider only (!= parser default): new provider, model reset.
@@ -260,14 +284,14 @@ class TestProviderSwitchRegression:
             (["myagent", "--restart", "--provider", "deepseek", "--model", "deepseek-chat"],
              "deepseek", "deepseek-chat"),
             # model only: saved provider kept, explicit model wins.
-            (["myagent", "--restart", "--model", "sonnet"], "claude-code", "sonnet"),
+            (["myagent", "--restart", "--model", "sonnet"], "claude-code-sdk", "sonnet"),
             # same provider re-passed explicitly + no model: model resets to
             # the provider's default. The operator rule (a related internal incident):
             # any explicit provider declaration without --model means "use that
             # provider's default", even when re-declaring the same provider —
             # this is the only way to heal an already-poisoned same-provider
             # config (saved provider matches the cross-provider stale model).
-            (["myagent", "--restart", "--provider", "claude-code"], "claude-code", None),
+            (["myagent", "--restart", "--provider", "claude-code-sdk"], "claude-code-sdk", None),
         ],
     )
     def test_override_matrix(self, saved_launch_config, argv, exp_provider, exp_model):
@@ -400,7 +424,36 @@ class TestStopAgent:
 
     @pytest.mark.asyncio
     async def test_timeout_raises_error(self, temp_data_dir, saved_launch_config):
-        """If process doesn't die within timeout, raise TimeoutError."""
+        """A process that outlives SIGKILL too still raises TimeoutError.
+
+        The default is now ``force=True`` (backlog item 3), so reaching the
+        timeout means BOTH signals were ignored — see
+        ``test_restart_sigkill_escalation.py`` for the escalation contract.
+        """
+        from deep_worker_cli.process.agent_stop import stop_agent
+        from deep_worker_cli.process.registry import ProcessRegistry
+
+        _write_metadata(temp_data_dir, saved_launch_config, status="idle")
+
+        registry = MagicMock(spec=ProcessRegistry)
+        registry.lookup.return_value = AgentProcessInfo(
+            name="myagent", pid=99999, pid_file=Path("/tmp/x.pid"),
+            working_dir="/tmp/test", started_at=datetime.now(), rpyc_port=18861,
+        )
+
+        with patch("deep_worker_cli.process.agent_stop.os.kill"), \
+             patch("deep_worker_cli.process.agent_stop._is_process_alive", return_value=True), \
+             pytest.raises(TimeoutError, match="survived SIGKILL"):
+            await stop_agent(
+                "myagent", registry, data_dir=temp_data_dir,
+                timeout=0.3, kill_grace=0.3,
+            )
+
+    @pytest.mark.asyncio
+    async def test_timeout_without_force_keeps_sigterm_only_contract(
+        self, temp_data_dir, saved_launch_config
+    ):
+        """``force=False`` opts out of escalation and reports the old error."""
         from deep_worker_cli.process.agent_stop import stop_agent
         from deep_worker_cli.process.registry import ProcessRegistry
 
@@ -415,7 +468,10 @@ class TestStopAgent:
         with patch("deep_worker_cli.process.agent_stop.os.kill"), \
              patch("deep_worker_cli.process.agent_stop._is_process_alive", return_value=True), \
              pytest.raises(TimeoutError, match="did not stop"):
-            await stop_agent("myagent", registry, data_dir=temp_data_dir, timeout=0.5)
+            await stop_agent(
+                "myagent", registry, data_dir=temp_data_dir,
+                timeout=0.5, force=False,
+            )
 
     @pytest.mark.asyncio
     async def test_stop_error_status_agent(self, temp_data_dir, saved_launch_config):
@@ -476,7 +532,7 @@ class TestRestartValidation:
             result = load_launch_config("myagent")
 
         assert result is not None
-        assert result["provider"] == "claude-code"
+        assert result["provider"] == "claude-code-sdk"
         assert result["model"] == "opus"
 
 
@@ -492,7 +548,7 @@ class TestRestartLaunchConfigPersistence:
 
         launch_config = build_launch_config(effective)
         assert launch_config["model"] == "sonnet"
-        assert launch_config["provider"] == "claude-code"
+        assert launch_config["provider"] == "claude-code-sdk"
         assert launch_config["clean"] is False  # --clean not passed
 
     def test_clean_explicit_persisted(self, saved_launch_config, default_args):

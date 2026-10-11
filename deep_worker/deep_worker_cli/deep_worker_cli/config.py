@@ -18,6 +18,7 @@ from rich.console import Console
 
 from deep_worker_cli._version import __version__
 from deep_worker_cli.exceptions import CapabilityError
+from deep_worker_cli.storage_paths import project_config_dir
 from deep_worker_cli.model_predicate import (
     model_can_belong_to_provider as _leaf_model_can_belong_to_provider,
 )
@@ -353,7 +354,7 @@ def _find_project_agent_md(project_root: Path) -> list[Path]:
     """Find project-specific AGENTS.md file(s).
 
     Checks two locations and returns ALL that exist:
-    1. project_root/.deepagents/AGENTS.md
+    1. project_root/.deep_worker/AGENTS.md
     2. project_root/AGENTS.md
 
     Both files will be loaded and combined if both exist.
@@ -366,10 +367,11 @@ def _find_project_agent_md(project_root: Path) -> list[Path]:
     """
     paths = []
 
-    # Check .deepagents/AGENTS.md (preferred)
-    deepagents_md = project_root / ".deepagents" / "AGENTS.md"
-    if deepagents_md.exists():
-        paths.append(deepagents_md)
+    # Check .deep_worker/AGENTS.md (preferred). ``.deepagents/`` is banned
+    # for reads as well as writes (project policy), so it is not consulted.
+    project_md = project_config_dir(project_root) / "AGENTS.md"
+    if project_md.exists():
+        paths.append(project_md)
 
     # Check root AGENTS.md (fallback, but also include if both exist)
     root_md = project_root / "AGENTS.md"
@@ -422,49 +424,59 @@ def parse_shell_allow_list(allow_list_str: str | None) -> list[str] | None:
 # ==============================================================================
 # Provider Context Limits and Summarization Configuration
 # ==============================================================================
-# Context window sizes (in tokens) for different AI providers
-# Used as fallback when model profile doesn't provide max_input_tokens
-# Sources: Official documentation from Anthropic, DeepSeek, OpenAI, Google
-
+# Context window sizes (in tokens) for different AI providers.
+# Used as fallback when model profile doesn't provide max_input_tokens.
+#
+# Source of truth — DO NOT add hand-curated numbers here.
+# ------------------------------------------------------------
+# This dict deliberately contains NOTHING. All values come from
+# either:
+#
+#   (a) LangChain SDK profile data (``langchain_anthropic``,
+#       ``langchain_openai``, ``langchain_google_genai`` ship
+#       ``data._profiles._PROFILES`` with ``max_input_tokens``).
+#       These are kept current by the SDK maintainers on each
+#       release — and the :func:`get_model_context_limit` function
+#       reads ``model_profile["max_input_tokens"]`` from the
+#       LangChain model object first (priority 1).
+#
+#   (b) The ``default`` entry below — a generous fallback that
+#       prevents summarization from triggering spuriously on
+#       long conversations for unknown models.
+#
+# We do NOT hardcode Anthropic / OpenAI / Google values here
+# because they would be stale the day a new model ships. We
+# do NOT hardcode family aliases ("fable", "opus", "sonnet",
+# "haiku", "mythos") because the operator's contract is that
+# a family alias means "the latest available model in this
+# family" — and we cannot statically know the latest one.
+# Adding static values for family aliases is a past
+# regression in a different form: any value we
+# write here will be wrong the next time Anthropic ships a
+# new generation.
+#
+# For providers that do not ship SDK profile data (DeepSeek, Grok,
+# Mistral, Cohere), the path is:
+#   1. Try ``model_profile["max_input_tokens"]`` from LangChain
+#      (most providers populate this).
+#   2. Try provider-specific profile sources (see
+#      ``provider_max.py``).
+#   3. Fall back to ``default``.
+#
+# Resolution order (see :func:`get_model_context_limit`):
+#   1. LangChain ``model_profile["max_input_tokens"]`` (authoritative).
+#   2. Exact match against provider-keyed tables (see
+#      ``context_limit/provider_max.py`` — that file builds the
+#      table from SDK-shipped data, not from a hand-curated dict).
+#   3. ``default`` (100k) — generous fallback that lets small-window
+#      summarization heuristics still trigger on long conversations.
 PROVIDER_CONTEXT_LIMITS: dict[str, int] = {
-    # Claude Code short names (used by claude-code provider)
-    "opus": 1_000_000,
-    "sonnet": 200_000,
-    "haiku": 200_000,
-    # Anthropic Claude models (full names)
-    "claude-opus-4.6": 1_000_000,  # Requires anthropic-beta header
-    "claude-sonnet-4.6": 1_000_000,  # Requires anthropic-beta header
-    "claude-sonnet-4.5": 200_000,
-    "claude-sonnet-4": 200_000,
-    "claude-haiku-4.5": 200_000,
-    "claude-3.5-sonnet": 200_000,
-    "claude-3.5-haiku": 200_000,
-    "claude-3-opus": 200_000,
-    "claude-3-sonnet": 200_000,
-    "claude-3-haiku": 200_000,
-    # DeepSeek models
-    "deepseek-chat": 128_000,  # V3.2 API (legacy alias)
-    "deepseek-reasoner": 128_000,  # V3.2 API (legacy alias)
-    "deepseek-v3": 128_000,
-    "deepseek-v3.1": 128_000,
-    "deepseek-v3.2": 128_000,
-    "deepseek-v4-flash": 1_000_000,  # 1M context
-    "deepseek-v4-pro": 1_000_000,  # 1M context
-    "deepseek-coder-v2": 128_000,
-    "deepseek-r1": 64_000,  # R1 has smaller context
-    # OpenAI models
-    "gpt-5": 400_000,
-    "gpt-4-turbo": 128_000,
-    "gpt-4": 128_000,
-    "gpt-3.5-turbo": 16_385,
-    # Google Gemini models
-    "gemini-2.0-flash": 1_000_000,
-    "gemini-1.5-pro": 2_000_000,
-    # Mistral models
-    "mistral-large": 128_000,
-    # Cohere models
-    "command-r-plus": 128_000,
-    # Fallback for unknown models
+    # The ONLY entry here. Everything else is sourced from the
+    # LangChain profile data at runtime (see priority 1 in the
+    # resolution order above). Adding more entries here means
+    # accepting responsibility for keeping them current — which
+    # is the wrong tradeoff for a CLI that has to track dozens
+    # of rapidly-iterating providers.
     "default": 100_000,
 }
 
@@ -539,10 +551,23 @@ def get_model_context_limit(
             return PROVIDER_CONTEXT_LIMITS[model_name]
 
         # Try partial match (e.g., "anthropic:claude-sonnet-4.5" → "claude-sonnet-4.5")
-        # or "openrouter/anthropic/claude-sonnet-4.5" → "claude-sonnet-4.5"
-        for known_model, limit in PROVIDER_CONTEXT_LIMITS.items():
-            if known_model != "default" and known_model in model_name:
-                return limit
+        # or "openrouter/anthropic/claude-sonnet-4.5" → "claude-sonnet-4.5".
+        # IMPORTANT: prefer the LONGEST matching key, otherwise a
+        # substring like "gpt-5" would shadow "gpt-5-codex" (and give
+        # 1.05M for the 400k Codex CLI variant). A past
+        # lesson: substring aliases silently mask newer models. Iteration
+        # order in dicts is insertion order in CPython 3.7+, so we have
+        # to sort by length explicitly.
+        candidates = sorted(
+            (
+                (known_model, limit)
+                for known_model, limit in PROVIDER_CONTEXT_LIMITS.items()
+                if known_model != "default" and known_model in model_name
+            ),
+            key=lambda item: -len(item[0]),
+        )
+        if candidates:
+            return candidates[0][1]
 
     # Priority 3: Fallback
     return PROVIDER_CONTEXT_LIMITS["default"]
@@ -860,13 +885,18 @@ class Settings:
         return self.project_root is not None
 
     @property
-    def user_deepagents_dir(self) -> Path:
-        """Get the base user-level .deepagents directory.
+    def user_deep_worker_agents_dir(self) -> Path:
+        """Get the base user-level deep-worker agents dir (project policy).
+
+        Distinct from ``user_agents_dir`` (``~/.agents``), which is the
+        tool-agnostic alias tree.
 
         Returns:
-            Path to ~/.deepagents
+            Path to ~/.deep_worker/agents
         """
-        return Path.home() / ".deepagents"
+        from deep_worker_cli.storage_paths import deep_worker_home
+
+        return deep_worker_home() / "agents"
 
     @staticmethod
     def get_user_agent_md_path(agent_name: str) -> Path:
@@ -879,8 +909,8 @@ class Settings:
 
         Returns:
             Path to the agent data AGENTS.md file. For storage v3 this is
-            the AGENTS.md in the per-agent data directory; legacy v2 agents
-            keep using ~/.deepagents/{agent_name}/AGENTS.md.
+            ~/.deep_worker/{agent_name}/data/AGENTS.md; legacy v2 agents keep
+            using ~/.deep_worker/agents/{agent_name}/AGENTS.md.
         """
         from deep_worker_cli.storage_paths import deepagents_data_dir
         return deepagents_data_dir(agent_name, create=False) / "AGENTS.md"
@@ -891,11 +921,11 @@ class Settings:
         Returns path regardless of whether the file exists.
 
         Returns:
-            Path to {project_root}/.deepagents/AGENTS.md, or None if not in a project
+            Path to {project_root}/.deep_worker/AGENTS.md, or None if not in a project
         """
         if not self.project_root:
             return None
-        return self.project_root / ".deepagents" / "AGENTS.md"
+        return project_config_dir(self.project_root) / "AGENTS.md"
 
     @staticmethod
     def _is_valid_agent_name(agent_name: str) -> bool:
@@ -917,9 +947,9 @@ class Settings:
             agent_name: Name of the agent
 
         Returns:
-            Path to the agent data directory. For storage v3 this is the
-            per-agent data directory; legacy v2 agents keep using
-            ~/.deepagents/{agent_name}.
+            Path to the agent data directory. For storage v3 this is
+            ~/.deep_worker/{agent_name}/data; legacy v2 agents keep using
+            ~/.deep_worker/agents/{agent_name}.
 
         Raises:
             ValueError: If the agent name contains invalid characters.
@@ -940,9 +970,9 @@ class Settings:
             agent_name: Name of the agent
 
         Returns:
-            Path to the agent data directory. For storage v3 this is the
-            per-agent data directory; legacy v2 agents keep using
-            ~/.deepagents/{agent_name}.
+            Path to the agent data directory. For storage v3 this is
+            ~/.deep_worker/{agent_name}/data; legacy v2 agents keep using
+            ~/.deep_worker/agents/{agent_name}.
 
         Raises:
             ValueError: If the agent name contains invalid characters.
@@ -957,16 +987,16 @@ class Settings:
         agent_dir = deepagents_data_dir(agent_name, create=True)
         return agent_dir
 
-    def ensure_project_deepagents_dir(self) -> Path | None:
-        """Ensure the project .deepagents directory exists and return its path.
+    def ensure_project_config_dir(self) -> Path | None:
+        """Ensure the project ``.deep_worker`` dir exists and return its path.
 
         Returns:
-            Path to project .deepagents directory, or None if not in a project
+            Path to project .deep_worker directory, or None if not in a project
         """
         if not self.project_root:
             return None
 
-        project_deepagents_dir = self.project_root / ".deepagents"
+        project_deepagents_dir = project_config_dir(self.project_root)
         project_deepagents_dir.mkdir(parents=True, exist_ok=True)
         return project_deepagents_dir
 
@@ -977,7 +1007,7 @@ class Settings:
             agent_name: Name of the agent
 
         Returns:
-            Path to ~/.deepagents/{agent_name}/skills/
+            Path to ~/.deep_worker/agents/{agent_name}/skills/
         """
         return self.get_agent_dir(agent_name) / "skills"
 
@@ -988,7 +1018,7 @@ class Settings:
             agent_name: Name of the agent
 
         Returns:
-            Path to ~/.deepagents/{agent_name}/skills/
+            Path to ~/.deep_worker/agents/{agent_name}/skills/
         """
         from deep_worker_cli.storage_paths import deepagents_data_dir, ensure_private_dir
 
@@ -999,17 +1029,17 @@ class Settings:
         """Get project-level skills directory path.
 
         Returns:
-            Path to {project_root}/.deepagents/skills/, or None if not in a project
+            Path to {project_root}/.deep_worker/skills/, or None if not in a project
         """
         if not self.project_root:
             return None
-        return self.project_root / ".deepagents" / "skills"
+        return project_config_dir(self.project_root) / "skills"
 
     def ensure_project_skills_dir(self) -> Path | None:
         """Ensure project-level skills directory exists and return its path.
 
         Returns:
-            Path to {project_root}/.deepagents/skills/, or None if not in a project
+            Path to {project_root}/.deep_worker/skills/, or None if not in a project
         """
         if not self.project_root:
             return None
@@ -1026,7 +1056,7 @@ class Settings:
             agent_name: Name of the CLI agent (e.g., "deepagents")
 
         Returns:
-            Path to ~/.deepagents/{agent_name}/agents/
+            Path to ~/.deep_worker/agents/{agent_name}/agents/
         """
         return self.get_agent_dir(agent_name) / "agents"
 
@@ -1034,11 +1064,11 @@ class Settings:
         """Get project-level agents directory path for custom subagent definitions.
 
         Returns:
-            Path to {project_root}/.deepagents/agents/, or None if not in a project
+            Path to {project_root}/.deep_worker/agents/, or None if not in a project
         """
         if not self.project_root:
             return None
-        return self.project_root / ".deepagents" / "agents"
+        return project_config_dir(self.project_root) / "agents"
 
     @property
     def user_agents_dir(self) -> Path:
@@ -1375,7 +1405,7 @@ def _detect_provider(model_name: str) -> str | None:
         model_name: Model name to detect provider from
 
     Returns:
-        Provider name (deepseek, openai, anthropic, google, vertexai, claude-code) or None if can't detect
+        Provider name (deepseek, openai, anthropic, google, vertexai, claude-code-sdk) or None if can't detect
     """
     model_lower = model_name.lower()
 
@@ -1385,8 +1415,13 @@ def _detect_provider(model_name: str) -> str | None:
     if any(x in model_lower for x in ["gpt", "o1", "o3"]):
         return "openai"
 
-    # Check for Claude Code simple names (sonnet, haiku, opus, inherit)
-    # These are Claude Code-specific short names that Claude SDK resolves
+    # Check for Claude Code simple names (sonnet, haiku, opus, inherit).
+    # Auto-detection points at ``claude-code`` — the ACP-based provider,
+    # which is the one a bare ``--model sonnet`` should now reach. The
+    # legacy SDK provider is still available, but only when asked for by
+    # name (``--provider claude-code-sdk``): it carries a hard dependency
+    # on the private Claude Agent SDK fork, so it must never be what an
+    # operator lands on by accident.
     if model_lower in ("sonnet", "haiku", "opus", "inherit"):
         return "claude-code"
 
@@ -1415,6 +1450,10 @@ model_can_belong_to_provider = _leaf_model_can_belong_to_provider
 
 # Provider → (env_var, hardcoded_default) mapping.
 # Single source of truth for default model names.
+# Process cache for ~/.deep_worker/providers.json (see _config_provider_specs).
+_CONFIG_PROVIDER_CACHE: tuple | None = None
+
+
 _PROVIDER_DEFAULT_MODELS: dict[str, tuple[str | None, str | None]] = {
     "deepseek": ("DEEPSEEK_MODEL", "deepseek-v4-flash"),
     "openai": ("OPENAI_MODEL", "gpt-5.2"),
@@ -1429,9 +1468,13 @@ _PROVIDER_DEFAULT_MODELS: dict[str, tuple[str | None, str | None]] = {
     # deep-worker cannot know which applies, so it passes no ``--model``
     # and lets the claude CLI resolve its own default — the same contract
     # codex and grok already use. The previous hardcoded ``"sonnet"``
-    # silently overrode a rejected ``--model fable`` (see a related internal
-    # incident analysis (not included here)). CLAUDE_CODE_MODEL pins it when
-    # the operator wants.
+    # silently overrode a rejected ``--model fable`` (see a related
+    # internal incident analysis (not included here)). CLAUDE_CODE_SDK_MODEL
+    # pins it when the operator wants.
+    "claude-code-sdk": ("CLAUDE_CODE_SDK_MODEL", None),
+    # claude-code: do NOT pin a model. The claude-agent-acp adapter lets
+    # Claude Code resolve its own default (same contract as claude-code-sdk).
+    # CLAUDE_CODE_MODEL pins it when the operator wants.
     "claude-code": ("CLAUDE_CODE_MODEL", None),
     # Codex: do NOT pin a model version. Let Codex CLI pick its own
     # default (which evolves with the CLI). If the user sets
@@ -1466,6 +1509,81 @@ def get_default_model_name(provider: str) -> str | None:
     return fallback
 
 
+def _config_provider_specs() -> tuple:
+    """Config-declared API providers, or () when none/unreadable.
+
+    Cached per process: this is consulted on every model construction and
+    the file is small and static for the life of the agent.
+    """
+    global _CONFIG_PROVIDER_CACHE
+    if _CONFIG_PROVIDER_CACHE is None:
+        from deep_worker_cli.runtime.provider_registry import (
+            ProviderConfigError,
+            load_provider_specs,
+        )
+
+        try:
+            _CONFIG_PROVIDER_CACHE = load_provider_specs()
+        except ProviderConfigError as exc:
+            # Fail loud: a broken providers.json otherwise degrades into a
+            # baffling "unknown provider" much later.
+            console.print(f"[bold red]Error:[/bold red] {exc}")
+            sys.exit(1)
+    return _CONFIG_PROVIDER_CACHE
+
+
+def _config_provider_spec(provider: str | None):
+    """The config-declared spec named ``provider``, or None."""
+    if not provider:
+        return None
+    wanted = provider.strip().lower()
+    for spec in _config_provider_specs():
+        if spec.name == wanted:
+            return spec
+    return None
+
+
+def _config_provider_for_model(model_name: str):
+    """The config-declared spec claiming ``model_name`` via markers, or None."""
+    if not model_name:
+        return None
+    for spec in _config_provider_specs():
+        if spec.matches_model(model_name):
+            return spec
+    return None
+
+
+def _create_config_provider_model(spec, model_name: str, user: str | None):
+    """Build a chat model for a config-declared provider.
+
+    Only the ``openai`` dialect exists today (``SUPPORTED_DIALECTS`` in the
+    registry rejects anything else at load time), so this maps onto
+    ``ChatOpenAI`` with the operator's ``base_url``/key. ``model_name``
+    reaches the vendor VERBATIM — no local whitelist; an unknown name is
+    rejected by the vendor with a real error
+    (no local model whitelist).
+    """
+    from langchain_openai import ChatOpenAI
+
+    kwargs: dict[str, Any] = {
+        "model": model_name,
+        "base_url": spec.base_url,
+        "api_key": spec.api_key(),
+        # Same rationale as the deepseek branch: langchain_openai only
+        # auto-enables stream_options={"include_usage": true} for the
+        # DEFAULT base URL. We always pass an explicit base_url, so without
+        # this the token-statistics subsystem would record ``no_usage``.
+        "stream_usage": True,
+    }
+    if user is not None:
+        kwargs["model_kwargs"] = {"user": user}
+    # Operator escape hatch for vendor-specific knobs (temperature, etc.).
+    # Applied last so config can override our defaults deliberately.
+    kwargs.update(spec.extra)
+
+    return ChatOpenAI(**kwargs)
+
+
 def create_model(
     model_name_override: str | None = None,
     *,
@@ -1475,13 +1593,14 @@ def create_model(
     kind: str | None = None,
     stats_callback_factory: Callable[..., Any] | None = None,
     usage_event_callback_factory: Callable[..., Any] | None = None,
+    auto_approve: bool = False,
 ) -> BaseChatModel:
     """Create the appropriate model based on provider and model name.
 
     Args:
         model_name_override: DEPRECATED - First positional arg for backward compatibility.
                             Use model_name keyword arg instead.
-        provider: Provider name ("deepseek", "openai", "anthropic", "google", "vertexai", "claude-code")
+        provider: Provider name ("deepseek", "openai", "anthropic", "google", "vertexai", "claude-code-sdk")
                  If None, auto-detects based on available API keys or model name.
         model_name: Model name (e.g., "deepseek-chat", "gpt-4o", "sonnet", "haiku", "opus")
                    If None, uses environment variable or provider default.
@@ -1500,7 +1619,12 @@ def create_model(
         usage_event_callback_factory: Optional ``(kind, *, provider, model_name)``
               factory producing the event callback installed via
               ``model.set_usage_event_callback`` on custom providers
-              (claude-code/codex/grok).
+              (claude-code-sdk/codex/grok).
+        auto_approve: When True, permission prompts are auto-approved for
+              providers that surface them (claude-code). Mirrors the
+              CLI ``-sp``/``--dangerously-skip-permissions`` semantic
+              (owner decision): fail-closed deny unless explicitly
+              opted in. Ignored by providers without permission prompts.
 
     Returns:
         ChatModel instance (OpenAI, Anthropic, Google, or ClaudeCode)
@@ -1515,9 +1639,37 @@ def create_model(
         model_name = model_name_override
 
     # Determine provider and model
+    # Set when a config-declared provider (~/.deep_worker/providers.json)
+    # owns this construction; consumed by the dispatch chain below.
+    resolved_config_spec = None
+
     # CASE 1: Explicit provider provided - use it (model_name may or may not be provided)
     if provider:
-        # Validate provider has credentials (except claude-code which doesn't need API key)
+        # Config-declared API providers (~/.deep_worker/providers.json) are
+        # resolved BEFORE the built-in chain so adding a standard
+        # OpenAI-compatible vendor never requires editing this function.
+        config_spec = _config_provider_spec(provider)
+        if config_spec is not None:
+            if not config_spec.has_credentials():
+                console.print(
+                    f"[bold red]Error:[/bold red] Provider "
+                    f"'{config_spec.name}' requires {config_spec.api_key_env}. "
+                    f"Put it in ~/.deep_worker/env.d/{config_spec.name}.env "
+                    f"(mode 0600)."
+                )
+                sys.exit(1)
+            model_name = config_spec.resolve_model(model_name)
+            if not model_name:
+                console.print(
+                    f"[bold red]Error:[/bold red] No model specified for "
+                    f"provider '{config_spec.name}'. Pass --model, set "
+                    f"{config_spec.default_model_env or '<default_model_env>'}, "
+                    f"or add 'default_model' to its providers.json entry."
+                )
+                sys.exit(1)
+            resolved_config_spec = config_spec
+
+        # Validate provider has credentials (except claude-code-sdk which doesn't need API key)
         if provider == "deepseek" and not settings.has_deepseek:
             console.print(f"[bold red]Error:[/bold red] Provider '{provider}' requires DEEPSEEK_API_KEY")
             sys.exit(1)
@@ -1535,7 +1687,7 @@ def create_model(
                 f"[bold red]Error:[/bold red] Provider '{provider}' requires GOOGLE_CLOUD_PROJECT"
             )
             sys.exit(1)
-        # claude-code and codex don't need API key validation
+        # claude-code-sdk and codex don't need API key validation
         # (they use cached local CLI login)
 
         # Provider is valid and has credentials (or doesn't need them)
@@ -1546,9 +1698,26 @@ def create_model(
 
     # CASE 2: Only model_name provided (old behavior) - auto-detect provider
     elif model_name:
-        # Use provided model, auto-detect provider
-        provider = _detect_provider(model_name)
-        if not provider:
+        # Config-declared providers get first refusal on auto-detection via
+        # their operator-supplied ``model_markers`` (a provider with no
+        # markers never claims a model, so built-in detection is unchanged).
+        config_spec = _config_provider_for_model(model_name)
+        if config_spec is not None:
+            if not config_spec.has_credentials():
+                console.print(
+                    f"[bold red]Error:[/bold red] Model '{model_name}' "
+                    f"requires {config_spec.api_key_env}. Put it in "
+                    f"~/.deep_worker/env.d/{config_spec.name}.env (mode 0600)."
+                )
+                sys.exit(1)
+            resolved_config_spec = config_spec
+            provider = config_spec.name
+
+        # Use provided model, auto-detect provider (built-ins only — a
+        # config-declared provider already claimed it above via its markers).
+        if resolved_config_spec is None:
+            provider = _detect_provider(model_name)
+        if resolved_config_spec is None and not provider:
             console.print(
                 "[bold red]Error:[/bold red] Could not detect provider "
                 f"from model name: {model_name}"
@@ -1662,7 +1831,15 @@ def create_model(
 
     # Create the model
     model: BaseChatModel
-    if provider == "deepseek":
+    if resolved_config_spec is not None:
+        # Config-declared API provider. Falls through to the shared tail
+        # below (context limit + token-stats attachment) exactly like the
+        # built-ins — returning early here would silently skip token
+        # statistics.
+        model = _create_config_provider_model(
+            resolved_config_spec, model_name or "", user
+        )
+    elif provider == "deepseek":
         # ⚠️ Use ChatDeepSeek, NOT a bare ChatOpenAI.
         #
         # The default deepseek model (deepseek-v4-flash) is a THINKING /
@@ -1801,13 +1978,48 @@ def create_model(
                 temperature=0,
                 max_tokens=None,
             )
-    elif provider == "claude-code":
+    elif provider == "claude-code-sdk":
         # ============================================================================
         # CLAUDE-CODE provider — vendored package + Claude Agent SDK fork.
         # ============================================================================
         # Resolve the provider origin through provider_paths (source root on
         # sys.path in source mode; no-op in installed mode). See
         # deep_worker_cli/provider_paths.py.
+        from deep_worker_cli.provider_paths import ensure_provider_importable
+
+        resolution = ensure_provider_importable(
+            "deep_worker.providers.claude_code_sdk_provider"
+        )
+        if resolution.unavailable:
+            raise CapabilityError(
+                capability="claude-code-sdk",
+                remedy=resolution.remedy or resolution.unavailable,
+            )
+
+        from deep_worker.providers.claude_code_sdk_provider import ClaudeCodeChatModel
+
+        # Claude Code accepts simple model names (sonnet, haiku, opus, inherit)
+        # or full model names (claude-sonnet-4-5-20250929)
+        # The Claude SDK automatically resolves simple names to latest versions
+        model = ClaudeCodeChatModel(
+            model=model_name,
+            max_tokens=20_000,
+        )
+    elif provider == "claude-code":
+        # ============================================================================
+        # CLAUDE-CODE-ACP provider — Claude Code via the Agent Client Protocol
+        # (pinned @agentclientprotocol/claude-agent-acp adapter). Removes the
+        # hard dependency on the private Claude Agent SDK fork. See
+        # docs/providers/acp/docs/DESIGN_ACP_PROVIDER_LAYER.md.
+        # ============================================================================
+        # Resolve the provider origin through provider_paths (source root on
+        # sys.path in source mode; no-op in installed mode). See
+        # deep_worker_cli/provider_paths.py.
+        # ``model_name`` may be None — the adapter lets Claude Code pick its
+        # own current default (same contract as claude-code-sdk/codex/grok).
+        # Auto-approve mirrors the CLI's ``-sp``/``--dangerously-skip-permissions``
+        # (owner decision): false (deny-all) unless the operator opts in.
+        # ============================================================================
         from deep_worker_cli.provider_paths import ensure_provider_importable
 
         resolution = ensure_provider_importable(
@@ -1819,14 +2031,14 @@ def create_model(
                 remedy=resolution.remedy or resolution.unavailable,
             )
 
-        from deep_worker.providers.claude_code_provider import ClaudeCodeChatModel
+        from deep_worker.providers.claude_code_provider import (
+            ClaudeCodeAcpChatModel,
+        )
 
-        # Claude Code accepts simple model names (sonnet, haiku, opus, inherit)
-        # or full model names (claude-sonnet-4-5-20250929)
-        # The Claude SDK automatically resolves simple names to latest versions
-        model = ClaudeCodeChatModel(
-            model=model_name,
+        model = ClaudeCodeAcpChatModel(
+            model=model_name,            # may be None — Claude Code picks default
             max_tokens=20_000,
+            auto_approve=auto_approve,   # explicit -sp semantic, fail-closed
         )
     elif provider == "codex":
         # ============================================================================
@@ -1853,7 +2065,7 @@ def create_model(
         model = CodexChatModel(
             model=model_name,            # may be None — Codex picks default
             max_tokens=20_000,
-            # sandbox_mode/approval_policy defaults match Q3 (always-skip-prompts)
+            auto_approve=auto_approve,   # explicit -sp semantic, fail-closed
         )
     elif provider == "grok":
         # ============================================================================
@@ -1880,6 +2092,7 @@ def create_model(
         model = GrokChatModel(
             model=model_name,            # may be None — grok picks default
             max_tokens=20_000,
+            auto_approve=auto_approve,   # explicit -sp semantic, fail-closed
         )
     else:
         # Should not reach here due to earlier validation
@@ -1893,7 +2106,7 @@ def create_model(
 
     # Token-stats instrumentation (DESIGN_AGENT_TOKEN_STATS.md §5.1, §7).
     # Standard LangChain providers get an instance-level AsyncCallbackHandler;
-    # custom providers (claude-code/codex/grok) get ONLY the event callback via
+    # custom providers (claude-code-sdk/codex/grok) get ONLY the event callback via
     # ``set_usage_event_callback`` — a double source is impossible structurally.
     if stats_callback_factory is not None or usage_event_callback_factory is not None:
         _attach_token_stats(
@@ -1922,17 +2135,17 @@ def _attach_token_stats(
     Standard LangChain providers (deepseek/openai/anthropic/google/vertexai)
     receive a ``TokenStatsCallbackHandler`` on the model instance (inherited by
     ``bind_tools`` copies → summarization included). Custom providers
-    (claude-code/codex/grok) receive ONLY ``set_usage_event_callback(cb)`` —
+    (claude-code-sdk/codex/grok) receive ONLY ``set_usage_event_callback(cb)`` —
     never the LangChain handler, so a double usage source is impossible
     structurally (MAJOR-2, DESIGN_AGENT_TOKEN_STATS.md).
     """
     from deep_worker_cli.stats.token_stats import (
         CUSTOM_PROVIDERS,
-        STANDARD_PROVIDERS,
+        is_standard_provider,
     )
 
     try:
-        if provider in STANDARD_PROVIDERS and stats_callback_factory is not None:
+        if is_standard_provider(provider) and stats_callback_factory is not None:
             from deep_worker_cli.stats.callback import TokenStatsCallbackHandler
 
             handler = stats_callback_factory(kind, provider=provider, model_name=model_name)

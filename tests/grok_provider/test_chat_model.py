@@ -115,6 +115,7 @@ class _FakeProxy:
     def __init__(self) -> None:
         self.server_name = "deep_worker_proxy_test"
         self.resolved: list[tuple[str, Any]] = []
+        self.resolved_tool_names: list[str | None] = []
         self._tools: list[dict] = []
 
     def update_tools(self, md: list[dict]) -> None:
@@ -126,8 +127,18 @@ class _FakeProxy:
     async def start(self) -> None:
         return None
 
-    def resolve_call(self, call_id: str, result: Any) -> None:
+    def resolve_call(
+        self,
+        call_id: str,
+        result: Any,
+        *,
+        tool_name: str | None = None,
+    ) -> None:
+        # Mirrors the real ProxyMCPServer.resolve_call signature, including
+        # the keyword-only ``tool_name`` production passes. A fake that
+        # drifts from the real signature turns a green suite into a lie.
         self.resolved.append((call_id, result))
+        self.resolved_tool_names.append(tool_name)
 
 
 @pytest.fixture()
@@ -304,6 +315,43 @@ class TestNewTurn:
         assert "<system>" in first_text and "be helpful" in first_text
         assert "hello" in first_text
 
+    async def test_first_turn_replays_history_into_the_new_session(
+        self, model
+    ) -> None:
+        """A restarted agent (or one switched over from another provider)
+        has a LangGraph history but no live grok session. The brand-new
+        session must receive the prior turns, not just the newest line.
+
+        Before the fix the 7b re-slice fired on this first turn — its only
+        guard was ``sent_count < len(state_messages)``, trivially true when
+        ``sent_count`` seeds to 0 — and collapsed the whole history down to
+        the trailing HumanMessage. Mirrors the 2026-08-16 claude-code
+        amnesia; grok shares the code shape.
+        """
+        acp = model._acp_client
+        history = [
+            SystemMessage(content="sys"),
+            HumanMessage(content="remember: the codeword is ALPHA"),
+            AIMessage(content="noted"),
+            HumanMessage(content="what is the codeword?"),
+        ]
+        task = asyncio.create_task(
+            model.ainvoke(history, config=_cfg("restarted"))
+        )
+        await asyncio.sleep(0.01)
+        sid = f"sess-{acp.session_counter}"
+        acp.push_update(sid, {"sessionUpdate": "agent_message_chunk",
+                              "content": {"text": "ALPHA"}})
+        await asyncio.sleep(0.01)
+        acp.finish("end_turn")
+        await asyncio.wait_for(task, timeout=1)
+
+        first_text = acp.prompts[0]["prompt"][0]["text"]
+        assert "what is the codeword?" in first_text
+        assert "the codeword is ALPHA" in first_text, (
+            "the first grok turn dropped the agent's prior history"
+        )
+
     async def test_session_registered_in_index(self, model) -> None:
         acp = model._acp_client
         task = asyncio.create_task(
@@ -400,7 +448,7 @@ class TestProxyToolCall:
 
 
 class TestMapToolCall:
-    def test_unknown_builtin_routes_to_grok_builtin(self, model) -> None:
+    async def test_unknown_builtin_routes_to_grok_builtin(self, model) -> None:
         st = model._client_state.get_or_create("agentA")
         tc = model._map_tool_call(
             st,
@@ -414,7 +462,33 @@ class TestMapToolCall:
         assert tc["name"] == "GrokBuiltin"
         assert tc["args"]["_grok_original_title"] == "future_builtin_xyz"
 
-    def test_known_imagine_builtin_surfaces_by_acp_title(self, model) -> None:
+    def test_builtin_future_uses_the_running_loop_not_get_event_loop(
+        self, model
+    ) -> None:
+        """``_map_tool_call`` must take the RUNNING loop.
+
+        ``asyncio.get_event_loop()`` no longer creates a loop on demand
+        (Python 3.12) — it raises "There is no current event loop" whenever
+        the thread has none, which is exactly the state an earlier async test
+        leaves behind. That made three tests here pass in isolation and fail
+        in a full-suite run.
+
+        Asserted at the source level on purpose: from INSIDE a running loop
+        both spellings behave identically, so a behavioural test cannot tell
+        them apart and would not catch a regression back to the broken form.
+        """
+        import inspect
+
+        from deep_worker.providers.grok_provider import chat_model as cm_mod
+
+        source = inspect.getsource(cm_mod.GrokChatModel._map_tool_call)
+        assert "get_running_loop()" in source
+        assert "get_event_loop()" not in source, (
+            "_map_tool_call must not use asyncio.get_event_loop(): it raises "
+            "when the calling thread has no loop set"
+        )
+
+    async def test_known_imagine_builtin_surfaces_by_acp_title(self, model) -> None:
         st = model._client_state.get_or_create("agentA")
         tc = model._map_tool_call(
             st,
@@ -774,7 +848,7 @@ class TestMapToolCallProxyNormalization:
         assert tc is not None
         assert tc["args"] == {"file_path": "/y", "offset": 100}
 
-    def test_builtin_passthrough_rawInput_is_not_normalized(
+    async def test_builtin_passthrough_rawInput_is_not_normalized(
         self, fake_home, monkeypatch
     ) -> None:
         """CASE B (built-in passthrough) MUST forward rawInput verbatim.

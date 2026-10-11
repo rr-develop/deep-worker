@@ -2,8 +2,41 @@
 
 // State
 let ws = null;
-let selectedAgent = null;
-let agents = {};
+// Exposed on ``globalThis`` (window in browser, global in node) so that
+// node-side unit tests can pre-seed the selected agent / ``agents``
+// before driving the broadcast handlers.
+//
+// A related internal incident analysis (not included here), frontend section: the previous
+// form was
+//
+//     let selectedAgent = (globalThis.selectedAgent = null);
+//
+// which copies the value ONCE at load. A ``let`` at module scope does
+// not create a ``window`` property, so a later bare ``selectedAgent =
+// name`` in ``selectAgent()`` updated only the module binding while
+// ``globalThis.selectedAgent`` stayed ``null`` forever. Every handler
+// that guards on ``globalThis.selectedAgent`` (handleAgentMessage,
+// handleAgentContextChanged, _applyTokenUpdateIfFirstSeen) therefore
+// early-returned on every event in a real browser — while node tests
+// that pre-seed ``globalThis.selectedAgent`` directly stayed green,
+// because they never exercise ``selectAgent()``.
+//
+// The fix: there is NO module-local binding any more. The selected
+// agent lives solely as a ``globalThis`` property, and every read and
+// write in this file goes through ``globalThis.selectedAgent``, so the
+// two spellings cannot diverge because there is only one slot.
+//
+// A ``var`` alias was rejected deliberately: in a browser classic script
+// ``var`` binds to the global object and would work, but under the
+// node-side CommonJS test harness it is module-scoped and silently
+// diverges again — i.e. the tests would keep passing while production
+// broke, which is the exact failure mode this incident is about.
+//
+// ``agents`` below is safe as a plain alias: it is only ever MUTATED
+// (``agents[name] = …``), never reassigned, so the object identity that
+// was published on globalThis stays correct.
+globalThis.selectedAgent = null;
+let agents = (typeof globalThis !== 'undefined') ? (globalThis.agents = {}) : {};
 let selectedAgents = new Set(); // Multi-select for batch operations
 // request_id → pending entry. Two coexisting shapes discriminated by
 // ``type``:
@@ -75,7 +108,7 @@ function renderAgentList() {
     for (const [name, agent] of Object.entries(agents)) {
         const item = document.createElement('div');
         item.className = 'agent-item';
-        if (selectedAgent === name) {
+        if (globalThis.selectedAgent === name) {
             item.classList.add('selected');
         }
         
@@ -116,7 +149,7 @@ function getStatusDisplayLabel(agent) {
     return status;
 }
 
-// Get CSS class for status indicator dot (matches the web UI)
+// Get CSS class for status indicator dot
 //
 // IMPORTANT: the 'interrupted' check MUST come before any
 // status.includes('waiting') check. Otherwise — depending on string
@@ -131,7 +164,7 @@ function getStatusDotClass(status) {
     return '';
 }
 
-// Get CSS class for status text (matches the web UI)
+// Get CSS class for status text
 function getStatusTextClass(status) {
     if (status === 'ready' || status === 'idle') return 'status-text-ready';
     if (status === 'working' || status === 'running') return 'status-text-working';
@@ -145,7 +178,7 @@ function getStatusTextClass(status) {
 // (dead / not in the registry) rather than a transient failure against a live
 // agent. When true, the failed-op handler should remove the card — otherwise
 // a phantom card for an already-dead agent lingers and "Stop" appears to do
-// nothing (observed in a past incident). Backend signals this via a LookupError raised
+// nothing. Backend signals this via a LookupError raised
 // from request_stop ("Agent '<name>' not found"). We match on error_type AND
 // the message text so a backend wording/type tweak can't silently regress.
 // Pure function (no DOM/globals) so it is unit-testable in node.
@@ -162,7 +195,7 @@ function stopFailureMeansAgentGone(data) {
 // Select an agent
 function selectAgent(name) {
     console.log(`Selecting agent: ${name}`);
-    selectedAgent = name;
+    globalThis.selectedAgent = name;
 
     // Update UI
     renderAgentList();
@@ -178,6 +211,9 @@ function selectAgent(name) {
     document.getElementById('selected-agent-name').textContent = name;
     document.getElementById('agent-provider').textContent = agent.provider;
     document.getElementById('agent-model').textContent = agent.model;
+
+    // Context status bar — paint from in-memory AgentInfo mirror.
+    _paintContextSpans(agent);
 
     // Per-agent uptime: push started_at into the DOM once, then start
     // a single local clock-tick that re-renders every second. NO
@@ -204,6 +240,20 @@ function selectAgent(name) {
 
     // Load last assistant response
     loadLastResponse(name);
+
+    // The MCP and Stats panels belong to the previously selected agent, so
+    // drop their content and re-fetch only if the user actually opens them.
+    // Selecting an agent must not trigger a stats recompute or an MCP read.
+    mcpTabLoadedFor = null;
+    statsTabLoadedFor = null;
+    const mcpHost = document.getElementById('mcp-attached-list');
+    if (mcpHost) mcpHost.replaceChildren();
+    const statsHost = document.getElementById('stats-tab-content');
+    if (statsHost) statsHost.replaceChildren();
+
+    const activeTab = getActiveAgentTab();
+    if (activeTab === 'mcp') loadMcpTab(name);
+    if (activeTab === 'stats') loadStatsTab(name);
 }
 
 // Setup event listeners
@@ -221,6 +271,7 @@ function setupEventListeners() {
     // Full dialog button + verbosity dropdown
     document.getElementById('full-dialog-btn').onclick = openFullDialog;
     restoreFullDialogVerbosity();
+    restoreFullDialogMode();
 
     // Interrupt button — cancels the current agent invocation
     // (process keeps running, ready for next user message)
@@ -231,12 +282,17 @@ function setupEventListeners() {
 
     // Stop TaskManager button
     document.getElementById('stop-taskmanager-btn').onclick = stopTaskManager;
+
+    // Agent panel tabs and their lazily-loaded content.
+    setupAgentTabs();
+    setupMcpTab();
+    setupStatsTab();
 }
 
 // Interrupt currently running agent invocation.
 // The agent process keeps running; only the in-flight task is cancelled.
 async function interruptAgent() {
-    if (!selectedAgent) return;
+    if (!globalThis.selectedAgent) return;
 
     const btn = document.getElementById('interrupt-btn');
     const original = btn ? btn.textContent : null;
@@ -246,7 +302,7 @@ async function interruptAgent() {
     }
 
     try {
-        const response = await fetch(`/api/agents/${selectedAgent}/interrupt`, {
+        const response = await fetch(`/api/agents/${globalThis.selectedAgent}/interrupt`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
         });
@@ -258,7 +314,7 @@ async function interruptAgent() {
 
         // The actual confirmation arrives via WebSocket (agent_interrupted /
         // agent_interrupt_result). We just acknowledge the dispatch here.
-        showNotification(`Interrupt sent to ${selectedAgent}`, 'success');
+        showNotification(`Interrupt sent to ${globalThis.selectedAgent}`, 'success');
     } catch (error) {
         console.error('Error interrupting agent:', error);
         showNotification(`Failed to interrupt: ${error.message}`, 'error');
@@ -272,7 +328,7 @@ async function interruptAgent() {
 
 // Send message to agent
 async function sendMessage() {
-    if (!selectedAgent) {
+    if (!globalThis.selectedAgent) {
         alert('Please select an agent first');
         return;
     }
@@ -285,10 +341,10 @@ async function sendMessage() {
         return;
     }
     
-    console.log(`Sending message to ${selectedAgent}: ${message}`);
+    console.log(`Sending message to ${globalThis.selectedAgent}: ${message}`);
     
     try {
-        const response = await fetch(`/api/agents/${selectedAgent}/message`, {
+        const response = await fetch(`/api/agents/${globalThis.selectedAgent}/message`, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
@@ -309,8 +365,7 @@ async function sendMessage() {
     }
 }
 
-// Copy last response to clipboard (matches the web UI copyLastResponse)
-async function copyLastResponse(event) {
+// Copy last response to clipboardasync function copyLastResponse(event) {
     const content = document.getElementById('last-response-content');
     const text = content.textContent;
 
@@ -339,7 +394,7 @@ async function copyLastResponse(event) {
 // The error panel is SEPARATE from the Last Response panel. It is
 // persistent (never auto-dismissed), copyable, and shows the full
 // agent error text. It never overwrites the model's last response.
-// In a past incident, errors used to be a transient toast that
+// Errors used to be a transient toast that
 // vanished and could not be copied.
 
 // Show (or update) the persistent error panel with the given text.
@@ -414,21 +469,121 @@ function restoreFullDialogVerbosity() {
     });
 }
 
-// Open full dialog in new tab. Verbosity comes from the dropdown.
+// localStorage key for the persisted Full Dialog ACTION mode
+// (DESIGN_FULL_DIALOG_ACTION_MODE.md §3.2). Global, not per agent: survives
+// agent switches and browser restarts.
+const FULL_DIALOG_MODE_KEY = 'deep_worker_web.dialog_mode';
+
+// What the 📜 button does:
+//   tab      — open the static snapshot in a new tab (original behaviour);
+//   copy     — fetch the snapshot and put it on the clipboard, render nothing;
+//   download — save the snapshot as a .txt file, render nothing.
+// copy/download exist for screen-reader users: rendering a huge plain-text
+// tab makes Chrome build a full accessibility tree and serve the reader on
+// its UI thread — the whole browser freezes (measured 57 s for 150 KB).
+const FULL_DIALOG_MODE_VALUES = ['tab', 'copy', 'download'];
+
+function getFullDialogMode() {
+    const sel = document.getElementById('full-dialog-mode');
+    const v = sel ? sel.value : 'tab';
+    return FULL_DIALOG_MODE_VALUES.includes(v) ? v : 'tab';
+}
+
+function restoreFullDialogMode() {
+    const sel = document.getElementById('full-dialog-mode');
+    if (!sel) return;
+    try {
+        const saved = localStorage.getItem(FULL_DIALOG_MODE_KEY);
+        if (saved && FULL_DIALOG_MODE_VALUES.includes(saved)) {
+            sel.value = saved;
+        }
+    } catch (e) {
+        // localStorage unavailable — ignore
+    }
+    sel.addEventListener('change', () => {
+        try {
+            localStorage.setItem(FULL_DIALOG_MODE_KEY, sel.value);
+        } catch (e) { /* ignore */ }
+    });
+}
+
+function fullDialogUrl(agent, verbosity, download) {
+    const base = `/api/agents/${encodeURIComponent(agent)}/dialog-text?verbosity=${encodeURIComponent(verbosity)}`;
+    return download ? `${base}&download=1` : base;
+}
+
+// Fetch the snapshot and place it on the clipboard. Nothing is rendered:
+// the text lives only in a JS string and the clipboard. There is
+// deliberately NO hidden-textarea / execCommand fallback — that would put
+// the text back into the DOM and recreate the accessibility-tree freeze.
+async function copyFullDialogToClipboard(agent, verbosity) {
+    if (!navigator.clipboard || !navigator.clipboard.writeText) {
+        showNotification('Clipboard API unavailable in this context — use "Download .txt"', 'error');
+        return;
+    }
+    const resp = await fetch(fullDialogUrl(agent, verbosity, false), { cache: 'no-store' });
+    const text = await resp.text();
+    if (!resp.ok) {
+        let reason = text;
+        try { reason = JSON.parse(text).detail || text; } catch (e) { /* plain text */ }
+        showNotification(`Full Dialog: HTTP ${resp.status} — ${reason}`, 'error');
+        return;
+    }
+    await navigator.clipboard.writeText(text);
+    showNotification(`Copied ${text.length.toLocaleString()} characters (${agent}, ${verbosity})`, 'success');
+}
+
+// Save the snapshot as a file. Same-origin <a download> never opens a tab and
+// never renders; the server names the file (Content-Disposition). If the
+// server answers 503/504/500 the error body is what gets saved — deliberate,
+// the file then states the reason (design §6).
+function downloadFullDialog(agent, verbosity) {
+    const a = document.createElement('a');
+    a.href = fullDialogUrl(agent, verbosity, true);
+    a.download = `dialog_${agent}_${verbosity}.txt`;
+    a.style.display = 'none';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    showNotification(`Downloading Full Dialog (${agent}, ${verbosity})`, 'info');
+}
+
+// The 📜 button. Verbosity and mode come from the two dropdowns.
+//
+// tab mode: the tab is a STATIC, CLICK-TIME SNAPSHOT (text/plain, no script,
+// no streaming, Cache-Control: no-store) — it never updates itself.
+// 'noopener' puts it in its own browsing-context group (separate renderer
+// process), so a heavy dialog can never stall this page and vice versa.
+// See docs/DESIGN_FULL_DIALOG_STATIC_SNAPSHOT.md.
 function openFullDialog() {
-    if (!selectedAgent) return;
+    if (!globalThis.selectedAgent) return;
 
     const verbosity = getFullDialogVerbosity();
-    const url = `/api/agents/${selectedAgent}/dialog-text?verbosity=${encodeURIComponent(verbosity)}`;
-    window.open(url, '_blank');
+    const mode = getFullDialogMode();
+    const agent = globalThis.selectedAgent;
+
+    if (mode === 'copy') {
+        const btn = document.getElementById('full-dialog-btn');
+        if (btn) btn.disabled = true;
+        copyFullDialogToClipboard(agent, verbosity)
+            .catch((e) => showNotification(`Copy failed: ${e && e.message ? e.message : e}`, 'error'))
+            .finally(() => { if (btn) btn.disabled = false; });
+        return;
+    }
+    if (mode === 'download') {
+        downloadFullDialog(agent, verbosity);
+        return;
+    }
+    const url = fullDialogUrl(agent, verbosity, false);
+    window.open(url, '_blank', 'noopener,noreferrer');
 }
 
 // Open the token/cache stats page for the selected agent (§6.2).
 // The page fetches the snapshot itself on load; no polling.
 function openAgentStats() {
-    if (!selectedAgent) return;
-    const url = `/static/stats.html?agent=${encodeURIComponent(selectedAgent)}`;
-    window.open(url, '_blank');
+    if (!globalThis.selectedAgent) return;
+    const url = `/static/stats.html?agent=${encodeURIComponent(globalThis.selectedAgent)}`;
+    window.open(url, '_blank', 'noopener,noreferrer');
 }
 
 // Load agent history using fire-and-forget with request correlation
@@ -550,7 +705,7 @@ function handleLastResponseResult(data) {
         clearTimeout(pending.timeout);
         pending.resolve(last_response);
         pendingRequests.delete(request_id);
-    } else if (agent_name === selectedAgent) {
+    } else if (agent_name === globalThis.selectedAgent) {
         // No pending request — direct UI update
         const responseContent = document.getElementById('last-response-content');
         if (last_response && last_response.content) {
@@ -577,7 +732,7 @@ function handleApprovalRequest(data) {
     const { agent_name, approval_id, actions } = data;
     console.log(`Approval request for ${agent_name}:`, actions);
 
-    if (agent_name !== selectedAgent) return;
+    if (agent_name !== globalThis.selectedAgent) return;
 
     // If auto-approve is enabled, send approve immediately
     if (autoApproveEnabled) {
@@ -633,25 +788,25 @@ async function sendApprovalDecision(agentName, approvalId, decision) {
 
 // Approve button handler
 function approveAction() {
-    if (!selectedAgent || !currentApprovalId) return;
-    sendApprovalDecision(selectedAgent, currentApprovalId, 'approve');
+    if (!globalThis.selectedAgent || !currentApprovalId) return;
+    sendApprovalDecision(globalThis.selectedAgent, currentApprovalId, 'approve');
     document.getElementById('approval-panel').style.display = 'none';
     currentApprovalId = null;
 }
 
 // Reject button handler
 function rejectAction() {
-    if (!selectedAgent || !currentApprovalId) return;
-    sendApprovalDecision(selectedAgent, currentApprovalId, 'reject');
+    if (!globalThis.selectedAgent || !currentApprovalId) return;
+    sendApprovalDecision(globalThis.selectedAgent, currentApprovalId, 'reject');
     document.getElementById('approval-panel').style.display = 'none';
     currentApprovalId = null;
 }
 
 // Auto-approve all button handler
 function autoApproveAll() {
-    if (!selectedAgent || !currentApprovalId) return;
+    if (!globalThis.selectedAgent || !currentApprovalId) return;
     autoApproveEnabled = true;
-    sendApprovalDecision(selectedAgent, currentApprovalId, 'auto_approve_all');
+    sendApprovalDecision(globalThis.selectedAgent, currentApprovalId, 'auto_approve_all');
     document.getElementById('approval-panel').style.display = 'none';
     currentApprovalId = null;
     showNotification('Auto-approve enabled for this session', 'success');
@@ -668,23 +823,23 @@ function updateStopTaskManagerButton(agent) {
 
     // Update button text to show state
     if (taskManagerActive) {
-        stopBtn.textContent = '⏹️ Stop TaskManager';
-        stopBtn.title = 'Stop the running TaskManager';
+        stopBtn.textContent = '⏹️ Stop TM';
+        stopBtn.title = 'Stop the running TM (TaskManager)';
     } else {
-        stopBtn.textContent = '⏹️ Stop TaskManager';
-        stopBtn.title = 'TaskManager is not active';
+        stopBtn.textContent = '⏹️ Stop TM';
+        stopBtn.title = 'TM (TaskManager) is not active';
     }
 }
 
 // Stop TaskManager (fire-and-forget, result arrives via WebSocket).
 async function stopTaskManager() {
-    if (!selectedAgent) return;
+    if (!globalThis.selectedAgent) return;
 
-    if (!confirm('Stop TaskManager for this agent?')) return;
+    if (!confirm('Stop TM (TaskManager) for this agent?')) return;
 
     const btn = document.getElementById('stop-taskmanager-btn');
     try {
-        const response = await fetch(`/api/agents/${selectedAgent}/stop_task_manager`, {
+        const response = await fetch(`/api/agents/${globalThis.selectedAgent}/stop_task_manager`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ force: false }),
@@ -695,7 +850,7 @@ async function stopTaskManager() {
             return;
         }
         const data = await response.json();
-        trackButton(data.request_id, btn, 'task_manager_stop', selectedAgent, '⏳ Stopping TM…');
+        trackButton(data.request_id, btn, 'task_manager_stop', globalThis.selectedAgent, '⏳ Stopping TM…');
         showNotification('TaskManager stop requested', 'info');
     } catch (error) {
         showNotification('Error stopping TaskManager: ' + error.message, 'error');
@@ -704,7 +859,7 @@ async function stopTaskManager() {
 
 // Toggle TaskManager enabled/disabled
 async function toggleTaskManager(enabled) {
-    if (!selectedAgent) return;
+    if (!globalThis.selectedAgent) return;
     // Update the local cache IMMEDIATELY so the choice sticks when the
     // user switches to another agent and back. ``selectAgent`` /
     // ``updateTmControls`` read ``agents[name].task_manager_disabled``;
@@ -715,13 +870,13 @@ async function toggleTaskManager(enabled) {
     // UX correct instantly and independent of broadcast timing.)
     // User report 2026-05-20: disabling TM did not stick across
     // re-select. Disabling must be permanent until the user re-enables.
-    const agent = agents[selectedAgent];
+    const agent = agents[globalThis.selectedAgent];
     if (agent) {
         agent.task_manager_disabled = !enabled;
         agent.has_task_manager = true;
     }
     try {
-        await fetch(`/api/agents/${selectedAgent}/task-manager/toggle`, {
+        await fetch(`/api/agents/${globalThis.selectedAgent}/task-manager/toggle`, {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({enabled}),
@@ -734,10 +889,10 @@ async function toggleTaskManager(enabled) {
 
 // Reset TaskManager to initial state
 async function resetTaskManager() {
-    if (!selectedAgent) return;
+    if (!globalThis.selectedAgent) return;
     if (!confirm('Reset TaskManager? This clears all evaluation history.')) return;
     try {
-        const response = await fetch(`/api/agents/${selectedAgent}/task-manager/reset`, {
+        const response = await fetch(`/api/agents/${globalThis.selectedAgent}/task-manager/reset`, {
             method: 'POST',
         });
         if (response.ok) {
@@ -825,7 +980,7 @@ function labelForOp(op) {
         agent_restart: 'Restart',
         agent_spawn: 'Start',
         batch: 'Batch',
-        task_manager_stop: 'Stop TaskManager',
+        task_manager_stop: 'Stop TM',
         agent_summarize: 'Summarize context',
     };
     return m[op] || op;
@@ -889,6 +1044,19 @@ function handleWebSocketMessage(data) {
         case 'agent_started_at_changed':
             handleAgentStartedAtChanged(data);
             break;
+        case 'agent_context_changed':
+            // Auto-refresh contract: the backend fires this on every
+            // status poll where the 6 context fields (agent_*/tm_*)
+            // OR the operator-set ``context_limit`` changed
+            // (diff-check in agent_service._maybe_broadcast_context_changed).
+            // Without this case the operator has to refresh the page
+            // to see any context update — regression from commit
+            // 3bdf351 where the case was omitted, no test exercised
+            // the switch itself, and the AST-guard did not exist yet.
+            // See tests/unit/test_ws_router_context_changed.js and
+            // tests/unit/test_ws_router_covers_backend_broadcasts.py.
+            handleAgentContextChanged(data);
+            break;
         case 'agent_terminated':
             handleAgentTerminated(data);
             break;
@@ -902,7 +1070,7 @@ function handleWebSocketMessage(data) {
             // A client RPyC channel to the agent was flooded and quarantined.
             // This is a WARNING ONLY — the agent keeps working and its status
             // is unchanged. Show a non-blocking warning; do NOT touch the
-            // agent's status badge or the error panel. Observed in a past incident.
+            // agent's status badge or the error panel.
             handleChannelQuarantined(data);
             break;
 
@@ -921,6 +1089,20 @@ function handleWebSocketMessage(data) {
                 'info',
             );
             break;
+        case 'agent_shutdown_rpc_failed': {
+            // Backend attempted an in-process shutdown RPC and it failed;
+            // it falls back to SIGTERM automatically, but the operator
+            // should see WHY the graceful path did not work.  Warning
+            // (not error) — the stop still proceeds.
+            const p = data.payload || {};
+            const reason = p.reason || 'unknown';
+            const detail = p.detail ? ` (${p.detail})` : '';
+            showNotification(
+                `Graceful shutdown RPC failed for ${data.agent_name || ''}: ${reason}${detail} — falling back to SIGTERM`,
+                'warning',
+            );
+            break;
+        }
         case 'batch_progress':
             // Throttled progress; log only — summary shows final state.
             if (data.payload) {
@@ -956,7 +1138,7 @@ function handleWebSocketMessage(data) {
             finalizeRequest(data.request_id);
             // If a stop/restart failed because the agent is GONE (not found /
             // not running), the card is a phantom — remove it so the UI is
-            // consistent and "Stop" visibly resolves it (observed in a past incident).
+            // consistent and "Stop" visibly resolves it.
             if (
                 (data.type === 'agent_stop_failed' || data.type === 'agent_restart_failed') &&
                 data.agent_name &&
@@ -997,9 +1179,12 @@ function handleWebSocketMessage(data) {
 // Handle agent message
 function handleAgentMessage(data) {
     const { agent_name, message } = data;
+    // Single source of truth: the selected agent lives only as a
+    // globalThis property (see the declaration at the top of this file).
+    const sel = globalThis.selectedAgent;
 
     // Only update if this is the selected agent (as per design decision Q2)
-    if (agent_name !== selectedAgent) {
+    if (agent_name !== sel) {
         return;
     }
 
@@ -1060,6 +1245,10 @@ function handleAgentMessage(data) {
         // Log for debugging
         console.log(`[Last Response] Updated (${message.type}): ${message.content.length} chars`);
     }
+
+    // Best-effort token_update propagation to the context status bar.
+    // Only fires before a snapshot is known (post-snapshot rule: M7).
+    _applyTokenUpdateIfFirstSeen(message);
 }
 
 // Handle agent response (fire-and-forget callback)
@@ -1079,7 +1268,7 @@ function handleAgentResponse(data) {
     // from the real-time WebSocket subscription.
 
     // Only update if this is the selected agent
-    if (agent_name !== selectedAgent) {
+    if (agent_name !== globalThis.selectedAgent) {
         return;
     }
 
@@ -1111,7 +1300,7 @@ function handleAgentError(data) {
     // For the selected agent, surface the FULL error text persistently
     // in the dedicated error panel — copyable, does not auto-dismiss,
     // and does NOT overwrite the model's last response.
-    if (agent_name === selectedAgent) {
+    if (agent_name === globalThis.selectedAgent) {
         const fullText = error_type ? `${error_type}: ${error}` : String(error);
         showLastError(fullText);
         // Intentionally NOT reloading last-response here: the error must
@@ -1141,7 +1330,7 @@ function handleHistoryResponse(data) {
         pendingRequests.delete(request_id);
     } else {
         // No pending request - might be auto-refresh
-        if (agent_name === selectedAgent) {
+        if (agent_name === globalThis.selectedAgent) {
             displayHistory(history, agent_name);
         }
     }
@@ -1177,7 +1366,7 @@ function handleDetailedStatusResponse(data) {
     }
 
     // Update UI if this is the selected agent
-    if (agent_name === selectedAgent && status) {
+    if (agent_name === globalThis.selectedAgent && status) {
         document.getElementById('agent-provider').textContent = status.provider;
         document.getElementById('agent-model').textContent = status.model;
 
@@ -1219,7 +1408,7 @@ function handleAgentMetadata(data) {
             agents[agent_name].status_metadata = null;
         }
 
-        if (agent_name === selectedAgent) {
+        if (agent_name === globalThis.selectedAgent) {
             document.getElementById('agent-provider').textContent = agents[agent_name].provider;
             document.getElementById('agent-model').textContent = agents[agent_name].model;
         }
@@ -1253,7 +1442,7 @@ function handleAgentStatus(data) {
         }
 
         // Update UI if this is the selected agent
-        if (agent_name === selectedAgent) {
+        if (agent_name === globalThis.selectedAgent) {
             updateStopTaskManagerButton(agents[agent_name]);
             updateTmControls(agents[agent_name]);
             // Persistent error panel mirrors the agent's error state.
@@ -1301,7 +1490,7 @@ function handleAgentDiscovered(data) {
     // Covers the ungraceful-restart path: reconcile briefly sees the
     // agent as GONE, then rediscovers it with a fresh started_at.
     // Push the new value into the uptime panel and reset the ticker.
-    if (agent.name === selectedAgent) {
+    if (agent.name === globalThis.selectedAgent) {
         setAgentUptimeStartedAt(agent.started_at);
         startAgentUptimeTicker();
     }
@@ -1316,7 +1505,7 @@ function handleAgentStartedAtChanged(data) {
     if (agents[agent_name]) {
         agents[agent_name].started_at = started_at;
     }
-    if (agent_name === selectedAgent) {
+    if (agent_name === globalThis.selectedAgent) {
         setAgentUptimeStartedAt(started_at);
         startAgentUptimeTicker();
     }
@@ -1339,8 +1528,8 @@ function handleAgentTerminated(data) {
     }
 
     // Deselect if it was the selected agent
-    if (selectedAgent === agent_name) {
-        selectedAgent = null;
+    if (globalThis.selectedAgent === agent_name) {
+        globalThis.selectedAgent = null;
         document.getElementById('no-agent-selected').style.display = 'flex';
         document.getElementById('agent-selected').style.display = 'none';
         // Stop the per-agent uptime ticker — nothing to tick against
@@ -1366,14 +1555,14 @@ function handleAgentInterrupted(data) {
     //   (often a correction). Rendered in amber.
     // - WAITING_INPUT = inside an in-progress turn, waiting for a tool to
     //   return. Rendered in blue.
-    const target = agentName || selectedAgent;
+    const target = agentName || globalThis.selectedAgent;
     if (target && agents[target]) {
         agents[target].status = 'interrupted';
         agents[target].interrupted = true;
         renderAgentList();
     }
 
-    if (target === selectedAgent) {
+    if (target === globalThis.selectedAgent) {
         showNotification(
             `Agent ${target} interrupted — awaiting your input`,
             'info',
@@ -1389,7 +1578,7 @@ function handleAgentInterruptResult(data) {
         console.log(`[Interrupt] dispatched for ${agent_name}: ${message || 'ok'}`);
     } else {
         console.warn(`[Interrupt] failed for ${agent_name}: ${error || 'unknown'}`);
-        if (agent_name === selectedAgent) {
+        if (agent_name === globalThis.selectedAgent) {
             showNotification(
                 `Interrupt failed: ${error || 'unknown error'}`,
                 'error',
@@ -1402,7 +1591,6 @@ function handleAgentInterruptResult(data) {
 // flooded and quarantined. The agent KEEPS WORKING and its status is
 // unchanged — so we show a non-blocking warning toast only, and deliberately
 // do NOT touch the agent's status badge or the "Last Error" panel.
-// Observed in a past incident.
 function handleChannelQuarantined(data) {
     const { agent_name, peer, connid } = data;
     console.warn(
@@ -1411,7 +1599,7 @@ function handleChannelQuarantined(data) {
     );
     // Only surface a toast for the agent the user is looking at, to avoid
     // noise from background agents.
-    if (agent_name === selectedAgent) {
+    if (agent_name === globalThis.selectedAgent) {
         showNotification(
             `Warning: a client connection to ${agent_name} was flooded and ` +
             `quarantined. The agent keeps working — status unchanged.`,
@@ -1438,6 +1626,11 @@ function showNotification(message, type = 'info') {
     if (!container) {
         container = document.createElement('div');
         container.id = 'notification-container';
+        // Announce toasts to screen readers (NVDA/JAWS): copy/download
+        // results are ONLY reported through toasts. Polite = queued, does
+        // not interrupt the current utterance.
+        container.setAttribute('role', 'status');
+        container.setAttribute('aria-live', 'polite');
         container.style.cssText = `
             position: fixed;
             top: 20px;
@@ -1572,10 +1765,208 @@ function refreshAgentUptimeDisplay() {
     el.textContent = formatAgentUptime(startedAtIso, Date.now());
 }
 
+// =====================================================================
+// Context status bar (DESIGN_AGENT_CONTEXT_STATUS_BAR.md)
+// Pure formatting helper exposed for both browser and node tests.
+// =====================================================================
+function _fmtK(n) {
+    // "1500" -> "1.5k", "42100" -> "42.1k", "999" -> "999".
+    if (n == null) return null;
+    if (typeof n !== 'number' || !Number.isFinite(n)) return null;
+    if (n < 1000) return String(n);
+    const k = n / 1000;
+    if (Number.isInteger(k)) return `${k}k`;
+    // 1 decimal place, trim trailing zero when second decimal is zero.
+    const s = k.toFixed(1);
+    return s.endsWith('.0') ? `${Math.round(k)}k` : `${s}k`;
+}
+
+function formatAgentContext(used, size, semantics) {
+    // No data at all → "-".
+    if (used == null && size == null && semantics == null) return '-';
+
+    // Snapshot semantics: provider reported BOTH used AND size. The UI
+    // uses "X/Y" so the user can see how close they are to the limit.
+    // Snapshot-without-size (used != null, size == null) is an anomaly
+    // (provider declared a snapshot but didn't carry the size); render
+    // "X/?" instead of a bare number so the user sees something is
+    // wrong with the snapshot rather than mistaking it for a normal
+    // tokens-only reading.
+    if (semantics === 'context_snapshot') {
+        const uStr = _fmtK(used == null ? 0 : used);
+        const sStr = size == null ? '?' : _fmtK(size);
+        return `${uStr}/${sStr}`;
+    }
+    // Tokens semantics (or null semantics): the provider returned token
+    // counts but no size (no context_snapshot). Numbers come from the
+    // provider's tokenizer — they are EXACT, not estimated. Render
+    // just the count, no qualifier.
+    //
+    // An "(est.)" qualifier is reserved for a future path where the
+    // system estimates token usage WITHOUT provider data (e.g. char/4
+    // heuristics or a local tokenizer fallback). No such path exists
+    // in the code today; flagging a provider-reported count as an
+    // estimate would mislead the operator about its provenance.
+    const uStr = _fmtK(used);
+    if (uStr == null) return '-';
+    return `${uStr} tokens`;
+}
+
+// Render the ``Last turn`` per-turn token total.  This is DELIBERATELY
+// separate from ``formatAgentContext`` so the two numbers can never be
+// confused with each other or with the operator-set ``-l`` limit.  The
+// per-turn total is the sum of prompt + completion tokens the provider
+// billed for the most recent response; it is NOT a cumulative context
+// gauge and MUST NOT be compared with ``context_limit``.
+// rg1_worker 2026-08-22 (Context: 2265.4k vs Limit: 400k regression).
+function formatLastTurnTokens(total) {
+    const s = _fmtK(total);
+    if (s == null) return null;
+    return `${s} tokens`;
+}
+
+// Render the operator-set context limit (-l flag). Pure formatter —
+// isolated for unit testing in node. The shape is "400k (-l)" so the
+// operator can see at a glance:
+//   - the SIZE of the cap (so they know what the guard is holding);
+//   - the SOURCE (the -l flag) — distinguishes it from a provider's
+//     default window that happens to match (rg1_worker 2026-08-18 — the
+//     original silent failure).
+function formatContextLimit(limit) {
+    // Missing (-l not set) → "-" — the UI must not invent a value
+    // where the operator did not set one.
+    if (limit == null) return '-';
+    // Defensive: NaN / Infinity / negative are not valid -l values
+    // (parse_context_limit normalises to a positive int). Render the
+    // missing-marker rather than "null (-l)" or "NaN (-l)".
+    const fmt = _fmtK(limit);
+    if (fmt == null) return '-';
+    return `${fmt} (-l)`;
+}
+
+// Render both the agent-context and (when applicable) the TM-context
+// spans from the per-agent in-memory state. Treats `data-` attributes on
+// the span as the source of truth so a manual refresh races correctly
+// with broadcast-driven updates.
+function _paintContextSpans(agentInfo) {
+    const agentEl = document.getElementById('agent-context');
+    const tmWrap = document.getElementById('agent-tm-context-wrap');
+    const tmEl = document.getElementById('agent-tm-context');
+    const limitEl = document.getElementById('agent-context-limit');
+    const lastTurnWrap = document.getElementById('agent-last-turn-wrap');
+    const lastTurnEl = document.getElementById('agent-last-turn');
+    if (!agentEl) return;
+    agentEl.textContent = formatAgentContext(
+        agentInfo.agent_context_used,
+        agentInfo.agent_context_size,
+        agentInfo.agent_context_semantics,
+    );
+    if (limitEl) {
+        limitEl.textContent = formatContextLimit(agentInfo.context_limit);
+    }
+    // ``Last turn`` row — visible only when the backend has an actual
+    // per-turn number to show.  Keeping the wrap hidden when the number
+    // is missing avoids a dangling ``Last turn: -`` that would look like
+    // a broken field to the operator.
+    // Suppress the row entirely when it would restate the ``Context``
+    // number.  Under tokens semantics ``Context`` shows ``prompt_tokens``
+    // and ``Last turn`` shows ``total_tokens``; a provider that reports no
+    // completion accounting makes the two collide, and painting the same
+    // value on two rows reads as a broken field.  Under snapshot semantics
+    // ``Context`` renders as ``used/size``, so an equal per-turn total is
+    // NOT a duplicate and the row stays.
+    if (lastTurnWrap) {
+        const isTokensSemantics = agentInfo.agent_context_semantics === 'tokens';
+        const duplicatesContext = (
+            isTokensSemantics
+            && agentInfo.agent_last_turn_tokens != null
+            && agentInfo.agent_last_turn_tokens === agentInfo.agent_context_used
+        );
+        const lastStr = duplicatesContext
+            ? null
+            : formatLastTurnTokens(agentInfo.agent_last_turn_tokens);
+        if (lastStr != null) {
+            lastTurnWrap.style.display = '';
+            if (lastTurnEl) lastTurnEl.textContent = lastStr;
+        } else {
+            lastTurnWrap.style.display = 'none';
+            if (lastTurnEl) lastTurnEl.textContent = '';
+        }
+    }
+    if (tmWrap) {
+        const hasTm = agentInfo.has_task_manager === true;
+        tmWrap.style.display = hasTm ? '' : 'none';
+        if (hasTm && tmEl) {
+            tmEl.textContent = formatAgentContext(
+                agentInfo.tm_context_used,
+                agentInfo.tm_context_size,
+                agentInfo.tm_context_semantics,
+            );
+        } else if (tmEl) {
+            tmEl.textContent = '';
+        }
+    }
+}
+
+// Receives the backend ``agent_context_changed`` broadcast and mirrors
+// the 6 fields into the in-memory agent_info, then re-paints the
+// spans. Isolated as a separate export so the node test can drive
+// snapshot + token_update sequences directly. Reads the selected agent
+// and ``agents`` from ``globalThis`` so node-side tests can pre-seed
+// them; in the browser ``globalThis === window`` (no-op).
+function handleAgentContextChanged(data) {
+    if (!data || data.agent_name !== globalThis.selectedAgent) return;
+    const agentInfo = globalThis.agents[globalThis.selectedAgent];
+    if (!agentInfo) return;
+    agentInfo.agent_context_used = data.agent_context_used;
+    agentInfo.agent_context_size = data.agent_context_size;
+    agentInfo.agent_context_semantics = data.agent_context_semantics;
+    // ``*_last_turn_tokens`` is a NEW field (rg1_worker 2026-08-22); older
+    // backends won't send it, so keep the previous value when the key is
+    // absent instead of clobbering it to ``undefined``.
+    if ('agent_last_turn_tokens' in data) {
+        agentInfo.agent_last_turn_tokens = data.agent_last_turn_tokens;
+    }
+    agentInfo.tm_context_used = data.tm_context_used;
+    agentInfo.tm_context_size = data.tm_context_size;
+    agentInfo.tm_context_semantics = data.tm_context_semantics;
+    if ('tm_last_turn_tokens' in data) {
+        agentInfo.tm_last_turn_tokens = data.tm_last_turn_tokens;
+    }
+    // Mirror the operator-set -l value so the limit span re-paints when
+    // the agent restarts with a new limit. The backend diff-check
+    // already collapses broadcasts when the value is unchanged.
+    if ('context_limit' in data) {
+        agentInfo.context_limit = data.context_limit;
+    }
+    _paintContextSpans(agentInfo);
+}
+
+// Inside ``handleAgentMessage`` the agent may push a ``token_update``
+// carrying ``total_tokens`` (no kind, no semantics). For the FIRST
+// message — before any snapshot has been seen — we use it as a
+// best-effort estimate by storing it as
+// ``agents[selected].agent_context_used = total_tokens`` and
+// ``semantics = 'tokens'``. Once a snapshot is known, we MUST NOT
+// overwrite it. TM NEVER receives a token_update (the TM uses
+// ``manager_agent.ainvoke`` directly without a notify-callback).
+function _applyTokenUpdateIfFirstSeen(message) {
+    if (!message || message.type !== 'token_update') return;
+    const agentInfo = globalThis.agents[globalThis.selectedAgent];
+    if (!agentInfo) return;
+    const totalTokens = message.total_tokens;
+    if (typeof totalTokens !== 'number' || !Number.isFinite(totalTokens)) return;
+    // Snapshot already known — leave it alone (M7).
+    if (agentInfo.agent_context_semantics != null) return;
+    agentInfo.agent_context_used = totalTokens;
+    agentInfo.agent_context_semantics = 'tokens';
+    _paintContextSpans(agentInfo);
+}
+
 function startAgentUptimeTicker() {
     // Single-instance guarantee — always stop the previous ticker before
     // starting a new one. Prevents leaked intervals when the user quickly
-    // switches selectedAgent or after multiple ``agent_started_at_changed``
+    // switches the selected agent or after multiple ``agent_started_at_changed``
     // events for the same panel.
     stopAgentUptimeTicker();
     refreshAgentUptimeDisplay();
@@ -1696,10 +2087,10 @@ async function batchRestart() {
 }
 
 async function stopCurrentAgent() {
-    if (!selectedAgent) return;
+    if (!globalThis.selectedAgent) return;
     const btn = document.getElementById('stop-agent-btn');
     try {
-        const response = await fetch(`/api/agents/${selectedAgent}/stop`, {
+        const response = await fetch(`/api/agents/${globalThis.selectedAgent}/stop`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({}),
@@ -1710,18 +2101,18 @@ async function stopCurrentAgent() {
             return;
         }
         const data = await response.json();
-        trackButton(data.request_id, btn, 'agent_stop', selectedAgent, '⏳ Stopping…');
-        showNotification(`Stop requested for '${selectedAgent}'`, 'info');
+        trackButton(data.request_id, btn, 'agent_stop', globalThis.selectedAgent, '⏳ Stopping…');
+        showNotification(`Stop requested for '${globalThis.selectedAgent}'`, 'info');
     } catch (error) {
         showNotification('Error stopping agent: ' + error.message, 'error');
     }
 }
 
 async function restartCurrentAgent() {
-    if (!selectedAgent) return;
+    if (!globalThis.selectedAgent) return;
     const btn = document.getElementById('restart-agent-btn');
     try {
-        const response = await fetch(`/api/agents/${selectedAgent}/restart`, {
+        const response = await fetch(`/api/agents/${globalThis.selectedAgent}/restart`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({}),
@@ -1732,18 +2123,18 @@ async function restartCurrentAgent() {
             return;
         }
         const data = await response.json();
-        trackButton(data.request_id, btn, 'agent_restart', selectedAgent, '⏳ Restarting…');
-        showNotification(`Restart requested for '${selectedAgent}'`, 'info');
+        trackButton(data.request_id, btn, 'agent_restart', globalThis.selectedAgent, '⏳ Restarting…');
+        showNotification(`Restart requested for '${globalThis.selectedAgent}'`, 'info');
     } catch (error) {
         showNotification('Error restarting agent: ' + error.message, 'error');
     }
 }
 
 async function summarizeCurrentAgent() {
-    if (!selectedAgent) return;
+    if (!globalThis.selectedAgent) return;
     const btn = document.getElementById('summarize-agent-btn');
     try {
-        const response = await fetch(`/api/agents/${selectedAgent}/summarize`, {
+        const response = await fetch(`/api/agents/${globalThis.selectedAgent}/summarize`, {
             method: 'POST',
         });
         if (!response.ok) {
@@ -1752,11 +2143,540 @@ async function summarizeCurrentAgent() {
             return;
         }
         const data = await response.json();
-        trackButton(data.request_id, btn, 'agent_summarize', selectedAgent, 'Summarizing…');
-        showNotification(`Summarization requested for '${selectedAgent}' (${data.request_id})`, 'info');
+        trackButton(data.request_id, btn, 'agent_summarize', globalThis.selectedAgent, 'Summarizing…');
+        showNotification(`Summarization requested for '${globalThis.selectedAgent}' (${data.request_id})`, 'info');
     } catch (error) {
         showNotification('Error requesting summarization: ' + error.message, 'error');
     }
+}
+
+// ===========================================================================
+// Agent panel tabs (Dialog / MCP / Stats)
+//
+// No framework here: the tab switch follows the two patterns already used in
+// this file — show/hide sibling panels, and localStorage for persistence.
+// The inactive panel gets the ``hidden`` attribute rather than a display
+// class so it leaves the accessibility tree entirely; a large hidden-but-
+// present DOM is a measured browser-freeze risk under a screen reader.
+// ===========================================================================
+
+const AGENT_TAB_KEY = 'deepworker.agentTab';
+const AGENT_TABS = ['dialog', 'mcp', 'stats'];
+
+// Panels are populated lazily, once per selected agent, so switching agents
+// does not fetch anything for tabs the user never opens.
+let mcpTabLoadedFor = null;
+let statsTabLoadedFor = null;
+
+function getActiveAgentTab() {
+    try {
+        const stored = localStorage.getItem(AGENT_TAB_KEY);
+        if (AGENT_TABS.includes(stored)) return stored;
+    } catch (e) { /* private mode — fall through to the default */ }
+    return 'dialog';
+}
+
+function switchAgentTab(tab) {
+    if (!AGENT_TABS.includes(tab)) tab = 'dialog';
+
+    AGENT_TABS.forEach(name => {
+        const panel = document.getElementById(`tab-${name}`);
+        const btn = document.getElementById(`tab-btn-${name}`);
+        const active = name === tab;
+        if (panel) panel.hidden = !active;
+        if (btn) {
+            btn.setAttribute('aria-selected', active ? 'true' : 'false');
+            btn.classList.toggle('active', active);
+        }
+    });
+
+    try { localStorage.setItem(AGENT_TAB_KEY, tab); } catch (e) { /* ignore */ }
+
+    // Fetch on first activation only. Never on agent select, never on a timer.
+    if (tab === 'mcp' && globalThis.selectedAgent && mcpTabLoadedFor !== globalThis.selectedAgent) {
+        loadMcpTab(globalThis.selectedAgent);
+    }
+    if (tab === 'stats' && globalThis.selectedAgent && statsTabLoadedFor !== globalThis.selectedAgent) {
+        loadStatsTab(globalThis.selectedAgent);
+    }
+}
+
+function setupAgentTabs() {
+    const bar = document.querySelector('.agent-tabs');
+    if (!bar) return;
+    const tabs = Array.from(bar.querySelectorAll('.agent-tab'));
+
+    tabs.forEach(btn => {
+        btn.onclick = () => switchAgentTab(btn.dataset.tab);
+        // Arrow-key navigation is expected of a real tablist.
+        btn.addEventListener('keydown', (e) => {
+            const idx = tabs.indexOf(btn);
+            let next = null;
+            if (e.key === 'ArrowRight') next = tabs[(idx + 1) % tabs.length];
+            if (e.key === 'ArrowLeft') next = tabs[(idx - 1 + tabs.length) % tabs.length];
+            if (next) {
+                e.preventDefault();
+                next.focus();
+                switchAgentTab(next.dataset.tab);
+            }
+        });
+    });
+
+    switchAgentTab(getActiveAgentTab());
+}
+
+// ===========================================================================
+// MCP tab
+// ===========================================================================
+
+function mcpEl(tag, cls, text) {
+    const node = document.createElement(tag);
+    if (cls) node.className = cls;
+    // textContent only — server names, commands and URLs are user-supplied.
+    if (text !== undefined && text !== null) node.textContent = String(text);
+    return node;
+}
+
+function mcpSpecSummary(spec) {
+    if (!spec) return '';
+    if (spec.url) return spec.url;
+    const args = Array.isArray(spec.args) && spec.args.length ? ' ' + spec.args.join(' ') : '';
+    return (spec.command || '') + args;
+}
+
+function renderMcpAttached(body, liveByServer) {
+    const host = document.getElementById('mcp-attached-list');
+    if (!host) return;
+    host.replaceChildren();
+
+    (body.layer_errors || []).forEach(err => {
+        host.appendChild(mcpEl('div', 'mcp-error',
+            `Layer "${err.layer}" could not be read: ${err.message}`));
+    });
+
+    const servers = body.servers || [];
+    if (!servers.length) {
+        host.appendChild(mcpEl('em', null, 'No MCP servers configured for this agent.'));
+        return;
+    }
+
+    servers.forEach(srv => {
+        const row = mcpEl('div', 'mcp-row');
+
+        const attached = liveByServer && Object.prototype.hasOwnProperty.call(liveByServer, srv.name);
+        const state = mcpEl('span', 'mcp-state', srv.disabled ? '✖' : (attached ? '✔' : '○'));
+        state.title = srv.disabled ? 'Disabled'
+            : (attached ? 'Attached and running' : 'Configured — applies after restart');
+        row.appendChild(state);
+
+        row.appendChild(mcpEl('span', 'mcp-name', srv.name));
+        row.appendChild(mcpEl('span', 'mcp-transport', (srv.spec && srv.spec.type) || 'stdio'));
+        row.appendChild(mcpEl('span', 'mcp-target', mcpSpecSummary(srv.spec)));
+
+        const badges = mcpEl('span', 'mcp-badges');
+        badges.appendChild(mcpEl('span', 'mcp-badge', srv.layer));
+        if (srv.weight === 'heavy') {
+            const b = mcpEl('span', 'mcp-badge mcp-badge-warn', 'heavy');
+            b.title = srv.weight_reason || 'May be slow to start.';
+            badges.appendChild(b);
+        }
+        if (srv.spec && srv.spec.auto_approve) {
+            const b = mcpEl('span', 'mcp-badge mcp-badge-warn', 'auto-approve');
+            b.title = 'Tools from this server skip approval prompts.';
+            badges.appendChild(b);
+        }
+        if (srv.env_status === 'unresolved') {
+            const b = mcpEl('span', 'mcp-badge mcp-badge-warn', 'env?');
+            b.title = 'Unset variable(s): ' + (srv.unresolved_vars || []).join(', ') +
+                '. If also unset for the agent, it will fail to start.';
+            badges.appendChild(b);
+        }
+        // Tool counts come only from what the agent actually reports.
+        // A configured-but-not-attached server shows no count at all —
+        // never a 0, which would read as "this server has no tools".
+        if (attached) {
+            badges.appendChild(mcpEl('span', 'mcp-badge',
+                `${liveByServer[srv.name].length} tools`));
+        }
+        row.appendChild(badges);
+
+        const actions = mcpEl('span', 'mcp-actions');
+        if (srv.editable) {
+            const toggle = mcpEl('button', 'btn btn-secondary btn-sm',
+                srv.disabled ? 'Enable' : 'Disable');
+            toggle.onclick = () => setMcpEnabled(srv.name, !!srv.disabled);
+            actions.appendChild(toggle);
+
+            const del = mcpEl('button', 'btn btn-danger btn-sm', '✕');
+            del.title = 'Remove from this agent';
+            del.onclick = () => removeMcpServer(srv.name);
+            actions.appendChild(del);
+        } else {
+            const note = mcpEl('span', 'mcp-readonly', `from ${srv.layer}`);
+            note.title = 'Defined in a shared layer; edit it there or override it here.';
+            actions.appendChild(note);
+        }
+        row.appendChild(actions);
+
+        host.appendChild(row);
+    });
+}
+
+async function loadMcpTab(agentName) {
+    mcpTabLoadedFor = agentName;
+    const host = document.getElementById('mcp-attached-list');
+    if (host) host.replaceChildren(mcpEl('em', null, 'Loading…'));
+
+    try {
+        const resp = await fetch(`/api/agents/${encodeURIComponent(agentName)}/mcp`);
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const body = await resp.json();
+
+        // Live tools are best-effort: a stopped agent must not break the tab.
+        let liveByServer = null;
+        try {
+            const liveResp = await fetch(
+                `/api/agents/${encodeURIComponent(agentName)}/mcp/live`);
+            if (liveResp.ok) {
+                const live = await liveResp.json();
+                if (live.success) liveByServer = live.by_server || {};
+            }
+        } catch (e) { /* agent not running — leave counts absent */ }
+
+        renderMcpAttached(body, liveByServer);
+
+        const hint = document.getElementById('mcp-restart-hint');
+        if (hint) {
+            const pending = (body.servers || []).some(s =>
+                !s.disabled && liveByServer &&
+                !Object.prototype.hasOwnProperty.call(liveByServer, s.name));
+            hint.hidden = !pending;
+        }
+    } catch (error) {
+        if (host) {
+            host.replaceChildren(mcpEl('div', 'mcp-error',
+                'Could not load MCP config: ' + error.message));
+        }
+    }
+}
+
+async function loadMcpCatalog(rescan) {
+    const host = document.getElementById('mcp-catalog-list');
+    if (host) host.replaceChildren(mcpEl('em', null, rescan ? 'Scanning…' : 'Loading…'));
+
+    try {
+        const resp = rescan
+            ? await fetch('/api/mcp/catalog/scan', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({}),
+            })
+            : await fetch('/api/mcp/catalog');
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const body = await resp.json();
+        renderMcpCatalog(body.servers || []);
+    } catch (error) {
+        if (host) {
+            host.replaceChildren(mcpEl('div', 'mcp-error',
+                'Could not load the catalog: ' + error.message));
+        }
+    }
+}
+
+function renderMcpCatalog(servers) {
+    const host = document.getElementById('mcp-catalog-list');
+    if (!host) return;
+    host.replaceChildren();
+
+    if (!servers.length) {
+        host.appendChild(mcpEl('em', null,
+            'Nothing found yet. Press Scan to look for configured servers, or Add one manually.'));
+        return;
+    }
+
+    servers.forEach(entry => {
+        const row = mcpEl('div', 'mcp-row');
+        row.appendChild(mcpEl('span', 'mcp-name', entry.label || entry.id));
+        row.appendChild(mcpEl('span', 'mcp-transport', (entry.spec && entry.spec.type) || 'stdio'));
+        row.appendChild(mcpEl('span', 'mcp-target', mcpSpecSummary(entry.spec)));
+
+        const badges = mcpEl('span', 'mcp-badges');
+        if (entry.weight && entry.weight !== 'unknown') {
+            const b = mcpEl('span',
+                'mcp-badge' + (entry.weight === 'heavy' ? ' mcp-badge-warn' : ''),
+                entry.weight);
+            if (entry.weight_reason) b.title = entry.weight_reason;
+            badges.appendChild(b);
+        }
+        if (entry.pinned) badges.appendChild(mcpEl('span', 'mcp-badge', 'manual'));
+        if (entry.stale) {
+            const b = mcpEl('span', 'mcp-badge mcp-badge-warn', 'stale');
+            b.title = 'Not seen in the latest scan. Kept in case it comes back.';
+            badges.appendChild(b);
+        }
+        // Only ever shown after an explicit Test filled tools_hint.
+        if (Array.isArray(entry.tools_hint)) {
+            badges.appendChild(mcpEl('span', 'mcp-badge', `${entry.tools_hint.length} tools`));
+        }
+        row.appendChild(badges);
+
+        const actions = mcpEl('span', 'mcp-actions');
+        const attach = mcpEl('button', 'btn btn-primary btn-sm', 'Attach');
+        attach.onclick = () => attachCatalogEntry(entry);
+        actions.appendChild(attach);
+        row.appendChild(actions);
+
+        host.appendChild(row);
+    });
+}
+
+async function attachCatalogEntry(entry) {
+    if (!globalThis.selectedAgent) return;
+    await saveMcpServer(entry.id, entry.spec);
+}
+
+async function saveMcpServer(name, spec) {
+    try {
+        const resp = await fetch(
+            `/api/agents/${encodeURIComponent(globalThis.selectedAgent)}/mcp/${encodeURIComponent(name)}`,
+            {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ spec }),
+            });
+        const body = await resp.json();
+        if (!resp.ok) {
+            showNotification('Could not attach: ' + (body.detail || resp.status), 'error');
+            return;
+        }
+        (body.warnings || []).forEach(w => showNotification(w, 'warning'));
+        showNotification(
+            `'${name}' saved. Restart the agent to apply.`, 'success');
+        loadMcpTab(globalThis.selectedAgent);
+    } catch (error) {
+        showNotification('Could not attach: ' + error.message, 'error');
+    }
+}
+
+async function removeMcpServer(name) {
+    if (!confirm(`Remove '${name}' from this agent?`)) return;
+    try {
+        const resp = await fetch(
+            `/api/agents/${encodeURIComponent(globalThis.selectedAgent)}/mcp/${encodeURIComponent(name)}`,
+            { method: 'DELETE' });
+        if (!resp.ok) {
+            showNotification(`Could not remove '${name}'`, 'error');
+            return;
+        }
+        showNotification(`'${name}' removed. Restart the agent to apply.`, 'success');
+        loadMcpTab(globalThis.selectedAgent);
+    } catch (error) {
+        showNotification('Could not remove: ' + error.message, 'error');
+    }
+}
+
+async function setMcpEnabled(name, enabled) {
+    try {
+        const resp = await fetch(
+            `/api/agents/${encodeURIComponent(globalThis.selectedAgent)}/mcp/${encodeURIComponent(name)}/enable`,
+            {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ enabled }),
+            });
+        if (!resp.ok) {
+            showNotification(`Could not update '${name}'`, 'error');
+            return;
+        }
+        loadMcpTab(globalThis.selectedAgent);
+    } catch (error) {
+        showNotification('Could not update: ' + error.message, 'error');
+    }
+}
+
+function parseKeyValueList(raw) {
+    const out = {};
+    (raw || '').split(',').forEach(pair => {
+        const trimmed = pair.trim();
+        if (!trimmed) return;
+        const eq = trimmed.indexOf('=');
+        if (eq <= 0) return;
+        out[trimmed.slice(0, eq).trim()] = trimmed.slice(eq + 1).trim();
+    });
+    return out;
+}
+
+function readMcpForm() {
+    const type = document.getElementById('mcp-f-type').value;
+    const name = (document.getElementById('mcp-f-name').value || '').trim();
+    const spec = { type };
+
+    if (type === 'http') {
+        spec.url = (document.getElementById('mcp-f-url').value || '').trim();
+        const headers = parseKeyValueList(document.getElementById('mcp-f-headers').value);
+        if (Object.keys(headers).length) spec.headers = headers;
+    } else {
+        spec.command = (document.getElementById('mcp-f-command').value || '').trim();
+        const args = (document.getElementById('mcp-f-args').value || '').trim();
+        if (args) spec.args = args.split(/\s+/);
+        const cwd = (document.getElementById('mcp-f-cwd').value || '').trim();
+        if (cwd) spec.cwd = cwd;
+        const env = parseKeyValueList(document.getElementById('mcp-f-env').value);
+        if (Object.keys(env).length) spec.env = env;
+    }
+
+    if (document.getElementById('mcp-f-auto-approve').checked) spec.auto_approve = true;
+    return { name, spec };
+}
+
+function updateMcpFormVisibility() {
+    const http = document.getElementById('mcp-f-type').value === 'http';
+    [['mcp-l-url', 'mcp-f-url'], ['mcp-l-headers', 'mcp-f-headers']].forEach(([l, f]) => {
+        document.getElementById(l).hidden = !http;
+        document.getElementById(f).hidden = !http;
+    });
+    [['mcp-l-command', 'mcp-f-command'], ['mcp-l-args', 'mcp-f-args'],
+     ['mcp-l-cwd', 'mcp-f-cwd'], ['mcp-l-env', 'mcp-f-env']].forEach(([l, f]) => {
+        document.getElementById(l).hidden = http;
+        document.getElementById(f).hidden = http;
+    });
+}
+
+async function testMcpForm() {
+    const { spec } = readMcpForm();
+    const feedback = document.getElementById('mcp-form-feedback');
+    feedback.textContent = 'Connecting…';
+    try {
+        const resp = await fetch(
+            `/api/agents/${encodeURIComponent(globalThis.selectedAgent)}/mcp/test`,
+            {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ spec }),
+            });
+        const body = await resp.json();
+        if (!resp.ok) {
+            feedback.textContent = 'Failed: ' + (body.detail || resp.status);
+            return;
+        }
+        feedback.textContent = body.success
+            ? `OK — ${body.tool_count} tool(s): ${body.tool_names.slice(0, 8).join(', ')}` +
+              (body.tool_names.length > 8 ? ', …' : '')
+            : 'Failed: ' + body.error;
+    } catch (error) {
+        feedback.textContent = 'Failed: ' + error.message;
+    }
+}
+
+async function saveMcpFromForm() {
+    const { name, spec } = readMcpForm();
+    if (!name) {
+        document.getElementById('mcp-form-feedback').textContent = 'A name is required.';
+        return;
+    }
+    await saveMcpServer(name, spec);
+}
+
+async function saveMcpToCatalog() {
+    const { name, spec } = readMcpForm();
+    const feedback = document.getElementById('mcp-form-feedback');
+    if (!name) {
+        feedback.textContent = 'A name is required.';
+        return;
+    }
+    try {
+        const resp = await fetch(`/api/mcp/catalog/${encodeURIComponent(name)}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ spec }),
+        });
+        const body = await resp.json();
+        if (!resp.ok) {
+            feedback.textContent = 'Failed: ' + (body.detail || resp.status);
+            return;
+        }
+        feedback.textContent = 'Saved to the catalog.';
+        loadMcpCatalog(false);
+    } catch (error) {
+        feedback.textContent = 'Failed: ' + error.message;
+    }
+}
+
+function setupMcpTab() {
+    const on = (id, handler) => {
+        const node = document.getElementById(id);
+        if (node) node.onclick = handler;
+    };
+    on('mcp-refresh-btn', () => globalThis.selectedAgent && loadMcpTab(globalThis.selectedAgent));
+    on('mcp-scan-btn', () => loadMcpCatalog(true));
+    on('mcp-add-toggle-btn', () => {
+        const form = document.getElementById('mcp-add-form');
+        if (form) {
+            form.hidden = !form.hidden;
+            if (!form.hidden) updateMcpFormVisibility();
+        }
+    });
+    on('mcp-test-btn', testMcpForm);
+    on('mcp-save-btn', saveMcpFromForm);
+    on('mcp-save-catalog-btn', saveMcpToCatalog);
+
+    const type = document.getElementById('mcp-f-type');
+    if (type) type.onchange = updateMcpFormVisibility;
+}
+
+// ===========================================================================
+// Stats tab — on-request only (no timer, no interval, no recompute)
+// ===========================================================================
+
+async function loadStatsTab(agentName) {
+    statsTabLoadedFor = agentName;
+    const host = document.getElementById('stats-tab-content');
+    if (!host) return;
+    host.replaceChildren(mcpEl('em', null, 'Loading…'));
+
+    try {
+        const resp = await fetch(`/api/agents/${encodeURIComponent(agentName)}/stats`);
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const body = await resp.json();
+        renderStatsTab(body);
+    } catch (error) {
+        host.replaceChildren(mcpEl('div', 'mcp-error',
+            'Could not load stats: ' + error.message));
+    }
+}
+
+function renderStatsTab(data) {
+    const host = document.getElementById('stats-tab-content');
+    if (!host) return;
+    host.replaceChildren();
+
+    const stats = (data && data.stats) || data || {};
+    const rows = [
+        ['Input tokens', stats.input_tokens],
+        ['Output tokens', stats.output_tokens],
+        ['Cache read', stats.cache_read_tokens],
+        ['Cache write', stats.cache_creation_tokens],
+        ['Total tokens', stats.total_tokens],
+        ['Requests', stats.requests],
+    ];
+
+    const table = mcpEl('div', 'stats-grid');
+    rows.forEach(([label, value]) => {
+        if (value === undefined || value === null) return;
+        table.appendChild(mcpEl('span', 'stats-label', label));
+        table.appendChild(mcpEl('span', 'stats-value', value));
+    });
+
+    if (!table.childElementCount) {
+        host.appendChild(mcpEl('em', null, 'No statistics available for this agent.'));
+        return;
+    }
+    host.appendChild(table);
+}
+
+function setupStatsTab() {
+    const btn = document.getElementById('stats-refresh-btn');
+    if (btn) btn.onclick = () => globalThis.selectedAgent && loadStatsTab(globalThis.selectedAgent);
 }
 
 // ---------------------------------------------------------------------------
@@ -1769,6 +2689,27 @@ if (typeof module !== 'undefined' && module.exports) {
     module.exports = {
         stopFailureMeansAgentGone,
         formatAgentUptime,
+        formatAgentContext,
+        formatContextLimit,
+        formatLastTurnTokens,
+        handleAgentContextChanged,
+        handleAgentMessage,
         handleAgentSummarized,
+        // Exposed so node-side tests can drive the WS router directly
+        // and assert dispatch — prevents the ``no case for a broadcast''
+        // regression class (test_ws_router_context_changed.js).
+        handleWebSocketMessage,
+        // Exposed so a node test can drive the ONE code path a user
+        // click runs. A related internal incident: every
+        // node test used to pre-seed ``globalThis.selectedAgent`` by hand
+        // and none ever called this function, so the whole suite stayed
+        // green while the single line that publishes the selection was
+        // broken in production (test_select_agent_publishes_global.js).
+        selectAgent,
+        mcpSpecSummary,
+        parseKeyValueList,
+        // Exposed for node-side DOM tests of the Context / Last turn
+        // duplicate-suppression gate (test_last_turn_hidden_when_duplicate.js).
+        _paintContextSpans,
     };
 }

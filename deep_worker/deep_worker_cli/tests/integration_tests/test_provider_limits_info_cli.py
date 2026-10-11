@@ -30,8 +30,18 @@ def _env(home: Path) -> dict[str, str]:
 def test_limits_info_reads_persisted_provider_availability(tmp_path: Path) -> None:
     data_dir = deep_worker_home(tmp_path)
     data_dir.mkdir()
+    # Keyed by ACCOUNT GROUP, not by provider name. ``AvailabilityTracker``
+    # reads through ``_key()`` -> ``account_group_for()``, so a record filed
+    # under the bare "grok" is invisible to it and the CLI prints
+    # ``no_limit_record``.
+    #
+    # The fixture used the raw provider name because it was written before
+    # account grouping existed (test: 81165f5, grouping: 4a8370b) and was
+    # never updated — the assertion has been failing ever since. It is a
+    # stale-schema test bug, not an environment problem: grouping is what
+    # lets claude-code and claude-code-sdk share one subscription's limits.
     (data_dir / "provider_availability.json").write_text(json.dumps({
-        "grok": {
+        "grok-account": {
             "available_after_utc": "2099-07-05T14:44:51+00:00",
             "available_after_source": "fallback",
             "available_after_note": "No provider reset time was parseable; using 24h rough fallback for grok.",

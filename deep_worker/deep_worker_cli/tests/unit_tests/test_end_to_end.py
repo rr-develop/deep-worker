@@ -74,7 +74,7 @@ def mock_settings(
 
     # Patch settings
     with patch("deep_worker_cli.agent.settings") as mock_settings_obj:
-        mock_settings_obj.user_deepagents_dir = tmp_path / "agents"
+        mock_settings_obj.user_deep_worker_agents_dir = tmp_path / "agents"
         mock_settings_obj.ensure_agent_dir.return_value = agent_dir
         mock_settings_obj.ensure_user_skills_dir.return_value = skills_dir
         mock_settings_obj.get_project_skills_dir.return_value = None
@@ -189,15 +189,32 @@ class TestDeepAgentsCLIEndToEnd:
 
             # Invoke the agent
             thread_id = str(uuid.uuid4())
+            # Sizes come from the PROVIDER, never from a character count
+            # (owner directive 2026-08-25): each assistant turn carries the
+            # context the provider says it read, exactly as a real one does
+            # via ``usage_metadata``. The text is still large so the summary
+            # has something real to compact.
             text_10_000_tokens = "x" * 10_000 * 4
             text_50_000_tokens = "x" * 50_000 * 4
+
+            def _ai(content: str, reported: int) -> AIMessage:
+                return AIMessage(
+                    content=content,
+                    usage_metadata={
+                        "input_tokens": reported,
+                        "output_tokens": 1,
+                        "total_tokens": reported + 1,
+                    },
+                )
+
             input_messages = [
                 HumanMessage(content=text_10_000_tokens),
-                AIMessage(content=text_50_000_tokens),  # 60,000 tokens
+                _ai(text_50_000_tokens, 60_000),
                 HumanMessage(content=text_10_000_tokens),
-                AIMessage(content=text_50_000_tokens),  # 120,000 tokens
+                _ai(text_50_000_tokens, 120_000),
                 HumanMessage(content=text_10_000_tokens),
-                AIMessage(content=text_50_000_tokens),  # 180,000 tokens (summarizes)
+                # 180,000 reported against a 200,000 window → summarizes.
+                _ai(text_50_000_tokens, 180_000),
                 HumanMessage(content="query"),
             ]
             result = agent.invoke(
@@ -212,13 +229,13 @@ class TestDeepAgentsCLIEndToEnd:
             # The injected message MUST quote the new on-disk path.
             synth_content = result["messages"][0].content
             assert isinstance(synth_content, str)
-            assert f"/.{HOME_DIR_NAME}/test-agent/summaries/" in synth_content, (
+            assert f"/.{HOME_DIR_NAME}/agents/test-agent/summaries/" in synth_content, (
                 f"summary message does not quote new on-disk path: {synth_content!r}"
             )
 
             # And a real file must exist at that path, with at least one
             # `## Summarized at` section matching the new contract.
-            summaries_dir = deep_worker_home(tmp_path) / "test-agent" / "summaries"
+            summaries_dir = deep_worker_home(tmp_path) / "agents" / "test-agent" / "summaries"
             assert summaries_dir.is_dir(), (
                 f"summaries dir was not created at {summaries_dir}"
             )
@@ -233,8 +250,8 @@ class TestDeepAgentsCLIEndToEnd:
             first_line = body.splitlines()[0]
             import json
             data = json.loads(first_line)
-            assert data.get("schema_version") == 4
-            assert data.get("kind") == "deepagents.summarization_history.message"
+            assert data.get("schema_version") == 5
+            assert data.get("kind") == "deepagents.summarization_history.segment"
             assert "summarized_at" in data
 
     def test_cli_agent_with_fake_llm_with_tools(self, tmp_path: Path) -> None:

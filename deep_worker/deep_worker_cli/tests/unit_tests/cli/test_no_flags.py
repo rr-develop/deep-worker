@@ -27,7 +27,7 @@ from deep_worker_cli.cli.agent_command import (
 def saved_with_all_true():
     """Saved launch_config where every boolean flag is True."""
     return {
-        "provider": "claude-code",
+        "provider": "claude-code-sdk",
         "model": "opus",
         "working_dir": "/path/to/production",
         "skip_permissions": True,

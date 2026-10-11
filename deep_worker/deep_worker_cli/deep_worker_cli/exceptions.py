@@ -48,7 +48,7 @@ class ProcessNotAliveError(DeepWorkerError):
 # agent in ``IDLE`` so the user can just type "continue").
 #
 # Classification is by class name so it stays provider-agnostic — codex agents
-# never import the claude-code module and vice versa.
+# never import the claude-code-sdk module and vice versa.
 # ---------------------------------------------------------------------------
 
 
@@ -78,6 +78,7 @@ class AgentNotInitialisedError(DeepWorkerError):
 # non-recoverable.  Anything not on this list is recoverable by default.
 FATAL_EXCEPTION_TYPES: frozenset[str] = frozenset({
     "ClaudeUsageLimitError",
+    "AcpUsageLimitError",
     "CodexUsageLimitError",
     "GrokUsageLimitError",
     "CheckpointCorruptedError",
@@ -88,126 +89,10 @@ FATAL_EXCEPTION_TYPES: frozenset[str] = frozenset({
     # Continuing summarization would silently discard the evicted history.
     # See DESIGN_FAIL_LOUD_SUMMARIZATION_OFFLOAD.md.
     "HistoryOffloadError",
-})
-
-
-def is_fatal_exception(exc: BaseException) -> bool:
-    """Return True iff ``exc`` should transition the agent to ERROR.
-
-    All other exceptions are recoverable per the No-Agent-Error-State Policy
-    — the runtime must convert them into a tool-result or SystemMessage so the
-    user can just type "continue".
-    """
-    return type(exc).__name__ in FATAL_EXCEPTION_TYPES
-
-
-# ---------------------------------------------------------------------------
-# No-Agent-Error-State Policy — exception taxonomy.
-#
-# See docs/DESIGN_NO_AGENT_ERROR_STATE_POLICY.md and docs/POLICIES.md.
-#
-# The agent runtime classifies unhandled exceptions during ``_handle_invoke``
-# as either *fatal* (transition the agent to ``AgentStatus.ERROR``) or
-# *recoverable* (append a SystemMessage explaining the failure, leave the
-# agent in ``IDLE`` so the user can just type "continue").
-#
-# Classification is by class name so it stays provider-agnostic — codex agents
-# never import the claude-code module and vice versa.
-# ---------------------------------------------------------------------------
-
-
-class CheckpointCorruptedError(DeepWorkerError):
-    """Raised by storage when the on-disk thread state cannot be loaded.
-
-    Fatal — without checkpoint we cannot resume the conversation safely.
-    """
-
-
-class ProviderAuthFatalError(DeepWorkerError):
-    """Raised by a provider when credentials are revoked / unrecoverable.
-
-    Fatal — usage of the provider cannot continue without operator action.
-    """
-
-
-class AgentNotInitialisedError(DeepWorkerError):
-    """Raised when the agent's runtime graph is missing — cannot proceed.
-
-    Fatal — the agent has nothing to run.
-    """
-
-
-# Match by class name so the table stays provider-agnostic.  Adding to this
-# set is an explicit decision that the new failure mode is genuinely
-# non-recoverable.  Anything not on this list is recoverable by default.
-FATAL_EXCEPTION_TYPES: frozenset[str] = frozenset({
-    "ClaudeUsageLimitError",
-    "CodexUsageLimitError",
-    "GrokUsageLimitError",
-    "CheckpointCorruptedError",
-    "ProviderAuthFatalError",
-    "AgentNotInitialisedError",
-    "HistoryOffloadError",
-})
-
-
-def is_fatal_exception(exc: BaseException) -> bool:
-    """Return True iff ``exc`` should transition the agent to ERROR.
-
-    All other exceptions are recoverable per the No-Agent-Error-State Policy
-    — the runtime must convert them into a tool-result or SystemMessage so the
-    user can just type "continue".
-    """
-    return type(exc).__name__ in FATAL_EXCEPTION_TYPES
-
-
-# ---------------------------------------------------------------------------
-# No-Agent-Error-State Policy — exception taxonomy.
-#
-# See docs/DESIGN_NO_AGENT_ERROR_STATE_POLICY.md and docs/POLICIES.md.
-#
-# The agent runtime classifies unhandled exceptions during ``_handle_invoke``
-# as either *fatal* (transition the agent to ``AgentStatus.ERROR``) or
-# *recoverable* (append a SystemMessage explaining the failure, leave the
-# agent in ``IDLE`` so the user can just type "continue").
-#
-# Classification is by class name so it stays provider-agnostic — codex agents
-# never import the claude-code module and vice versa.
-# ---------------------------------------------------------------------------
-
-
-class CheckpointCorruptedError(DeepWorkerError):
-    """Raised by storage when the on-disk thread state cannot be loaded.
-
-    Fatal — without checkpoint we cannot resume the conversation safely.
-    """
-
-
-class ProviderAuthFatalError(DeepWorkerError):
-    """Raised by a provider when credentials are revoked / unrecoverable.
-
-    Fatal — usage of the provider cannot continue without operator action.
-    """
-
-
-class AgentNotInitialisedError(DeepWorkerError):
-    """Raised when the agent's runtime graph is missing — cannot proceed.
-
-    Fatal — the agent has nothing to run.
-    """
-
-
-# Match by class name so the table stays provider-agnostic.  Adding to this
-# set is an explicit decision that the new failure mode is genuinely
-# non-recoverable.  Anything not on this list is recoverable by default.
-FATAL_EXCEPTION_TYPES: frozenset[str] = frozenset({
-    "ClaudeUsageLimitError",
-    "CodexUsageLimitError",
-    "GrokUsageLimitError",
-    "CheckpointCorruptedError",
-    "ProviderAuthFatalError",
-    "AgentNotInitialisedError",
-    "HistoryOffloadError",
+    # Raised by the same middleware when producing the summary itself fails.
+    # The error text must never be substituted for the summary, and history
+    # must not be evicted behind the failure. See POLICIES.md §12.
+    "SummarizationFailedError",
 })
 
 
@@ -241,19 +126,62 @@ def is_fatal_exception(exc: BaseException) -> bool:
 # ---------------------------------------------------------------------------
 
 PROVIDER_API_ERROR_TYPES: frozenset[str] = frozenset({
-    # grok ACP JSON-RPC error reply that is NOT an account-terminal cap
-    # (those are GrokUsageLimitError, already fatal). E.g. an upstream 5xx or
-    # a malformed session error the runtime recovers from.
+    # Shared ACP layer JSON-RPC error reply that is NOT an account-terminal cap
+    # (those are AcpUsageLimitError, already fatal). Raised for every CLI on the
+    # shared layer: claude-code, grok, and any future ACP provider.
+    #
+    # These were MISSING while the table listed only the grok-fork names below.
+    # Matching by class NAME makes the table provider-agnostic, but it also
+    # makes it a hidden dependency on the class hierarchy: when grok moved off
+    # its private fork onto the shared client (2026-08-24) it stopped raising
+    # Grok* and started raising Acp*, and without these two entries every
+    # recoverable grok API error would have silently dropped out of the
+    # classification — the same failure shape as the 2026-08-23 cache-routing
+    # incident, where a provider rename left a dispatcher keyed on the old name.
+    "AcpClientError",
+    "AcpConcurrentPromptError",
+    # grok's pre-2026-08-24 fork of the ACP client. Retained because a
+    # checkpoint or a persisted error record written before the migration can
+    # still carry these names.
     "GrokAcpClientError",
     "GrokConcurrentPromptError",
     # codex exec protocol error that is not a usage cap.
     "CodexProtocolError",
-    # claude-code CLI returned an upstream API error AS the turn (repacked
+    # claude-code-sdk CLI returned an upstream API error AS the turn (repacked
     # into a TextBlock or signalled via ResultMessage.is_error /
     # AssistantMessage.error). Recoverable at the account level; the request
     # itself failed. See DESIGN_FIX_API_ERROR_AS_FINAL_ANSWER.md.
     "ClaudeApiResponseError",
 })
+
+
+#: Exception class names that mean "the account hit a rate/usage cap".
+#:
+#: Matched by class NAME, like every other classifier in this module, so a
+#: provider SDK never has to be importable here. These are the shapes the
+#: OpenAI-compatible clients raise: config-driven providers go through
+#: ``langchain_openai`` → ``openai``, whose cap surfaces as
+#: ``RateLimitError`` (HTTP 429) rather than as one of our typed
+#: ``*UsageLimitError`` classes.
+RATE_LIMIT_ERROR_TYPES: frozenset[str] = frozenset({
+    "RateLimitError",
+})
+
+
+def is_rate_limit_error(exc: BaseException) -> bool:
+    """Return True iff ``exc`` is an account-level rate/usage cap.
+
+    Used to route caps from config-driven providers into the availability
+    tracker. Built-in providers raise their own typed ``*UsageLimitError``
+    and are handled by dedicated branches; this covers the generic
+    OpenAI-dialect shape that would otherwise be treated as an ordinary
+    recoverable error and leave the cap unrecorded (incident 2026-08-17:
+    two agents stalled on minimax with nothing written to the tracker).
+    """
+    if type(exc).__name__ in RATE_LIMIT_ERROR_TYPES:
+        return True
+    # Some clients wrap the status without subclassing a named error.
+    return getattr(exc, "status_code", None) == 429
 
 
 def is_provider_api_error(exc: BaseException) -> bool:

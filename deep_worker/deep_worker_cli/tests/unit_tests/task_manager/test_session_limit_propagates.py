@@ -49,7 +49,7 @@ class ProviderXUsageLimitError(Exception):
 
 def _make_task_manager() -> TaskManager:
     cfg = MagicMock()
-    cfg.provider = "claude-code"
+    cfg.provider = "claude-code-sdk"
     cfg.model = "opus"
     cfg.working_dir = Path("/tmp")
     tm = TaskManager(

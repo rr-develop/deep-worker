@@ -175,7 +175,7 @@ Semantics:
 - `force=False` and a `serena` entry already exists → do not overwrite
   (idempotent, friendly to manual edits);
 - atomic file write (tmp + `os.replace`);
-- **permissions:** file `0o600`, `.deepagents/` directory `0o700` — the
+- **permissions:** file `0o600`, `.deep_worker/` directory `0o700` — the
   config may contain `${env:…}` references to secrets. No 777/666
   (project policy).
 
@@ -483,7 +483,7 @@ internal directory (we don't commit it to git; Serena puts its own
 |---|---|
 | Polling prohibited | JSON-RPC stdio event-driven; no busy-wait |
 | No new threads | Serena — an external **process**, not a thread; the pool already exists |
-| File permissions (not 777/666) | `mcp.json` `0o600`, `.deepagents/` `0o700` (§4.2) |
+| File permissions (not 777/666) | `mcp.json` `0o600`, `.deep_worker/` `0o700` (§4.2) |
 | Don't change architecture/contracts | External MCP is reused **as is**; new code — additive `lsp/` package |
 | Non-blocking approaches | calls through the existing async adapter + `BoundedToolCallMiddleware` |
 

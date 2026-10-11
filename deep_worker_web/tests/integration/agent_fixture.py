@@ -256,7 +256,7 @@ def agent_fixture(
                 # test_agent_<pid>_<ts>/ directories. Safe: agent_name
                 # is the f-string ``test_agent_{pid}_{ts}`` (line 128)
                 # or the caller-supplied name, all under our control.
-                data_dir = deep_worker_home() / agent_name
+                data_dir = deep_worker_home() / "agents" / agent_name
                 if data_dir.exists():
                     shutil.rmtree(data_dir, ignore_errors=True)
 

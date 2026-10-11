@@ -2,40 +2,46 @@
   "_comment": "Two-way provider manifest invariant: the eligible source set \u2014 every *.py plus py.typed under deep_worker/providers/<pkg>, minus the deny list \u2014 must EXACTLY equal the files below. Regenerate with `python3 hooks/stage_providers.py --update` after any provider source change.",
   "deny": {},
   "packages": {
+    "acp": {
+      "files": {
+        "__init__.py": "357032d41af405f6f20d927ccb7562a16d233c7f1e07d9f6e318a17689764815",
+        "acp_client.py": "8353b0252bd9feea095b7cccee21d39222699f26c8ac0d9eb2f9d68bab23d913",
+        "acp_types.py": "fb448fd5ead861ed952d4b20aef074bb96bacc0ecc4b4effe72d8b49aca4d36f",
+        "arg_compat.py": "d49d7362be35e3ae26e041626d59f4cd43b1162fe57c1788d685c2f0e755eb30",
+        "builtin_tool_passthrough.py": "792ae234ee36a850015d2e7939e8ca7adbab201c1ffaa02b3e4e2078978a3415",
+        "chat_model.py": "e226d7d73e93f3b2b9249b375a52b13be602f6f2f542ecaca208aa4ae82097f6",
+        "client_state.py": "7d9b9fb69a8a437a14551292ec3629f89dc872ee919c73a076ab5aff0f688287",
+        "context_watch.py": "0aebadb03cbdda5f312732a2d17035c6ab88de433c7501932e7bd049b1931124",
+        "custom_types.py": "ea409fe838648edc3604f4d5a0ac81f0c4504360ff2997164aeb1b9ca144a09f",
+        "limit_errors.py": "6f036a533a7d94a439bae66b82e1bcd957930e38300fd9bf75d7e2fd7431f840",
+        "profile.py": "2c125993b9f58d44d069c7a139e4074152972560b174eee3e476d98eac92b623",
+        "proxy_mcp_server.py": "17242ec676733b1c29c9755a85f959509cadb38ea7ad943526b2c0d8d5fe667e",
+        "py.typed": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "session_state.py": "47ad003af9dc2e820960c0f969d532b74e9c15fbcafa61bab8da5b1d9c8fff7b"
+      },
+      "source_subpath": "deep_worker/providers/acp"
+    },
     "claude_code_provider": {
       "files": {
-        "__init__.py": "b39dc577bafda66bd779960b934772bc062815760d9762ab8ff8fd0a61877c14",
-        "api_error_detect.py": "3200669a73bec108e3e3c1dc60443d21a0526086c4a4ce72416b9bbbe2ae5859",
-        "chat_model.py": "5ffaff5d4a6a78a17ebb590a0e13beec5788a442e4d175fc2a2ba7a181314e58",
-        "client_manager.py": "5c415480d89bb8462950d9b945df0fdbdc6b97d4b962a9fa6e7ad5da898acb24",
-        "custom_types.py": "bb9a690f1a3e8d17cd240911668f1a19939b508f6bc3c58dcc18e4e25c034c05",
-        "delivery_resolve_middleware.py": "0ae4ae79f2ef0e6f2b43d1087103f436ccb1a834cc478525433307e156b108f9",
-        "orphaned_tool_calls.py": "da7325f14a2adba5a178d953502b554db54d85154c47698acf4c96e8c551f49b",
-        "proxy_mcp_server.py": "90261ec56aa7b13835e4fec1d54fe12a9ced3b400629a8f1a4a3cc43bb5132f2",
-        "py.typed": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "session_import.py": "3dd1f5ede21cfb5e428d6319206843b9c53fab49f8a259997b97f337626c939f",
-        "session_restore.py": "5a2878f24423f59cd6e580963a75598c2ac02590c7520e7c5b2b1bae22fb9aa8",
-        "session_state.py": "402a2ac6056b5cb8bf940633f9aa5dae972316b61da7d3e6b3f07b7f8916c9f5",
-        "session_synthesis.py": "a7deedc7228f07b091a126bcd49fd0b596b7f6e179f5942117ec71dc31403483",
-        "session_tail_match.py": "e8d7ce1b2ad47f1eb4f84538a5ee76e450716e52cf769262c27b30c3f119cd35",
-        "web_search/__init__.py": "54072416d6e53075a85ba022c195d1d9836f22aa396dad517d4ab6abb0810e17",
-        "web_search/web_search_delegation.py": "ccbe29f7ed9aa4cb3b654000f3b2a66ebdae770ac430059ede3b880adbb8b003",
-        "web_search/web_search_hooks.py": "5579dfc992145a58d76d8eb14ab32770ffc3c6bac3eab4f7fb1315b787911fa5"
+        "__init__.py": "27aa4f65876d3fa2c35d0981e6d954b1c9d3438468938da533b1f42d9803d1a1",
+        "chat_model.py": "cc9b2ba21ff058fb1d6166334e631b49fc881a80f9109fa0100845e83c7a52cc",
+        "profile.py": "8ebe51e491462d76335ca03d8895dcfe0fa67a375150e94c1d9a047d1ecc5f1b"
       },
       "source_subpath": "deep_worker/providers/claude_code_provider"
     },
     "codex_provider": {
       "files": {
-        "__init__.py": "1da8e7102c36bb27c4f802d6b114eb39152feafbf0a4827367cc9567093f2b21",
-        "chat_model.py": "79709a5a09914bfb19b47252fa26314e442f3ac3d5ba243602553347a883fa70",
-        "client_state.py": "9b522e61a67730c6d5e54a2133088553853ee9a5b96bc3d154f14f16f24c30b6",
-        "custom_types.py": "d9e0180c99b3bc463fb95f80dbd4a71204f82ac881460c8332357d10955488ae",
-        "event_pump.py": "f8089b63052280e7557b6003a6ebe0c2d5c15f620444cb25923c70ad3073e71c",
-        "exec_runner.py": "3686b280b544d6a281a4a763b143f1ff7d3076feb1799593e337ad28002da51e",
-        "native_tools.py": "8f87abbc63d7d6e9684988c3ff961329616b1b542c49e92e7ae9ee33198ba6ad",
-        "proxy_mcp_server.py": "2248e8ca0b04b2708cefe3f9c42a743c821bd83fd7802b5d8a79369bd2494a35",
+        "__init__.py": "8d68b912a487e844dbea82be5ec5e3e2b90c8115155e63e65a62e51302a8f376",
+        "chat_model.py": "63528c36e0c872280cc23ab2af94c61e406133ffda6250418534f78e26cc0456",
+        "client_state.py": "f2f1367f456beda4c8b3e868d108976468e74b1fd04c243843cf479efaefe916",
+        "context_watch.py": "40b4540f95c233bd996353b3d7228d1f640b4ad8cc350eda7957ab82d549e8dc",
+        "custom_types.py": "dc6ddcfa357dac689a8da38dcac4c0d826f644863e3982efb8c2881d55669a75",
+        "event_pump.py": "1c02694d7e4f46a896c56e4397220f7806c3d23a933b07a36fef2e716ee7ce0c",
+        "exec_runner.py": "5b1e8937c54a7e524ac7165768d23323d5d06827bc1ad6caf283dca47a197589",
+        "native_tools.py": "1758aaaa2969198eafb4aa688db0d539fb2244564d03280286b8fad45953bb9d",
+        "proxy_mcp_server.py": "f3d874917b6faa36f27cf1676adbdae112116f2f7dcf0759f119a2adb1b55888",
         "py.typed": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "session_state.py": "112480ad8cc2f4b85fa66c0df8dd2684a160c8136e6799b96eb3d7a7cc153bdc"
+        "session_state.py": "723bbef7421262ec7961e71b421728023b3cfbb6398916a244f9a9f4773324b7"
       },
       "source_subpath": "deep_worker/providers/codex_provider"
     },
@@ -43,7 +49,7 @@
       "files": {
         "__init__.py": "1528eca6cbec1761e2af81ffb5966ed8bcd49a2ba65e0feee53299b61b72d1e2",
         "bridge.py": "5043dbab8188e66c73d76fc63727c9f8926668ebc40f761cf4f10bab5ee93463",
-        "card.py": "24bf94cb3e420f0ffcb1dbcbd16d6ba7fbe4d8ef931310e9d54c612c0e52f18c",
+        "card.py": "43e3ab6828cec32f8bef0e0e2bab6dfe4ae5d9e1b5b4e72060581bbefffb7548",
         "client.py": "a32d0ac8b18f145ec327b43cce2aae89051bba0603fd133e3df5cc8515da9f5f",
         "config.py": "52dfe99fc4993fbb4344f918d36f42923ab57605ca80bbfa47d4a6eb496a0ad2",
         "executor.py": "5423408505a9f76d1bbb1a6f21fed1f32fcb267436eabee196c37d87932404d2",
@@ -56,34 +62,30 @@
     "grok_provider": {
       "files": {
         "__init__.py": "bfb7d663ff6b9a0505ea453df57ea6c87b1f045f7722220c262a18bb9a9ecaaa",
-        "acp_client.py": "e7157561ac1270aef8fdd3e79c4a53d36af6ba0fb4452a11c9369189c2197567",
-        "acp_types.py": "c970f3d564af25f379f6f8b780188e81e74db483760c7b71beaadcb647f1de84",
-        "arg_compat.py": "0f393a687ab395f5817db81f27209dd85fc6b015c3b9cdc199d6257299811445",
-        "builtin_tool_passthrough.py": "123a36e7ccc66cbcbddaaed455aa2ed17e43a57bb1ac3287168a8ee095bab6db",
-        "chat_model.py": "81fbe41170172cf74852eb10f374f999d6b21fa26da2bdc3d3ebdff204e3a890",
-        "client_state.py": "a49e351896e0975c515b2f547bf6d9e83c710c0ca646a9553c8416d93b3895e9",
-        "custom_types.py": "6dce75c040101423faddc7dce24c48334fbfabc89721f834f218091960e97951",
-        "limit_errors.py": "34b9b9bc166974603b003f019fe2b446277c584327d72cfbd106e31fafb49ec4",
-        "proxy_mcp_server.py": "febc7e46f837bb46f4c7ecbbb5224bed21f83b9d91dcce579e4b75fa124b1b48",
-        "py.typed": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "session_state.py": "61b6a61bdaad0cd920042a371e828a031f610bd1e9e4fa178be654a5becc832c"
+        "acp_types.py": "41da50e82ed4ce081fe1dd821cfff74ac282dac89d5a9df3cfb08f4dbaddfb37",
+        "builtin_tool_passthrough.py": "a0279afbb66defffd16986f59d209d206f72d5610f077cfe83b4f6f97a8186db",
+        "chat_model.py": "4b674675a3a70d2caca7bd1d1114cc639a99a0b68aa5328ac945d11a8fc348fb",
+        "limit_errors.py": "1ea2b0055c3a71133aa595d8bc91d72208bcf474ed82de9831ebe1879e4fcccc",
+        "profile.py": "73e463a13483b7e78665ebf2044887915424ceee4ffbf597f2014cdebf301bf8",
+        "py.typed": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
       },
       "source_subpath": "deep_worker/providers/grok_provider"
     },
     "semantic_search": {
       "files": {
         "__init__.py": "bb2e42e09e81acdb9012035e8995cfa4a69399c4d8f76c11fa2ed8317fd39d19",
+        "_embed_cache.py": "2a33d4780f20dd95c22999f56b36805ce7f6bb36834dc90986208be1527eaa80",
         "_tokenizer.py": "6214cf97212c85cecc4ae1d95dbe4b3487a7b8c4f405be2c43af281e88c1516f",
         "config.py": "a7f61eb7f86fac27902abb93d3a454f2e48a2b871649e62bd6b187bc162ed74e",
         "exceptions.py": "d6d73c5715ec5e86fb713db1df2da58b048509ebbbeb30ce5be79ca7fc3d4929",
-        "history_indexer.py": "8db52c49c7b3ca72dc322a6d0b3fbe40a20916ec3eb5ae329c852941da02b192",
-        "history_retriever.py": "d706ac386e3ca1932646afeddf69c6ae7c424a82aa4bb051a77056fe18835229",
-        "indexer.py": "7f68a00b8429c9961ba4800f407d8fb79f7c812a66126c59f5f85ba4acfc7f64",
-        "long_text_embedding.py": "bd74b5e4e0c53f2101c60978282d09a816d1dc9f0fa0afbfd1faf00d8814e3e7",
+        "history_indexer.py": "12b01382bc5a70dea49542ee165c49463c92440158801f28b01ada99c1811a59",
+        "history_retriever.py": "97691ce2537620172e1a2c244f5826ecffa930b4a3eba0f74b5eaaf307441eaf",
+        "indexer.py": "662667c7a02b1bcc39b57c6bc0710a0944c03dfc72161610250dab1abf9ea885",
+        "long_text_embedding.py": "175588819cffbc434f0d3454e6bf627f076c09fb4a98b09424a080ed2bf3f3ac",
         "message_embedding_store.py": "85621722dab533dc36d3cf8f7ba0e756d5cd33bcf7eaba813a6f998ee29da320",
         "message_search.py": "b53fe6a7c38eb599337333aab4a7dd4ada25a385b9a6bcad6893689ddee03cc8",
         "py.typed": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "retriever.py": "09848c5b0c0ba0c710886283c6f8b48b79e442c67f2781f86b60e82104c1ae9f",
+        "retriever.py": "eabc5a70adb1f65eb73e017265423311a7bd91285a7e30d4629fd8aadeed54fa",
         "scanner.py": "36ed0f7eb07d0d890c28fcdf221dd92caef22d04a484446d0e20fe282d072f72",
         "search_cli.py": "f841ab09e54e54d72580daf9c8cf53958bbc2b20ceb7c310619ef9d38e9182e8"
       },

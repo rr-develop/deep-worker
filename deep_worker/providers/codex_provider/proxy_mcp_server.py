@@ -1,6 +1,6 @@
 """ProxyMCPServer — in-agent-process HTTP MCP server.
 
-⚠️ ARCHITECTURAL INVARIANT (same as claude_code_provider's proxy):
+⚠️ ARCHITECTURAL INVARIANT (same as claude_code_sdk_provider's proxy):
 ═══════════════════════════════════════════════════════════════════════════════
 The MCP handler NEVER executes the tool. It only parks an asyncio.Future and
 awaits resolution. The Future is set by ``CodexChatModel.ainvoke`` when the
@@ -41,12 +41,12 @@ logger = logging.getLogger(__name__)
 # by default (the job-handle mechanism is the default — see POLICIES.md
 # §7.1). It is NOT a deadline for the work — the Future is parked, not
 # cancelled. 120s ("~2 minutes") per project policy, identical to
-# claude_code_provider. Override via ``DW_LONG_RUNNING_WAIT_SECONDS``.
+# claude_code_sdk_provider. Override via ``DW_LONG_RUNNING_WAIT_SECONDS``.
 def _default_wait_seconds() -> float:
     """THE single source of truth for the tool-wait bound — delegates to
     ``deepagents.middleware.bounded_tool_call.resolve_tool_wait_seconds`` so
     there is NO independent timer constant in this provider (variant A,
-    identical to claude_code_provider). The former private
+    identical to claude_code_sdk_provider). The former private
     ``_DEFAULT_LONG_RUNNING_WAIT_SECONDS`` (120s) is gone."""
     from deepagents.middleware.bounded_tool_call import resolve_tool_wait_seconds
 
@@ -79,7 +79,7 @@ class ProxyMCPServer:
     ) -> None:
         self._tools_metadata: list[ToolMetadata] = list(tools_metadata)
         # Default job-handle wait (120s, env-overridable). Same policy and
-        # contract as claude_code_provider — provider-agnostic, no
+        # contract as claude_code_sdk_provider — provider-agnostic, no
         # exceptions. See docs/POLICIES.md §7.1.
         if long_running_wait_seconds is None:
             long_running_wait_seconds = _default_wait_seconds()
@@ -223,23 +223,17 @@ class ProxyMCPServer:
             if not fut.done():
                 fut.set_result(result)
             return
-        # Dual-key parked-job lookup (observed fix, 2026-07-31): the local
-        # ``self._jobs`` dict is keyed by canonical ``job_N`` now, but this
-        # method is still entered by the originating ``call_id`` — resolve
-        # either namespace via the shared ``ParkedJobRegistry`` alias.
-        job_key: str | None = call_id if call_id in self._jobs else None
-        if job_key is None:
-            from deepagents.middleware.parked_job_registry import (  # noqa: PLC0415
-                get_parked_job_registry,
-            )
-            parked = get_parked_job_registry().resolve(call_id)
-            if parked is not None and parked.job_id in self._jobs:
-                job_key = parked.job_id
+        from deepagents.middleware.parked_job_registry import (  # noqa: PLC0415
+            complete_parked_job,
+            resolve_parked_job_key,
+        )
+
+        job_key = resolve_parked_job_key(call_id, self._jobs)
         if job_key is not None:
-            job = self._jobs.pop(job_key)
-            jfut = job["future"]
+            jfut = self._jobs[job_key]["future"]
             if not jfut.done():
                 jfut.set_result(result)
+            complete_parked_job(job_key)
 
     def _matching_pending_calls(
         self,
@@ -286,7 +280,7 @@ class ProxyMCPServer:
 
         ── Bounded wait — HARD POLICY, NO bare await future ──
         EVERY tool is waited on with a finite bound so it can NEVER hang the
-        turn forever (identical contract to claude_code_provider). Two modes
+        turn forever (identical contract to claude_code_sdk_provider). Two modes
         set in __init__:
 
           "job_handle"     (DEFAULT for every tool): wait ``wait_seconds``;
@@ -337,19 +331,18 @@ class ProxyMCPServer:
                 build_in_progress_notice,
             )
 
-            registry = get_parked_job_registry()
-            existing = registry.resolve_by_alias(call_id) if call_id else None
-            job_id = (
-                existing.job_id if existing is not None else registry.allocate()
-            )
-            registry.register(
-                job_id,
-                kind="tool",
-                handle=fut,
+            # The registry owns the whole parked-job lifetime — id reuse,
+            # completion, erasure. Re-implementing any of that here is what
+            # POLICIES.md §14 forbids.
+            def _forget(jid: str) -> None:
+                self._jobs.pop(jid, None)
+
+            job_id = get_parked_job_registry().park(
+                fut,
                 alias=call_id or None,
                 tool_name=tool_name,
-            )
-            fut.add_done_callback(lambda _f: registry.drop(job_id))
+                on_release=_forget,
+            ).job_id
 
             self._jobs[job_id] = {
                 "future": fut,

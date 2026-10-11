@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import pathlib
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -56,12 +55,6 @@ async def _flush_text_buffer(callback_id: int) -> None:
     # This matches deepagents pattern where text is consumed immediately
     buffer["text"] = ""
 
-    # DEBUG: Log flush
-    import time
-    with pathlib.Path("/tmp/dwcli_batch_debug.log").open("a") as f:
-        f.write(f"\n[{time.time():.3f}] FLUSHING text buffer: {len(accumulated_text)} chars\n")
-        f.write(f"  text preview: {accumulated_text[:50]!r}\n")
-
     await notify_callback({
         "type": "assistant_chunk",
         "role": "assistant",
@@ -95,12 +88,6 @@ async def _add_text_to_buffer(
 
     buffer = _text_buffers[callback_id]
     buffer["text"] += text
-
-    # DEBUG: Log accumulation
-    import time
-    with pathlib.Path("/tmp/dwcli_batch_debug.log").open("a") as f:
-        f.write(f"\n[{time.time():.3f}] ACCUMULATING text: +{len(text)} chars, total={len(buffer['text'])}\n")
-        f.write(f"  added: {text!r}\n")
 
     # Flush immediately if buffer is large
     if len(buffer["text"]) >= TEXT_BATCH_MAX_CHARS:
@@ -156,13 +143,6 @@ async def process_message_chunk(
         To reduce RPyC overhead, text chunks are batched for up to 50ms or 100 chars
         before sending. This prevents character-by-character RPyC calls.
     """
-    # DEBUG: Log entry
-    import time
-    with pathlib.Path("/tmp/dwcli_process_message_ENTRY.log").open("a") as f:
-        f.write(f"\n[{time.time():.3f}] process_message_chunk CALLED\n")
-        f.write(f"  message type: {type(message).__name__}\n")
-        f.write(f"  has content_blocks: {hasattr(message, 'content_blocks')}\n")
-
     # Use callback ID for buffer keying (based on object id)
     callback_id = id(notify_callback)
 
@@ -258,15 +238,6 @@ async def process_message_chunk(
 
             # Tool call chunks (streaming) - accumulate and send when complete
             elif block_type == "tool_call_chunk":
-                # DEBUG: Log when tool_call_chunk arrives
-                import threading
-                import time
-                with pathlib.Path("/tmp/dwcli_stream_debug.log").open("a") as f:
-                    f.write(f"\n[{time.time():.3f}] [Thread: {threading.current_thread().name}] TOOL_CALL_CHUNK:\n")
-                    f.write(f"  id={block.get('id')}\n")
-                    f.write(f"  name={block.get('name')}\n")
-                    f.write(f"  args={repr(block.get('args'))[:100]}\n")
-
                 if tool_call_buffer is None:
                     # No buffer provided, skip chunk accumulation
                     continue
@@ -294,8 +265,6 @@ async def process_message_chunk(
 
                 # If still no buffer_key found, this is an error - skip chunk
                 if buffer_key is None:
-                    with pathlib.Path("/tmp/dwcli_stream_debug.log").open("a") as f:
-                        f.write(f"  WARNING: No buffer entry found for index={index}, skipping chunk\n")
                     continue
 
                 # Create buffer entry if doesn't exist (first chunk)
@@ -330,15 +299,6 @@ async def process_message_chunk(
                     final_id = tool_call_buffer[buffer_key]["id"]
                     final_name = tool_call_buffer[buffer_key]["name"]
 
-                    # DEBUG: Log when tool_call is sent
-                    import threading
-                    import time
-                    with pathlib.Path("/tmp/dwcli_stream_debug.log").open("a") as f:
-                        f.write(f"\n[{time.time():.3f}] [Thread: {threading.current_thread().name}] TOOL_CALL COMPLETE - calling notify_callback:\n")
-                        f.write(f"  name={final_name}\n")
-                        f.write(f"  id={final_id}\n")
-                        f.write(f"  args={args_json}\n")
-
                     await notify_callback({
                         "type": "tool_call",
                         "name": final_name,
@@ -346,8 +306,6 @@ async def process_message_chunk(
                         "id": final_id,
                     })
 
-                    with pathlib.Path("/tmp/dwcli_stream_debug.log").open("a") as f:
-                        f.write(f"[{time.time():.3f}] notify_callback returned\n")
                     # Remove from buffer
                     del tool_call_buffer[buffer_key]
                 except json.JSONDecodeError:

@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import sys
 from collections.abc import Callable
 from datetime import datetime
@@ -12,26 +13,42 @@ from types import SimpleNamespace
 from typing import Any, Protocol
 
 from deep_worker_cli.agent_config_pkg.agent_config import AgentConfig
+from deep_worker_cli.tool_selection import (
+    merge_increments,
+    parse_increment_spec,
+    native_tool_caveat,
+    parse_tool_selection,
+    parse_tool_selection_spec,
+)
 from deep_worker_cli.client.agent_client import AgentClient
+from deep_worker_cli.middleware.tool_completion import (
+    _canonical_turn_ending_spec_str,
+    _parse_turn_ending_tool_specs,
+)
 from deep_worker_cli.process.agent_process import AgentProcess
 from deep_worker_cli.process.registry import ProcessRegistry
 from deep_worker_cli.runtime.availability_tracker import AvailabilityTracker
-from deep_worker_cli.storage_paths import deep_worker_home
+from deep_worker_cli.runtime.provider_chain import (
+    SUPPORTED_PROVIDERS,
+    all_provider_names,
+)
+from deep_worker_cli.storage_paths import agent_root, deep_worker_home
 
-clear_history_index = None
-index_all_history_files = None
 
 # Claude-session import (DESIGN_IMPORT_CLAUDE_SESSION.md). The provider lives at
-# <repo-root>/claude_code_provider/ and is NOT importable until the repo root is
+# <repo-root>/claude_code_sdk_provider/ and is NOT importable until the repo root is
 # on sys.path — exactly the bootstrap ``tools.py`` does for web_search. A plain
-# top-level ``from deep_worker.providers.claude_code_provider...`` import here breaks EVERY invocation
+# top-level ``from deep_worker.providers.claude_code_sdk_provider...`` import here breaks EVERY invocation
 # of ``deep-worker`` (even ``--help``), because the CLI module is imported
 # before any sys.path setup runs. Add the repo root first, THEN import, so the
 # names exist as module globals (tests patch
 # ``agent_command.parse_claude_transcript`` / ``resolve_transcript_path``).
 _repo_root = Path(__file__).resolve().parents[4]  # .../<repo>/  (cli→cli_pkg→pkg→deep_worker→repo)
-if (_repo_root / "claude_code_provider").exists() and str(_repo_root) not in sys.path:
+if (_repo_root / "claude_code_sdk_provider").exists() and str(_repo_root) not in sys.path:
     sys.path.insert(0, str(_repo_root))
+
+
+_SDK_PROVIDER = "deep_worker.providers.claude_code_sdk_provider"
 
 
 class _ParseClaudeTranscript(Protocol):
@@ -46,32 +63,39 @@ def _load_claude_session_imports() -> tuple[
     _ParseClaudeTranscript | None,
     _ResolveTranscriptPath | None,
 ]:
-    """Best-effort import of the claude-code transcript importer.
+    """Best-effort import of the claude-code-sdk transcript importer.
 
-    ``claude_code_provider`` is a monorepo-only package (NOT vendored into the
+    ``claude_code_sdk_provider`` is a monorepo-only package (NOT vendored into the
     PyPI wheel). When it is genuinely absent, degrade gracefully: keep this
     module importable (``--help`` etc.) and let ``--import-claude`` report a
     clear error at use time. Only the missing-provider case
-    (``ModuleNotFoundError`` on ``claude_code_provider`` itself) is swallowed;
+    (``ModuleNotFoundError`` on ``claude_code_sdk_provider`` itself) is swallowed;
     any other import defect of an installed/source provider — including a
-    missing/renamed ``claude_code_provider.session_import`` submodule — is
+    missing/renamed ``claude_code_sdk_provider.session_import`` submodule — is
     re-raised so it is not masked as "package absent".
 
     Returns:
         ``(parse_claude_transcript, resolve_transcript_path)``, or
-        ``(None, None)`` when ``claude_code_provider`` is not installed.
+        ``(None, None)`` when ``claude_code_sdk_provider`` is not installed.
 
     Raises:
         ModuleNotFoundError: an import defect OTHER than the missing
-            ``claude_code_provider`` package itself.
+            ``claude_code_sdk_provider`` package itself.
     """
     try:
-        from deep_worker.providers.claude_code_provider.session_import import (  # noqa: PLC0415
+        from deep_worker.providers.claude_code_sdk_provider.session_import import (  # noqa: PLC0415
             parse_claude_transcript,
             resolve_transcript_path,
         )
     except ModuleNotFoundError as exc:
-        if exc.name != "claude_code_provider":
+        # ``exc.name`` is the dotted name of the module that is missing: the
+        # provider package itself, or a parent package when the source root
+        # is not on sys.path. A missing submodule of a present provider is
+        # still a defect and is re-raised.
+        name = exc.name or ""
+        if name != "claude_code_sdk_provider" and not (
+            name == _SDK_PROVIDER or _SDK_PROVIDER.startswith(name + ".")
+        ):
             raise
         return None, None
     return parse_claude_transcript, resolve_transcript_path
@@ -103,9 +127,248 @@ _PARSER_DEFAULTS = {
     "web_search_policy": "auto",
     "preferred_provider": None,
     "no_update_preferred": False,
+    "failover_chain": None,
     "fork": None,
     "fork_from": None,
+    "context_limit": None,
+    "hot_cache_ttl": None,
+    "summary_keep": None,
 }
+
+
+_CONTEXT_LIMIT_RE = re.compile(r"^(\d+)([kKmM])?$")
+
+# Sentinel returned by ``parse_context_limit`` for the literal "default"
+# token. Surfaces to ``merge_restart_config`` as an explicit "operator
+# said clear this" signal — distinct from the bare-restart case where
+# ``args.context_limit is None`` simply because no ``-l`` was passed.
+# ``build_launch_config`` converts the sentinel to ``None`` for the
+# runtime path via :func:`_resolved_context_limit`. See
+# ``test_restart_preserves_context_limit.py`` for the contract.
+_CONTEXT_LIMIT_CLEAR_SENTINEL = "__context_limit_cleared__"
+
+
+def _resolved_context_limit(value):
+    """Convert the CLI value to what the runtime wants.
+
+    * sentinel → ``None`` (operator explicitly cleared the limit).
+    * ``None`` → ``None`` (bare restart, no ``-l`` on the line).
+    * ``int`` → unchanged.
+
+    Used by :func:`build_launch_config` so the sentinel never reaches
+    the runtime — it only carries meaning along the CLI dataflow.
+    """
+    if value == _CONTEXT_LIMIT_CLEAR_SENTINEL:
+        return None
+    return value
+
+
+def parse_context_limit(value: str) -> int | str:
+    """Parse ``--context_limit`` / ``-l`` into token count or a clear sentinel.
+
+    ``default`` (any case) returns the clear sentinel
+    (see ``_CONTEXT_LIMIT_CLEAR_SENTINEL``). ``k``/``K`` = ×1_000,
+    ``M``/``m`` = ×1_000_000. Floats, empty strings, unknown suffixes,
+    zero and negatives are rejected so the stored value is reversible
+    from the CLI token.
+    """
+    text = value.strip()
+    if text.lower() == "default":
+        return _CONTEXT_LIMIT_CLEAR_SENTINEL
+    if not text:
+        raise argparse.ArgumentTypeError(
+            "context_limit must be a positive integer with optional k/M suffix, or 'default'"
+        )
+    match = _CONTEXT_LIMIT_RE.fullmatch(text)
+    if match is None:
+        raise argparse.ArgumentTypeError(
+            f"invalid context_limit {value!r}: expected a positive integer "
+            f"with optional k/M suffix, or 'default'"
+        )
+    number = int(match.group(1))
+    if number == 0:
+        raise argparse.ArgumentTypeError("context_limit must be greater than 0")
+    suffix = match.group(2)
+    if suffix in ("k", "K"):
+        number *= 1_000
+    elif suffix in ("m", "M"):
+        number *= 1_000_000
+    return number
+
+
+def parse_hot_cache_ttl(value: str) -> tuple[str, int]:
+    """Parse ``--hot-cache-ttl <sec>`` or ``--hot-cache-ttl <provider>=<sec>``.
+
+    Bare seconds apply to every provider (key ``*``). ``0`` is always-cold.
+    """
+    text = value.strip()
+    if not text:
+        raise argparse.ArgumentTypeError(
+            "hot-cache-ttl must be <sec> or <provider>=<sec>"
+        )
+    if "=" in text:
+        provider, _, rest = text.partition("=")
+        provider = provider.strip().lower()
+        rest = rest.strip()
+    else:
+        provider = "*"
+        rest = text
+    if not provider:
+        raise argparse.ArgumentTypeError("hot-cache-ttl provider must be non-empty")
+    if not rest.isdigit():
+        raise argparse.ArgumentTypeError(
+            f"invalid hot-cache-ttl {value!r}: expected a non-negative integer "
+            f"or <provider>=<sec>"
+        )
+    return provider, int(rest)
+
+
+def parse_summary_keep(value: str) -> tuple[str, int | float]:
+    """Parse ``--summary-keep <spec>`` into a ``keep`` retention policy.
+
+    Accepted forms::
+
+        0        -> ("tokens", 0)      no tail at all, summary only
+        10000    -> ("tokens", 10000)  token CEILING
+        10k      -> ("tokens", 10000)  token CEILING
+        10%      -> ("fraction", 0.10) share of the effective window
+        0.10     -> ("fraction", 0.10) share of the effective window
+        20m      -> ("messages", 20)   last N messages
+
+    A token value is a ceiling applied against the default share (see
+    ``resolve_summary_keep``); a fraction or message count replaces the
+    default outright. ``0`` is exact — it is never min()-ed.
+    """
+    text = value.strip()
+    if not text:
+        raise argparse.ArgumentTypeError(
+            "summary-keep must be 0, <tokens>, <N>k, <N>%, 0.<N> or <N>m"
+        )
+
+    if text.endswith("%"):
+        body = text[:-1].strip()
+        try:
+            percent = float(body)
+        except ValueError:
+            raise argparse.ArgumentTypeError(
+                f"invalid summary-keep {value!r}: expected a number before '%'"
+            ) from None
+        if not 0 < percent <= 100:
+            raise argparse.ArgumentTypeError(
+                f"invalid summary-keep {value!r}: percentage must be in (0, 100]"
+            )
+        return "fraction", percent / 100.0
+
+    lowered = text.lower()
+    if lowered.endswith("m"):
+        body = lowered[:-1].strip()
+        if not body.isdigit():
+            raise argparse.ArgumentTypeError(
+                f"invalid summary-keep {value!r}: expected <N>m for a message count"
+            )
+        count = int(body)
+        if count <= 0:
+            raise argparse.ArgumentTypeError(
+                f"invalid summary-keep {value!r}: message count must be > 0 "
+                f"(use 0 for an empty tail)"
+            )
+        return "messages", count
+
+    if lowered.endswith("k"):
+        body = lowered[:-1].strip()
+        if not body.isdigit():
+            raise argparse.ArgumentTypeError(
+                f"invalid summary-keep {value!r}: expected <N>k for a token ceiling"
+            )
+        return "tokens", int(body) * 1_000
+
+    if lowered.isdigit():
+        return "tokens", int(lowered)
+
+    # Bare decimal in (0, 1] is a fraction: 0.10 == 10%.
+    try:
+        fraction = float(lowered)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"invalid summary-keep {value!r}: expected 0, <tokens>, <N>k, "
+            f"<N>%, 0.<N> or <N>m"
+        ) from None
+    if not 0 < fraction <= 1:
+        raise argparse.ArgumentTypeError(
+            f"invalid summary-keep {value!r}: fractional values must be in (0, 1]"
+        )
+    return "fraction", fraction
+
+
+def resolve_summary_keep(spec, default_keep):
+    """Combine an operator ``--summary-keep`` spec with the computed default.
+
+    A token spec is a CEILING — it may only lower the default, never raise it
+    (operator requirement: "no more than 10k" is an upper bound). An explicit
+    ``("tokens", 0)`` is exact and is never min()-ed. Fraction and message
+    specs replace the default outright.
+
+    A token ceiling against a *fraction* default cannot be compared here (the
+    window is unknown until the model resolves), so the ceiling is carried
+    through as-is.
+    """
+    if spec is None:
+        return default_keep
+    kind, value = spec
+    if kind != "tokens":
+        return spec
+    if value == 0:
+        return "tokens", 0
+    default_kind, default_value = default_keep
+    if default_kind == "tokens":
+        return "tokens", min(int(value), int(default_value))
+    return "tokens", int(value)
+
+
+def _normalize_summary_keep(value):
+    """CLI tuple or saved list/tuple → ``(kind, value)`` or ``None``.
+
+    Anything that is not a recognised spec is treated as "not configured"
+    rather than raising. ``merge_restart_config`` reads this off an
+    ``argparse.Namespace`` that callers (and a number of existing tests)
+    build as a ``MagicMock``, where a missing attribute yields a mock rather
+    than the ``getattr`` default — raising here would turn an unrelated
+    restart into a hard failure. A genuinely malformed spec is rejected at
+    parse time by ``parse_summary_keep`` (argparse ``type=``), which is the
+    boundary that faces the operator.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return parse_summary_keep(value)
+    if isinstance(value, (tuple, list)) and len(value) == 2:
+        kind = str(value[0]).strip().lower()
+        try:
+            if kind == "fraction":
+                return "fraction", float(value[1])
+            if kind in {"tokens", "messages"}:
+                return kind, int(value[1])
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _normalize_hot_cache_ttl(value) -> dict[str, int]:
+    """CLI list-of-pairs or saved dict → ``{provider: seconds}``."""
+    if not value:
+        return {}
+    if isinstance(value, dict):
+        return {str(key).strip().lower(): int(sec) for key, sec in value.items()}
+    out: dict[str, int] = {}
+    for item in value:
+        if isinstance(item, (tuple, list)) and len(item) == 2:
+            out[str(item[0]).strip().lower()] = int(item[1])
+        elif isinstance(item, str):
+            key, sec = parse_hot_cache_ttl(item)
+            out[key] = sec
+        else:
+            raise TypeError(f"invalid hot_cache_ttl entry: {item!r}")
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -173,9 +436,63 @@ def normalize_model_arg(args: argparse.Namespace) -> None:
         args.model = None
 
 
+def apply_preferred_provider_override(args: argparse.Namespace) -> None:
+    """Make ``-pp``/``--preferred-provider`` select the ACTIVE provider.
+
+    ``--preferred-provider`` is documented to override both the long-term
+    preference and the active provider. That override lives in
+    ``merge_restart_config()``, which only runs when there is a saved
+    config to merge — so on a FIRST launch it never ran and
+    ``args.provider`` stayed at the parser default. ``deep-worker foo -pp
+    codex`` therefore started on deepseek and persisted deepseek's default
+    model, which the web UI then reported as the agent's model (operator
+    report 2026-09-01).
+
+    Applied right after ``parse_args`` for the same reason as
+    ``normalize_model_arg``: ``args`` is repaired once, before any consumer
+    (``AgentConfig``, the tool-selection preflight, ``build_launch_config``)
+    reads it, so they cannot disagree about which provider is active.
+
+    Two guards keep this confined to a genuine first launch:
+
+    * ``--restart`` is excluded outright. Under a temporary failover
+      ``provider`` and ``preferred_provider`` legitimately differ, and
+      ``merge_restart_config`` has already decided which wins; re-applying
+      the override would drag the agent back onto its preferred provider
+      and undo the failover
+      (``test_restart_preserves_preferred_model_under_failover``).
+    * An explicit ``--provider`` wins, since that flag *is* the
+      active-provider selector. Presence is read from ``argv`` rather than
+      inferred from "the value equals the default", because ``deepseek``
+      is both the default and a provider an operator may name outright.
+
+    Mutates ``args`` in place; returns nothing.
+    """
+    if getattr(args, "restart", False):
+        return
+    preferred = getattr(args, "preferred_provider", None)
+    if not preferred:
+        return
+    if "provider" in _explicit_cli_flags():
+        return
+    args.provider = preferred
+
+
 def _get_agent_data_dir(name: str) -> Path:
-    """Return the data directory for an agent."""
-    return deep_worker_home() / name
+    """Return the data directory for an agent.
+
+    Post-v6 we prefer the canonical ``agents/<name>/`` layout, but for
+    agents that haven't lazily migrated yet the launch_config loader
+    also checks the legacy ``~/.deep_worker/<name>/`` location via
+    ``read_agent_file`` (DESIGN_AGENT_DBS_UNDER_AGENTS_SUBDIR §4.5).
+    """
+    canonical = agent_root(name, create=False)
+    if (canonical / "session_metadata.json").exists():
+        return canonical
+    legacy = Path.home() / ".deep_worker" / name
+    if (legacy / "session_metadata.json").exists():
+        return legacy
+    return canonical  # caller will see "no metadata" anyway
 
 
 def load_launch_config(name: str) -> dict | None:
@@ -240,10 +557,24 @@ def _explicit_cli_flags(argv: list[str] | None = None) -> set[str]:
                           default=argparse.SUPPRESS)
     detector.add_argument("--no-update-preferred", dest="no_update_preferred",
                           action="store_true", default=argparse.SUPPRESS)
+    detector.add_argument("--failover-chain", dest="failover_chain",
+                          default=argparse.SUPPRESS)
     detector.add_argument("--fork", dest="fork",
                           default=argparse.SUPPRESS)
     detector.add_argument("--from", dest="fork_from",
                           default=argparse.SUPPRESS)
+    detector.add_argument("--turn-ending-tool", dest="turn_ending_tools",
+                          action="append", default=argparse.SUPPRESS)
+    detector.add_argument("--tools", dest="tools", default=argparse.SUPPRESS)
+    detector.add_argument("-l", "--context_limit", dest="context_limit",
+                          default=argparse.SUPPRESS)
+    detector.add_argument("--hot-cache-ttl", dest="hot_cache_ttl",
+                          action="append", default=argparse.SUPPRESS)
+    detector.add_argument("--summary-keep", dest="summary_keep",
+                          default=argparse.SUPPRESS)
+    # Exact ``-ls`` so prefix matching cannot swallow it as ``-l`` + ``s``.
+    detector.add_argument("-ls", "--list", dest="list_threads",
+                          action="store_true", default=argparse.SUPPRESS)
 
     # --no-* counterparts (store_const with const=False, default=SUPPRESS).
     # These extend the real parser's --no-* flags so that passing e.g.
@@ -285,7 +616,7 @@ def _warn_model_reset(
 ) -> None:
     """Tell the operator, exactly once, that a model was dropped.
 
-    A silent substitution is the whole point of this guard: the operator ran
+    A silent substitution is the whole defect: the operator ran
     ``--model fable`` and got ``sonnet`` with nothing on screen. Any transition
     that DISCARDS a model value must pass through here.
 
@@ -324,6 +655,70 @@ def _warn_model_reset(
         file=sys.stderr,
         flush=True,
     )
+
+
+def _emit_tool_selection_preflight(provider: str, spec: list[str]) -> None:
+    """Disclose un-suppressable provider natives on the TERMINAL.
+
+    A restricted run is a measurement, and the user has to learn that the
+    provider's own built-ins survived the restriction while they can still
+    read it — i.e. BEFORE ``daemonize()`` sends every later byte to a log
+    file nobody opens. The logger warning inside ``create_cli_agent``
+    remains, but it lands post-detach and so cannot be the only disclosure.
+
+    Silent by construction when nothing is restricted, so the default
+    launch prints nothing at all.
+    """
+    caveat = native_tool_caveat(provider, parse_tool_selection(spec))
+    if caveat:
+        print(f"WARNING: {caveat}", file=sys.stderr, flush=True)
+
+
+def _preflight_spec(value) -> list[str]:
+    """Normalise a ``--tools`` value (CLI string or saved list) to a spec."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [part.strip() for part in value.split(",") if part.strip()]
+    return list(value)
+
+
+def resolve_tool_spec(args: argparse.Namespace) -> list[str]:
+    """The tool spec this launch actually runs with.
+
+    ``--tools`` states the selection outright; ``--tools-add`` and
+    ``--tools-remove`` layer onto it. Both must reach the AgentConfig the
+    process is BUILT from and the launch_config it is RESTARTED from, or
+    the two disagree — which is not academic: resolving the increments for
+    ``launch_config`` alone let ``deep-worker probe --tools-rm 'lsp_*'``
+    reach ``idle`` with a pattern matching no tool, because the unknown-name
+    check runs against the AgentConfig spec and never saw the rule
+    (observed on a test probe). One owner for the rule,
+    per POLICIES §14.
+
+    On ``--restart`` the increments are already folded into ``args.tools``
+    by ``merge_restart_config``, which then clears the two flags — so this
+    is a no-op there rather than a second application.
+    """
+    return merge_increments(
+        parse_tool_selection_spec(getattr(args, "tools", None)),
+        parse_increment_spec(
+            getattr(args, "tools_add", None),
+            getattr(args, "tools_remove", None),
+        ),
+    )
+
+
+def _emit_effective_tool_selection_preflight(args: argparse.Namespace) -> None:
+    """Disclose the effective selection before the process daemonizes."""
+    config_path = getattr(args, "config", None)
+    if config_path:
+        config = AgentConfig.from_file(config_path)
+        _emit_tool_selection_preflight(config.provider, config.tools)
+        return
+    # The increments are part of the effective selection, so a preflight
+    # that read only ``--tools`` would understate what the agent runs with.
+    _emit_tool_selection_preflight(args.provider, resolve_tool_spec(args))
 
 
 def merge_restart_config(
@@ -389,12 +784,27 @@ def merge_restart_config(
     effective.web_search_policy = saved.get(
         "web_search_policy", _PARSER_DEFAULTS["web_search_policy"]
     )
+    # Failover chain name. MUST be restored from the saved config: every
+    # automatic failover restarts the agent, so a chain that reverted to
+    # "default" here would silently undo the operator's choice on the first
+    # usage limit — the failure mode that wiped preferred_model in 2026-08-14.
+    effective.failover_chain = saved.get("failover_chain") or "default"
     effective.clean = False  # NEVER inherit --clean
 
     # External MCP CLI overrides — restore from saved launch_config so a
     # restart reuses them (DESIGN_EXTERNAL_MCP_TOOLS.md §3.7).
     effective.mcp_config_paths = list(saved.get("mcp_config_paths") or [])
     effective.mcp_server_inline = list(saved.get("mcp_server_inline") or [])
+
+    # Turn-ending tool declarations — same restore semantics as the MCP
+    # lists above (see DESIGN_CLI_TURN_ENDING_TOOL_FLAG.md §3.3).
+    effective.turn_ending_tools = list(saved.get("turn_ending_tools") or [])
+    # Tool selection — restored as the raw spec in the CLI's own
+    # comma-separated form, so a restricted agent restarts restricted.
+    _saved_tools = list(saved.get("tools") or [])
+    effective.tools = ",".join(_saved_tools) if _saved_tools else None
+    effective.hot_cache_ttl = _normalize_hot_cache_ttl(saved.get("hot_cache_ttl"))
+    effective.summary_keep = _normalize_summary_keep(saved.get("summary_keep"))
 
     # Override with explicitly provided CLI args
     provider_overridden = _is_override(
@@ -448,12 +858,88 @@ def merge_restart_config(
         _PARSER_DEFAULTS["web_search_policy"],
     ):
         effective.web_search_policy = args.web_search_policy
+    if _is_override(
+        "failover_chain",
+        getattr(args, "failover_chain", _PARSER_DEFAULTS["failover_chain"]),
+        _PARSER_DEFAULTS["failover_chain"],
+    ):
+        effective.failover_chain = args.failover_chain
     mcp_config_paths = list(getattr(args, "mcp_config_paths", None) or [])
     mcp_server_inline = list(getattr(args, "mcp_server_inline", None) or [])
     if _is_override("mcp_config_paths", mcp_config_paths, []):
         effective.mcp_config_paths = mcp_config_paths
     if _is_override("mcp_server_inline", mcp_server_inline, []):
         effective.mcp_server_inline = mcp_server_inline
+    # Passing --turn-ending-tool on --restart REPLACES the saved list
+    # wholesale (no set-add semantics); passing nothing INHERITS it.
+    turn_ending_tools = list(getattr(args, "turn_ending_tools", None) or [])
+    if _is_override("turn_ending_tools", turn_ending_tools, []):
+        effective.turn_ending_tools = turn_ending_tools
+    # Passing --tools on --restart REPLACES the saved selection; an
+    # explicit empty string CLEARS it (the only way back to an
+    # unrestricted agent). Detection must be presence-based: by value,
+    # ``--tools ''`` is indistinguishable from an absent flag.
+    if "tools" in explicit:
+        effective.tools = getattr(args, "tools", None)
+    # ``--tools-add``/``--tools-remove`` are INCREMENTAL: they layer onto
+    # whatever selection is in force — the saved one, or the fresh
+    # ``--tools`` above when both are given — instead of restating it. That
+    # is the whole point of the flags: adding one tool to a restricted agent
+    # must not require listing the tools it already has.
+    _increments = parse_increment_spec(
+        getattr(args, "tools_add", None), getattr(args, "tools_remove", None)
+    )
+    if _increments:
+        _base = parse_tool_selection_spec(effective.tools)
+        effective.tools = ",".join(merge_increments(_base, _increments))
+    # Consumed above: the merged result now lives in ``effective.tools``.
+    # ``build_launch_config`` reads these two off the same namespace, so
+    # leaving them set would apply the increment a second time — and
+    # leaving them UNSET here would let them fall through to the bare CLI
+    # namespace, the exact dataflow that wiped mcp_config_paths and
+    # turn_ending_tools in a past incident.
+    effective.tools_add = None
+    effective.tools_remove = None
+
+    # context_limit needs a special "explicit clear" path because the
+    # argparse default is also ``None`` — bare ``--restart`` looks
+    # identical to ``--restart -l default`` post-parse, but the
+    # operator's intent differs ("inherit" vs "clear back to default").
+    # ``parse_context_limit`` returns the sentinel
+    # ``_CONTEXT_LIMIT_CLEAR_SENTINEL`` for the literal ``"default"``
+    # token (see ``parse_context_limit``); if we see the sentinel on
+    # the override branch, the operator explicitly asked to clear the
+    # saved value. On all non-sentinel overrides the value wins, and
+    # with no override at all the saved value is inherited. See
+    # ``test_restart_preserves_context_limit.py``.
+    saved_cl = saved.get("context_limit")
+    args_cl = getattr(args, "context_limit", _PARSER_DEFAULTS["context_limit"])
+    if args_cl == _CONTEXT_LIMIT_CLEAR_SENTINEL:
+        effective.context_limit = None
+    elif _is_override(
+        "context_limit",
+        args_cl,
+        _PARSER_DEFAULTS["context_limit"],
+    ):
+        effective.context_limit = args_cl
+    else:
+        effective.context_limit = saved_cl
+
+    args_ttl = getattr(args, "hot_cache_ttl", _PARSER_DEFAULTS["hot_cache_ttl"])
+    if _is_override(
+        "hot_cache_ttl",
+        args_ttl,
+        _PARSER_DEFAULTS["hot_cache_ttl"],
+    ):
+        effective.hot_cache_ttl = _normalize_hot_cache_ttl(args_ttl)
+
+    args_keep = getattr(args, "summary_keep", _PARSER_DEFAULTS["summary_keep"])
+    if _is_override(
+        "summary_keep",
+        args_keep,
+        _PARSER_DEFAULTS["summary_keep"],
+    ):
+        effective.summary_keep = _normalize_summary_keep(args_keep)
 
     # ------------------------------------------------------------------
     # preferred_provider logic
@@ -480,7 +966,7 @@ def merge_restart_config(
         effective.provider = args.preferred_provider
 
     # ------------------------------------------------------------------
-    # Consolidated model reset (operator rule, from a past incident)
+    # Consolidated model reset (operator rule, incident 2026-06-29)
     # ------------------------------------------------------------------
     # When the operator explicitly declares a provider (via ``-pp`` OR
     # ``--provider``) but gives no ``--model``, the saved model is taken to be
@@ -569,13 +1055,13 @@ def merge_restart_config(
     saved_provider = saved.get("provider", _PARSER_DEFAULTS["provider"])
     # When ``-pp`` moved the preferred provider to a new one, any saved
     # preferred_model belonged to the OLD preferred provider and is stale —
-    # do not carry it over (from a past incident). The new preferred provider
+    # do not carry it over (incident 2026-06-29). The new preferred provider
     # resolves its own default unless an explicit --model was given.
     pp_switched = pp_explicit and args.preferred_provider != saved.get(
         "preferred_provider", saved_provider
     )
     if provider_decl_unpinned:
-        # RC-1 (review finding): on ANY explicit provider declaration without
+        # RC-1 (review): on ANY explicit provider declaration without
         # --model, preferred_model must track the (None) reset of model.
         # Otherwise a stale ``preferred_model`` survives same-provider ``-pp``
         # and would re-pin the foreign model later via the restore-on-idle /
@@ -652,6 +1138,11 @@ def build_launch_config(args: argparse.Namespace) -> dict:
     """
     from deep_worker_cli.config import get_default_model_name
 
+    provider = args.provider
+    preferred_provider = getattr(
+        args, "preferred_provider", _PARSER_DEFAULTS["preferred_provider"]
+    )
+
     model = args.model
     if model is None:
         # Resolve the provider default. For providers with no pinned
@@ -660,7 +1151,7 @@ def build_launch_config(args: argparse.Namespace) -> dict:
         # NOT coerce to "unknown": that string would be read back on
         # restart and forwarded to CodexChatModel, which the API
         # rejects with HTTP 400 (observed in a past incident).
-        model = get_default_model_name(args.provider)
+        model = get_default_model_name(provider)
 
     working_dir = args.dir
     if working_dir is None:
@@ -684,8 +1175,7 @@ def build_launch_config(args: argparse.Namespace) -> dict:
     # comes back (observed in a past incident). Deriving dev_tree from the
     # real code tree keeps the persisted flag consistent with reality, so the
     # flag never lies about which tree must be used on restart. The canonical
-    # dev tree path is deployment-specific and mirrors the bash launcher's
-    # DEV_TREE; it is supplied through the override env var (also honored for
+    # dev tree path mirrors the bash launcher's DEV_TREE (override honored for
     # tests).
     _dev_tree_root = Path(
         os.environ.get(
@@ -700,9 +1190,9 @@ def build_launch_config(args: argparse.Namespace) -> dict:
     )
 
     return {
-        "provider": args.provider,
+        "provider": provider,
         "model": model,
-        "model_provider": args.provider if model else None,
+        "model_provider": provider if model else None,
         "working_dir": str(working_dir),
         "skip_permissions": args.skip_permissions,
         "task_manager": args.task_manager,
@@ -715,19 +1205,43 @@ def build_launch_config(args: argparse.Namespace) -> dict:
         ),
         "dev_tree": dev_tree,
         "web_search_policy": getattr(args, "web_search_policy", "auto"),
-        "preferred_provider": getattr(
-            args, "preferred_provider", args.provider
-        ),
+        "preferred_provider": preferred_provider or provider,
         "preferred_model": (
             model
-            if args.provider
-            == getattr(args, "preferred_provider", args.provider)
+            if provider == (preferred_provider or provider)
             else getattr(args, "preferred_model", None)
         ),
         # External MCP CLI overrides — persisted so that --restart preserves them.
         "mcp_config_paths": list(getattr(args, "mcp_config_paths", None) or []),
         "mcp_server_inline": list(getattr(args, "mcp_server_inline", None) or []),
-        "storage_version": 5,
+        # Turn-ending tools are persisted as the RAW CLI strings, not as
+        # parsed declarations: the format is stable, readable in
+        # session_metadata.json, and re-parsed through the same code path
+        # on every start, so first launch and --restart cannot diverge.
+        "turn_ending_tools": list(getattr(args, "turn_ending_tools", None) or []),
+        # Tool selection, persisted for the same reason and in the same
+        # form: the raw spec, re-parsed on every start, so a restricted
+        # agent comes back restricted after --restart.
+        "tools": resolve_tool_spec(args),
+        "context_limit": _resolved_context_limit(getattr(
+            args, "context_limit", _PARSER_DEFAULTS["context_limit"]
+        )),
+        "hot_cache_ttl": _normalize_hot_cache_ttl(getattr(
+            args, "hot_cache_ttl", _PARSER_DEFAULTS["hot_cache_ttl"]
+        )),
+        "summary_keep": _normalize_summary_keep(getattr(
+            args, "summary_keep", _PARSER_DEFAULTS["summary_keep"]
+        )),
+        # Name of this agent's failover chain in
+        # ~/.deep_worker/failover_chains.json. Absent/empty reads as
+        # "default", so every pre-existing agent keeps today's behaviour
+        # without a migration pass.
+        "failover_chain": (
+            getattr(args, "failover_chain", None)
+            or _PARSER_DEFAULTS["failover_chain"]
+            or "default"
+        ),
+        "storage_version": 6,
         "tree_root": str(_repo_root),
         "started_at": datetime.now().isoformat(),
         "pid": os.getpid(),
@@ -768,17 +1282,52 @@ async def restart_agent(args: argparse.Namespace) -> int:
     # 2. Merge with CLI overrides
     effective = merge_restart_config(saved, args)
 
-    # 3. Stop running agent if needed
+    # 3. Stop running agent if needed.
+    #
+    # `force=True` makes stop_agent escalate SIGTERM -> SIGKILL instead of
+    # giving up. Before that, a shutdown slower than the budget (in a past
+    # incident: a 644 MB threads.db flushing on close) raised TimeoutError,
+    # which this function turned into `return 1` — so step 5 never ran. The
+    # old process died moments later anyway and nothing replaced it, leaving
+    # the agent DOWN. That is strictly worse than not running --restart.
     registry = ProcessRegistry()
     existing = registry.lookup(name)
     if existing:
         try:
             data_dir = _get_agent_data_dir(name)
-            await stop_agent(name, registry, data_dir=data_dir)
+            await stop_agent(
+                name,
+                registry,
+                data_dir=data_dir,
+                force=True,
+                # Set only by the ``restart_self`` tool. Waives the
+                # "actively running" guard for a self-initiated restart —
+                # the agent is always mid-turn when it calls the tool, so
+                # without this the restart is refused and the tool has to
+                # fall back to killing its own process, which destroys the
+                # in-process MCP server and makes the CLI fabricate a
+                # "user rejected" tool result. See
+                # DESIGN_RESTART_SELF_FALSE_DENIAL.md.
+                #
+                # The flag is only a claim; the token is what authorizes it.
+                # stop_agent verifies the token against the one the agent
+                # minted in its own private dir and consumes it, so an
+                # external --self-requested cannot bypass the guard.
+                self_requested=getattr(args, "self_requested", False),
+                self_requested_token=getattr(
+                    args, "self_requested_token", None
+                ),
+            )
         except RuntimeError as e:
+            # status=running — the agent is mid-turn. Unchanged contract.
             print(f"Error: {e}", file=sys.stderr)
             return 1
         except TimeoutError as e:
+            # Survived SIGKILL (uninterruptible I/O). Deliberately abort
+            # rather than continue to step 5: a second process on the same
+            # data directory means two writers on one threads.db and a
+            # registry entry that describes neither. A DOWN agent is
+            # recoverable; a corrupted checkpoint database is not.
             print(f"Error: {e}", file=sys.stderr)
             return 1
 
@@ -791,23 +1340,34 @@ async def restart_agent(args: argparse.Namespace) -> int:
             print(f"Error cleaning agent history: {e}", file=sys.stderr)
             return 1
 
-    # 5. Apply effective args and delegate to run_agent
-    # Copy effective values back into args for run_agent()
-    args.provider = effective.provider
-    args.model = effective.model
-    args.dir = effective.dir
-    args.skip_permissions = effective.skip_permissions
-    args.task_manager = effective.task_manager
-    args.memory_only = effective.memory_only
-    args.history_memory = effective.history_memory
-    args.use_sqlite = effective.use_sqlite
-    args.auto_approve_send_message = effective.auto_approve_send_message
-    args.clean = False  # Already handled above if needed
-    # Copy preferred_provider (may differ from args.provider when
-    # --provider was overridden but --no-update-preferred was set)
-    args.preferred_provider = getattr(effective, "preferred_provider", args.provider)
-
-    return await run_agent(args)
+    # 5. Delegate to run_agent with the FULL merged namespace.
+    #
+    # ⚠ DO NOT reintroduce a field-by-field copy-back of `effective` into
+    # `args`. That is exactly the pattern that silently wiped SIX
+    # persisted inputs of build_launch_config on every --restart
+    # (observed in a past incident, see
+    # docs/DESIGN_RESTART_PRESERVES_LAUNCH_CONFIG.md):
+    #   mcp_config_paths, mcp_server_inline, turn_ending_tools → []
+    #   web_search_policy                                      → "auto"
+    #   dev_tree, preferred_model  → masked (build re-derives them from
+    #       _repo_root / model respectively), so the loss surfaces only
+    #       in the failover shape provider != preferred_provider.
+    # Every persisted field a future contributor adds needs another line
+    # here, and one omission silently regresses to the parser default.
+    #
+    # `merge_restart_config` already produced a Namespace that is a strict
+    # superset of `args` (it starts from `argparse.Namespace(**vars(args))`
+    # and only overrides). `run_agent` and `build_launch_config` read the
+    # SAME attribute names, so passing `effective` directly gives every
+    # existing AND future persisted field the correct value with no
+    # per-field code. Two tests pin this against a future "let me restore
+    # clarity" refactor: `test_no_field_by_field_copy_back_in_restart_agent`
+    # (no copy-back reappears) and
+    # `test_every_build_launch_config_input_is_handled_by_merge_restart_config`
+    # (every args attribute build_launch_config reads is deliberately
+    # assigned on `effective`).
+    effective.clean = False  # NEVER inherit --clean (already documented above)
+    return await run_agent(effective)
 
 
 async def do_fork(args: argparse.Namespace) -> int:
@@ -979,7 +1539,9 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--provider",
         default="deepseek",
-        choices=["deepseek", "gemini", "openai", "claude-code", "codex", "grok"],
+        # Built-ins PLUS anything declared in ~/.deep_worker/providers.json,
+        # so a config-added API provider is selectable with no code change.
+        choices=list(all_provider_names()),
         help="AI provider to use (default: deepseek)",
     )
 
@@ -1121,13 +1683,69 @@ def create_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
+        "-l",
+        "--context_limit",
+        dest="context_limit",
+        type=parse_context_limit,
+        default=None,
+        metavar="VALUE",
+        help="Effective context window in tokens (e.g. 200000, 200k, 1M). "
+             "Summarization trigger and keep are computed from this window. "
+             "Pass 'default' to clear a previously saved override.",
+    )
+
+    parser.add_argument(
+        "--hot-cache-ttl",
+        dest="hot_cache_ttl",
+        type=parse_hot_cache_ttl,
+        action="append",
+        default=None,
+        metavar="SPEC",
+        help="Hot-cache TTL in seconds for summarization "
+             "(DESIGN_SUMMARIZATION_HOT_COLD §4). Repeatable. "
+             "Forms: <sec> (all providers) or <provider>=<sec>. "
+             "0 = always cold. Survives --restart.",
+    )
+
+    parser.add_argument(
+        "--summary-keep",
+        dest="summary_keep",
+        type=parse_summary_keep,
+        default=None,
+        metavar="SPEC",
+        help="How much raw conversation tail to keep after summarization. "
+             "Forms: 0 (no tail, summary only), <N>/<N>k (token CEILING, "
+             "lowers but never raises the default), <N>%% or 0.<N> "
+             "(share of the window, replaces the default), <N>m (message "
+             "count). Default: 10%% of --context_limit. Survives --restart.",
+    )
+
+    parser.add_argument(
         "--restart",
+        "-r",
         action="store_true",
         help="Restart agent with parameters from previous launch. "
              "Additional options override saved values. "
              "Use --no-* flags (e.g. --no-tm, --no-skip-permissions) to "
              "disable a previously saved boolean flag. "
              "--clean is NOT inherited; pass it explicitly if needed.",
+    )
+
+    # Internal: set by the ``restart_self`` tool when an agent restarts
+    # itself. The flag alone grants nothing — it must be accompanied by
+    # --self-requested-token, a one-time capability the agent minted in its
+    # own private data dir. See process/self_restart_token.py.
+    parser.add_argument(
+        "--self-requested",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+
+    parser.add_argument(
+        "--self-requested-token",
+        dest="self_requested_token",
+        default=None,
+        help=argparse.SUPPRESS,
     )
 
     parser.add_argument(
@@ -1176,6 +1794,29 @@ def create_parser() -> argparse.ArgumentParser:
             "preferred_provider. Intended for automatic failover so the "
             "operator's original preference survives a temporary provider "
             "switch. Also see --preferred-provider."
+        ),
+    )
+
+    parser.add_argument(
+        "--failover-chain",
+        metavar="NAME",
+        default=None,
+        dest="failover_chain",
+        help=(
+            "Name of the failover chain this agent follows when a provider "
+            "hits a usage limit. Chains live in "
+            "~/.deep_worker/failover_chains.json; 'default' is used when "
+            "omitted. See --list-failover-chains."
+        ),
+    )
+
+    parser.add_argument(
+        "--list-failover-chains",
+        action="store_true",
+        dest="list_failover_chains",
+        help=(
+            "Print the configured failover chains and exit. Shows each step "
+            "and flags any that names an unknown or uncredentialed provider."
         ),
     )
 
@@ -1372,7 +2013,7 @@ def create_parser() -> argparse.ArgumentParser:
         default=[],
         help=(
             "Path to an additional MCP config file (same JSON shape as "
-            "~/.deepagents/mcp.json). Repeatable; later files override earlier."
+            "~/.deep_worker/mcp.json). Repeatable; later files override earlier."
         ),
     )
     parser.add_argument(
@@ -1383,6 +2024,70 @@ def create_parser() -> argparse.ArgumentParser:
         help=(
             "Inline MCP server, formatted '<name>={...json...}'. Repeatable. "
             "Overrides any same-named entry from config files."
+        ),
+    )
+    # Turn-ending tools — see docs/DESIGN_CLI_TURN_ENDING_TOOL_FLAG.md.
+    parser.add_argument(
+        "--turn-ending-tool",
+        dest="turn_ending_tools",
+        action="append",
+        default=[],
+        type=_canonical_turn_ending_spec_str,
+        metavar="NAME[:FIELD]",
+        help=(
+            "Declare a tool whose successful result ends the agent's turn. "
+            "Repeatable. NAME is the GRAPH-side tool name — for an external "
+            "MCP server it is the mangled '<server>__<tool>' form, e.g. "
+            "'repo_graph__submit_fragments'. With ':FIELD' the turn ends "
+            "only when that top-level field of the result is exactly True; "
+            "without it, when 'success' is truthy."
+        ),
+    )
+    parser.add_argument(
+        "--tools",
+        metavar="SPEC",
+        default=None,
+        help=(
+            "Restrict which tools the agent may call (see "
+            "docs/DESIGN_TOOL_SELECTION.md). Omit for every tool — the "
+            "default, unchanged. 'none' (or '-*') denies all; "
+            "'none,read_file,grep' denies all but those; '-execute' removes "
+            "only those. A spec starting with '-' needs the '=' form, e.g. "
+            "--tools='-execute', because argparse reads a leading dash as an "
+            "option. Applies to "
+            "deep-worker tools; on the ACP providers (claude-code, grok) "
+            "and partly on codex the CLI's own native tools stay reachable "
+            "and a warning says so at startup."
+        ),
+    )
+    parser.add_argument(
+        "--tools-add",
+        dest="tools_add",
+        metavar="NAMES",
+        action="append",
+        default=None,
+        help=(
+            "Add tools on top of the CURRENT selection instead of restating "
+            "it. Comma-separated and repeatable; '*' and '?' are wildcards, "
+            "e.g. --tools-add 'serena__*'. On --restart this layers over the "
+            "saved selection, so a restricted agent can gain one tool "
+            "without listing the rest."
+        ),
+    )
+    parser.add_argument(
+        "--tools-remove",
+        "--tools-rm",
+        dest="tools_remove",
+        metavar="NAMES",
+        action="append",
+        default=None,
+        help=(
+            "Remove tools from the CURRENT selection. Same form as "
+            "--tools-add. When both name the same tool the more specific "
+            "one wins, so \"--tools-rm 'serena__*' --tools-add "
+            "serena__find_symbol\" drops the family but keeps that one; "
+            "equally specific opposites are an error rather than a "
+            "silent winner."
         ),
     )
     parser.add_argument(
@@ -1522,7 +2227,7 @@ def resolve_startup_queries(
 # ⚠️ DO NOT re-add a "seed the claude session_uuid hint" step here.
 #
 # An earlier version seeded ``claude_session_state.json`` with the imported
-# transcript's uuid so the claude-code provider would RESUME that real file.
+# transcript's uuid so the claude-code-sdk provider would RESUME that real file.
 # That broke tool availability (observed in a past incident): the imported transcript is
 # an ORDINARY ``claude`` session created OUTSIDE deep_worker. Resuming it makes
 # the CLI restore THAT session's tool/permission configuration, which has no
@@ -1533,7 +2238,7 @@ def resolve_startup_queries(
 # tool instead of its full set.
 #
 # Correct behaviour: import writes ONLY the SQLite history (provider-agnostic).
-# Under claude-code, with no hint, the provider starts a fresh session (full MCP
+# Under claude-code-sdk, with no hint, the provider starts a fresh session (full MCP
 # tools) and carries the imported memory the normal way — synthesizing OUR own
 # transcript from the LangGraph history (session_synthesis), exactly like a
 # cross-provider continuation. See DESIGN_IMPORT_CLAUDE_SESSION.md §6.
@@ -1544,7 +2249,7 @@ async def handle_import_claude(args: argparse.Namespace) -> int:
 
     Resolve ``--import-claude`` → parse → write to the agent's per-agent DB.
     This is provider-agnostic: it writes ONLY the message history (the agent's
-    memory). It deliberately does NOT touch claude-code session state — see the
+    memory). It deliberately does NOT touch claude-code-sdk session state — see the
     note above on why seeding a resume hint loses the agent's tools.
     Returns 0 on success, non-zero on a user-facing error. Errors are printed
     to stderr (this runs pre-daemonize so the user sees them).
@@ -1553,7 +2258,7 @@ async def handle_import_claude(args: argparse.Namespace) -> int:
 
     if parse_claude_transcript is None or resolve_transcript_path is None:
         print(
-            "Error: --import-claude requires the claude_code_provider package, "
+            "Error: --import-claude requires the claude_code_sdk_provider package, "
             "which is only available in the source checkout (not in the PyPI "
             "wheel).",
             file=sys.stderr,
@@ -1589,7 +2294,7 @@ async def handle_import_claude(args: argparse.Namespace) -> int:
         return 1
 
     # 3/4. Write into the agent's SQLite DB (replace=clean). This is the ONLY
-    # side effect — provider-agnostic. We do NOT seed any claude-code session
+    # side effect — provider-agnostic. We do NOT seed any claude-code-sdk session
     # hint (see the note above ``handle_import_claude``).
     replace = bool(getattr(args, "clean", False))
     try:
@@ -1764,6 +2469,7 @@ async def run_agent(args: argparse.Namespace) -> int:
                 working_dir=working_dir,
                 provider=args.provider,
                 web_search_policy=getattr(args, "web_search_policy", "auto"),
+                tools=resolve_tool_spec(args),
             )
 
         # Build launch_config for persistent storage via the single source
@@ -1791,6 +2497,24 @@ async def run_agent(args: argparse.Namespace) -> int:
         else:
             startup_sum_query, startup_query = resolve_startup_queries(args)
 
+        # Turn-ending tool specs: validate the FULL list here, before any
+        # AgentProcess exists. Per-value grammar was already enforced by
+        # argparse's ``type=`` handler on first launch, but cross-entry
+        # collisions (a name declared twice, or a CLI declaration of the
+        # built-in ``send_message_to_agent``) cannot be seen one value at a
+        # time — and on --restart the values come from
+        # session_metadata.json, which argparse never touched.
+        #
+        # Validating here keeps the failure OUT of AgentProcess.start()'s
+        # init ``try``, which would otherwise swallow it into an ERROR-mode
+        # agent that stays registered. The parsed result is intentionally
+        # discarded: AgentProcess.__init__ re-parses the raw strings, so
+        # each entry point enforces the contract independently.
+        turn_ending_tool_specs = list(
+            getattr(args, "turn_ending_tools", None) or []
+        )
+        _parse_turn_ending_tool_specs(turn_ending_tool_specs)
+
         # Create and start agent
         agent = AgentProcess(
             name=args.name,
@@ -1809,6 +2533,7 @@ async def run_agent(args: argparse.Namespace) -> int:
             mcp_server_inline=list(
                 getattr(args, "mcp_server_inline", None) or []
             ),
+            turn_ending_tool_specs=turn_ending_tool_specs,
             startup_query=startup_query,
             startup_sum_query=startup_sum_query,
             startup_summarize=bool(getattr(args, "summarize", False)),
@@ -2129,7 +2854,6 @@ def daemonize(name: str, log_dir: Path | None = None) -> None:
     # on-disk total per stream NEVER exceeds 1 GiB — enforced in-process, with no
     # logrotate/cron needed. Captures print, logging, AND C-level writes to fd
     # 1/2 alike. See log_rotation.py and a related internal incident analysis
-    # (not included here).
     stdout_write_fd, _stdout_log_thread = start_pipe_writer(str(stdout_log))
     stderr_write_fd, _stderr_log_thread = start_pipe_writer(str(stderr_log))
 
@@ -2345,7 +3069,7 @@ async def remove_before_command(
         )
         console.print(
             "  A future cutoff matches every existing thread and would "
-            "delete ALL data under ~/.deepagents/ and "
+            "delete ALL data under ~/.deep_worker/ and "
             "~/.deep_worker/*/summaries/."
         )
         console.print(
@@ -2478,6 +3202,57 @@ def _human_size(n: int) -> str:
             return f"{n:.1f}{unit}"
         n //= 1024
     return f"{n}GB"
+
+
+def show_failover_chains() -> int:
+    """Print the configured failover chains and flag unusable steps.
+
+    Read-only. Diagnoses the two ways a chain can disappoint at failover
+    time: a step naming a provider that does not exist, and one whose API
+    key env var is unset (a restart onto it could not authenticate).
+    """
+    from deep_worker_cli.runtime.failover_chains import (
+        FailoverChainConfigError,
+        chains_path,
+        load_chains,
+    )
+    from deep_worker_cli.runtime.provider_chain import all_provider_names
+
+    path = chains_path()
+    try:
+        chains = load_chains()
+    except FailoverChainConfigError as exc:
+        print(f"config error: {exc}")
+        return 1
+
+    known = set(all_provider_names())
+    try:
+        from deep_worker_cli.runtime.provider_registry import load_provider_specs
+
+        specs = {spec.name: spec for spec in load_provider_specs()}
+    except Exception:  # noqa: BLE001 — listing must survive a bad registry
+        specs = {}
+
+    print(f"config: {path}")
+    for name in sorted(chains):
+        chain = chains[name]
+        print(f"\nchain: {name}")
+        if chain.description:
+            print(f"  description: {chain.description}")
+        for i, step in enumerate(chain.steps):
+            line = f"  {i}. {step.provider}"
+            if step.model:
+                line += f" (model={step.model})"
+            notes: list[str] = []
+            if step.provider not in known:
+                notes.append("UNKNOWN PROVIDER")
+            spec = specs.get(step.provider)
+            if spec is not None and not spec.has_credentials():
+                notes.append(f"no credentials (${spec.api_key_env} unset)")
+            if notes:
+                line += "  <- " + "; ".join(notes)
+            print(line)
+    return 0
 
 
 def show_provider_limits_info(provider: str) -> int:
@@ -2621,6 +3396,34 @@ def show_agent_info(name: str) -> int:
     print(f"commit: {commit}")
     print(f"started_at: {started_at}")
     print(f"pid: {pid}{running_str}")
+    # Context-limit display (the operator must
+    # see the enforced limit at a glance). Shows ``None`` for
+    # default behaviour and the number for an explicit ``-l``. See
+    # ``docs/DESIGN_CONTEXT_LIMIT_GUARANTEE.md`` §3.7.
+    _cl_display = launch_config.get("context_limit")
+    if _cl_display is None or _cl_display == "":
+        print("context_limit: (default — provider/model cap applies)")
+    else:
+        print(f"context_limit: {_cl_display:,} tokens (-l {(_cl_display // 1000) if _cl_display >= 1000 else _cl_display}{'k' if _cl_display >= 1000 else ''}, operator-set)")
+    _ttl_display = launch_config.get("hot_cache_ttl") or {}
+    if _ttl_display:
+        parts = [f"{k}={v}s" for k, v in sorted(_ttl_display.items())]
+        print("hot_cache_ttl: " + ", ".join(parts))
+    else:
+        print("hot_cache_ttl: (default table / env)")
+    _keep_display = launch_config.get("summary_keep")
+    if _keep_display:
+        _keep_kind, _keep_value = _keep_display
+        if _keep_kind == "tokens" and _keep_value == 0:
+            print("summary_keep: 0 (no tail — summary only)")
+        elif _keep_kind == "tokens":
+            print(f"summary_keep: {_keep_value:,} tokens (ceiling)")
+        elif _keep_kind == "fraction":
+            print(f"summary_keep: {_keep_value:.0%} of the window")
+        else:
+            print(f"summary_keep: last {_keep_value} messages")
+    else:
+        print("summary_keep: (default — 10% of context_limit)")
     print("flags:")
     for flag_name, flag_value in flags.items():
         print(f"  {flag_name}: {str(flag_value).lower()}")
@@ -2633,97 +3436,6 @@ def show_agent_info(name: str) -> int:
 def _normalize_status_value(status: object) -> str:
     status_value = getattr(status, "value", status)
     return str(status_value).lower()
-
-
-def _history_indexer_funcs():
-    global clear_history_index, index_all_history_files
-    # Offline CLI path: no runtime middleware is involved; resolve the
-    # semantic_search provider explicitly (source root on sys.path in source
-    # mode). See deep_worker_cli/provider_paths.py.
-    #
-    # Explicit request (--reindex-history) → hard-fail with an actionable
-    # remedy when the semantic-search extra is missing.
-    from deep_worker_cli.provider_paths import ensure_provider_importable
-    from deep_worker_cli.exceptions import CapabilityError
-
-    resolution = ensure_provider_importable("deep_worker.providers.semantic_search")
-    if resolution.unavailable:
-        raise CapabilityError(
-            capability="semantic-search",
-            remedy="pip install deep-worker[semantic-search]",
-        )
-    if clear_history_index is None:
-        from deep_worker.providers.semantic_search.history_indexer import clear_history_index as _clear
-
-        clear_history_index = _clear
-    if index_all_history_files is None:
-        from deep_worker.providers.semantic_search.history_indexer import index_all_history_files as _index
-
-        index_all_history_files = _index
-    return clear_history_index, index_all_history_files
-
-
-def _run_reindex_with_progress(summaries_dir: Path):
-    from rich.progress import (
-        BarColumn,
-        MofNCompleteColumn,
-        Progress,
-        SpinnerColumn,
-        TaskProgressColumn,
-        TextColumn,
-        TimeElapsedColumn,
-        TimeRemainingColumn,
-    )
-
-    _, index_func = _history_indexer_funcs()
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TaskProgressColumn(),          # percentage
-        MofNCompleteColumn(),          # done/total messages
-        TextColumn("msgs"),
-        TimeElapsedColumn(),
-        TextColumn("<"),
-        TimeRemainingColumn(),         # ETA
-    ) as progress:
-        # Progress is measured in MESSAGES (jsonl lines) — a count known up
-        # front, so the bar shows X/N, %%, and ETA from the first tick.
-        # (Chunk counts are only known after the slow chunking pass, so they
-        # cannot drive an ETA and were the cause of the "0/None" bar.)
-        # Two phases share one bar (analyze then index) with a distinct total
-        # each: Phase 1 ticks by message GROUP during chunking so the long
-        # tokenization pass is not silent; Phase 2 ticks by MESSAGE during
-        # embedding/writing with X/N + %% + ETA.
-        task = progress.add_task("Reindexing history...", total=None)
-        current_file = {"name": ""}
-
-        def on_progress(filename: str) -> None:
-            current_file["name"] = filename
-            progress.update(task, description=f"Analyzing {filename}")
-
-        def on_analyze_progress(done: int, total: int) -> None:
-            desc = (
-                f"Analyzing {current_file['name']}"
-                if current_file["name"]
-                else "Analyzing history..."
-            )
-            progress.update(task, completed=done, total=total, description=desc)
-
-        def on_message_progress(done: int, total: int) -> None:
-            desc = (
-                f"Indexing {current_file['name']}"
-                if current_file["name"]
-                else "Indexing history..."
-            )
-            progress.update(task, completed=done, total=total, description=desc)
-
-        return index_func(
-            summaries_dir,
-            on_progress=on_progress,
-            on_message_progress=on_message_progress,
-            on_analyze_progress=on_analyze_progress,
-        )
 
 
 def _print_reindex_stats(stats: object) -> None:
@@ -2823,18 +3535,21 @@ async def reindex_history_command(agent_name: str) -> int:
         return 0
 
     try:
-        clear_func, _ = _history_indexer_funcs()
-        clear_func(summaries_dir)
-    except Exception as exc:
-        print(f"Error: failed to clear history index: {exc}", file=sys.stderr)
-        return 1
+        from deep_worker_cli.semantic_memory.client import SemanticMemoryClient
 
-    try:
-        stats = _run_reindex_with_progress(summaries_dir)
+        reply = await SemanticMemoryClient().index_history(
+            summaries_dir, clear_first=True
+        )
     except Exception as exc:
         print(f"Error: failed to rebuild history index: {exc}", file=sys.stderr)
         return 1
 
+    stats = SimpleNamespace(
+        files_processed=reply.files_indexed,
+        lines_read=reply.lines_read,
+        chunks_indexed=reply.chunks_added,
+        errors=reply.errors,
+    )
     _print_reindex_stats(stats)
     return 1 if stats.errors else 0
 
@@ -2859,10 +3574,18 @@ def _build_subcommand_registry() -> dict[str, tuple[Any, Any]]:
         handle_mcp_command,
         setup_mcp_parser,
     )
+    from deep_worker_cli.cli.migrate_command import (
+        handle_migrate_agent_dbs_command,
+        setup_migrate_agent_dbs_parser,
+    )
 
     return {
         "lsp": (setup_lsp_parser, handle_lsp_command),
         "mcp": (setup_mcp_parser, handle_mcp_command),
+        "migrate-agent-dbs": (
+            setup_migrate_agent_dbs_parser,
+            handle_migrate_agent_dbs_command,
+        ),
     }
 
 
@@ -3000,6 +3723,8 @@ def main() -> int:
     # --restart, and web-spawned subprocesses alike.
     normalize_model_arg(args)
 
+    apply_preferred_provider_override(args)
+
     if args.migrate_storage:
         return asyncio.run(migrate_storage_command(args))
 
@@ -3042,6 +3767,12 @@ def main() -> int:
             print("Error: --reindex-history requires an agent name.", file=sys.stderr)
             return 2
         return asyncio.run(reindex_history_command(args.name))
+
+    if getattr(args, "list_failover_chains", False):
+        if args.name:
+            print("Error: --list-failover-chains does not take an agent name.", file=sys.stderr)
+            return 2
+        return show_failover_chains()
 
     if getattr(args, "limits_info", False):
         if args.name:
@@ -3143,7 +3874,7 @@ def main() -> int:
 
         # Check if running agent can be stopped
         from deep_worker_cli.process.registry import ProcessRegistry
-        from deep_worker_cli.process.agent_stop import stop_agent as _stop_agent, _read_agent_status
+        from deep_worker_cli.process.agent_stop import _read_agent_status
 
         registry = ProcessRegistry()
         existing = registry.lookup(args.name)
@@ -3169,6 +3900,9 @@ def main() -> int:
 
         # Save CWD before daemonize changes it
         effective = merge_restart_config(saved, args)
+        _emit_tool_selection_preflight(
+            effective.provider, _preflight_spec(getattr(effective, "tools", None))
+        )
         if effective.dir:
             os.environ["DEEP_WORKER_ORIGINAL_CWD"] = str(Path(effective.dir).resolve())
         elif "DEEP_WORKER_ORIGINAL_CWD" not in os.environ:
@@ -3265,7 +3999,7 @@ def main() -> int:
         import shutil
         # Remove per-agent data directory (contains session_metadata.json).
         # Fast (a few unlinks); no DB lock involved.
-        data_dir = deep_worker_home() / args.name
+        data_dir = agent_root(args.name, create=False)
         if data_dir.exists():
             try:
                 shutil.rmtree(data_dir)
@@ -3285,6 +4019,9 @@ def main() -> int:
                 except OSError:
                     pass  # best-effort; not worth blocking startup
         print(f"  [--clean: DB cleanup will run in background]")
+
+    # Tool-selection disclosure must reach the terminal, not the log file.
+    _emit_effective_tool_selection_preflight(args)
 
     # Daemonize IMMEDIATELY. Everything below here executes in the
     # detached grandchild; parent already returned to the shell.

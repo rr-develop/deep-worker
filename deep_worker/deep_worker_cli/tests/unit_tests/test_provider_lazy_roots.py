@@ -4,9 +4,9 @@ The lazy-root contract requires:
 
 * §3.2 — canonical ``deep_worker.providers.<pkg>`` roots MUST be lazy
   (PEP 562 ``__getattr__``): importing the root must NOT load heavy
-  submodules (``claude_agent_sdk`` for claude_code_provider; indexer /
-  retriever / history_* / embedding for semantic_search; llama-index).
-* §3.2b — the five root shims (``claude_code_provider/`` etc. at the repo
+  submodules (indexer / retriever / history_* / embedding for
+  semantic_search; llama-index).
+* §3.2b — the four root shims (``codex_provider/`` etc. at the repo
   root) must be single-``__init__.py`` dirs that warn once
   (DeprecationWarning) and delegate lazily to the canonical root with
   root-identity preserved; old submodule paths are NOT supported.
@@ -22,6 +22,7 @@ test session's own imports cannot pollute ``sys.modules``.
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import subprocess
 import sys
@@ -40,11 +41,24 @@ _DEEPAGENTS = _REPO_ROOT / "deep_worker" / "deepagents"
 _DW_ROOT = _REPO_ROOT / "deep_worker"
 
 _PROVIDERS = (
-    "claude_code_provider",
     "codex_provider",
     "grok_provider",
     "semantic_search",
     "deepworker_a2a",
+    "acp",
+    "claude_code_provider",
+)
+
+# Top-level root shims exist ONLY for the legacy four packages (DESIGN §3.2b);
+# the shared ``acp`` layer and the ACP provider package have no top-level alias.
+_SHIM_PROVIDERS = _PROVIDERS[:4]
+
+# Resolving semantic_search's public API imports its heavy stack, which is the
+# optional ``semantic-search`` extra (llama-index). Without it these checks
+# cannot run.
+_requires_llama_index = pytest.mark.skipif(
+    importlib.util.find_spec("llama_index") is None,
+    reason="optional semantic-search extra (llama-index) is not installed",
 )
 
 
@@ -103,7 +117,6 @@ def test_fresh_interpreter_canonical_roots_do_not_load_heavy_stack() -> None:
     heavy submodules, claude_agent_sdk, or llama-index."""
     code = """
 import sys
-import deep_worker.providers.claude_code_provider
 import deep_worker.providers.codex_provider
 import deep_worker.providers.grok_provider
 import deep_worker.providers.semantic_search
@@ -111,8 +124,7 @@ import deep_worker.providers.deepworker_a2a
 
 heavy = [
     m for m in sys.modules
-    if m.startswith("deep_worker.providers.claude_code_provider.")
-    or m.startswith("deep_worker.providers.semantic_search.")
+    if m.startswith("deep_worker.providers.semantic_search.")
     or m.startswith("deep_worker.providers.deepworker_a2a.")
 ]
 sdk = "claude_agent_sdk" in sys.modules
@@ -128,13 +140,11 @@ print("OK")
     )
 
 
+@_requires_llama_index
 def test_fresh_interpreter_lazy_resolution_returns_public_api() -> None:
     """Attribute access on the canonical roots resolves the public API
     from the right submodule."""
     code = """
-from deep_worker.providers.claude_code_provider import (
-    ClaudeCodeChatModel, ClientManager, ProxyMCPServer, WebSearchDelegationTool,
-)
 from deep_worker.providers.semantic_search import (
     search, IndexConfig, search_messages, index_repository, search_history,
 )
@@ -142,7 +152,6 @@ from deep_worker.providers.deepworker_a2a import A2AConfig
 from deep_worker.providers.codex_provider import CodexChatModel
 from deep_worker.providers.grok_provider import GrokChatModel
 
-assert ClaudeCodeChatModel.__module__ == "deep_worker.providers.claude_code_provider.chat_model"
 assert search.__module__ == "deep_worker.providers.semantic_search.retriever"
 assert search_messages.__module__ == "deep_worker.providers.semantic_search.message_search"
 assert index_repository.__module__ == "deep_worker.providers.semantic_search.indexer"
@@ -162,7 +171,7 @@ def test_unknown_attribute_raises_attribute_error() -> None:
     """PEP 562 __getattr__ must raise AttributeError for unknown names."""
     code = """
 import deep_worker.providers.semantic_search as ss
-import deep_worker.providers.claude_code_provider as cc
+import deep_worker.providers.codex_provider as cc
 for mod in (ss, cc):
     try:
         mod.does_not_exist_xyz
@@ -187,7 +196,7 @@ print("OK")
 def test_shim_dirs_contain_only_init_py() -> None:
     """Each root shim dir must contain exactly ``__init__.py`` (and no
     source files — old submodule paths are NOT supported)."""
-    for pkg in _PROVIDERS:
+    for pkg in _SHIM_PROVIDERS:
         shim_dir = _REPO_ROOT / pkg
         assert shim_dir.is_dir(), f"missing root shim dir: {shim_dir}"
         entries = sorted(
@@ -199,15 +208,15 @@ def test_shim_dirs_contain_only_init_py() -> None:
 
 
 def test_shim_import_is_lazy_and_warns_once() -> None:
-    """``import claude_code_provider`` (no attribute access) must NOT load
+    """``import codex_provider`` (no attribute access) must NOT load
     the canonical root; the first attribute access emits exactly ONE
     DeprecationWarning and delegates."""
     code = """
 import sys
 import warnings
 
-import claude_code_provider
-assert "deep_worker.providers.claude_code_provider" not in sys.modules, (
+import codex_provider
+assert "deep_worker.providers.codex_provider" not in sys.modules, (
     "shim import must not load the canonical root"
 )
 assert not any(m.startswith("deep_worker.providers.") for m in sys.modules), (
@@ -216,16 +225,16 @@ assert not any(m.startswith("deep_worker.providers.") for m in sys.modules), (
 
 with warnings.catch_warnings(record=True) as caught:
     warnings.simplefilter("always")
-    from claude_code_provider import ClaudeCodeChatModel
+    from codex_provider import CodexChatModel
     dwarns = [w for w in caught if issubclass(w.category, DeprecationWarning)]
     assert len(dwarns) == 1, f"expected exactly 1 DeprecationWarning, got {len(dwarns)}"
     # Second access: still one warning total (warn-once guard).
-    _ = claude_code_provider.ClaudeCodeChatModel
+    _ = codex_provider.CodexChatModel
     dwarns2 = [w for w in caught if issubclass(w.category, DeprecationWarning)]
     assert len(dwarns2) == 1, "warn-once violated"
 
-import deep_worker.providers.claude_code_provider as canonical
-assert claude_code_provider.ClaudeCodeChatModel is canonical.ClaudeCodeChatModel, (
+import deep_worker.providers.codex_provider as canonical
+assert codex_provider.CodexChatModel is canonical.CodexChatModel, (
     "root identity must be preserved (no double-loading)"
 )
 print("OK")
@@ -236,6 +245,7 @@ print("OK")
     )
 
 
+@_requires_llama_index
 def test_semantic_search_shim_is_lazy() -> None:
     """``import semantic_search`` (shim) must not load any canonical
     semantic_search submodule and must not pull llama-index."""
@@ -263,8 +273,7 @@ def test_old_submodule_paths_not_supported() -> None:
     must NOT create the module under the old name."""
     code = """
 import sys
-for old in ("claude_code_provider.web_search", "codex_provider.native_tools",
-            "semantic_search.history_indexer"):
+for old in ("codex_provider.native_tools", "semantic_search.history_indexer"):
     try:
         __import__(old)
     except ModuleNotFoundError:
@@ -282,9 +291,9 @@ print("OK")
 
 def test_shim_unknown_attribute_raises_attribute_error() -> None:
     code = """
-import claude_code_provider
+import codex_provider
 try:
-    claude_code_provider.nope
+    codex_provider.nope
 except AttributeError:
     pass
 else:

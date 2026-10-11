@@ -68,7 +68,7 @@ def test_mcp_add_and_remove_write_private_project_file(
     )
 
     assert _cmd_add(add_args) == 0
-    path = tmp_path / ".deepagents" / "mcp.json"
+    path = tmp_path / ".deep_worker" / "mcp.json"
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert json.loads(path.read_text(encoding="utf-8"))["mcpServers"]["demo"] == {
         "command": "python3",

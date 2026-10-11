@@ -60,15 +60,12 @@ def resolve_sentence_transformer(
     :func:`embed_model_tokenizer`) so the vector space and the 510-token
     ceiling match the search index exactly.
     """
-    if embed_model is None:
-        from llama_index.embeddings.huggingface import (  # type: ignore[import-untyped]  # noqa: PLC0415
-            HuggingFaceEmbedding,
-        )
+    # Route through the shared process-wide cache so this fifth call site
+    # cannot silently rebuild the 449 MB embedder on every invocation.
+    # See a related internal incident analysis (not included here).
+    from ._embed_cache import resolve_embed_model  # noqa: PLC0415
 
-        embed_model = HuggingFaceEmbedding(
-            model_name=config.embedding_model,
-            model_kwargs={"local_files_only": True},
-        )
+    embed_model = resolve_embed_model(config, embed_model)
 
     tokenize_fn, model_max_length, reserve = embed_model_tokenizer(embed_model)
     eff_max = effective_max_tokens(config, model_max_length, reserve)

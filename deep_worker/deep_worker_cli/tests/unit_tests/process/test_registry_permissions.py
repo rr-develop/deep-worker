@@ -43,6 +43,10 @@ class TestRegistryPermissions:
         assert file_perms == 0o666, f"Expected 0o666, got {oct(file_perms)}"
 
 
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0,
+    reason="root bypasses file permission bits, so a read-only file stays writable",
+)
 class TestRegistryOwnershipValidation:
     """Test pre-startup validation of registry file ownership."""
 

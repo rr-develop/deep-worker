@@ -8,7 +8,7 @@ that caused the reported failure:
     Error: no such table: checkpoints
 
 The tests use a temporary ``HOME`` so they do not touch the developer's
-real agent data directory.
+real ``~/.deep_worker``.
 """
 from __future__ import annotations
 
@@ -20,6 +20,13 @@ from pathlib import Path
 
 import aiosqlite
 import pytest
+
+
+def _agent_db(home: Path, agent_name: str) -> Path:
+    """The per-agent DB under the v3 layout: ``agents/<name>/threads.db``."""
+    db = home / ".deep_worker" / "agents" / agent_name / "threads.db"
+    db.parent.mkdir(parents=True, exist_ok=True)
+    return db
 
 
 def _schema_sql() -> tuple[str, str]:
@@ -108,9 +115,9 @@ async def _seed_per_agent_db(
 
 @pytest.fixture
 def isolated_home(tmp_path):
-    """Run deep-worker with a temp HOME so tests don't touch the agent data directory."""
+    """Run deep-worker with a temp HOME so tests don't touch ~/.deep_worker."""
     home = tmp_path / "home"
-    (home / ".deepagents").mkdir(parents=True)
+    (home / ".deep_worker" / "agents").mkdir(parents=True)
 
     old_home = os.environ.get("HOME")
     os.environ["HOME"] = str(home)
@@ -123,7 +130,7 @@ def isolated_home(tmp_path):
             os.environ["HOME"] = old_home
 
 
-def _run_dw_cli(*args: str, home: Path, timeout: int = 20) -> subprocess.CompletedProcess:
+def _run_deep_worker(*args: str, home: Path, timeout: int = 20) -> subprocess.CompletedProcess:
     """Run deep-worker with an overridden HOME env.
 
     We always use ``env=`` to guarantee deep-worker sees our fake HOME even
@@ -150,13 +157,13 @@ def _run_dw_cli(*args: str, home: Path, timeout: int = 20) -> subprocess.Complet
 
 
 @pytest.mark.asyncio
-async def test_dw_history_reads_per_agent_db_file(isolated_home):
+async def test_deep_worker_history_reads_per_agent_db_file(isolated_home):
     """`deep-worker --history <agent>` reads sessions_<agent>.db and
     prints the stored messages (used to fail with 'no such table:
     checkpoints').
     """
     agent = "integ_agent_hist"
-    per_agent_db = isolated_home / ".deepagents" / f"sessions_{agent}.db"
+    per_agent_db = _agent_db(isolated_home, agent)
     await _seed_per_agent_db(
         per_agent_db,
         thread_id=agent,
@@ -164,7 +171,7 @@ async def test_dw_history_reads_per_agent_db_file(isolated_home):
         agent_name_meta=agent,
     )
 
-    result = _run_dw_cli("--history", agent, home=isolated_home)
+    result = _run_deep_worker("--history", agent, home=isolated_home)
 
     assert result.returncode == 0, (
         f"deep-worker --history exited non-zero.\n"
@@ -176,16 +183,16 @@ async def test_dw_history_reads_per_agent_db_file(isolated_home):
 
 
 @pytest.mark.asyncio
-async def test_dw_history_still_works_when_global_db_is_empty(
+async def test_deep_worker_history_still_works_when_global_db_is_empty(
     isolated_home,
 ):
     """Exact reproducer of the bug: empty legacy global + populated
     per-agent file."""
     agent = "integ_lc4"
     # Empty 0-byte legacy file, like on the dev machine.
-    (isolated_home / ".deepagents" / "sessions.db").write_bytes(b"")
+    # No global DB: the v1 layout lived in ~/.deepagents (POLICIES §16).
 
-    per_agent_db = isolated_home / ".deepagents" / f"sessions_{agent}.db"
+    per_agent_db = _agent_db(isolated_home, agent)
     await _seed_per_agent_db(
         per_agent_db,
         thread_id=agent,
@@ -193,19 +200,19 @@ async def test_dw_history_still_works_when_global_db_is_empty(
         agent_name_meta=agent,
     )
 
-    result = _run_dw_cli("--history", agent, home=isolated_home)
+    result = _run_deep_worker("--history", agent, home=isolated_home)
 
     assert result.returncode == 0, result.stderr or result.stdout
     assert "integ marker message" in result.stdout
 
 
 @pytest.mark.asyncio
-async def test_dw_history_works_for_tm_thread(isolated_home):
+async def test_deep_worker_history_works_for_tm_thread(isolated_home):
     """`deep-worker --history <agent>:tm` reads sessions_<agent>.db
     (derives agent from thread_id prefix)."""
     agent = "integ_tm_agent"
     tm_thread = f"{agent}:tm"
-    per_agent_db = isolated_home / ".deepagents" / f"sessions_{agent}.db"
+    per_agent_db = _agent_db(isolated_home, agent)
     await _seed_per_agent_db(
         per_agent_db,
         thread_id=tm_thread,
@@ -213,35 +220,35 @@ async def test_dw_history_works_for_tm_thread(isolated_home):
         agent_name_meta=agent,
     )
 
-    result = _run_dw_cli("--history", tm_thread, home=isolated_home)
+    result = _run_deep_worker("--history", tm_thread, home=isolated_home)
 
     assert result.returncode == 0, result.stderr or result.stdout
     assert "tm integ message" in result.stdout
 
 
 @pytest.mark.asyncio
-async def test_dw_list_shows_threads_from_per_agent_db(isolated_home):
+async def test_deep_worker_list_shows_threads_from_per_agent_db(isolated_home):
     """`deep-worker --list` aggregates threads across all
     sessions_*.db files, not just the legacy global."""
     now = datetime.now(UTC).isoformat()
 
     # Two per-agent DBs with different threads.
     await _seed_per_agent_db(
-        isolated_home / ".deepagents" / "sessions_list_a.db",
+        _agent_db(isolated_home, "list_a"),
         thread_id="list_a",
         content="a",
         agent_name_meta="list_a",
         updated_at=now,
     )
     await _seed_per_agent_db(
-        isolated_home / ".deepagents" / "sessions_list_b.db",
+        _agent_db(isolated_home, "list_b"),
         thread_id="list_b",
         content="b",
         agent_name_meta="list_b",
         updated_at=now,
     )
 
-    result = _run_dw_cli("--list", home=isolated_home)
+    result = _run_deep_worker("--list", home=isolated_home)
 
     assert result.returncode == 0, result.stderr or result.stdout
     assert "list_a" in result.stdout, (
@@ -253,14 +260,14 @@ async def test_dw_list_shows_threads_from_per_agent_db(isolated_home):
 
 
 @pytest.mark.asyncio
-async def test_dw_remove_before_cleans_per_agent_dbs(isolated_home):
+async def test_deep_worker_remove_before_cleans_per_agent_dbs(isolated_home):
     """`deep-worker --remove-before <cutoff>` sweeps every
     sessions_<agent>.db file, not only the legacy global."""
     old_ts = (datetime.now(UTC) - timedelta(days=200)).isoformat()
     recent_ts = datetime.now(UTC).isoformat()
 
-    old_db = isolated_home / ".deepagents" / "sessions_old_one.db"
-    recent_db = isolated_home / ".deepagents" / "sessions_new_one.db"
+    old_db = _agent_db(isolated_home, "old_one")
+    recent_db = _agent_db(isolated_home, "new_one")
 
     await _seed_per_agent_db(
         old_db,
@@ -278,14 +285,14 @@ async def test_dw_remove_before_cleans_per_agent_dbs(isolated_home):
     )
 
     # Dry run first.
-    result = _run_dw_cli(
+    result = _run_deep_worker(
         "--remove-before", "30d", "--dry-run", home=isolated_home
     )
     assert result.returncode == 0, result.stderr or result.stdout
     assert "old_one" in result.stdout or "1" in result.stdout  # count visible
 
     # Real run.
-    result = _run_dw_cli(
+    result = _run_deep_worker(
         "--remove-before", "30d", home=isolated_home
     )
     assert result.returncode == 0, result.stderr or result.stdout
@@ -304,10 +311,10 @@ async def test_dw_remove_before_cleans_per_agent_dbs(isolated_home):
             assert (await cursor.fetchone())[0] == 1
 
 
-def test_dw_history_missing_thread_has_clean_error(isolated_home):
+def test_deep_worker_history_missing_thread_has_clean_error(isolated_home):
     """Missing thread → non-zero exit with a human-readable error
     (not a raw SQLite traceback)."""
-    result = _run_dw_cli("--history", "definitely_missing", home=isolated_home)
+    result = _run_deep_worker("--history", "definitely_missing", home=isolated_home)
 
     assert result.returncode != 0
     combined = (result.stdout + result.stderr).lower()

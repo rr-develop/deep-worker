@@ -19,7 +19,7 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 
-from deep_worker_cli.storage_paths import deep_worker_home
+from deep_worker_cli.storage_paths import agent_root, deep_worker_home
 from typing import Any
 
 from langchain_core.tools import tool
@@ -40,7 +40,9 @@ def _resolve_path(
     if not assistant_id or not thread_id:
         return None
     home_path = Path(home) if home else Path.home()
-    return deep_worker_home(home_path) / assistant_id / "summaries" / f"{thread_id}.md"
+    # DESIGN_AGENT_DBS_UNDER_AGENTS_SUBDIR §3.2: agent summaries
+    # now live under ``agents/<name>/summaries/<thread_id>.md``.
+    return agent_root(assistant_id, home=home_path, create=False) / "summaries" / f"{thread_id}.md"
 
 
 def _extract_runtime_info(

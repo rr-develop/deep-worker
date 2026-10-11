@@ -1,6 +1,6 @@
 """Shared TypedDicts and dataclasses for the Codex provider.
 
-Mirrors ``claude_code_provider/custom_types.py`` in spirit but with
+Mirrors ``claude_code_sdk_provider/custom_types.py`` in spirit but with
 Codex-specific names. Nothing in here ever escapes the provider
 package — it's all internal wiring.
 """
@@ -117,3 +117,15 @@ class ThreadState:
     # an ainvoke that returned tool_calls and the next ainvoke that
     # resolves them). ``None`` when no turn is in progress.
     current_exec: Any | None = field(default=None, repr=False)
+
+    # Live context gauge for the turn in flight (mid-turn readings
+    # from the codex rollout). Process-local, never persisted.
+    context_watcher: Any = None
+
+    # Latest context size codex reported for this thread (the
+    # rollout's ``last_token_usage``). Stamped onto the turn's
+    # AIMessage so the guard/summarizer decide on provider data.
+    last_provider_context: int | None = None
+    # Messages of the request in flight — a stamp must be bound to
+    # the history it measured (``first_id``).
+    last_request_messages: Any = None

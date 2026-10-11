@@ -17,13 +17,16 @@ from textual.message import Message
 from textual.widgets import Static
 
 # ============================================================================
-# rpyc-async is a regular PyPI dependency (>=1.0.0) providing the
-# AsyncioServer-based protocol (rpyc_async.core.async_connect). The previous
-# sys.path injection of a local rpyc_async checkout was removed: on a
-# developer machine it shadowed the PyPI package with sources, making
-# "clean env" wheel installs test the wrong code.
+# RPYC_ASYNC — LOCAL SOURCES FIRST, INSTALLED PACKAGE AS FALLBACK
+# ============================================================================
+# A local rpyc_async checkout takes priority over any installed
+# distribution; without one we fall back to `pip install rpyc-async`.
+# Owner decision 2026-10-11. The imports below must stay BELOW this one,
+# which is what puts the checkout on sys.path. See rpyc_async_source for the
+# rationale and for the correction of the "PyPI only (D5)" claim.
 # ============================================================================
 
+import deep_worker_cli.rpyc_async_source  # noqa: F401  (import for side effect)
 import rpyc_async as rpyc
 from rpyc_async.core.async_connect import async_connect
 from deep_worker_cli.process.registry import ProcessRegistry

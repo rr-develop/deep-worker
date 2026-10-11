@@ -241,8 +241,19 @@ def cmd_migrate(args: argparse.Namespace) -> int:
     from deep_worker_cli.lsp.migrate import migrate_mcp_config
 
     path = _config_path(args)
-    if migrate_mcp_config(path):
-        print(f"migrated {path} → bridge (backup at {path}.bak)")
+    # Same rule as ``lsp enable``: the USER layer is shared by every
+    # agent, so it gets the "own working directory" form rather than
+    # whatever literal the legacy entry happened to name.
+    follow_agent_cwd = getattr(args, "scope", "project") == "user"
+    if migrate_mcp_config(path, follow_agent_cwd=follow_agent_cwd):
+        root_note = (
+            "each agent's own working directory"
+            if follow_agent_cwd
+            else "the entry's project root"
+        )
+        print(
+            f"migrated {path} → bridge ({root_note}; backup at {path}.bak)"
+        )
         return 0
     print(f"{path}: nothing to migrate")
     return 0

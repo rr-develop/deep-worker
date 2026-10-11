@@ -42,6 +42,18 @@ from langchain_core.messages import (
 
 from deepagents.middleware.message_timestamps import CREATED_AT_KEY, TOOL_CALL_CREATED_AT_KEY
 
+#: ``additional_kwargs`` key stamped by the agent runtime on the
+#: SystemMessage it appends for a recoverable failure. Forwarded into the
+#: serialised dict so the web can render the failure instead of showing
+#: the model's last musing as if it were an answer.
+RECOVERABLE_ERROR_KEY = "recoverable_error"
+
+#: Bumped whenever ``serialize_message`` changes the shape it produces.
+#: Entries carrying an older version are treated as misses, so a shape
+#: change cannot be masked by dicts cached before it — see
+#: ``MessageDictCache.serialize``.
+_SERIALIZATION_VERSION = 2
+
 
 def serialize_message(msg: Any) -> dict[str, Any]:
     """Convert a LangChain message into a JSON-ready dict.
@@ -62,6 +74,15 @@ def serialize_message(msg: Any) -> dict[str, Any]:
         created_at = additional_kwargs.get(CREATED_AT_KEY)
         if isinstance(created_at, str):
             msg_dict[CREATED_AT_KEY] = created_at
+        # Forwarded one key at a time, like ``created_at`` above, rather
+        # than emitting ``additional_kwargs`` wholesale: the rest of it is
+        # internal (``input_message_id``, …) and would ride along on every
+        # polling ``get_history`` call. Without this the flag never leaves
+        # the agent, and the web cannot tell a runtime failure from an
+        # ordinary system message.
+        # See docs/DESIGN_RECOVERABLE_ERROR_VISIBILITY.md §5.3.
+        if additional_kwargs.get(RECOVERABLE_ERROR_KEY) is True:
+            msg_dict[RECOVERABLE_ERROR_KEY] = True
 
     if isinstance(msg, HumanMessage):
         content = msg.content if isinstance(msg.content, str) else str(msg.content)
@@ -139,24 +160,40 @@ class MessageDictCache:
     __slots__ = ("_by_id", "_hits", "_misses")
 
     def __init__(self) -> None:
-        self._by_id: dict[str, dict[str, Any]] = {}
+        self._by_id: dict[str, tuple[int, dict[str, Any]]] = {}
         self._hits = 0
         self._misses = 0
 
     def serialize(self, msg: Any) -> dict[str, Any]:
         """Return the serialised dict for ``msg``, caching the result
-        iff the message has an ``id``."""
+        iff the message has an ``id``.
+
+        The stored version is checked on every read. A message is
+        immutable, but the *shape* ``serialize_message`` produces is not:
+        when it gains a field, entries cached under the old shape would
+        otherwise be served unchanged for the life of the process — and
+        the messages that matter here (the runtime's recoverable-error
+        SystemMessage) do get an ``id``, assigned by the ``add_messages``
+        reducer during ``aupdate_state``, so they are cached like any
+        other. See docs/DESIGN_RECOVERABLE_ERROR_VISIBILITY.md §5.3.2.
+
+        The version is kept *beside* the entry rather than inside the
+        key, which stays a plain id: ``prune_to`` is called on every
+        ``get_history`` with a set of plain string ids, and a tuple key
+        would match none of them, silently evicting the whole cache on
+        each poll.
+        """
         msg_id = getattr(msg, "id", None)
         if not isinstance(msg_id, str) or not msg_id:
             # Uncacheable — serialise fresh every time.
             return serialize_message(msg)
         cached = self._by_id.get(msg_id)
-        if cached is not None:
+        if cached is not None and cached[0] == _SERIALIZATION_VERSION:
             self._hits += 1
-            return cached
+            return cached[1]
         self._misses += 1
         built = serialize_message(msg)
-        self._by_id[msg_id] = built
+        self._by_id[msg_id] = (_SERIALIZATION_VERSION, built)
         return built
 
     def prune_to(self, keep_ids: set[str]) -> int:

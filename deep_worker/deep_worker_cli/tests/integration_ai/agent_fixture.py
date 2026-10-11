@@ -31,7 +31,11 @@ from deep_worker_cli.process.agent_process import AgentProcess
 from deep_worker_cli.process.registry import ProcessRegistry
 
 from .models import AgentFixtureInfo, AgentStatus
-from deep_worker_cli.storage_paths import deep_worker_home
+from deep_worker_cli.storage_paths import (
+    agent_root,
+    deep_worker_home,
+    legacy_agent_root,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -145,13 +149,21 @@ def _cleanup_agent_files(agent_info: AgentFixtureInfo) -> None:
     #    process created this in AgentProcess.__init__ for its
     #    SessionManager. Best-effort: a missing dir is fine (agent
     #    may not have reached the SessionManager init phase).
-    data_dir = deep_worker_home() / agent_info.agent_name
-    if data_dir.exists():
-        try:
-            shutil.rmtree(data_dir, ignore_errors=False)
-            logger.debug(f"Removed agent data dir: {data_dir}")
-        except OSError as e:
-            logger.warning(f"Failed to remove data dir {data_dir}: {e}")
+    #
+    #    Post-v6 the canonical location is ``~/.deep_worker/agents/<name>/``
+    #    (DESIGN_AGENT_DBS_UNDER_AGENTS_SUBDIR §3). We also clean the
+    #    legacy ``~/.deep_worker/<name>/`` location in case some older
+    #    test process (pre-v6 deploy) left it behind.
+    for data_dir in (
+        agent_root(agent_info.agent_name),
+        legacy_agent_root(agent_info.agent_name),
+    ):
+        if data_dir.exists():
+            try:
+                shutil.rmtree(data_dir, ignore_errors=False)
+                logger.debug(f"Removed agent data dir: {data_dir}")
+            except OSError as e:
+                logger.warning(f"Failed to remove data dir {data_dir}: {e}")
 
 
 def _get_existing_agent(agent_name: str, registry: ProcessRegistry) -> Optional[AgentFixtureInfo]:
@@ -234,7 +246,7 @@ def _agent_process_entry_point(
             if model:
                 os.environ["GOOGLE_MODEL"] = model
 
-    # claude-code doesn't require API key (uses local Claude Code installation)
+    # claude-code-sdk doesn't require API key (uses local Claude Code installation)
     # No environment setup needed
 
     # Create config

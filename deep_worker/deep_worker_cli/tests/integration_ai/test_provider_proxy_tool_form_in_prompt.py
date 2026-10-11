@@ -42,17 +42,6 @@ def _prompt_for(model: object) -> str:
     )
 
 
-def test_claude_code_real_model_yields_static_mcp_form() -> None:
-    try:
-        from deep_worker.providers.claude_code_provider import ClaudeCodeChatModel
-    except Exception:  # noqa: BLE001
-        pytest.skip("claude_code_provider not importable")
-    model = ClaudeCodeChatModel()
-    assert _provider_of(model) == "claude-code"
-    prompt = _prompt_for(model)
-    assert "mcp__deepworker__send_message_to_agent" in prompt
-
-
 def test_codex_real_model_yields_pid_prefixed_mcp_form() -> None:
     try:
         from deep_worker.providers.codex_provider import CodexChatModel

@@ -11,7 +11,7 @@ def test_claude_reset_timezone_from_real_log_format() -> None:
     observed = datetime(2026, 7, 4, 18, 0, 38, tzinfo=ZoneInfo("Europe/Amsterdam"))
 
     result = parse_limit_reset(
-        "claude-code",
+        "claude-code-sdk",
         "You've hit your session limit · resets 6:50pm (Europe/Amsterdam)",
         observed_at=observed,
     )
@@ -27,7 +27,7 @@ def test_claude_reset_rolls_to_next_day_when_local_time_already_passed() -> None
     observed = datetime(2026, 6, 28, 23, 57, 40, tzinfo=ZoneInfo("Europe/Amsterdam"))
 
     result = parse_limit_reset(
-        "claude-code",
+        "claude-code-sdk",
         "You've hit your session limit · resets 1am (Europe/Amsterdam)",
         observed_at=observed,
     )
@@ -121,7 +121,7 @@ def test_claude_unparseable_reset_uses_rough_6h_fallback() -> None:
 
     observed = datetime(2026, 7, 4, 14, 44, 51, tzinfo=timezone.utc)
 
-    result = parse_limit_reset("claude-code", "You've hit your session limit · resets soonish", observed_at=observed)
+    result = parse_limit_reset("claude-code-sdk", "You've hit your session limit · resets soonish", observed_at=observed)
 
     assert result.available_after_utc == observed + timedelta(hours=6)
     assert result.source == "fallback"

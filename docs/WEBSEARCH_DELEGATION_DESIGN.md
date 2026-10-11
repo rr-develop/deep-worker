@@ -199,7 +199,7 @@ async def extract_websearch_results(
 ### 3.1 File Structure
 
 ```
-claude_code_provider/
+claude_code_sdk_provider/
 ├── __init__.py
 ├── web_search_delegation.py  # NEW: Main tool implementation
 ├── web_search_hooks.py        # NEW: PreToolUse hook logic
@@ -209,7 +209,7 @@ claude_code_provider/
 
 ### 3.2 Core Implementation
 
-#### File: `claude_code_provider/web_search_delegation.py`
+#### File: `claude_code_sdk_provider/web_search_delegation.py`
 
 ```python
 """WebSearch delegation tool - universal web search via Claude Code SDK."""
@@ -232,7 +232,7 @@ from claude_agent_sdk import (
 )
 from claude_agent_sdk.types import HookMatcher
 
-from claude_code_provider.web_search_hooks import create_enforcement_hook
+from claude_code_sdk_provider.web_search_hooks import create_enforcement_hook
 
 
 class WebSearchInput(BaseModel):
@@ -499,7 +499,7 @@ Output: List of search results (title, URL, snippet).
         return []
 ```
 
-#### File: `claude_code_provider/web_search_hooks.py`
+#### File: `claude_code_sdk_provider/web_search_hooks.py`
 
 ```python
 """PreToolUse hooks for WebSearch parameter enforcement."""
@@ -581,12 +581,12 @@ def create_enforcement_hook(
 ### 4.1 Unit Tests
 
 ```python
-# File: claude_code_provider/tests/test_web_search_delegation.py
+# File: claude_code_sdk_provider/tests/test_web_search_delegation.py
 
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from claude_code_provider.web_search_delegation import (
+from claude_code_sdk_provider.web_search_delegation import (
     WebSearchDelegationTool,
     WebSearchInput,
 )
@@ -601,7 +601,7 @@ class TestWebSearchDelegationTool:
         tool = WebSearchDelegationTool(verbose=True)
 
         # Mock ClaudeSDKClient
-        with patch("claude_code_provider.web_search_delegation.ClaudeSDKClient") as mock_client:
+        with patch("claude_code_sdk_provider.web_search_delegation.ClaudeSDKClient") as mock_client:
             # Setup mock response
             mock_instance = AsyncMock()
             mock_client.return_value.__aenter__.return_value = mock_instance
@@ -718,7 +718,7 @@ async def test_real_websearch_delegation():
 @pytest.mark.asyncio
 async def test_parameter_enforcement_hook():
     """Test that PreToolUse hook enforces original parameters."""
-    from claude_code_provider.web_search_hooks import create_enforcement_hook
+    from claude_code_sdk_provider.web_search_hooks import create_enforcement_hook
 
     # Create hook with original params
     original_params = {
@@ -757,7 +757,7 @@ async def test_parameter_enforcement_hook():
 ```python
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage
-from claude_code_provider.web_search_delegation import WebSearchDelegationTool
+from claude_code_sdk_provider.web_search_delegation import WebSearchDelegationTool
 
 # Create Gemini model with web search capability
 model = ChatGoogleGenerativeAI(model="gemini-2.5-flash")
@@ -778,7 +778,7 @@ print(response.content)
 
 ```python
 from langchain_openai import ChatOpenAI
-from claude_code_provider.web_search_delegation import WebSearchDelegationTool
+from claude_code_sdk_provider.web_search_delegation import WebSearchDelegationTool
 
 model = ChatOpenAI(model="gpt-4o")
 tool = WebSearchDelegationTool()
@@ -793,7 +793,7 @@ response = await model_with_search.ainvoke([
 ### 5.3 Direct Tool Usage
 
 ```python
-from claude_code_provider.web_search_delegation import WebSearchDelegationTool
+from claude_code_sdk_provider.web_search_delegation import WebSearchDelegationTool
 import json
 
 tool = WebSearchDelegationTool(verbose=True)
@@ -972,7 +972,7 @@ async def validate_results_hook(input_data, tool_use_id, context):
 - [ ] Add to project README
 
 ### Phase 4: Integration
-- [ ] Export tool in `claude_code_provider/__init__.py`
+- [ ] Export tool in `claude_code_sdk_provider/__init__.py`
 - [ ] Add to provider configuration
 - [ ] Create example scripts
 - [ ] Update integration tests
@@ -982,7 +982,7 @@ async def validate_results_hook(input_data, tool_use_id, context):
 ## 12. Related Documents
 
 - [Claude Code Provider Design](claude_code_provider_design.md)
-- [Claude Code Provider Implementation Plan](claude_code_provider_implementation_plan.md)
+- [Claude Code Provider Implementation Plan](claude_code_sdk_provider_implementation_plan.md)
 - [Claude SDK Documentation](https://github.com/anthropics/claude-sdk-python)
 
 ---

@@ -1,7 +1,7 @@
 # codex_provider
 
 LangChain `BaseChatModel` wrapper around OpenAI's **Codex CLI**, designed as
-a drop-in sibling of `claude_code_provider/` for deep-worker.
+a drop-in sibling of `claude_code_sdk_provider/` for deep-worker.
 
 Use it as:
 
@@ -75,8 +75,9 @@ package itself is still strict-checked.
 
 * `tests/test_*.py` — unit tests with mocked subprocess + mocked
   proxy. Always run.
-* `tests/test_integration.py` — live tests against a real `codex`
-  binary / deep-worker agent. Skipped unless
+* `tests/test_integration.py` and
+  `tests/test_deep_worker_history_integration.py` — live tests against
+  a real `codex` binary / deep-worker agent. Skipped unless
   `CODEX_INTEGRATION_TESTS=1`.
 
 Run all units:

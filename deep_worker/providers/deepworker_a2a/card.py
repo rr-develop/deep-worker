@@ -30,7 +30,7 @@ DEFAULT_OUTPUT_MODES = ["text/plain"]
 def _default_skill(agent_name: str) -> AgentSkill:
     """The baseline general-purpose skill every deep-worker agent exposes.
 
-    Later phases may map the agent's ``~/.deepagents/<name>/skills`` into
+    Later phases may map the agent's ``~/.deep_worker/agents/<name>/skills`` into
     additional ``AgentSkill`` entries.
     """
     return AgentSkill(

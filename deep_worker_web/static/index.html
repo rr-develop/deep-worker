@@ -44,14 +44,21 @@
                         <h2 id="selected-agent-name">Agent Name</h2>
                         <div class="agent-controls">
                             <button id="full-dialog-btn" class="btn btn-secondary btn-sm">📜 Full Dialog</button>
+                            <div class="full-dialog-selects">
+                                <select id="full-dialog-verbosity" class="btn btn-secondary btn-sm" title="Verbosity level for Full Dialog">
+                                    <option value="final">Final answers only</option>
+                                    <option value="text">All assistant text</option>
+                                    <option value="full">Full (with tool calls)</option>
+                                    <option value="system_prompt">System prompt (invariant)</option>
+                                    <option value="tools">Available tools</option>
+                                </select>
+                                <select id="full-dialog-mode" class="btn btn-secondary btn-sm" title="What the Full Dialog button does">
+                                    <option value="tab">Open in new tab</option>
+                                    <option value="copy">Copy to clipboard</option>
+                                    <option value="download">Download .txt</option>
+                                </select>
+                            </div>
                             <button id="stats-btn" class="btn btn-secondary btn-sm" onclick="openAgentStats()">📊 Stats</button>
-                            <select id="full-dialog-verbosity" class="btn btn-secondary btn-sm" title="Verbosity level for Full Dialog">
-                                <option value="final">Final answers only</option>
-                                <option value="text">All assistant text</option>
-                                <option value="full">Full (with tool calls)</option>
-                                <option value="system_prompt">System prompt (invariant)</option>
-                                <option value="tools">Available tools</option>
-                            </select>
                             <button id="interrupt-btn" class="btn btn-warning btn-sm" title="Interrupt current agent invocation (process keeps running)">⏸ Interrupt</button>
                             <button id="summarize-agent-btn" class="btn btn-secondary btn-sm" onclick="summarizeCurrentAgent()">Summarize context</button>
                             <button id="stop-agent-btn" class="btn btn-danger btn-sm" onclick="stopCurrentAgent()">⏹ Stop</button>
@@ -75,9 +82,39 @@
                         <span id="agent-provider">unknown</span>
                         <span class="status-label">Model:</span>
                         <span id="agent-model">unknown</span>
+                        <span class="status-label">Context:</span>
+                        <span id="agent-context" title="Agent context usage (live / limit). The limit is the operator's -l flag — when set, the guard holds it; when absent, the provider's default applies.">-</span>
+                        <span class="status-label">Limit:</span>
+                        <span id="agent-context-limit" title="Operator-set context limit (-l flag). Rendered next to live usage so the operator can see the guard is holding the limit they asked for. rg1_worker 2026-08-18.">-</span>
+                        <span id="agent-last-turn-wrap" style="display:none">
+                            <span class="status-label">Last turn:</span>
+                            <span id="agent-last-turn" title="Per-turn token total from the most recent record (prompt + completion of the last turn). Separate from Context so the two are never confused with the operator's -l cap. rg1_worker 2026-08-22.">-</span>
+                        </span>
+                        <span id="agent-tm-context-wrap" style="display:none">
+                            <span class="status-label">TM:</span>
+                            <span id="agent-tm-context" title="TaskManager context usage">-</span>
+                        </span>
                         <span class="status-label">Uptime:</span>
                         <span id="agent-uptime" data-started-at="">-</span>
                     </div>
+
+                    <!-- Tab bar. The header and info bar stay OUTSIDE the tabs:
+                         Stop/Restart/Interrupt and the error panel are
+                         agent-wide and must stay reachable from any tab. -->
+                    <div class="agent-tabs" role="tablist" aria-label="Agent panels">
+                        <button class="agent-tab" id="tab-btn-dialog" role="tab"
+                                aria-selected="true" aria-controls="tab-dialog"
+                                data-tab="dialog">Dialog</button>
+                        <button class="agent-tab" id="tab-btn-mcp" role="tab"
+                                aria-selected="false" aria-controls="tab-mcp"
+                                data-tab="mcp">MCP</button>
+                        <button class="agent-tab" id="tab-btn-stats" role="tab"
+                                aria-selected="false" aria-controls="tab-stats"
+                                data-tab="stats">Stats</button>
+                    </div>
+
+                    <div class="tab-panel" id="tab-dialog" role="tabpanel"
+                         aria-labelledby="tab-btn-dialog" tabindex="0">
 
                     <!-- Last Error Panel - placed prominently at top of agent view so it is
                          immediately visible without scrolling when the agent is selected as current.
@@ -130,6 +167,104 @@
                         <textarea id="message-input" placeholder="Enter your message here..." rows="4"></textarea>
                         <button id="send-btn" class="btn btn-primary">Send Message</button>
                     </div>
+                    </div><!-- /#tab-dialog -->
+
+                    <!-- MCP tab. Populated on first activation only; nothing
+                         here polls, and rendering never connects to any MCP
+                         server (tool counts come from an explicit Test or
+                         from /mcp/live). -->
+                    <div class="tab-panel" id="tab-mcp" role="tabpanel"
+                         aria-labelledby="tab-btn-mcp" tabindex="0" hidden>
+                        <div class="mcp-section">
+                            <div class="mcp-section-header">
+                                <h3>Attached to this agent</h3>
+                                <button id="mcp-refresh-btn" class="btn btn-secondary btn-sm"
+                                        title="Reload the configuration from disk">↻ Reload</button>
+                            </div>
+                            <p id="mcp-restart-hint" class="mcp-hint" hidden>
+                                Changes apply when the agent restarts.
+                                Restarting interrupts whatever it is doing.
+                            </p>
+                            <div id="mcp-attached-list" class="mcp-list">
+                                <em>Loading…</em>
+                            </div>
+                        </div>
+
+                        <div class="mcp-section">
+                            <div class="mcp-section-header">
+                                <h3>Available on this host</h3>
+                                <div class="mcp-section-actions">
+                                    <button id="mcp-scan-btn" class="btn btn-secondary btn-sm"
+                                            title="Scan config files for MCP servers (reads files only, never starts them)">🔍 Scan</button>
+                                    <button id="mcp-add-toggle-btn" class="btn btn-secondary btn-sm">+ Add</button>
+                                </div>
+                            </div>
+                            <div id="mcp-catalog-list" class="mcp-list">
+                                <em>Not scanned yet.</em>
+                            </div>
+                        </div>
+
+                        <div class="mcp-section" id="mcp-add-form" hidden>
+                            <h3>Add / connect a server</h3>
+                            <div class="mcp-form-grid">
+                                <label for="mcp-f-name">Name</label>
+                                <input type="text" id="mcp-f-name" placeholder="my-server">
+
+                                <label for="mcp-f-type">Transport</label>
+                                <select id="mcp-f-type">
+                                    <option value="stdio">stdio (local process)</option>
+                                    <option value="http">http (local or remote URL)</option>
+                                </select>
+
+                                <label for="mcp-f-command" id="mcp-l-command">Command</label>
+                                <input type="text" id="mcp-f-command" placeholder="npx">
+
+                                <label for="mcp-f-args" id="mcp-l-args">Args</label>
+                                <input type="text" id="mcp-f-args" placeholder="-y @scope/server (space-separated)">
+
+                                <label for="mcp-f-cwd" id="mcp-l-cwd">Working dir</label>
+                                <input type="text" id="mcp-f-cwd" placeholder="(optional)">
+
+                                <label for="mcp-f-url" id="mcp-l-url">URL</label>
+                                <input type="text" id="mcp-f-url" placeholder="http://127.0.0.1:1234/mcp">
+
+                                <label for="mcp-f-headers" id="mcp-l-headers">Headers</label>
+                                <input type="text" id="mcp-f-headers"
+                                       placeholder="Authorization=Bearer ${env:MY_TOKEN}">
+
+                                <label for="mcp-f-env" id="mcp-l-env">Env</label>
+                                <input type="text" id="mcp-f-env" placeholder="KEY=${env:MY_VAR}">
+                            </div>
+                            <p class="mcp-hint">
+                                Use <code>${env:VAR}</code> for secrets — the value is read
+                                from the agent's environment and never stored in the file.
+                            </p>
+                            <label class="mcp-check">
+                                <input type="checkbox" id="mcp-f-auto-approve">
+                                Auto-approve this server's tools (skips approval prompts)
+                            </label>
+                            <div class="mcp-form-actions">
+                                <button id="mcp-test-btn" class="btn btn-secondary btn-sm">Test connection</button>
+                                <button id="mcp-save-btn" class="btn btn-primary btn-sm">Attach to agent</button>
+                                <button id="mcp-save-catalog-btn" class="btn btn-secondary btn-sm"
+                                        title="Save to the host catalog without attaching">Save to catalog</button>
+                            </div>
+                            <div id="mcp-form-feedback" class="mcp-feedback" role="status" aria-live="polite"></div>
+                        </div>
+                    </div><!-- /#tab-mcp -->
+
+                    <!-- Stats tab. Fetched on first activation and on explicit
+                         Refresh only — no timer, no interval, no recompute. -->
+                    <div class="tab-panel" id="tab-stats" role="tabpanel"
+                         aria-labelledby="tab-btn-stats" tabindex="0" hidden>
+                        <div class="mcp-section-header">
+                            <h3>Token statistics</h3>
+                            <button id="stats-refresh-btn" class="btn btn-secondary btn-sm">↻ Refresh</button>
+                        </div>
+                        <div id="stats-tab-content" class="stats-tab-content">
+                            <em>Not loaded yet.</em>
+                        </div>
+                    </div><!-- /#tab-stats -->
                 </div>
             </div>
         </div>

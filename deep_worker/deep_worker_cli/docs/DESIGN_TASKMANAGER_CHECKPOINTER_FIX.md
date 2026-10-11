@@ -429,7 +429,7 @@ When using `--task-manager` (`-tm`), two threads are created:
 2. **Manager thread:** `{agent_name}:tm` - Evaluates task completion
 
 Both threads share the same checkpointer type:
-- In production: AsyncSqliteSaver (persisted to `~/.deepagents/sessions.db`)
+- In production: AsyncSqliteSaver (persisted to a per-agent threads database in the user data directory)
 - In tests: InMemorySaver (memory-only, not persisted)
 
 View both threads:

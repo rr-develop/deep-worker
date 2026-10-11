@@ -28,6 +28,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Final
 
+from deep_worker_cli.external_mcp.config import AGENT_WORKING_DIR_PLACEHOLDER
 from deep_worker_cli.lsp.service.registry import RegistryEntry, ServiceRegistry
 from deep_worker_cli.lsp.service.service_cli import build_serve_argv
 from deep_worker_cli.lsp.service.supervisor import (
@@ -81,20 +82,39 @@ def connect_or_fail(
 
 def build_bridge_mcp_entry(
     *,
-    workspace_root: Path | str,
+    workspace_root: Path | str | None = None,
     auto_approve: bool = True,
     dw_command: str | None = None,
+    follow_agent_cwd: bool = False,
 ) -> dict[str, Any]:
     """Build the ``mcpServers.<BRIDGE_SERVER_NAME>`` entry for the bridge.
 
     Replaces the legacy entry that exec'd the backend binary directly
     inside every agent. Shape stays compatible with the existing loader
-    in ``external_mcp/config.py`` — no loader change required.
+    in ``external_mcp/config.py``.
+
+    With ``follow_agent_cwd`` the root is written as the placeholder
+    ``${agent:working_dir}`` instead of a literal path, and the loader
+    substitutes each agent's own workspace root at start. That is the
+    USER-scope form: a config shared by every agent must not name one
+    project, or it silently becomes everybody's navigation target (see
+    ``docs/design/lsp_user_scope_follows_agent_cwd.md``).
+
+    Project- and agent-scope entries keep the literal root — there the
+    whole point is to name one specific project.
     """
-    root = Path(workspace_root).resolve()
+    if follow_agent_cwd:
+        root_arg = AGENT_WORKING_DIR_PLACEHOLDER
+    elif workspace_root is not None:
+        root_arg = str(Path(workspace_root).resolve())
+    else:
+        raise ValueError(
+            "build_bridge_mcp_entry requires workspace_root unless "
+            "follow_agent_cwd is set"
+        )
     return {
         "type": "stdio",
         "command": dw_command or _DW_COMMAND,
-        "args": ["lsp", "bridge", "--project-root", str(root)],
+        "args": ["lsp", "bridge", "--project-root", root_arg],
         "auto_approve": bool(auto_approve),
     }

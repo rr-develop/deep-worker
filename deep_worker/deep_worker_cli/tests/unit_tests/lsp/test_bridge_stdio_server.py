@@ -90,18 +90,52 @@ def test_every_tool_marks_its_essential_arguments_required():
 # ── dispatch ─────────────────────────────────────────────────────────
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param({"symbols": ["Foo"]}, id="object"),
+        pytest.param([{"name": "Foo"}, {"name": "Bar"}], id="array"),
+        pytest.param([], id="empty-array"),
+        pytest.param({}, id="empty-object"),
+        pytest.param("Foo", id="string"),
+    ],
+)
 @pytest.mark.asyncio
-async def test_successful_call_returns_payload_as_content():
-    session = _FakeSession(result={"symbols": ["Foo"]})
+async def test_successful_call_returns_payload_as_content(payload):
+    """Every JSON shape the backend can produce must survive the hop.
+
+    The shape is spelled out in each case on purpose: ``_FakeSession``
+    defaults ``result`` to ``None``, so an omitted argument would
+    quietly become the failure case and fail for an unrelated reason.
+
+    An array used to be the shape that broke: the SDK only builds an
+    envelope for a ``dict``, and took the list of symbols for
+    ready-made MCP content.
+    """
+    session = _FakeSession(result=payload)
     server = build_mcp_server(session)
 
-    handler = server.request_handlers
     result = await _call(server, "find_symbol", {"name_path": "Foo"})
 
     assert session.calls == [("find_symbol", {"name_path": "Foo"})]
-    text = "".join(c.text for c in result.content)
-    assert json.loads(text) == {"symbols": ["Foo"]}
     assert result.isError is not True
+    text = "".join(c.text for c in result.content)
+    assert json.loads(text) == payload
+
+
+@pytest.mark.asyncio
+async def test_absent_payload_is_an_error_not_an_empty_success():
+    """``None`` carries no shape, so it must not be dressed up as data.
+
+    An empty string is indistinguishable from a genuinely empty answer;
+    legitimate emptiness still carries its shape (``{}``, ``[]``).
+    """
+    session = _FakeSession(result=None)
+    server = build_mcp_server(session)
+
+    result = await _call(server, "find_symbol", {"name_path": "Foo"})
+
+    assert result.isError is True, "absent payload was reported as success"
 
 
 @pytest.mark.asyncio
@@ -158,7 +192,7 @@ def test_enable_writes_bridge_entry_not_a_direct_backend_spawn(tmp_path: Path):
     """
     from deep_worker_cli.lsp.enable import enable_lsp_at_path
 
-    cfg = tmp_path / ".deepagents" / "mcp.json"
+    cfg = tmp_path / ".deep_worker" / "mcp.json"
     enable_lsp_at_path(cfg, workspace_root=tmp_path)
 
     entry = json.loads(cfg.read_text())["mcpServers"]["serena"]

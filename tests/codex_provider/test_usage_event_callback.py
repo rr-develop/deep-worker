@@ -1,7 +1,7 @@
 """TDD for the codex usage-event callback (DESIGN_AGENT_TOKEN_STATS.md §5.2).
 
 ``CodexChatModel`` reports token-stats through the SAME event callback
-contract as claude-code:
+contract as claude-code-sdk:
 
 * ``ainvoke`` start → ``cb(event="invocation_start")`` (no record).
 * ``TurnCompletedEvent`` (terminal, per-turn usage, branch A) →

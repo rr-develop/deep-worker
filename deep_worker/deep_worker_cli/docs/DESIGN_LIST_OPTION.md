@@ -2,7 +2,7 @@
 
 ## Overview
 
-The `--list` (alias `-ls`) option for `deep-worker` command displays a complete list of all conversation threads stored in the sessions database (`~/.deepagents/sessions.db`). This provides users with visibility into all existing conversation threads across all agents.
+The `--list` (alias `-ls`) option for `deep-worker` command displays a complete list of all conversation threads stored in the sessions database. This provides users with visibility into all existing conversation threads across all agents.
 
 ## Command Syntax
 
@@ -209,7 +209,7 @@ ORDER BY thread_id ASC;  -- Sort dynamically based on --sort option
 ### Data Retrieval Process
 
 1. **Connect to Database**:
-   - Path: `~/.deepagents/sessions.db`
+   - Path: the agent's thread database (this design predates the v3 layout; the legacy global DB it named has since been removed — see POLICIES §16)
    - Use `aiosqlite` for async operations
    - Timeout: 30 seconds
 
@@ -442,6 +442,6 @@ def format_threads_json(threads: list[dict], sort_by: str, filter_agent: str | N
 ## References
 
 - Existing code: `deep_worker_cli/sessions.py::list_threads()`
-- Database schema: `~/.deepagents/sessions.db`
+- Database schema: the agent's thread database
 - Related option: `--clean` (CLEAN_OPTION.md)
 - Command structure: `deep_worker_cli/cli/agent_command.py`

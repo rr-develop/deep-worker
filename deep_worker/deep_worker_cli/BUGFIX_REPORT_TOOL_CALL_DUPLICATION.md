@@ -229,7 +229,7 @@ Note: Bug is fixed and verified with deepseek provider
 
 3. **Performance Monitoring:** Track query response times in CI to detect regressions.
 
-4. **Provider Testing:** Set up test environment with multiple providers (deepseek, claude-code, etc.) for comprehensive testing.
+4. **Provider Testing:** Set up test environment with multiple providers (deepseek, claude-code-sdk, etc.) for comprehensive testing.
 
 ## Conclusion
 

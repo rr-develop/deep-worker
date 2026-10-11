@@ -19,76 +19,77 @@ from deep_worker_cli.config import (
 
 
 class TestProviderContextLimits:
-    """Tests for PROVIDER_CONTEXT_LIMITS mapping."""
+    """Tests for PROVIDER_CONTEXT_LIMITS mapping.
 
-    def test_claude_opus_4_6_limit(self) -> None:
-        """Test that Claude Opus 4.6 has 1M context."""
-        assert PROVIDER_CONTEXT_LIMITS["claude-opus-4.6"] == 1_000_000
+    Architectural shift (rg1_worker 2026-08-18 → 2026-08-19):
+    ---------------------------------------------------------
+    As of the 2026-08-19 fix, PROVIDER_CONTEXT_LIMITS contains
+    ONLY the ``default`` entry. Hand-curated values for specific
+    models are NOT in this dict any more — they come from:
 
-    def test_claude_sonnet_4_6_limit(self) -> None:
-        """Test that Claude Sonnet 4.6 has 1M context."""
-        assert PROVIDER_CONTEXT_LIMITS["claude-sonnet-4.6"] == 1_000_000
+     1. ``model_profile["max_input_tokens"]`` (priority 1, the
+        LangChain SDK's authoritative per-model value, kept
+        current by the SDK maintainers on every release).
+     2. The provider-keyed table in
+        ``context_limit/provider_max.py`` (built from the same
+        LangChain SDK profile data — never hand-curated).
 
-    def test_claude_sonnet_4_5_limit(self) -> None:
-        """Test that Claude Sonnet 4.5 has 200K context."""
-        assert PROVIDER_CONTEXT_LIMITS["claude-sonnet-4.5"] == 200_000
+    These tests pin the new architecture: PROVIDER_CONTEXT_LIMITS
+    is a thin fallback shell, not a hand-curated model map.
+    """
 
-    def test_claude_sonnet_4_limit(self) -> None:
-        """Test that Claude Sonnet 4 has 200K context."""
-        assert PROVIDER_CONTEXT_LIMITS["claude-sonnet-4"] == 200_000
+    def test_dict_only_has_default_fallback(self) -> None:
+        """The dict contains ONLY the ``default`` key. Every other
+        value the CLI uses is sourced from LangChain SDK profile
+        data at runtime, not from a hand-curated entry here.
+        """
+        assert set(PROVIDER_CONTEXT_LIMITS.keys()) == {"default"}
 
-    def test_deepseek_chat_limit(self) -> None:
-        """Test that DeepSeek chat (V3.2) has 128K context."""
-        assert PROVIDER_CONTEXT_LIMITS["deepseek-chat"] == 128_000
-
-    def test_deepseek_v3_limit(self) -> None:
-        """Test that DeepSeek V3 has 128K context."""
-        assert PROVIDER_CONTEXT_LIMITS["deepseek-v3"] == 128_000
-
-    def test_deepseek_r1_limit(self) -> None:
-        """Test that DeepSeek R1 has 64K context."""
-        assert PROVIDER_CONTEXT_LIMITS["deepseek-r1"] == 64_000
-
-    def test_gpt_4_limit(self) -> None:
-        """Test that GPT-4 has 128K context."""
-        assert PROVIDER_CONTEXT_LIMITS["gpt-4"] == 128_000
-
-    def test_gpt_35_turbo_limit(self) -> None:
-        """Test that GPT-3.5 Turbo has 16K context."""
-        assert PROVIDER_CONTEXT_LIMITS["gpt-3.5-turbo"] == 16_385
-
-    def test_default_fallback(self) -> None:
-        """Test that default fallback is 100K."""
+    def test_default_fallback_is_100k(self) -> None:
+        """Default fallback is 100K, so summarization does not
+        trigger spuriously on long conversations for unknown
+        models."""
         assert PROVIDER_CONTEXT_LIMITS["default"] == 100_000
+
+    def test_no_family_aliases_in_dict(self) -> None:
+        """Family aliases (fable, opus, sonnet, haiku, mythos) MUST
+        NOT appear in this dict. Per the operator contract,
+        family aliases refer to the latest available model in
+        the family, which is dynamic — we cannot statically
+        encode its context window.
+        """
+        for alias in ("fable", "opus", "sonnet", "haiku", "mythos"):
+            assert alias not in PROVIDER_CONTEXT_LIMITS, (
+                f"family alias {alias!r} in PROVIDER_CONTEXT_LIMITS. "
+                f"Family aliases must resolve via model_profile (the "
+                f"current generation's value), not via a static dict "
+                f"entry. The rg1_worker 2026-08-18 lesson."
+            )
 
 
 class TestGetModelContextLimit:
     """Tests for get_model_context_limit() function."""
 
     def test_from_model_profile_priority(self) -> None:
-        """Test that model profile takes priority over known models."""
+        """Test that model profile takes priority over the static
+        dict and the default fallback. The profile is the
+        authoritative runtime source — it comes from the
+        LangChain SDK's model introspection and is kept
+        current on every SDK release.
+        """
         profile = {"max_input_tokens": 150_000}
         limit = get_model_context_limit("claude-sonnet-4.5", profile)
-        # Profile value (150K) overrides known value (200K)
+        # Profile value (150K) wins over the default fallback (100K).
         assert limit == 150_000
 
-    def test_from_known_model_exact_match(self) -> None:
-        """Test exact model name match."""
-        limit = get_model_context_limit("claude-sonnet-4.5", None)
-        assert limit == 200_000
-
-    def test_from_known_model_partial_match(self) -> None:
-        """Test partial model name match (provider prefix)."""
-        limit = get_model_context_limit("anthropic:claude-sonnet-4.5", None)
-        assert limit == 200_000
-
-    def test_deepseek_with_provider_prefix(self) -> None:
-        """Test DeepSeek model with provider prefix."""
-        limit = get_model_context_limit("deepseek:deepseek-chat", None)
-        assert limit == 128_000
+    def test_profile_overrides_default_for_unknown_model(self) -> None:
+        """An unknown model name with a profile → profile wins."""
+        profile = {"max_input_tokens": 64_000}
+        limit = get_model_context_limit("totally-unknown-xyz", profile)
+        assert limit == 64_000
 
     def test_fallback_unknown_model(self) -> None:
-        """Test fallback for completely unknown model."""
+        """Test fallback for completely unknown model (no profile)."""
         limit = get_model_context_limit("unknown-model-xyz", None)
         assert limit == 100_000
 
@@ -97,11 +98,23 @@ class TestGetModelContextLimit:
         limit = get_model_context_limit(None, None)
         assert limit == 100_000
 
-    def test_openrouter_model_extraction(self) -> None:
-        """Test extracting model name from OpenRouter format."""
-        limit = get_model_context_limit("openrouter/anthropic/claude-sonnet-4.5", None)
-        # Should find "claude-sonnet-4.5" and return 200K
-        assert limit == 200_000
+    def test_empty_profile_does_not_override_default(self) -> None:
+        """An empty profile dict (no ``max_input_tokens`` key) →
+        falls through to the default fallback."""
+        limit = get_model_context_limit("anything", {})
+        assert limit == 100_000
+
+    def test_profile_with_non_int_max_input_tokens_falls_through(self) -> None:
+        """A profile with ``max_input_tokens`` set to a non-int
+        (e.g. ``None``) falls through to the default. This is
+        the rg1_worker 2026-08-18 belt-and-braces guard: the
+        downstream code only accepts ints, so an unexpected
+        type from a future SDK is silently ignored rather than
+        corrupting the trigger calculation."""
+        limit = get_model_context_limit("anything", {"max_input_tokens": None})
+        assert limit == 100_000
+        limit = get_model_context_limit("anything", {"max_input_tokens": "200000"})
+        assert limit == 100_000
 
 
 class TestGetSummarizationConfig:

@@ -85,12 +85,14 @@ class TestForkAgentData:
         deep_root = deep_worker_home(home)
         deep_root.mkdir(parents=True)
         os.chmod(deep_root, 0o700)
-        src_dw = deep_root / "src_agent"
+        src_dw = deep_root / "agents" / "src_agent"
+        src_dw.parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(src_dw.parent, 0o700)
         src.rename(src_dw)
 
         fork_agent_data("src_agent", "dst_agent", home=home)
 
-        dst_dw = deep_root / "dst_agent"
+        dst_dw = deep_root / "agents" / "dst_agent"
         assert dst_dw.is_dir()
         assert (dst_dw / "data").is_dir()
         assert (dst_dw / "data" / "notes.txt").read_text() == "working data"
@@ -117,13 +119,15 @@ class TestForkAgentData:
         deep_root.mkdir(parents=True)
         os.chmod(deep_root, 0o700)
 
-        src_dw = deep_root / "src_agent"
+        src_dw = deep_root / "agents" / "src_agent"
+        src_dw.parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(src_dw.parent, 0o700)
         src_dw.mkdir()
         os.chmod(src_dw, 0o700)
         (src_dw / "session_metadata.json").write_text("{}")
         os.chmod(src_dw / "session_metadata.json", 0o600)
 
-        dst_dw = deep_root / "dst_agent"
+        dst_dw = deep_root / "agents" / "dst_agent"
         dst_dw.mkdir()
         os.chmod(dst_dw, 0o700)
 
@@ -135,7 +139,9 @@ class TestForkAgentData:
         deep_root.mkdir(parents=True)
         os.chmod(deep_root, 0o700)
 
-        src_dw = deep_root / "src_agent"
+        src_dw = deep_root / "agents" / "src_agent"
+        src_dw.parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(src_dw.parent, 0o700)
         src_dw.mkdir()
         os.chmod(src_dw, 0o700)
         (src_dw / "session_metadata.json").write_text("{}")
@@ -143,7 +149,7 @@ class TestForkAgentData:
 
         fork_agent_data("src_agent", "dst_agent", home=tmp_path)
 
-        dst_dw = deep_root / "dst_agent"
+        dst_dw = deep_root / "agents" / "dst_agent"
         assert dst_dw.is_dir()
         assert not (dst_dw / "data").exists()
 
@@ -152,7 +158,9 @@ class TestForkAgentData:
         deep_root.mkdir(parents=True)
         os.chmod(deep_root, 0o700)
 
-        src_dw = deep_root / "src_agent"
+        src_dw = deep_root / "agents" / "src_agent"
+        src_dw.parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(src_dw.parent, 0o700)
         src_dw.mkdir()
         os.chmod(src_dw, 0o700)
         (src_dw / "session_metadata.json").write_text("{}")
@@ -160,7 +168,7 @@ class TestForkAgentData:
 
         fork_agent_data("src_agent", "dst_agent", home=tmp_path)
 
-        dst_dw = deep_root / "dst_agent"
+        dst_dw = deep_root / "agents" / "dst_agent"
         assert not (dst_dw / "summaries").exists()
 
     def test_no_threads_db(self, tmp_path: Path) -> None:
@@ -168,7 +176,9 @@ class TestForkAgentData:
         deep_root.mkdir(parents=True)
         os.chmod(deep_root, 0o700)
 
-        src_dw = deep_root / "src_agent"
+        src_dw = deep_root / "agents" / "src_agent"
+        src_dw.parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(src_dw.parent, 0o700)
         src_dw.mkdir()
         os.chmod(src_dw, 0o700)
         (src_dw / "session_metadata.json").write_text("{}")
@@ -176,7 +186,7 @@ class TestForkAgentData:
 
         fork_agent_data("src_agent", "dst_agent", home=tmp_path)
 
-        dst_dw = deep_root / "dst_agent"
+        dst_dw = deep_root / "agents" / "dst_agent"
         assert not (dst_dw / "threads.db").exists()
 
     def test_no_session_metadata(self, tmp_path: Path) -> None:
@@ -184,13 +194,15 @@ class TestForkAgentData:
         deep_root.mkdir(parents=True)
         os.chmod(deep_root, 0o700)
 
-        src_dw = deep_root / "src_agent"
+        src_dw = deep_root / "agents" / "src_agent"
+        src_dw.parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(src_dw.parent, 0o700)
         src_dw.mkdir()
         os.chmod(src_dw, 0o700)
 
         fork_agent_data("src_agent", "dst_agent", home=tmp_path)
 
-        dst_dw = deep_root / "dst_agent"
+        dst_dw = deep_root / "agents" / "dst_agent"
         assert dst_dw.is_dir()
         assert not (dst_dw / "session_metadata.json").exists()
 
@@ -202,11 +214,13 @@ class TestForkAgentData:
         deep_root = deep_worker_home(home)
         deep_root.mkdir(parents=True)
         os.chmod(deep_root, 0o700)
-        src_dw = deep_root / "src_agent"
+        src_dw = deep_root / "agents" / "src_agent"
+        src_dw.parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(src_dw.parent, 0o700)
         src.rename(src_dw)
 
         fork_agent_data("src_agent", "dst_agent", home=home)
-        dst_dw = deep_root / "dst_agent"
+        dst_dw = deep_root / "agents" / "dst_agent"
 
         assert oct(os.stat(dst_dw).st_mode)[-3:] == "700"
         assert oct(os.stat(dst_dw / "data").st_mode)[-3:] == "700"
@@ -226,11 +240,14 @@ class TestForkAgentData:
         deep_root = deep_worker_home(home)
         deep_root.mkdir(parents=True)
         os.chmod(deep_root, 0o700)
-        src.rename(deep_root / "src_agent")
+        agents_root = deep_root / "agents"
+        agents_root.mkdir(parents=True, exist_ok=True)
+        os.chmod(agents_root, 0o700)
+        src.rename(agents_root / "src_agent")
 
         fork_agent_data("src_agent", "dst_agent", home=home, message_id="msg2")
 
-        dst_dw = deep_root / "dst_agent"
+        dst_dw = deep_root / "agents" / "dst_agent"
         sum_file = dst_dw / "summaries" / "thread_abc.jsonl"
         assert sum_file.exists()
         lines = [l for l in sum_file.read_text().strip().splitlines() if l.strip()]
@@ -247,7 +264,10 @@ class TestForkAgentData:
         deep_root = deep_worker_home(home)
         deep_root.mkdir(parents=True)
         os.chmod(deep_root, 0o700)
-        src.rename(deep_root / "src_agent")
+        agents_root = deep_root / "agents"
+        agents_root.mkdir(parents=True, exist_ok=True)
+        os.chmod(agents_root, 0o700)
+        src.rename(agents_root / "src_agent")
 
         with pytest.raises(ValueError, match="not found"):
             fork_agent_data("src_agent", "dst_agent", home=home, message_id="nonexistent")
@@ -258,7 +278,9 @@ class TestForkAgentData:
         deep_root.mkdir(parents=True)
         os.chmod(deep_root, 0o700)
 
-        src_dw = deep_root / "src_agent"
+        src_dw = deep_root / "agents" / "src_agent"
+        src_dw.parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(src_dw.parent, 0o700)
         src_dw.mkdir()
         os.chmod(src_dw, 0o700)
         (src_dw / "session_metadata.json").write_text("{}")
@@ -282,7 +304,10 @@ class TestForkAgentData:
         deep_root = deep_worker_home(home)
         deep_root.mkdir(parents=True)
         os.chmod(deep_root, 0o700)
-        src.rename(deep_root / "src_agent")
+        agents_root = deep_root / "agents"
+        agents_root.mkdir(parents=True, exist_ok=True)
+        os.chmod(agents_root, 0o700)
+        src.rename(agents_root / "src_agent")
 
         with pytest.raises(ValueError, match="not found in any summary"):
             fork_agent_data("src_agent", "dst_agent", home=home, message_id="msg1")

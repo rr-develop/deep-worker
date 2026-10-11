@@ -391,7 +391,7 @@ Phase 1 implementation of missing dwcli features:
 All features maintain agent-as-source-of-truth principle.
 Tests: 21 new unit tests, all passing.
 
-🤖 Generated with [Claude Code](https://claude.com/claude-code)
+🤖 Generated with [Claude Code](https://claude.com/claude-code-sdk)
 
 Co-Authored-By: Claude <noreply@anthropic.com>
 ```
@@ -422,7 +422,7 @@ maintaining client-server RPyC architecture.
 
 Tests: 16 additional unit tests (37 total), all passing.
 
-🤖 Generated with [Claude Code](https://claude.com/claude-code)
+🤖 Generated with [Claude Code](https://claude.com/claude-code-sdk)
 
 Co-Authored-By: Claude <noreply@anthropic.com>
 ```

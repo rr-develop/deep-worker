@@ -5,7 +5,7 @@ login at ``~/.codex/auth.json``. They are slow (each test spawns one
 or more ``codex exec`` subprocesses and talks to the remote API).
 
 They are skipped unless ``CODEX_INTEGRATION_TESTS=1`` is set in env,
-mirroring the pattern claude_code_provider uses for its live tests.
+mirroring the pattern claude_code_sdk_provider uses for its live tests.
 
 Run with::
 

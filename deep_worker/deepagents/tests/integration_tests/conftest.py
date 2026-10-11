@@ -11,7 +11,7 @@ deep_worker: Copy of deepagents-cli renamed to deep-worker",
 2026-02-10). ``git blame`` on every ``ChatAnthropic(...)`` /
 ``SAMPLE_MODEL`` / ``anthropic:...`` line in those files points back
 to that import commit. They were **not** authored or adapted for
-this project.
+this host.
 
 Several of those upstream tests actually drive an LLM via
 ``agent.invoke(...)`` / ``.stream(...)`` against a model that resolves
@@ -19,8 +19,8 @@ to ``langchain_anthropic.ChatAnthropic`` — directly, via
 ``init_chat_model("anthropic:...")``, via the bare-name resolver
 (``SAMPLE_MODEL = "claude-sonnet-4-20250514"``), or implicitly through
 ``deepagents.graph.get_default_model()``. ``ChatAnthropic`` talks to
-the public Anthropic HTTPS API and is the WRONG transport in this
-environment: the Claude Code SDK is authenticated through the user's login
+the public Anthropic HTTPS API and is the WRONG transport on this
+host: the Claude Code SDK is authenticated through the user's login
 session, so the project's ``claude-code`` provider
 (``deep_worker_cli.config.create_model(provider="claude-code", ...)``)
 works without any env key. Adapting each upstream test to that

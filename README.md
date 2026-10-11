@@ -13,8 +13,8 @@ conversation history, and are driven interactively with `dwcli`.
 | Directory | Purpose |
 |---|---|
 | `deep_worker/deep_worker_cli` | Core agent runtime: `deep-worker` daemon and `dwcli` interactive client |
-| `claude_code_provider` | Claude Code provider — LangChain `BaseChatModel` backed by the Claude Code SDK |
-| `codex_provider` | OpenAI Codex CLI provider — drop-in sibling of `claude_code_provider` |
+| `claude_code_sdk_provider` | Claude Code provider — LangChain `BaseChatModel` backed by the Claude Code SDK |
+| `codex_provider` | OpenAI Codex CLI provider — drop-in sibling of `claude_code_sdk_provider` |
 | `grok_provider` | xAI Grok CLI provider (Agent Client Protocol, ACP v1) |
 | `dw_hist` | `dw-hist` — host-level CLI for semantically browsing agent conversation history |
 | `lsp` | Optional LSP code navigation for agents (Serena MCP integration) |

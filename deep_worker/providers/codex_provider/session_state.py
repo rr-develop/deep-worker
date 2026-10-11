@@ -10,7 +10,7 @@ the first ``ainvoke`` replays the WHOLE LangGraph history into a brand-new
 
 Persisting ``sent_count`` (so only the unsent tail is mirrored) and the Codex
 session uuid (so spawn resumes the existing session via
-``codex exec resume <uuid>``) makes restart deterministic. Unlike claude-code
+``codex exec resume <uuid>``) makes restart deterministic. Unlike claude-code-sdk
 the uuid is authoritative, NOT a hint: Codex assigns it once in its first
 ``thread.started`` event and it is stable for the session's life, and Codex
 owns the transcript store at ``CODEX_HOME/sessions/<uuid>.jsonl``. A
@@ -24,7 +24,7 @@ keep separate entries while sharing the agent's data dir). The ``:tm`` (and a
 defensive ``__epoch_N``) suffix is stripped ONLY to choose the directory.
 
 The filename is ``codex_session_state.json`` — deliberately distinct from
-claude-code's ``claude_session_state.json`` so the two providers never collide
+claude-code-sdk's ``claude_session_state.json`` so the two providers never collide
 in a shared agent data dir.
 
 All functions are best-effort: a corrupt/unreadable file degrades to ``None``
@@ -36,7 +36,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Any
-from deep_worker_cli.storage_paths import deep_worker_home
+from deep_worker_cli.storage_paths import agent_root
 
 _STATE_FILENAME = "codex_session_state.json"
 
@@ -62,7 +62,7 @@ def _thread_base(thread_id: str) -> str:
 
 def session_state_path(thread_id: str) -> Path:
     """Path to the state file for the agent owning ``thread_id``."""
-    data_dir = deep_worker_home() / _thread_base(thread_id)
+    data_dir = agent_root(_thread_base(thread_id), create=False)
     return data_dir / _STATE_FILENAME
 
 

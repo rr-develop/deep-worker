@@ -34,7 +34,7 @@ Or for system Python:
 python3 [YOUR_SKILLS_DIR]/arxiv-search/arxiv_search.py "your search query" [--max-papers N]
 ```
 
-Replace `[YOUR_SKILLS_DIR]` with the absolute skills directory path from your system prompt (e.g., `~/.deepagents/agent/skills` or the full absolute path).
+Replace `[YOUR_SKILLS_DIR]` with the absolute skills directory path from your system prompt (e.g., `~/.deep_worker/agents/agent/skills` or the full absolute path).
 
 **Arguments:**
 - `query` (required): The search query string (e.g., "neural networks protein structure", "single cell RNA-seq")
@@ -44,17 +44,17 @@ Replace `[YOUR_SKILLS_DIR]` with the absolute skills directory path from your sy
 
 Search for machine learning papers:
 ```bash
-.venv/bin/python ~/.deepagents/agent/skills/arxiv-search/arxiv_search.py "deep learning drug discovery" --max-papers 5
+.venv/bin/python ~/.deep_worker/agents/agent/skills/arxiv-search/arxiv_search.py "deep learning drug discovery" --max-papers 5
 ```
 
 Search for computational biology papers:
 ```bash
-.venv/bin/python ~/.deepagents/agent/skills/arxiv-search/arxiv_search.py "protein folding prediction"
+.venv/bin/python ~/.deep_worker/agents/agent/skills/arxiv-search/arxiv_search.py "protein folding prediction"
 ```
 
 Search for bioinformatics methods:
 ```bash
-.venv/bin/python ~/.deepagents/agent/skills/arxiv-search/arxiv_search.py "genome assembly algorithms"
+.venv/bin/python ~/.deep_worker/agents/agent/skills/arxiv-search/arxiv_search.py "genome assembly algorithms"
 ```
 
 ## Output Format

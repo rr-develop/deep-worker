@@ -73,7 +73,24 @@ git commit --no-verify  # ❌ ABSOLUTELY FORBIDDEN
 Pre-commit hooks enforce type checking, .venv detection, and pip installation
 guards. If a commit is blocked, FIX THE ISSUE — do not bypass the check.
 
-### 5. Why This Matters
+### 5. CI test pipeline must stay green
+
+The GitHub Actions `Unit tests` workflow (`.github/workflows/unittest.yml`) runs
+`pytest tests/unit_tests` on Python 3.11 and 3.12 for every push to `master`/`main`.
+A test that depends on a host-specific path is a red-pipeline bug the moment it
+lands, because the CI runner uses `$GITHUB_WORKSPACE` on a fresh `ubuntu-latest`
+image — NOT the developer's local directory layout. Required reading before touching
+tests:
+
+* [`docs/CI_CD_TESTS.md`](./docs/CI_CD_TESTS.md) — portability rules, the exact
+  reproduction command, and the `gh` CLI recipes for pulling failure logs.
+* [`docs/POLICIES.md`](./docs/POLICIES.md) §6 — the one-line policy statement.
+
+If your test fails on CI but passes locally, the bug is in your test's
+portability — never edit `.github/workflows/*.yml` and never add a skip to make
+the pipeline green. Use the procedure in `CI_CD_TESTS.md` §5.
+
+### 6. Why This Matters
 
 Using installed packages instead of source code causes:
 - RPyC proxy errors: `AttributeError: cannot access '__reversed__'`

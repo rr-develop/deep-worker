@@ -33,10 +33,10 @@ runtime model.
 
 The wheel ships its five provider packages **inside** the `deep_worker`
 namespace — never as top-level packages (avoids collisions with real PyPI
-distributions such as `claude-code-provider` / `semantic-search`):
+distributions such as `claude-code-sdk-provider` / `semantic-search`):
 
 ```python
-from deep_worker.providers.claude_code_provider import ClaudeCodeChatModel
+from deep_worker.providers.claude_code_sdk_provider import ClaudeCodeChatModel
 from deep_worker.providers.semantic_search import SemanticSearchIndexer
 ```
 
@@ -133,7 +133,7 @@ deep-worker --history thread_id
 deep-worker --history thread_id --format json
 
 # ⚠️ DANGER: --remove-before is GLOBAL and DESTRUCTIVE.
-# It sweeps every sessions_*.db under ~/.deepagents/ AND every
+# It sweeps every per-agent checkpoint DB under ~/.deep_worker/ AND every
 # ~/.deep_worker/<agent>/summaries/<thread>.md across ALL agents for the
 # current $HOME. NEVER run this command from an ad-hoc shell / integration
 # test without first isolating $HOME to a temp directory (see the
@@ -247,7 +247,63 @@ Notes:
 - A failing `is_success` predicate is treated as "not successful" and logged;
   it never stalls the agent.
 
+### Declaring turn-ending tools from the CLI
+
+Agents started with the stock `deep-worker` binary have no launcher code of
+their own, so they use the repeatable `--turn-ending-tool` flag instead:
+
+```bash
+deep-worker rg_extractor --provider deepseek --model deepseek-chat \
+    --dir /path/to/workdir -m -sp \
+    --turn-ending-tool repo_graph__submit_fragments:document_closed
+```
+
+| Value | Predicate |
+| --- | --- |
+| `<name>` | ends the turn when `success` is truthy |
+| `<name>:<field>` | ends the turn only when that top-level field is exactly `True` |
+
+`<field>` is matched with `.get()`, so a missing key and `false` behave
+identically — the turn simply continues. The check is `is True`, not
+truthiness: `1`, `"true"` and `["yes"]` do NOT end the turn. CLI-declared
+tools are always jump-only (`echo_field=None`); no assistant message is
+injected.
+
+`<field>` must be a single top-level key: a dot in the FIELD (`tool:a.b`)
+is rejected, because nested paths are out of scope. A dot in the tool NAME
+is fine (`a.b:c` is a valid spec for a tool literally named `a.b`) — only
+the part after the `:` is constrained. Whitespace is rejected anywhere in
+the spec rather than trimmed, so a stray space from shell quoting fails
+loudly instead of silently producing a second, near-identical declaration.
+
+⚠️ **`<name>` is the graph-side tool name, not the form the model calls.**
+For a tool exposed by an external MCP server, that is the mangled
+`<server>__<tool>` name — server `repo_graph` exposing `submit_fragments`
+becomes `repo_graph__submit_fragments`. Do not pass the provider-visible
+`mcp__…` form; the middleware matches on `ToolMessage.name`, which carries
+the graph name.
+
+The flag is repeatable, and each start logs one machine-greppable line per
+declaration, so a launcher can prove its flag arrived:
+
+```
+turn_ending_tool_registered name=repo_graph__submit_fragments
+turn_ending_tool_not_found name=repo_graph__submit_fragment candidates=['repo_graph__submit_fragments', ...]
+```
+
+A name that is not in the final tool inventory is a WARNING, never a startup
+failure — an external MCP endpoint may come up after the agent, and the
+declaration still matches if the tool appears later.
+
+Declarations are persisted to `session_metadata.json` and survive
+`--restart`. Passing `--turn-ending-tool` together with `--restart`
+REPLACES the saved list wholesale (same semantics as `--mcp-config`);
+passing nothing inherits it. Declaring the same name twice — including a
+bare `foo` alongside `foo:done` — or declaring the built-in
+`send_message_to_agent` fails at startup before the agent is constructed.
+
 See [`docs/DESIGN_TOOL_COMPLETION_MIDDLEWARE.md`](docs/DESIGN_TOOL_COMPLETION_MIDDLEWARE.md)
+and [`docs/DESIGN_CLI_TURN_ENDING_TOOL_FLAG.md`](docs/DESIGN_CLI_TURN_ENDING_TOOL_FLAG.md)
 for the full contract.
 
 ## 📖 Resources

@@ -37,77 +37,77 @@ class LspServiceStub(object):
             channel: A grpc.Channel.
         """
         self.Health = channel.unary_unary(
-                '/' + "deep_worker.lsp.v1.LspService/Health",
+                '/deep_worker.lsp.v1.LspService/Health',
                 request_serializer=lsp__service__pb2.HealthRequest.SerializeToString,
                 response_deserializer=lsp__service__pb2.HealthReply.FromString,
                 _registered_method=True)
         self.AttachSession = channel.unary_stream(
-                '/' + "deep_worker.lsp.v1.LspService/AttachSession",
+                '/deep_worker.lsp.v1.LspService/AttachSession',
                 request_serializer=lsp__service__pb2.AttachRequest.SerializeToString,
                 response_deserializer=lsp__service__pb2.SessionEvent.FromString,
                 _registered_method=True)
         self.RefreshProject = channel.unary_unary(
-                '/' + "deep_worker.lsp.v1.LspService/RefreshProject",
+                '/deep_worker.lsp.v1.LspService/RefreshProject',
                 request_serializer=lsp__service__pb2.RefreshRequest.SerializeToString,
                 response_deserializer=lsp__service__pb2.RefreshReply.FromString,
                 _registered_method=True)
         self.ProjectStatus = channel.unary_unary(
-                '/' + "deep_worker.lsp.v1.LspService/ProjectStatus",
+                '/deep_worker.lsp.v1.LspService/ProjectStatus',
                 request_serializer=lsp__service__pb2.StatusRequest.SerializeToString,
                 response_deserializer=lsp__service__pb2.StatusReply.FromString,
                 _registered_method=True)
         self.FindSymbol = channel.unary_unary(
-                '/' + "deep_worker.lsp.v1.LspService/FindSymbol",
+                '/deep_worker.lsp.v1.LspService/FindSymbol',
                 request_serializer=lsp__service__pb2.FindSymbolRequest.SerializeToString,
                 response_deserializer=lsp__service__pb2.FindSymbolReply.FromString,
                 _registered_method=True)
         self.FindReferencingSymbols = channel.unary_unary(
-                '/' + "deep_worker.lsp.v1.LspService/FindReferencingSymbols",
+                '/deep_worker.lsp.v1.LspService/FindReferencingSymbols',
                 request_serializer=lsp__service__pb2.RefRequest.SerializeToString,
                 response_deserializer=lsp__service__pb2.RefReply.FromString,
                 _registered_method=True)
         self.FindDeclaration = channel.unary_unary(
-                '/' + "deep_worker.lsp.v1.LspService/FindDeclaration",
+                '/deep_worker.lsp.v1.LspService/FindDeclaration',
                 request_serializer=lsp__service__pb2.DeclRequest.SerializeToString,
                 response_deserializer=lsp__service__pb2.DeclReply.FromString,
                 _registered_method=True)
         self.FindImplementations = channel.unary_unary(
-                '/' + "deep_worker.lsp.v1.LspService/FindImplementations",
+                '/deep_worker.lsp.v1.LspService/FindImplementations',
                 request_serializer=lsp__service__pb2.ImplRequest.SerializeToString,
                 response_deserializer=lsp__service__pb2.ImplReply.FromString,
                 _registered_method=True)
         self.GetSymbolsOverview = channel.unary_unary(
-                '/' + "deep_worker.lsp.v1.LspService/GetSymbolsOverview",
+                '/deep_worker.lsp.v1.LspService/GetSymbolsOverview',
                 request_serializer=lsp__service__pb2.OverviewRequest.SerializeToString,
                 response_deserializer=lsp__service__pb2.OverviewReply.FromString,
                 _registered_method=True)
         self.GetDiagnosticsForFile = channel.unary_unary(
-                '/' + "deep_worker.lsp.v1.LspService/GetDiagnosticsForFile",
+                '/deep_worker.lsp.v1.LspService/GetDiagnosticsForFile',
                 request_serializer=lsp__service__pb2.DiagRequest.SerializeToString,
                 response_deserializer=lsp__service__pb2.DiagReply.FromString,
                 _registered_method=True)
         self.RenameSymbol = channel.unary_unary(
-                '/' + "deep_worker.lsp.v1.LspService/RenameSymbol",
+                '/deep_worker.lsp.v1.LspService/RenameSymbol',
                 request_serializer=lsp__service__pb2.RenameRequest.SerializeToString,
                 response_deserializer=lsp__service__pb2.RenameReply.FromString,
                 _registered_method=True)
         self.ReplaceSymbolBody = channel.unary_unary(
-                '/' + "deep_worker.lsp.v1.LspService/ReplaceSymbolBody",
+                '/deep_worker.lsp.v1.LspService/ReplaceSymbolBody',
                 request_serializer=lsp__service__pb2.ReplaceRequest.SerializeToString,
                 response_deserializer=lsp__service__pb2.ReplaceReply.FromString,
                 _registered_method=True)
         self.InsertBeforeSymbol = channel.unary_unary(
-                '/' + "deep_worker.lsp.v1.LspService/InsertBeforeSymbol",
+                '/deep_worker.lsp.v1.LspService/InsertBeforeSymbol',
                 request_serializer=lsp__service__pb2.InsertRequest.SerializeToString,
                 response_deserializer=lsp__service__pb2.InsertReply.FromString,
                 _registered_method=True)
         self.InsertAfterSymbol = channel.unary_unary(
-                '/' + "deep_worker.lsp.v1.LspService/InsertAfterSymbol",
+                '/deep_worker.lsp.v1.LspService/InsertAfterSymbol',
                 request_serializer=lsp__service__pb2.InsertRequest.SerializeToString,
                 response_deserializer=lsp__service__pb2.InsertReply.FromString,
                 _registered_method=True)
         self.SafeDeleteSymbol = channel.unary_unary(
-                '/' + "deep_worker.lsp.v1.LspService/SafeDeleteSymbol",
+                '/deep_worker.lsp.v1.LspService/SafeDeleteSymbol',
                 request_serializer=lsp__service__pb2.DeleteRequest.SerializeToString,
                 response_deserializer=lsp__service__pb2.DeleteReply.FromString,
                 _registered_method=True)
@@ -315,7 +315,7 @@ class LspService(object):
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/' + "deep_worker.lsp.v1.LspService/Health",
+            '/deep_worker.lsp.v1.LspService/Health',
             lsp__service__pb2.HealthRequest.SerializeToString,
             lsp__service__pb2.HealthReply.FromString,
             options,
@@ -342,7 +342,7 @@ class LspService(object):
         return grpc.experimental.unary_stream(
             request,
             target,
-            '/' + "deep_worker.lsp.v1.LspService/AttachSession",
+            '/deep_worker.lsp.v1.LspService/AttachSession',
             lsp__service__pb2.AttachRequest.SerializeToString,
             lsp__service__pb2.SessionEvent.FromString,
             options,
@@ -369,7 +369,7 @@ class LspService(object):
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/' + "deep_worker.lsp.v1.LspService/RefreshProject",
+            '/deep_worker.lsp.v1.LspService/RefreshProject',
             lsp__service__pb2.RefreshRequest.SerializeToString,
             lsp__service__pb2.RefreshReply.FromString,
             options,
@@ -396,7 +396,7 @@ class LspService(object):
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/' + "deep_worker.lsp.v1.LspService/ProjectStatus",
+            '/deep_worker.lsp.v1.LspService/ProjectStatus',
             lsp__service__pb2.StatusRequest.SerializeToString,
             lsp__service__pb2.StatusReply.FromString,
             options,
@@ -423,7 +423,7 @@ class LspService(object):
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/' + "deep_worker.lsp.v1.LspService/FindSymbol",
+            '/deep_worker.lsp.v1.LspService/FindSymbol',
             lsp__service__pb2.FindSymbolRequest.SerializeToString,
             lsp__service__pb2.FindSymbolReply.FromString,
             options,
@@ -450,7 +450,7 @@ class LspService(object):
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/' + "deep_worker.lsp.v1.LspService/FindReferencingSymbols",
+            '/deep_worker.lsp.v1.LspService/FindReferencingSymbols',
             lsp__service__pb2.RefRequest.SerializeToString,
             lsp__service__pb2.RefReply.FromString,
             options,
@@ -477,7 +477,7 @@ class LspService(object):
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/' + "deep_worker.lsp.v1.LspService/FindDeclaration",
+            '/deep_worker.lsp.v1.LspService/FindDeclaration',
             lsp__service__pb2.DeclRequest.SerializeToString,
             lsp__service__pb2.DeclReply.FromString,
             options,
@@ -504,7 +504,7 @@ class LspService(object):
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/' + "deep_worker.lsp.v1.LspService/FindImplementations",
+            '/deep_worker.lsp.v1.LspService/FindImplementations',
             lsp__service__pb2.ImplRequest.SerializeToString,
             lsp__service__pb2.ImplReply.FromString,
             options,
@@ -531,7 +531,7 @@ class LspService(object):
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/' + "deep_worker.lsp.v1.LspService/GetSymbolsOverview",
+            '/deep_worker.lsp.v1.LspService/GetSymbolsOverview',
             lsp__service__pb2.OverviewRequest.SerializeToString,
             lsp__service__pb2.OverviewReply.FromString,
             options,
@@ -558,7 +558,7 @@ class LspService(object):
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/' + "deep_worker.lsp.v1.LspService/GetDiagnosticsForFile",
+            '/deep_worker.lsp.v1.LspService/GetDiagnosticsForFile',
             lsp__service__pb2.DiagRequest.SerializeToString,
             lsp__service__pb2.DiagReply.FromString,
             options,
@@ -585,7 +585,7 @@ class LspService(object):
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/' + "deep_worker.lsp.v1.LspService/RenameSymbol",
+            '/deep_worker.lsp.v1.LspService/RenameSymbol',
             lsp__service__pb2.RenameRequest.SerializeToString,
             lsp__service__pb2.RenameReply.FromString,
             options,
@@ -612,7 +612,7 @@ class LspService(object):
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/' + "deep_worker.lsp.v1.LspService/ReplaceSymbolBody",
+            '/deep_worker.lsp.v1.LspService/ReplaceSymbolBody',
             lsp__service__pb2.ReplaceRequest.SerializeToString,
             lsp__service__pb2.ReplaceReply.FromString,
             options,
@@ -639,7 +639,7 @@ class LspService(object):
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/' + "deep_worker.lsp.v1.LspService/InsertBeforeSymbol",
+            '/deep_worker.lsp.v1.LspService/InsertBeforeSymbol',
             lsp__service__pb2.InsertRequest.SerializeToString,
             lsp__service__pb2.InsertReply.FromString,
             options,
@@ -666,7 +666,7 @@ class LspService(object):
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/' + "deep_worker.lsp.v1.LspService/InsertAfterSymbol",
+            '/deep_worker.lsp.v1.LspService/InsertAfterSymbol',
             lsp__service__pb2.InsertRequest.SerializeToString,
             lsp__service__pb2.InsertReply.FromString,
             options,
@@ -693,7 +693,7 @@ class LspService(object):
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/' + "deep_worker.lsp.v1.LspService/SafeDeleteSymbol",
+            '/deep_worker.lsp.v1.LspService/SafeDeleteSymbol',
             lsp__service__pb2.DeleteRequest.SerializeToString,
             lsp__service__pb2.DeleteReply.FromString,
             options,

@@ -18,7 +18,7 @@ def preserve_registry():
         registry_file.write_text(original)
 
 
-async def test_restart_agent_tool_invokes_restart_without_mocks(
+async def test_restart_agent_tool_invokes_deep_worker_restart_without_mocks(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     preserve_registry: Path,
@@ -29,8 +29,8 @@ async def test_restart_agent_tool_invokes_restart_without_mocks(
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     marker = tmp_path / "argv.json"
-    fake_dw = fake_bin / "deep-worker"
-    fake_dw.write_text(
+    fake_deep_worker = fake_bin / "deep-worker"
+    fake_deep_worker.write_text(
         f"""#!/usr/bin/env python3
 import json
 import os
@@ -56,7 +56,7 @@ registry_file.write_text(json.dumps(registry))
 print("Agent '{agent_name}' starting in background")
 """
     )
-    fake_dw.chmod(0o755)
+    fake_deep_worker.chmod(0o755)
     monkeypatch.setenv("PATH", f"{fake_bin}:{os.environ.get('PATH', '')}")
 
     tool = make_restart_agent_tool("caller_agent")

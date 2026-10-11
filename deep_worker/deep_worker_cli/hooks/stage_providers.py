@@ -57,14 +57,17 @@ except ImportError:  # pragma: no cover - dev / pre-commit / test context
 PROJECT_NAME = "deep-worker"
 SCHEMA_VERSION = 1
 
-# The five vendored provider packages (canonical import parent:
-# ``deep_worker.providers.<pkg>``).
+# The vendored provider packages (canonical import parent:
+# ``deep_worker.providers.<pkg>``). Order is stable — it defines the
+# manifest's package order. ``acp`` is the shared ACP layer; the provider
+# packages import from it (claude_code_provider imports ..acp.*).
 PROVIDER_PACKAGES = [
-    "claude_code_provider",
     "codex_provider",
     "grok_provider",
     "semantic_search",
     "deepworker_a2a",
+    "acp",
+    "claude_code_provider",
 ]
 
 # Tracked invariant manifest (project root) and the per-build integrity marker

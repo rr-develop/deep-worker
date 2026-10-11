@@ -54,7 +54,12 @@ def _project_root_of(entry: dict[str, Any], fallback: Path) -> Path:
     return fallback
 
 
-def migrate_mcp_config(path: Path, *, workspace_root: Path | None = None) -> bool:
+def migrate_mcp_config(
+    path: Path,
+    *,
+    workspace_root: Path | None = None,
+    follow_agent_cwd: bool = False,
+) -> bool:
     """Rewrite a legacy Serena entry in ``path`` to launch the bridge.
 
     Returns ``True`` if the file was modified, ``False`` if there was
@@ -80,10 +85,20 @@ def migrate_mcp_config(path: Path, *, workspace_root: Path | None = None) -> boo
         return False
     assert isinstance(entry, dict)  # narrowed by is_legacy_entry
 
-    root = _project_root_of(entry, workspace_root or path.parent)
+    # USER scope must not inherit the legacy literal: migrating a
+    # ``--project /some/repo`` entry at user scope would recreate the
+    # exact defect this placeholder exists to remove (one project
+    # becoming every agent's navigation target). The no-``--project``
+    # legacy form is worse still — its fallback is ``path.parent``,
+    # i.e. ``~/.deep_worker`` for the user layer.
     servers[BRIDGE_SERVER_NAME] = build_bridge_mcp_entry(
-        workspace_root=root,
+        workspace_root=(
+            None
+            if follow_agent_cwd
+            else _project_root_of(entry, workspace_root or path.parent)
+        ),
         auto_approve=bool(entry.get("auto_approve", True)),
+        follow_agent_cwd=follow_agent_cwd,
     )
 
     bak = path.with_suffix(path.suffix + ".bak")

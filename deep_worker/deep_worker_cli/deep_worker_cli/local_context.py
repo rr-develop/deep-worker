@@ -160,8 +160,8 @@ class LocalContextMiddleware(AgentMiddleware[LocalContextState, Any, Any]):
         files = []
         try:
             for item in sorted(cwd.iterdir()):
-                # Skip hidden files (except .deepagents)
-                if item.name.startswith(".") and item.name != ".deepagents":
+                # Skip hidden files (except the config dir)
+                if item.name.startswith(".") and item.name != ".deep_worker":
                     continue
 
                 # Skip ignored patterns
@@ -206,8 +206,8 @@ class LocalContextMiddleware(AgentMiddleware[LocalContextState, Any, Any]):
             Returns:
                 True if item should be included, False otherwise.
             """
-            # Skip hidden files (except .deepagents)
-            if item.name.startswith(".") and item.name != ".deepagents":
+            # Skip hidden files (except the config dir)
+            if item.name.startswith(".") and item.name != ".deep_worker":
                 return False
             # Skip ignored patterns
             return item.name not in IGNORE_PATTERNS

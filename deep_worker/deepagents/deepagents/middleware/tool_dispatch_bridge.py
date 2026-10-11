@@ -4,7 +4,7 @@ announced tool call over its control channel and yield the AUTHORITATIVE
 arguments.
 
 WHY THIS EXISTS (POLICIES.md §7.1, owner 2026-06-17): CLI providers
-(claude-code / codex) announce a tool call in the model's message stream and
+(claude-code-sdk / codex) announce a tool call in the model's message stream and
 deliver the real ``tools/call`` (with the authoritative args — the
 announcement args can differ, observed live, 2026-05-26) a moment later over a
 separate control channel. The old code waited for that delivery INSIDE

@@ -79,7 +79,7 @@ class TestNormalizeUsage:
 
     def test_claude_code_uses_anthropic_format(self):
         # Raw ResultMessage.usage (live probe shape).
-        u = normalize_usage("claude-code", {
+        u = normalize_usage("claude-code-sdk", {
             "input_tokens": 2,
             "cache_creation_input_tokens": 8200,
             "cache_read_input_tokens": 20399,
@@ -91,6 +91,67 @@ class TestNormalizeUsage:
         assert u.cache_hit_tokens == 20399
         assert u.cache_miss_tokens == 8202
         assert u.cache_hit_tokens + u.cache_miss_tokens == u.prompt_tokens
+
+    def test_acp_claude_code_maps_cache_via_codex_shape(self):
+        """ACP (`provider="claude-code"`) hands over the CODEX shape.
+
+        ``acp/chat_model.py:1544-1557`` builds
+        ``{input_tokens, output_tokens, cached_input_tokens, total_tokens}``
+        from ``session/prompt`` RESULT ``_meta``. Before ``b164482`` the name
+        ``claude-code`` belonged to the SDK provider and sat in the
+        ``_from_anthropic`` branch; the rename moved the NAME to the ACP
+        provider but left the dispatch behind, so ACP fell through to
+        ``_from_langchain_normalized`` — which reads ``input_tokens`` but
+        knows nothing about ``cached_input_tokens``. Tokens survived, the
+        cache split was silently dropped to ``None``.
+
+        Numbers below are from a real ACP turn
+        (2026-08-23T10:54:02.741Z), re-expressed in the codex shape that ACP
+        actually hands over. The stored row for that turn is
+        ``provider=claude-code-sdk`` in the raw Anthropic shape, so this is
+        the mapped equivalent, not a verbatim copy of a stored ACP record —
+        no live ACP token rows exist yet (see the caveat in the review).
+        """
+        u = normalize_usage("claude-code", {
+            "input_tokens": 111937,
+            "output_tokens": 2,
+            "cached_input_tokens": 111061,
+            "total_tokens": 111939,
+        })
+        assert u is not None
+        assert u.prompt_tokens == 111937
+        assert u.completion_tokens == 2
+        assert u.total_tokens == 111939
+        # The regression: both were None because the codex shape was not
+        # understood by the LangChain fallback parser.
+        assert u.cache_hit_tokens == 111061
+        assert u.cache_miss_tokens == 876
+        assert u.cache_hit_tokens + u.cache_miss_tokens == u.prompt_tokens
+
+    def test_acp_and_sdk_names_do_not_share_a_branch(self):
+        """The two Claude Code providers must NOT be normalised alike.
+
+        ``claude-code`` (ACP) speaks the codex shape (``input_tokens``
+        INCLUDES the cached prefix); ``claude-code-sdk`` speaks the raw
+        Anthropic shape (``input_tokens`` EXCLUDES it). Feeding the ACP
+        payload through the anthropic branch yields ``miss == prompt`` and
+        loses the hit entirely — pin that they diverge, so a future
+        "consolidate the two claude-code names" edit fails here.
+        """
+        acp_payload = {
+            "input_tokens": 111937,
+            "output_tokens": 2,
+            "cached_input_tokens": 111061,
+            "total_tokens": 111939,
+        }
+        acp = normalize_usage("claude-code", acp_payload)
+        sdk = normalize_usage("claude-code-sdk", acp_payload)
+        assert acp is not None and sdk is not None
+        assert acp.cache_hit_tokens == 111061
+        # The SDK branch cannot read ``cached_input_tokens`` — that is
+        # correct for its own payloads and wrong for this one.
+        assert sdk.cache_hit_tokens is None
+        assert acp.cache_hit_tokens != sdk.cache_hit_tokens
 
     def test_langchain_normalized_deepseek(self):
         u = normalize_usage("deepseek", {
@@ -239,6 +300,73 @@ class TestNormalizeUsage:
         assert u.cache_miss_tokens is None
 
 
+class TestAcpProductionWiring:
+    """Pin the ACP writer's payload shape against the dispatch.
+
+    A behavioural test alone cannot catch this class of defect: it picks its
+    own fixture, so it stays green while production hands over different
+    keys (the ``d03d7da`` lesson). These read the REAL sources.
+    """
+
+    @staticmethod
+    def _acp_chat_model_src() -> str:
+        here = Path(__file__).resolve()
+        for parent in here.parents:
+            cand = parent / "deep_worker" / "providers" / "acp" / "chat_model.py"
+            if cand.exists():
+                return cand.read_text(encoding="utf-8")
+            cand = parent / "providers" / "acp" / "chat_model.py"
+            if cand.exists():
+                return cand.read_text(encoding="utf-8")
+        pytest.skip("acp/chat_model.py not reachable from this tree")
+
+    def test_acp_meta_usage_keys_are_the_codex_shape(self):
+        """The dict ACP builds from ``_meta`` must use codex key names.
+
+        If someone renames these to the Anthropic names, the dispatch below
+        must change with them — this test is the tripwire.
+        """
+        import ast
+
+        src = self._acp_chat_model_src()
+        tree = ast.parse(src)
+        found: set[str] = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Dict):
+                continue
+            keys = {
+                k.value
+                for k in node.keys
+                if isinstance(k, ast.Constant) and isinstance(k.value, str)
+            }
+            if "input_tokens" in keys and "output_tokens" in keys:
+                found |= keys
+        assert found, "no usage dict literal found in acp/chat_model.py"
+        assert "cached_input_tokens" in found, (
+            "ACP no longer emits 'cached_input_tokens'; the normalize_usage "
+            "dispatch for provider='claude-code' must be revisited"
+        )
+
+    def test_dispatch_routes_acp_provider_name_to_codex_branch(self):
+        """``claude-code`` is the ACP provider name since ``b164482``.
+
+        Verified against the profile module rather than a hardcoded string
+        so a future rename cannot leave this test pinning a dead name.
+        """
+        acp = normalize_usage("claude-code", {
+            "input_tokens": 1000,
+            "output_tokens": 50,
+            "cached_input_tokens": 600,
+        })
+        codex = normalize_usage("codex", {
+            "input_tokens": 1000,
+            "output_tokens": 50,
+            "cached_input_tokens": 600,
+        })
+        assert acp is not None and codex is not None
+        assert acp == codex, "ACP payloads must normalise like codex ones"
+
+
 class TestRecorder:
     @pytest.mark.asyncio
     async def test_append_creates_0600_file(self, tmp_path):
@@ -299,7 +427,7 @@ class TestEventCallback:
     @pytest.mark.asyncio
     async def test_state_machine_writes_once_per_terminal(self, tmp_path):
         rec = TokenUsageRecorder(tmp_path)
-        cb = UsageEventCallback(rec, provider="claude-code", kind="agent")
+        cb = UsageEventCallback(rec, provider="claude-code-sdk", kind="agent")
         await cb(event="invocation_start")
         await cb(event="terminal", status=STATUS_OK, usage={
             "input_tokens": 2, "cache_read_input_tokens": 100,
@@ -313,7 +441,7 @@ class TestEventCallback:
         lines = (tmp_path / "token_stats.jsonl").read_text().strip().split("\n")
         assert len(lines) == 1
         data = json.loads(lines[0])
-        assert data["event_key"] == "claude-code|S1|U1"
+        assert data["event_key"] == "claude-code-sdk|S1|U1"
         assert data["provider_session_id"] == "S1"
         assert data["status"] == STATUS_OK
         assert data["prompt_tokens"] == 112  # 2 + 100 + 10
@@ -364,7 +492,7 @@ class TestEventCallback:
     @pytest.mark.asyncio
     async def test_cancelled_propagation_and_no_write(self, tmp_path, monkeypatch):
         rec = TokenUsageRecorder(tmp_path)
-        cb = UsageEventCallback(rec, provider="claude-code", kind="agent")
+        cb = UsageEventCallback(rec, provider="claude-code-sdk", kind="agent")
         await cb(event="invocation_start")
 
         async def boom(record):
@@ -396,7 +524,7 @@ class TestEventCallback:
     @pytest.mark.asyncio
     async def test_claude_uuid_none_never_deduped(self, tmp_path):
         rec = TokenUsageRecorder(tmp_path)
-        cb = UsageEventCallback(rec, provider="claude-code", kind="agent")
+        cb = UsageEventCallback(rec, provider="claude-code-sdk", kind="agent")
         await cb(event="terminal", status=STATUS_OK, usage={
             "input_tokens": 1, "output_tokens": 1,
         }, session_id="S", uuid=None, model="m")
@@ -582,19 +710,19 @@ class TestAggregator:
                  prompt=100, completion=10, hit=50, miss=50, total=110),
             _rec(provider="deepseek", model="deepseek-v4-flash",
                  prompt=200, completion=20, total=220),
-            _rec(provider="claude-code", model="sonnet",
+            _rec(provider="claude-code-sdk", model="sonnet",
                  prompt=300, completion=30, hit=100, miss=200, total=330),
-            _rec(provider="claude-code", model="haiku",
+            _rec(provider="claude-code-sdk", model="haiku",
                  prompt=50, completion=5, total=55),
         ]
         resp = aggregate_stats(records, agent="alice")
         assert resp.totals.requests == 4
-        assert [p.provider for p in resp.by_provider] == ["claude-code", "deepseek"]
+        assert [p.provider for p in resp.by_provider] == ["claude-code-sdk", "deepseek"]
         deepseek = next(p for p in resp.by_provider if p.provider == "deepseek")
         assert deepseek.totals.requests == 2
         assert [m.model for m in deepseek.by_model] == ["deepseek-v4-flash"]
         assert deepseek.by_model[0].totals.prompt_tokens == 300
-        claude = next(p for p in resp.by_provider if p.provider == "claude-code")
+        claude = next(p for p in resp.by_provider if p.provider == "claude-code-sdk")
         assert [m.model for m in claude.by_model] == ["haiku", "sonnet"]
 
     def test_stats_for_agent_missing_file_zeros(self, tmp_path):
@@ -621,4 +749,9 @@ class TestAggregator:
         assert r.record_id
 
     def test_custom_providers_set(self):
-        assert CUSTOM_PROVIDERS == {"claude-code", "codex", "grok"}
+        assert CUSTOM_PROVIDERS == {
+            "claude-code-sdk",
+            "claude-code",
+            "codex",
+            "grok",
+        }

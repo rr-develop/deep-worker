@@ -46,7 +46,7 @@ def _make_proc(data_dir: Path, tmp_path: Path, name: str = "test_drain"):
 
     config = AgentConfig(
         working_dir=tmp_path,
-        provider="claude-code",
+        provider="claude-code-sdk",
         model="claude-3-5-sonnet-20241022",
     )
     proc = AgentProcess(
@@ -233,13 +233,23 @@ async def test_failed_record_is_attempted_once_per_wake_and_does_not_spin(
         assert not task.done(), "consumer must stay alive"
 
         # A NEW arrival is a legitimate external edge: it retries the old
-        # record too, in seq order.
+        # record too.
+        #
+        # ORDER UPDATED by DESIGN_INBOX_STALE_REDELIVERY.md §3.3: the fresh
+        # record is attempted BEFORE the previously-attempted one. Walking
+        # plain seq order meant a retained record always went first, so a stale
+        # message perpetually overtook current traffic — the defect that design
+        # fixes. What THIS test guards is unchanged and still asserted: exactly
+        # one attempt per wake (no spin), and the retained record is retried on
+        # a genuine external edge rather than being dropped.
         await proc.publish_inbox_message("fresh", True)
         await asyncio.wait_for(
             _wait_for(lambda: len(attempts) >= 3, what="retry on new arrival"),
             _BOUND,
         )
-        assert attempts == ["doomed", "doomed", "fresh"]
+        assert attempts == ["doomed", "fresh", "doomed"], (
+            "fresh mail must not queue behind a known-failing record"
+        )
     finally:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)

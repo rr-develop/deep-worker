@@ -8,7 +8,7 @@ everything" and is almost always a bug. The opt-out is the explicit
 ``--force`` flag.
 
 These tests are pure-sync over ``monkeypatched HOME`` in ``tmp_path`` —
-no real ``~/.deepagents`` is touched, no subprocess, no RPyC, no LLM.
+no real ``~/.deep_worker`` is touched, no subprocess, no RPyC, no LLM.
 """
 from __future__ import annotations
 

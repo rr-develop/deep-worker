@@ -72,9 +72,22 @@ def ensure_message_created_at(
     message: AnyMessage,
     clock: MonotonicUtcClock,
 ) -> AnyMessage:
+    """Stamp ``created_at`` (and per-tool-call stamps) — SET-IF-MISSING ONLY.
+
+    IMMUTABILITY CONTRACT (operator requirement, 2026-08-19, see
+    ``docs/DESIGN_SUMMARIZATION_HOT_COLD.md`` §2.1): an existing, parseable
+    ``created_at`` is NEVER rewritten, no matter how it compares to the
+    clock. The previous monotonic-rewrite behaviour cascaded through whole
+    histories (one ``before_model`` pass re-stamped 721 of 722 messages of
+    a long-running agent's checkpoint), destroying the real receipt times that
+    provider/cache analytics and summarization depend on. The clock still
+    ``observe``s existing stamps so NEW stamps issued afterwards sort after
+    the newest existing one within this process.
+    """
     existing = message.additional_kwargs.get(CREATED_AT_KEY)
-    if isinstance(existing, str) and clock.observe(existing):
+    if isinstance(existing, str) and _parse_utc(existing) is not None:
         created_at = existing
+        clock.observe(existing)
     else:
         created_at = clock.next()
         message.additional_kwargs[CREATED_AT_KEY] = created_at
@@ -103,8 +116,8 @@ def ensure_messages_created_at(
 
 
 def format_message_with_timestamp(message: AnyMessage, clock: MonotonicUtcClock) -> str:
-    ensure_message_created_at(message, clock)
-    created_at = message.additional_kwargs[CREATED_AT_KEY]
+    existing = message.additional_kwargs.get(CREATED_AT_KEY)
+    created_at = existing if isinstance(existing, str) and _parse_utc(existing) else "?"
 
     lines: list[str] = []
     if isinstance(message, HumanMessage):
@@ -153,17 +166,54 @@ def ensure_message_created_at_after(
     return ensure_message_created_at(message, clock)
 
 
-def _stamp_response(value: Any, clock: MonotonicUtcClock) -> Any:
+#: How far ``_stamp_response`` will follow nested containers and ``.result``
+#: wrappers before giving up. Real responses nest a handful of levels at most;
+#: anything deeper is a malformed or self-referential value, not a message we
+#: still need to stamp.
+_MAX_STAMP_DEPTH = 25
+
+
+def _stamp_response(
+    value: Any,
+    clock: MonotonicUtcClock,
+    *,
+    _depth: int = 0,
+    _seen: set[int] | None = None,
+) -> Any:
+    """Stamp every message reachable from ``value``, without trusting its shape.
+
+    This runs on every model response, so it must terminate on whatever it is
+    handed. Two things bound it, because either alone is insufficient:
+
+    * ``_depth`` — a value can expose a fresh ``.result`` object on every access
+      (``unittest.mock.MagicMock`` does exactly that), so there is nothing to
+      recognise as already-visited and only a depth limit stops the descent;
+    * ``_seen`` — a genuine cycle (``a.result is b``, ``b.result is a``) revisits
+      the same objects, which the depth limit alone would only catch after
+      pointlessly re-stamping them.
+
+    Left unbounded, this recursed until ``RecursionError`` and the resulting
+    thousands-of-frames traceback cost 19.5 GB to format under pytest, taking
+    the host down twice (a related internal incident analysis, not included here).
+    """
     if isinstance(value, BaseMessage):
         ensure_message_created_at(value, clock)
         return value
+    if _depth >= _MAX_STAMP_DEPTH:
+        return value
+    if _seen is None:
+        _seen = set()
+    marker = id(value)
+    if marker in _seen:
+        return value
+    _seen.add(marker)
     if isinstance(value, list):
         for item in value:
-            _stamp_response(item, clock)
+            _stamp_response(item, clock, _depth=_depth + 1, _seen=_seen)
         return value
     result = getattr(value, "result", None)
     if result is not None:
-        _stamp_response(result, clock)
+        _stamp_response(result, clock, _depth=_depth + 1, _seen=_seen)
     return value
 
 

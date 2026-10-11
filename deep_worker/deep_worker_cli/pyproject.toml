@@ -88,15 +88,30 @@ dependencies = [
   "tavily-python>=0.7.21,<1.0.0",
   # External MCP clients (stdio + streamable HTTP). Exact host-compatible pin.
   "mcp==1.17.0",
+  # Upper bound demanded by the ``mcp==1.17.0`` pin above, NOT a preference.
+  # ``mcp`` 1.17.0 imports a private symbol that pydantic dropped in 2.14.0:
+  #     mcp/server/fastmcp/utilities/func_metadata.py:17
+  #     from pydantic._internal._typing_extra import eval_type_backport
+  # pydantic is otherwise unconstrained here and arrives transitively via
+  # langchain (>=2.7.4), so a fresh resolve took 2.14.0 and ``import
+  # mcp.types`` died at collection time — turning every CI run red while
+  # developer machines, holding an older pydantic, stayed green. Bisected:
+  # 2.13.0 imports fine, 2.14.0 does not. Lift this when the ``mcp`` pin
+  # moves to >=1.30.0, which stopped importing the private symbol.
+  "pydantic<2.14",
 
   # Clipboard
   "pyperclip>=1.11.0,<2.0.0",
 
-  # IPC/RPC — PyPI package (AsyncioServer-based RPyC fork).
-  # Switched from a local file:// direct reference to the public PyPI
-  # package (owner decision 2026-08-11): rpyc_async has been stable for a
-  # while, and this also exercises the published version.
-  # A first public release may pin ==1.0.0.
+  # IPC/RPC — AsyncioServer-based RPyC fork.
+  # This pin is only the FALLBACK. A local rpyc_async source checkout wins over
+  # any installed distribution (owner decision 2026-10-11, implemented in
+  # deep_worker_cli/rpyc_async_source.py), because the checkout is ahead of
+  # what is published: `rpyc_async.core.netref.async_call` — required by
+  # deep_worker_web.app.services.mcp_service — does not exist in 1.0.0, so a
+  # host resolving the published package cannot send inter-agent messages
+  # from the web UI. Raise this floor to >=1.1.0 once 1.1.0 is on PyPI; until
+  # then it understates what the code needs and only a checkout is complete.
   "rpyc-async>=1.0.0",
 
   # Utilities
@@ -203,8 +218,11 @@ test = [
 #   deep_worker_cli/LICENSE     → copy of the repo-root MIT LICENSE
 #                                 (drift-guarded by a unit test)
 #
-# `allow-direct-references` is intentionally ABSENT: it was only needed for
-# the old `rpyc-async @ file://...` dependency, which is gone (D5).
+# `allow-direct-references` is ABSENT because no dependency is declared as a
+# direct URL any more: `rpyc-async` is a plain version pin. That is a
+# packaging fact about this file only — it is NOT a prohibition on running
+# from a local checkout, which takes priority at runtime (see the
+# `rpyc-async` pin above and deep_worker_cli/rpyc_async_source.py).
 # ---------------------------------------------------------------------------
 # Vendored providers: the five
 # deep_worker/providers/<pkg> packages are staged into the wheel/sdist by a
@@ -237,16 +255,19 @@ deepagents = { path = "../deepagents", editable = true }
 # extra-paths is SAFETY-CRITICAL. DO NOT REMOVE ENTRIES without replacing
 # them with a working equivalent. In particular:
 #
-#   rpyc_async (previously a local source checkout)
-#       ← Removed 2026-08-11 (D5): rpyc-async is now installed from PyPI
-#         (>=1.0.0) as a regular dependency, so `ty` resolves the
-#         AsyncioServer-specific entry points from the installed package:
-#           - `rpyc.core.async_connect.async_connect`  (async client)
-#           - `Connection.aclose()`                    (async close)
-#           - `Connection.wait_closed()`               (async close wait)
+#   rpyc_async — resolved by `ty` from the installed distribution, which is
+#         enough for type checking the AsyncioServer entry points:
+#           - `rpyc_async.core.async_connect.async_connect`  (async client)
+#           - `Connection.aclose()`                          (async close)
+#           - `Connection.wait_closed()`                     (async close wait)
 #           - `Connection.add_close_callback(cb)`
-#         If the PyPI package ever lacks those, fix the package — do NOT
-#         re-add a /repos path and do NOT silence with `# ty: ignore`.
+#         Note this is a TYPE-CHECKING arrangement only. At RUNTIME a local
+#         rpyc_async checkout takes priority over the installed distribution
+#         (owner decision 2026-10-11, deep_worker_cli/rpyc_async_source.py),
+#         so `ty` may be reading an older API surface than the code runs
+#         against. If a symbol exists in the checkout but not in the installed
+#         package, `ty` will flag it — add the checkout to extra-paths rather
+#         than silencing with `# ty: ignore`.
 #
 # If you are tempted to bypass type checks: don't. Fix the path here
 # or fix the real type error. There are no third options.
@@ -267,12 +288,11 @@ extra-paths = [
            #   gracefully when A2A is enabled; ty must still resolve the
            #   import to type-check the integration code path.
     "../..",
-    "../../claude_code_provider",
     "../../semantic_search",
     "../deepagents",
     # Source fork of claude_agent_sdk (CLAUDE_AGENT_SDK_SRC contract):
     # the vendored
-    # claude_code_provider imports `claude_agent_sdk._mcp_context` lazily.
+    # claude_code_sdk_provider imports `claude_agent_sdk._mcp_context` lazily.
     # ty needs the fork on the search path to type-check that code path.
     # Mirrors the Claude SDK source entry already in pyrightconfig.json.
     # (A sibling checkout of the repository root, in both trees.)

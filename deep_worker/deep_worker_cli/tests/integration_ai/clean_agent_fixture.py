@@ -66,7 +66,7 @@ def clean_agent(request):
         Args:
             name: Agent name
             working_dir: Working directory for agent
-            provider: Optional provider (e.g., "claude-code", "anthropic")
+            provider: Optional provider (e.g., "claude-code-sdk", "anthropic")
             skip_permissions: Skip permission prompts (default: True for tests)
                              ⚠️  CRITICAL: This MUST be True for all tests that invoke tools!
                              Only set to False for tests that specifically test the approval workflow.

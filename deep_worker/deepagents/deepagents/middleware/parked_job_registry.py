@@ -36,6 +36,7 @@ Design notes:
 from __future__ import annotations
 
 import itertools
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -56,6 +57,9 @@ class ParkedJob:
     handle: Any
     tool_name: str | None = None
     aliases: set[str] = field(default_factory=set)
+    #: Invoked once the job is erased, for an owner with bookkeeping of its
+    #: own to clear. Set by ``park``; see the note there before relying on it.
+    on_release: Callable[[str], None] | None = None
 
 
 class ParkedJobRegistry:
@@ -101,6 +105,70 @@ class ParkedJobRegistry:
             job.aliases.add(alias)
         return job
 
+    def park(
+        self,
+        handle: Any,
+        *,
+        kind: JobKind = "tool",
+        alias: str | None = None,
+        tool_name: str | None = None,
+        on_release: "Callable[[str], None] | None" = None,
+    ) -> ParkedJob:
+        """Park a live unit of work. THE single entry point for parking.
+
+        This owns the whole lifetime, which is why every caller must come
+        through here instead of hand-rolling allocate + register + a
+        done-callback of its own (POLICIES.md §14):
+
+        * reuses the id already parked under ``alias``, so two layers parking
+          the same call cannot mint two ids;
+        * allocates a canonical ``job_N`` otherwise;
+        * attaches the completion hook ITSELF, so no caller can get the
+          "erase on completion" rule wrong again. Completion RETIRES the job
+          (it stays reachable, holding a result nobody has collected yet);
+          only ``complete`` erases it.
+
+        ``on_release`` is invoked when the job is finally erased, for owners
+        that must clear bookkeeping of their own. Prefer not needing it: a
+        second table shadowing this registry is exactly what §14 forbids.
+        """
+        existing = self.resolve_by_alias(alias) if alias else None
+        job_id = existing.job_id if existing is not None else self.allocate()
+        job = self.register(
+            job_id,
+            kind=kind,
+            handle=handle,
+            alias=alias,
+            tool_name=tool_name,
+        )
+        job.on_release = on_release
+        # The completion hook lives on the handle itself, or on the awaitable
+        # a wrapper handle carries. Finding it is the registry's job, so a
+        # caller never has to know which shape it holds — that knowledge
+        # leaking outwards is how five call sites each grew their own version.
+        awaitable = getattr(handle, "task", handle)
+        add_done_callback = getattr(awaitable, "add_done_callback", None)
+        if callable(add_done_callback):
+            add_done_callback(lambda _h: self.retire(job_id))
+        return job
+
+    def complete(self, job_id: str) -> None:
+        """Erase a job whose result has been delivered to its caller.
+
+        The ONLY legitimate reason to erase a record: someone now holds the
+        result. Erasing on completion instead was a past defect —
+        the work finished, the record vanished, and the caller was told "no
+        background job with id" (POLICIES.md §14).
+        """
+        job = self.resolve(job_id)
+        if job is None:
+            self._aliases.pop(job_id, None)
+            return
+        release = job.on_release
+        self.drop(job.job_id)
+        if release is not None:
+            release(job.job_id)
+
     def resolve(self, job_id: str) -> ParkedJob | None:
         """Look up by canonical ``job_N`` OR by ``tool_use_id`` alias."""
         job = self._jobs.get(job_id)
@@ -118,6 +186,32 @@ class ParkedJobRegistry:
         if canonical is None:
             return None
         return self._jobs.get(canonical)
+
+    def retire(self, job_id: str) -> None:
+        """Mark a finished job terminal WITHOUT making it unreachable.
+
+        Completion must not erase identity. A job whose work is done still
+        owes the caller an answer: ``wait_for_job`` has to be able to resolve
+        it and hand back the result it produced.
+
+        This is a past incident (2026-08-28): the sync parking site
+        called ``drop`` from ``add_done_callback``, so finishing deleted the
+        entry and the completed result became unreachable — the agent was
+        told "no background job with id" and could never confirm the work.
+        Erasure is ``drop``'s job, and only a caller that has already been
+        served (or an explicit kill) may do it.
+
+        Deliberately does NOT mutate the entry: reachability via ``resolve``
+        IS the terminal state, and the handle already knows whether its work
+        finished. A separate ``retired`` flag would be written and never read
+        — a second source of truth that could disagree with the handle.
+
+        The method exists so the parking site states its intent explicitly
+        ("this job is done, keep it reachable") instead of silently omitting
+        the ``drop`` that used to be here.
+
+        Idempotent; accepts either namespace.
+        """
 
     def drop(self, job_id: str) -> None:
         """Remove a finished/killed job and purge every alias pointing at it.
@@ -152,3 +246,33 @@ def get_parked_job_registry() -> ParkedJobRegistry:
     if _REGISTRY is None:
         _REGISTRY = ParkedJobRegistry()
     return _REGISTRY
+
+
+def resolve_parked_job_key(
+    call_id: str, jobs: "dict[str, Any]"
+) -> str | None:
+    """Find a provider's local job key from either id namespace.
+
+    A late result arrives under the originating ``call_id``, while the local
+    table is keyed by canonical ``job_N``; the shared registry knows the alias
+    that links them. Shared because all three provider proxy servers need
+    exactly this, and three hand-written copies had already drifted apart —
+    one returned a bool, two returned nothing (POLICIES.md §14).
+
+    Returns the key into ``jobs``, or ``None`` if this call has no parked job.
+    """
+    if call_id in jobs:
+        return call_id
+    parked = get_parked_job_registry().resolve(call_id)
+    if parked is not None and parked.job_id in jobs:
+        return parked.job_id
+    return None
+
+
+def complete_parked_job(job_id: str) -> None:
+    """Erase a parked job whose result has just been delivered.
+
+    Thin by design: the point is that no caller decides for itself when a
+    record dies.
+    """
+    get_parked_job_registry().complete(job_id)

@@ -37,7 +37,7 @@ import pytest
 def saved_launch_config_dev() -> dict:
     """A saved launch_config that was originally started with --dev."""
     return {
-        "provider": "claude-code",
+        "provider": "claude-code-sdk",
         "model": "opus",
         "working_dir": "/path/to/dev",
         "skip_permissions": True,
@@ -48,7 +48,7 @@ def saved_launch_config_dev() -> dict:
         "dev_tree": True,
         "started_at": "2026-05-13T22:00:00.000000",
         "pid": 12345,
-        "cli_args": "myagent --dev -sp -tm --provider claude-code --model opus",
+        "cli_args": "myagent --dev -sp -tm --provider claude-code-sdk --model opus",
     }
 
 
@@ -56,7 +56,7 @@ def saved_launch_config_dev() -> dict:
 def saved_launch_config_prod() -> dict:
     """A saved launch_config that was originally started WITHOUT --dev."""
     return {
-        "provider": "claude-code",
+        "provider": "claude-code-sdk",
         "model": "opus",
         "working_dir": "/path/to/prod",
         "skip_permissions": True,
@@ -67,7 +67,7 @@ def saved_launch_config_prod() -> dict:
         "dev_tree": False,
         "started_at": "2026-05-13T22:00:00.000000",
         "pid": 12345,
-        "cli_args": "myagent -sp -tm --provider claude-code --model opus",
+        "cli_args": "myagent -sp -tm --provider claude-code-sdk --model opus",
     }
 
 
@@ -142,12 +142,12 @@ class TestArgparseAcceptsDev:
         parser = create_parser()
         ns = parser.parse_args(
             ["myagent", "--dev", "-sp", "-tm",
-             "--provider", "claude-code", "--model", "opus"]
+             "--provider", "claude-code-sdk", "--model", "opus"]
         )
         assert ns.dev_tree is True
         assert ns.skip_permissions is True
         assert ns.task_manager is True
-        assert ns.provider == "claude-code"
+        assert ns.provider == "claude-code-sdk"
         assert ns.model == "opus"
 
 
@@ -263,13 +263,27 @@ class TestBuildLaunchConfigDevTree:
     ) -> None:
         """The mirror of the regression: when the running code tree is NOT
         the canonical dev tree (prod), and no flag/env is set, dev_tree stays
-        False so prod agents keep restarting on the prod tree."""
-        from deep_worker_cli.cli.agent_command import build_launch_config
+        False so prod agents keep restarting on the prod tree.
+
+        The override must point at a path that is NOT this checkout, and it
+        must stay that way wherever the suite runs. It previously hardcoded
+        a production-tree path, which made the test assert that tree is
+        not the dev tree while simultaneously declaring it to be exactly
+        that — so the test failed whenever the suite ran from there. Derive
+        the value from ``_repo_root`` instead, mirroring the paired
+        dev-tree test above.
+        """
+        from deep_worker_cli.cli.agent_command import (
+            _repo_root,
+            build_launch_config,
+        )
 
         import os
+        not_this_tree = str(_repo_root / "_definitely-not-the-dev-tree")
+        assert Path(not_this_tree).resolve() != _repo_root.resolve()
         with patch.dict(
             "os.environ",
-            {"DEEP_WORKER_DEV_TREE_ROOT_OVERRIDE": "/nonexistent/prod"},
+            {"DEEP_WORKER_DEV_TREE_ROOT_OVERRIDE": not_this_tree},
             clear=False,
         ):
             os.environ.pop("DEEP_WORKER_DEV_TREE", None)
@@ -324,7 +338,7 @@ class TestMergeRestartConfigDevTree:
         from deep_worker_cli.cli.agent_command import merge_restart_config
 
         legacy_saved = {
-            "provider": "claude-code",
+            "provider": "claude-code-sdk",
             "model": "opus",
             "working_dir": "/path/to/prod",
             "skip_permissions": True,

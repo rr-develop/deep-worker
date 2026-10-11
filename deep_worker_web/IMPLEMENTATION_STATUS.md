@@ -122,12 +122,16 @@
 ## ✅ ALL CORE FEATURES COMPLETED (2026-04-03)
 
 ### Full Dialog Page ✅
-- ✅ Complete HTML page (`/static/dialog.html`) with responsive design
-- ✅ Real-time message loading from API
-- ✅ Message role-based styling (user, assistant, tool_call, tool_result)
-- ✅ Refresh functionality
-- ✅ Export to JSON functionality
-- ✅ Proper error handling and empty states
+- ✅ Static, click-time snapshot served by `GET /api/agents/{name}/dialog-text`
+  as `text/plain` (no script, no streaming, `Cache-Control: no-store`),
+  opened with `window.open(url, '_blank', 'noopener,noreferrer')` — the tab
+  never updates itself and cannot stall the main UI
+  (`docs/DESIGN_FULL_DIALOG_STATIC_SNAPSHOT.md`, 2026-08-16)
+- ✅ Two-line snapshot banner (agent, verbosity, click-time stamp)
+- ✅ Verbosity modes: final / text / full / system_prompt / tools
+- ✅ Bounded wait: 504 with reason if the agent does not answer within 30 s
+- ❌ The former JS-driven `/static/dialog.html` page (fetch + Refresh /
+  Export buttons) was dead code since 2026-04-06 and was removed 2026-08-16
 - ✅ Integrated with main UI via "Full Dialog" button
 
 ### Stop TaskManager ✅

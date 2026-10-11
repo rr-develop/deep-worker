@@ -24,7 +24,7 @@ from deep_worker_cli.storage_paths import deep_worker_home
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("GROK_INTEGRATION_TESTS") != "1",
-    reason="set GROK_INTEGRATION_TESTS=1 to run live grok and deep-worker tests",
+    reason="set GROK_INTEGRATION_TESTS=1 to run live grok/deep-worker tests",
 )
 
 
@@ -52,9 +52,7 @@ def _run(args: list[str], *, env: dict[str, str], timeout: float):
 
 def _cleanup_agent_files(agent_name: str) -> None:
     shutil.rmtree(deep_worker_home() / agent_name, ignore_errors=True)
-    db_path = Path.home() / ".deepagents" / f"sessions_{agent_name}.db"
-    with contextlib.suppress(FileNotFoundError):
-        db_path.unlink()
+    shutil.rmtree(deep_worker_home() / "agents" / agent_name, ignore_errors=True)
 
 
 def _wait_registered(agent_name: str, env: dict[str, str], timeout: float = 60.0) -> None:

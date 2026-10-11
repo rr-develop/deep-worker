@@ -4,7 +4,7 @@ Bug (reported by a user)
 ------------------------------------
 The user was standing in a git worktree and ran ``deep-worker lsp enable``.
 The config was written into the MAIN repository's
-``.deepagents/mcp.json`` — that is, into the main repo, and with
+``.deep_worker/mcp.json`` — that is, into the main repo, and with
 ``--project <repo>`` inside.
 
 Cause: the bash launcher does ``cd "$SCRIPT_DIR"`` before running Python
@@ -84,7 +84,7 @@ def test_config_path_uses_original_cwd_env(tmp_path: Path) -> None:
 
     got = _config_path(_parse(["lsp", "enable", "--scope", "project"]))
 
-    assert got == user_dir / ".deepagents" / "mcp.json"
+    assert got == user_dir / ".deep_worker" / "mcp.json"
 
 
 def test_explicit_project_root_still_wins(tmp_path: Path) -> None:
@@ -133,8 +133,8 @@ def test_enable_writes_into_user_directory_not_install_dir(
     rc = handle_lsp_command(_parse(["lsp", "enable"]))
     assert rc == 0
 
-    user_cfg = user_dir / ".deepagents" / "mcp.json"
-    install_cfg = install_dir / ".deepagents" / "mcp.json"
+    user_cfg = user_dir / ".deep_worker" / "mcp.json"
+    install_cfg = install_dir / ".deep_worker" / "mcp.json"
 
     assert user_cfg.exists(), "config must be written into the user's directory"
     assert not install_cfg.exists(), "config must NOT leak into the install dir"

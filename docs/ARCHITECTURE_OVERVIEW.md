@@ -29,8 +29,8 @@ operational detail.
 | Component | Purpose |
 |---|---|
 | [`deep_worker/deep_worker_cli`](../deep_worker/deep_worker_cli/README.md) | Core runtime: `deep-worker` daemon, `dwcli` client, storage, providers |
-| [`claude_code_provider`](../claude_code_provider/README.md) | Claude Code provider — LangChain `BaseChatModel` backed by the Claude Code SDK |
-| [`codex_provider`](../codex_provider/README.md) | OpenAI Codex CLI provider — drop-in sibling of `claude_code_provider` |
+| [`claude_code_sdk_provider`](../claude_code_sdk_provider/README.md) | Claude Code provider — LangChain `BaseChatModel` backed by the Claude Code SDK |
+| [`codex_provider`](../codex_provider/README.md) | OpenAI Codex CLI provider — drop-in sibling of `claude_code_sdk_provider` |
 | [`grok_provider`](../grok_provider/README.md) | xAI Grok CLI provider (Agent Client Protocol, ACP v1) |
 | [`dw_hist`](../dw_hist/README.md) | `dw-hist` — host-level CLI for semantically browsing agent history |
 | [`lsp`](../lsp/README.md) | Optional LSP code navigation for agents (Serena MCP integration) |
@@ -79,7 +79,7 @@ tools). Design: `deepworker_a2a/docs/DESIGN_A2A_PROTOCOL_SUPPORT.md`.
 The default checkpointer stores **only the changes** between checkpoints
 instead of a full state snapshot on every step, cutting storage and write
 cost for long agent runs. Module: `deep_worker_cli/delta_checkpointer.py`.
-Design: `claude_code_provider/docs/DESIGN_delta_checkpointer.md`.
+Design: `claude_code_sdk_provider/docs/DESIGN_delta_checkpointer.md`.
 
 ### `read_image` tool
 

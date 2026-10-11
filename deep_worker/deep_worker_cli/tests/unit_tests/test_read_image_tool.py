@@ -1,14 +1,11 @@
-"""Tests for read_image tool and multimodal resolve_call handling."""
+"""Tests for the read_image tool."""
 
 import base64
 import json
 import tempfile
 from pathlib import Path
-from unittest.mock import MagicMock
 
 import pytest
-
-pytest.importorskip("claude_agent_sdk")  # optional dependency; skip when absent
 
 from PIL import Image
 
@@ -102,71 +99,6 @@ class TestReadImage:
 # ===========================================================================
 # resolve_call multimodal handling tests
 # ===========================================================================
-
-class TestResolveCallMultimodal:
-    """Tests for multimodal content handling in resolve_call."""
-
-    def test_string_content_unchanged(self):
-        """String content should produce a single text block (existing behavior)."""
-        from deep_worker.providers.claude_code_provider.chat_model import _build_mcp_content
-
-        result = _build_mcp_content("Hello, world!")
-        assert result == [{"type": "text", "text": "Hello, world!"}]
-
-    def test_list_with_text_only(self):
-        """List with text blocks should pass through."""
-        from deep_worker.providers.claude_code_provider.chat_model import _build_mcp_content
-
-        content = [{"type": "text", "text": "Some text"}]
-        result = _build_mcp_content(content)
-        assert result == [{"type": "text", "text": "Some text"}]
-
-    def test_list_with_image_url_converted_to_mcp_image(self):
-        """image_url block should be converted to MCP image block."""
-        from deep_worker.providers.claude_code_provider.chat_model import _build_mcp_content
-
-        content = [
-            {"type": "text", "text": "Image info"},
-            {
-                "type": "image_url",
-                "image_url": {"url": "data:image/png;base64,iVBOR123"},
-            },
-        ]
-        result = _build_mcp_content(content)
-        assert len(result) == 2
-        assert result[0] == {"type": "text", "text": "Image info"}
-        assert result[1]["type"] == "image"
-        assert result[1]["data"] == "iVBOR123"
-        assert result[1]["mimeType"] == "image/png"
-
-    def test_list_with_jpeg_image(self):
-        from deep_worker.providers.claude_code_provider.chat_model import _build_mcp_content
-
-        content = [
-            {
-                "type": "image_url",
-                "image_url": {"url": "data:image/jpeg;base64,/9j/abc"},
-            },
-        ]
-        result = _build_mcp_content(content)
-        assert result[0]["mimeType"] == "image/jpeg"
-        assert result[0]["data"] == "/9j/abc"
-
-    def test_mixed_content_all_preserved(self):
-        """Multiple text + image blocks should all be preserved."""
-        from deep_worker.providers.claude_code_provider.chat_model import _build_mcp_content
-
-        content = [
-            {"type": "text", "text": "First"},
-            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}},
-            {"type": "text", "text": "Second"},
-        ]
-        result = _build_mcp_content(content)
-        assert len(result) == 3
-        assert result[0]["type"] == "text"
-        assert result[1]["type"] == "image"
-        assert result[2]["type"] == "text"
-
 
 # ===========================================================================
 # Guard: read_image registered in tools list

@@ -137,6 +137,39 @@ CacheListener = Callable[[str, str, int], None]
 Signature: ``(thread_id, checkpoint_ns, new_version)``.
 """
 
+
+CommitListener = Callable[[frozenset[str]], None]
+"""Callback fired after a checkpoint is durably committed.
+
+Signature: ``(committed_tool_call_ids)`` — the ``tool_call_id`` of every
+``ToolMessage`` present in the committed checkpoint.
+
+This is the delivery signal: a tool result is delivered when, and only
+when, it has been persisted to the checkpoint. See
+``docs/DESIGN_DELIVERY_BARRIER_ON_CHECKPOINT.md``.
+
+Distinct from :data:`CacheListener` on purpose. Cache listeners are
+cheap invalidation callbacks whose failures are swallowed; a commit
+listener may take a consequential action (stopping this process), so a
+failure here is logged at ERROR rather than dropped.
+"""
+
+
+DeliveryCommitListener = Callable[[frozenset[str]], None]
+"""Callback fired after a checkpoint is durably committed.
+
+Signature: ``(committed_delivery_ids)`` — the ``delivery_id`` carried in
+``additional_kwargs`` by every inter-agent ``HumanMessage`` in the
+committed checkpoint.
+
+Same delivery criterion as :data:`CommitListener`, different subject: it
+answers "which inbox records are now durably part of the model's
+context", so the spool can drop a record only once that is true. A turn
+returning ``success`` is NOT that proof — the process can die between
+the turn's return and the commit, and unlinking on the former loses the
+message with the sender already told it was accepted.
+"""
+
 # SQL for table creation
 _CREATE_TABLES_SQL = """
 CREATE TABLE IF NOT EXISTS checkpoints (
@@ -214,6 +247,10 @@ class DeltaSqliteCheckpointer(BaseCheckpointSaver):
         self._cache_enabled = cache_enabled
         self._cache: dict[tuple[str, str], ThreadCacheEntry] = {}
         self._listeners: list[CacheListener] = []
+        # Delivery signal — fired after commit, independent of the cache.
+        self._commit_listeners: list[CommitListener] = []
+        # Same signal, keyed by inbox delivery_id instead of tool_call_id.
+        self._delivery_commit_listeners: list[DeliveryCommitListener] = []
         # Observability — read via get_cache_stats().
         self._cache_hits_total = 0
         self._cache_misses_total = 0
@@ -256,6 +293,51 @@ class DeltaSqliteCheckpointer(BaseCheckpointSaver):
         except ValueError:
             pass
 
+    def add_commit_listener(self, listener: CommitListener) -> None:
+        """Register a callback invoked after every durable commit.
+
+        The callback receives the ``tool_call_id`` of every ``ToolMessage``
+        in the committed checkpoint. This is the delivery signal defined in
+        ``docs/DESIGN_DELIVERY_BARRIER_ON_CHECKPOINT.md``: a result counts
+        as delivered once it is in the checkpoint, never before.
+
+        Unlike cache listeners, a failure here is NOT swallowed silently —
+        a consumer may be waiting on this signal to take an irreversible
+        action, and a dropped signal must be visible in the log.
+        """
+        self._commit_listeners.append(listener)
+
+    def remove_commit_listener(self, listener: CommitListener) -> None:
+        """Unregister a previously-added commit listener. No-op if absent."""
+        try:
+            self._commit_listeners.remove(listener)
+        except ValueError:
+            pass
+
+    def add_delivery_commit_listener(
+        self, listener: DeliveryCommitListener
+    ) -> None:
+        """Register a callback invoked after every durable commit.
+
+        The callback receives the ``delivery_id`` of every inter-agent
+        message in the committed checkpoint — the signal the inbox spool
+        uses to decide a record may finally be dropped.
+
+        As with :meth:`add_commit_listener`, failures are logged rather
+        than swallowed: a dropped signal here means a record is retained
+        and re-delivered, which must be visible.
+        """
+        self._delivery_commit_listeners.append(listener)
+
+    def remove_delivery_commit_listener(
+        self, listener: DeliveryCommitListener
+    ) -> None:
+        """Unregister a delivery commit listener. No-op if absent."""
+        try:
+            self._delivery_commit_listeners.remove(listener)
+        except ValueError:
+            pass
+
     def get_cache_stats(self) -> dict[str, int]:
         """Return current cache counters for debugging / benchmarking."""
         return {
@@ -274,6 +356,88 @@ class DeltaSqliteCheckpointer(BaseCheckpointSaver):
                 logger.exception(
                     "cache listener failed (thread_id=%s ns=%s version=%d)",
                     thread_id, ns, version,
+                )
+
+    @staticmethod
+    def _committed_tool_call_ids(checkpoint: Checkpoint) -> frozenset[str]:
+        """Collect the tool_call_id of every ToolMessage in a checkpoint.
+
+        Duck-typed on purpose: any message object carrying a non-empty
+        ``tool_call_id`` counts, so the barrier does not depend on a
+        particular message class or provider.
+        """
+        messages = (checkpoint.get("channel_values") or {}).get("messages")
+        if not messages:
+            return frozenset()
+        ids = {
+            call_id
+            for message in messages
+            if isinstance(call_id := getattr(message, "tool_call_id", None), str)
+            and call_id
+        }
+        return frozenset(ids)
+
+    @staticmethod
+    def _committed_delivery_ids(checkpoint: Checkpoint) -> frozenset[str]:
+        """Collect the delivery_id of every inter-agent message committed.
+
+        Duck-typed like :meth:`_committed_tool_call_ids`: the id is read
+        from ``additional_kwargs``, where ``_next_user_message`` stamps it
+        for inter-agent deliveries, so this does not depend on a message
+        class or provider.
+        """
+        messages = (checkpoint.get("channel_values") or {}).get("messages")
+        if not messages:
+            return frozenset()
+        ids = set()
+        for message in messages:
+            kwargs = getattr(message, "additional_kwargs", None)
+            if not isinstance(kwargs, dict):
+                continue
+            delivery_id = kwargs.get("delivery_id")
+            if isinstance(delivery_id, str) and delivery_id:
+                ids.add(delivery_id)
+        return frozenset(ids)
+
+    def _fire_delivery_commit_listeners(self, checkpoint: Checkpoint) -> None:
+        """Announce a durable commit to the inbox delivery listeners."""
+        if not self._delivery_commit_listeners:
+            return
+        delivery_ids = self._committed_delivery_ids(checkpoint)
+        if not delivery_ids:
+            return
+        for listener in self._delivery_commit_listeners:
+            try:
+                listener(delivery_ids)
+            except Exception:
+                logger.exception(
+                    "delivery commit listener failed (checkpoint_id=%s, "
+                    "%d delivery_id(s)); an inbox record will be RETAINED "
+                    "and may be delivered again",
+                    checkpoint.get("id"),
+                    len(delivery_ids),
+                )
+
+    def _fire_commit_listeners(self, checkpoint: Checkpoint) -> None:
+        """Announce a durable commit to the delivery-signal listeners.
+
+        Errors are logged at ERROR and never swallowed silently: a
+        consumer may be waiting on this signal to take an irreversible
+        action, so a dropped signal must leave a trace. A failing listener
+        still must not break persistence — aput has already committed.
+        """
+        if not self._commit_listeners:
+            return
+        tool_call_ids = self._committed_tool_call_ids(checkpoint)
+        for listener in self._commit_listeners:
+            try:
+                listener(tool_call_ids)
+            except Exception:
+                logger.exception(
+                    "commit listener failed (checkpoint_id=%s, %d tool_call_id(s)); "
+                    "a delivery signal was DROPPED",
+                    checkpoint.get("id"),
+                    len(tool_call_ids),
                 )
 
     def _cache_put(
@@ -358,7 +522,7 @@ class DeltaSqliteCheckpointer(BaseCheckpointSaver):
         #   synchronous=NORMAL — safe with WAL; prevents fsync on every
         #                        transaction while guaranteeing crash safety
         #                        within the WAL protocol.
-        # See DESIGN_FIX_SQLITE_DB_CORRUPTION.md.
+        # See DESIGN_FIX_SQLITE_DB_CORRUPTION.md (#4114e536).
         pragmas = [
             "PRAGMA journal_mode=WAL",
             "PRAGMA synchronous=NORMAL",
@@ -735,6 +899,15 @@ class DeltaSqliteCheckpointer(BaseCheckpointSaver):
         if new_version:
             self._fire_listeners(thread_id, checkpoint_ns, new_version)
 
+        # Delivery signal. The commit above is what makes a tool result
+        # part of the model's context, so this — and nothing earlier — is
+        # the point at which a result counts as delivered. Fired even when
+        # the cache is disabled: delivery does not depend on caching.
+        self._fire_commit_listeners(checkpoint)
+        # Same criterion, for the inbox: a spool record may be dropped
+        # only once its message is durably in the context.
+        self._fire_delivery_commit_listeners(checkpoint)
+
         return {
             "configurable": {
                 "thread_id": thread_id,
@@ -888,7 +1061,7 @@ class DeltaSqliteCheckpointer(BaseCheckpointSaver):
         # (delta payload + full snapshot + ``channel_versions`` +
         # ``versions_seen``) but left ``aput_writes`` untouched, so every
         # super-step kept inserting a full ``__pregel_tasks`` payload
-        # (0.5–4 MB / row) into the ``writes`` table. On one agent that
+        # (0.5–4 MB / row) into the ``writes`` table. On ``mj2_vac`` that
         # path accumulated 4 596 rows totalling 2.43 GB — 96 % of a
         # 2.84 GB threads.db. Worse, on cold start LangGraph's
         # ``aget_tuple`` merges these pending writes into the

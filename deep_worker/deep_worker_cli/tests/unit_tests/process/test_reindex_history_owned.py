@@ -6,9 +6,6 @@ from types import SimpleNamespace
 
 import pytest
 
-pytest.importorskip("llama_index")  # semantic-search dep; skip when absent
-
-
 @pytest.mark.asyncio
 async def test_reindex_history_owned_runs_under_invoke_lock(monkeypatch, tmp_path) -> None:
     from deep_worker_cli.process import agent_process as mod
@@ -19,19 +16,23 @@ async def test_reindex_history_owned_runs_under_invoke_lock(monkeypatch, tmp_pat
     proc._invoke_lock = asyncio.Lock()
     entered_while_locked: list[bool] = []
 
-    def fake_clear_then_index(path):
-        entered_while_locked.append(proc._invoke_lock.locked())
-        return SimpleNamespace(files_processed=1, lines_read=2, chunks_indexed=3, errors=0)
-
-    async def fake_to_thread(func, *args, **kwargs):
-        return func(*args, **kwargs)
+    class Client:
+        async def index_history(self, path, clear_first=False):
+            entered_while_locked.append(proc._invoke_lock.locked())
+            assert clear_first is True
+            return SimpleNamespace(
+                files_indexed=1,
+                chunks_added=3,
+                lines_read=2,
+                errors=0,
+            )
 
     import deep_worker_cli.summaries as summaries_mod
     summaries_dir = tmp_path / "summaries"
     summaries_dir.mkdir()
     monkeypatch.setattr(summaries_mod, "get_summaries_dir", lambda name: summaries_dir)
-    monkeypatch.setattr(mod, "_clear_then_index_history", fake_clear_then_index)
-    monkeypatch.setattr(mod.asyncio, "to_thread", fake_to_thread)
+    import deep_worker_cli.semantic_memory.client as client_mod
+    monkeypatch.setattr(client_mod, "SemanticMemoryClient", Client)
 
     result = await proc.reindex_history_owned()
 
@@ -40,48 +41,35 @@ async def test_reindex_history_owned_runs_under_invoke_lock(monkeypatch, tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_reindex_history_owned_clears_then_indexes_in_single_thread(monkeypatch, tmp_path) -> None:
+async def test_reindex_history_owned_uses_index_history_rpc(monkeypatch, tmp_path) -> None:
     from deep_worker_cli.process import agent_process as mod
     from deep_worker_cli.process.agent_process import AgentProcess
 
     proc = AgentProcess.__new__(AgentProcess)
     proc.name = "ag"
     proc._invoke_lock = asyncio.Lock()
-    thread_calls: list[str] = []
+    calls: list[tuple[object, bool]] = []
 
-    async def fake_to_thread(func, *args, **kwargs):
-        thread_calls.append(func.__name__)
-        return SimpleNamespace(files_processed=1, lines_read=2, chunks_indexed=3, errors=0)
+    class Client:
+        async def index_history(self, path, clear_first=False):
+            calls.append((path, clear_first))
+            return SimpleNamespace(
+                files_indexed=1,
+                chunks_added=3,
+                lines_read=2,
+                errors=0,
+            )
 
     import deep_worker_cli.summaries as summaries_mod
     summaries_dir = tmp_path / "summaries"
     summaries_dir.mkdir()
     monkeypatch.setattr(summaries_mod, "get_summaries_dir", lambda name: summaries_dir)
-    monkeypatch.setattr(mod.asyncio, "to_thread", fake_to_thread)
+    import deep_worker_cli.semantic_memory.client as client_mod
+    monkeypatch.setattr(client_mod, "SemanticMemoryClient", Client)
 
     await proc.reindex_history_owned()
 
-    assert thread_calls == ["_clear_then_index_history"]
-
-
-def test_clear_then_index_history_clears_before_index(monkeypatch, tmp_path) -> None:
-    from deep_worker_cli.process import agent_process as mod
-
-    calls: list[str] = []
-
-    monkeypatch.setattr(mod, "clear_history_index", lambda path: calls.append("clear"), raising=False)
-    monkeypatch.setattr(
-        mod,
-        "index_all_history_files",
-        lambda path: calls.append("index")
-        or SimpleNamespace(files_processed=1, lines_read=2, chunks_indexed=3, errors=0),
-        raising=False,
-    )
-
-    stats = mod._clear_then_index_history(tmp_path)
-
-    assert calls == ["clear", "index"]
-    assert stats.files_processed == 1
+    assert calls == [(summaries_dir, True)]
 
 
 @pytest.mark.asyncio

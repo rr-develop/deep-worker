@@ -18,7 +18,7 @@ import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
-from deep_worker_cli.storage_paths import deep_worker_home
+from deep_worker_cli.storage_paths import agent_root, deep_worker_home, legacy_agent_root
 
 logger = logging.getLogger(__name__)
 
@@ -46,19 +46,27 @@ def fork_agent_data(
         ValueError: *message_id* not found in any summary file.
     """
     home = home or Path.home()
-    src_dir = deep_worker_home(home) / source_name
-    dst_dir = deep_worker_home(home) / new_name
-
+    src_dir = legacy_agent_root(source_name, home=home)
     if not src_dir.is_dir():
-        raise FileNotFoundError(
-            f"Source agent '{source_name}' not found at {src_dir}"
-        )
+        # Source may live under the canonical layout (post-v6). Fallback to
+        # the new location so a fork works regardless of which migration
+        # state the source agent is in (DESIGN_AGENT_DBS §3.2, read fallback).
+        src_dir = agent_root(source_name, home=home, create=False)
+        if not src_dir.is_dir():
+            raise FileNotFoundError(
+                f"Source agent '{source_name}' not found at "
+                f"{legacy_agent_root(source_name, home=home)} or "
+                f"{agent_root(source_name, home=home, create=False)}"
+            )
+
+    dst_dir = agent_root(new_name, home=home, create=False)
 
     if dst_dir.exists():
         raise FileExistsError(f"Agent '{new_name}' already exists at {dst_dir}")
 
-    dst_dir.mkdir(parents=True)
-    os.chmod(dst_dir, 0o700)
+    # ``agent_root(create=True)`` creates both parent (agents/) and leaf with
+    # mode 0o700 (DESIGN §3.3 step 1, §5.3 privacy contract).
+    agent_root(new_name, home=home, create=True)
 
     # ── data/ ──────────────────────────────────────────────────────────────
     src_data = src_dir / "data"

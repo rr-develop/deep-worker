@@ -44,6 +44,29 @@ from deep_worker_cli.lsp.service.proto import lsp_service_pb2 as pb
 
 _log = logging.getLogger(__name__)
 
+
+def _blocking_waitpid(pid: int) -> None:
+    """Block in a worker thread until ``pid`` exits.
+
+    Used as the no-pidfd fallback for child-death detection on CPython
+    builds where ``os.pidfd_open`` is unavailable (it needs
+    ``<sys/pidfd.h>`` at compile time — uv-installed CPython 3.11.14
+    ships without it).  Runs to completion once the kernel reaps the
+    child; ``WNOHANG`` is NOT used, so we never busy-loop.  Idempotent
+    against ECHILD: by the time this is called, the child has either
+    been reaped by its real parent (and the call returns ``(0, 0)``
+    harmlessly) or still belongs to us and we block until it dies.
+    """
+    while True:
+        try:
+            waited_pid, _status = os.waitpid(pid, 0)
+        except ChildProcessError:
+            # Already reaped (e.g. by a previous test teardown).
+            return
+        if waited_pid == pid:
+            return
+
+
 #: gRPC RPC name → MCP tool name Serena advertises. Mirrors the 11
 #: entries in ``bridge_loop._TOOLS`` exactly.
 _RPC_TO_TOOL: Final[dict[str, str]] = {
@@ -424,26 +447,57 @@ class _OwnedStdioSession:
             """
             death = asyncio.Event()
             loop = asyncio.get_running_loop()
+            pidfd_supported = True
             try:
                 fd = os.pidfd_open(proc.pid, 0)
-            except OSError as e:  # pragma: no cover — kernel < 5.3
-                _log.error(
-                    "pidfd_open(%d) failed: %s; in-flight calls will only "
-                    "fail once the call budget expires",
+            except (OSError, AttributeError) as e:
+                # ``os.pidfd_open`` is unavailable on some CPython builds
+                # (it needs <sys/pidfd.h> at compile time — uv-installed
+                # CPython 3.11.14 ships without it).  Without a kernel
+                # descriptor we cannot make ``loop.add_reader`` work
+                # against the child, and ``os.kill(pid, 0)`` is unsafe
+                # (the slot can be reused within microseconds).  Fall
+                # back to a blocking ``waitpid`` running in the default
+                # executor — that is event-driven from the asyncio
+                # point of view (one Future resolves exactly once when
+                # the child dies) and complies with the no-polling
+                # policy enforced by ``test_no_polling_policy``.
+                _log.warning(
+                    "pidfd_open(%d) failed: %s; falling back to "
+                    "executor waitpid so in-flight calls still fail "
+                    "fast when the MCP child dies",
                     proc.pid, e,
                 )
-                return
+                pidfd_supported = False
+                fd = -1  # marker so the post-block cleanup skips close()
+                waitpid_future: asyncio.Future[None] = (
+                    loop.run_in_executor(None, _blocking_waitpid, proc.pid)
+                )
+
+                def _on_waitpid_done(_fut: asyncio.Future[None]) -> None:
+                    if not death.is_set():
+                        death.set()
+
+                waitpid_future.add_done_callback(_on_waitpid_done)
+
+            cancelled = False
             try:
-                loop.add_reader(fd, death.set)
+                if pidfd_supported:
+                    loop.add_reader(fd, death.set)
                 try:
                     await death.wait()
                 finally:
-                    loop.remove_reader(fd)
+                    if pidfd_supported:
+                        loop.remove_reader(fd)
             except asyncio.CancelledError:
-                return
+                cancelled = True
             finally:
-                with contextlib.suppress(OSError):
-                    os.close(fd)
+                if pidfd_supported and fd >= 0:
+                    with contextlib.suppress(OSError):
+                        os.close(fd)
+            if cancelled:
+                return
+
             _log.warning(
                 "mcp child %d exited; failing the session so in-flight "
                 "calls report a dead backend instead of hanging",

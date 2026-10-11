@@ -152,11 +152,11 @@ Existing events that will fire naturally:
 │ Agents                    [toolbar] │
 │ ┌─────────────────────────────────┐ │
 │ │ [☑] agent_a     ● idle         │ │
-│ │     claude-code / opus          │ │
+│ │     claude-code-sdk / opus          │ │
 │ │     /path/to/project            │ │
 │ ├─────────────────────────────────┤ │
 │ │ [☐] agent_b     ● running      │ │
-│ │     claude-code / opus          │ │
+│ │     claude-code-sdk / opus          │ │
 │ │     /path/to/other              │ │
 │ ├─────────────────────────────────┤ │
 │ │ [☑] agent_c     ● idle         │ │
@@ -191,7 +191,7 @@ Add stop/restart buttons to the existing agent header:
 ```
 ┌──────────────────────────────────────────────────┐
 │ agent_a                                         │
-│ claude-code / opus  ● idle                       │
+│ claude-code-sdk / opus  ● idle                       │
 │ [📜 Dialog] [⏹ Stop] [🔄 Restart] [⏹ Stop TM]  │
 └──────────────────────────────────────────────────┘
 ```

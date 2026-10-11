@@ -39,7 +39,7 @@ Add two runtime controls for TaskManager in deep_worker_web UI:
 
 - **Thread ID**: `{agent_name}:tm` (e.g. `test_dw:tm`)
 - **Checkpointer**: Same instance as subordinate agent (InMemorySaver or AsyncSqliteSaver)
-- **Database**: `~/.deepagents/sessions.db` (shared with subordinate)
+- **Database**: the subordinate agent's thread database (shared with it)
 - **System prompt**: `TASK_MANAGER_SYSTEM_PROMPT` from `prompts.py`
 
 ### Message Accumulation

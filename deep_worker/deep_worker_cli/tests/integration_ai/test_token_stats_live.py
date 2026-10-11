@@ -7,13 +7,11 @@ These verify FOR REAL (no mocks) the end-to-end statistics-collection path:
      and the invariant ``hit + miss = prompt`` where cache fields are present.
   2. TaskManager (``-tm``): kind="tm" records appear in the SAME file —
      several buckets in one file.
-  3. claude-code: terminal ``ResultMessage.usage`` → record
-     provider="claude-code" (event-driven, branch A).
-  4. codex: ``TurnCompletedEvent.usage`` → record provider="codex".
-  5. grok: per-turn usage from ``session/prompt`` RESULT ``_meta`` → record
+  3. codex: ``TurnCompletedEvent.usage`` → record provider="codex".
+  4. grok: per-turn usage from ``session/prompt`` RESULT ``_meta`` → record
      provider="grok" (tokens, cache hit = cachedReadTokens; live-red-discovery
      0.2.73 — the ACP ``usage_update`` does not actually arrive).
-  6. failover: the agent first runs on claude-code (record in file), then
+  5. failover: the agent first runs on claude-code (record in file), then
      the same agent (same data_dir) is restarted on deepseek — the effect
      of a failover restart → in ONE file records from ≥2 different
      providers. (The auto-failover mechanism itself — a real usage-limit →
@@ -41,9 +39,10 @@ from deep_worker_cli.stats.token_stats import (
     STATUS_OK,
     read_stats_file,
 )
-from deep_worker_cli.storage_paths import deep_worker_home
+from deep_worker_cli.storage_paths import agent_root
 
 from .agent_fixture import agent_fixture as _make_agent
+from .provider_home import provider_login  # noqa: F401 — pytest fixture
 
 pytestmark = pytest.mark.integration
 
@@ -51,7 +50,14 @@ _DEEPSEEK_MODEL = "deepseek-chat"
 
 
 def _stats_path(agent_name: str) -> Path:
-    return deep_worker_home() / agent_name / "token_stats.jsonl"
+    """Resolved the way production resolves it — never hand-assembled.
+
+    The old ``~/.deep_worker/<name>/`` layout moved to
+    ``~/.deep_worker/agents/<name>/`` (see the agent-DB storage layout
+    design, §3) and this helper was left behind, so every test here read an
+    empty directory and reported "the provider wrote nothing".
+    """
+    return agent_root(agent_name, create=False) / "token_stats.jsonl"
 
 
 def _read_records(agent_name: str) -> list[dict]:
@@ -186,48 +192,12 @@ def _claude_available() -> bool:
     return shutil.which("claude") is not None
 
 
-@pytest.fixture
-def claude_code_agent():
-    if not _claude_available():
-        pytest.skip("claude CLI not found; skipping integration test")
-    with _make_agent(
-        agent_name="test_stats_claude",
-        working_dir=Path("/tmp"),
-        provider="claude-code",
-        model=None,
-        skip_permissions=True,
-        api_key=None,
-        enable_task_manager=False,
-    ) as info:
-        yield info
-
-
-@pytest.mark.asyncio
-async def test_claude_code_agent_records_usage(claude_code_agent) -> None:
-    client = AgentClient(claude_code_agent.agent_name)
-    await client.connect()
-    try:
-        status = await _invoke_and_wait_idle(
-            client, "Reply with exactly one word: OK", idle_after=120.0
-        )
-        assert status in ("idle", "ready"), f"agent did not go idle: {status}"
-    finally:
-        await client.disconnect()
-
-    records = _read_records(claude_code_agent.agent_name)
-    assert records, "token_stats.jsonl is empty — claude-code did not record usage"
-    providers = {r["provider"] for r in records}
-    assert "claude-code" in providers, f"no claude-code records: {providers}"
-    ok_records = [r for r in records if r["status"] == STATUS_OK]
-    assert ok_records, "no status=ok record for claude-code"
-
-
 def _codex_available() -> bool:
     return shutil.which("codex") is not None
 
 
 @pytest.fixture
-def codex_agent():
+def codex_agent(provider_login):
     if not _codex_available():
         pytest.skip("codex CLI not found; skipping integration test")
     codex_model = os.getenv("CODEX_MODEL", "gpt-5.5")
@@ -269,7 +239,7 @@ _GROK_ENABLED = os.environ.get("GROK_INTEGRATION_TESTS", "").lower() in (
 
 
 @pytest.fixture
-def grok_agent():
+def grok_agent(provider_login):
     if not _GROK_ENABLED:
         pytest.skip("set GROK_INTEGRATION_TESTS=1 to enable live grok tests")
     if shutil.which("grok") is None:
@@ -323,7 +293,7 @@ def failover_agent():
         pytest.skip("DEEPSEEK_API_KEY not set; skipping integration test")
     # Simulate the effect of a failover restart: ONE agent (same data_dir),
     # but two different providers used sequentially. The real auto-failover
-    # (claude-code usage-limit → _schedule_failover → deep-worker --restart
+    # (usage-limit → _schedule_failover → deep-worker --restart
     # --provider <next>) is covered by test_grok_nested_402_failover_to_deepseek.py;
     # here we verify the token-statistics invariant — the recorder is bound
     # to the agent's data_dir, not to the provider, so after a provider

@@ -9,7 +9,7 @@ drifted apart. The duplicate is what let the stale Claude Code whitelist
 survive in two places at once.
 
 Past incident: ``deep-worker --restart <agent> --model fable`` booted the
-agent on ``sonnet``. The predicate's claude-code
+agent on ``sonnet``. The predicate's claude-code-sdk
 branch only accepted ``sonnet``/``haiku``/``opus``/``inherit`` plus any string
 containing ``claude``, so the documented alias ``fable`` was rejected, the
 model was nulled, and the hardcoded default took over — silently.
@@ -86,12 +86,12 @@ def model_can_belong_to_provider(provider: str | None, model: str | None) -> boo
     provider's own CLI would have accepted.
 
     Rejecting a valid token is the more damaging error — it silently
-    substitutes a different model — so the claude-code branch errs toward
+    substitutes a different model — so the claude-code-sdk branch errs toward
     accepting anything the documented alias table or the ``claude-*``
     namespace covers.
 
     Args:
-        provider: Provider name, e.g. ``"claude-code"``.
+        provider: Provider name, e.g. ``"claude-code-sdk"``.
         model: Model name or alias, e.g. ``"fable"``.
 
     Returns:
@@ -109,7 +109,7 @@ def model_can_belong_to_provider(provider: str | None, model: str | None) -> boo
     if model_name == _POISON_SENTINEL:
         return False
 
-    if provider_name == "claude-code":
+    if provider_name in ("claude-code-sdk", "claude-code"):
         return is_claude_code_model(model_name)
     if provider_name == "anthropic":
         return "claude" in model_name
@@ -122,4 +122,20 @@ def model_can_belong_to_provider(provider: str | None, model: str | None) -> boo
     if provider_name in ("openai", "codex"):
         return not any(marker in model_name for marker in _FOREIGN_MARKERS)
 
-    return False
+    # Config-declared API providers (providers.json). Unknown
+    # to this leaf module by design, so consult the registry lazily. A
+    # provider the operator declared owns whatever model they name for it:
+    # the vendor validates the model, not us. Import is deferred and
+    # failure-tolerant so this module stays dependency-free for the web
+    # layer.
+    return _is_config_provider(provider_name)
+
+
+def _is_config_provider(provider_name: str) -> bool:
+    """True when ``provider_name`` is declared in providers.json."""
+    try:
+        from deep_worker_cli.runtime.provider_registry import load_provider_specs
+
+        return any(spec.name == provider_name for spec in load_provider_specs())
+    except Exception:  # noqa: BLE001 — predicate must never raise
+        return False

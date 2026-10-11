@@ -405,7 +405,7 @@ class TestListAgents:
         (other_dir / "AGENTS.md").touch()
 
         mock_settings = Mock()
-        mock_settings.user_deepagents_dir = agents_dir
+        mock_settings.user_deep_worker_agents_dir = agents_dir
 
         output: list[str] = []
 
@@ -442,7 +442,7 @@ class TestListAgents:
         (custom_dir / "AGENTS.md").touch()
 
         mock_settings = Mock()
-        mock_settings.user_deepagents_dir = agents_dir
+        mock_settings.user_deep_worker_agents_dir = agents_dir
 
         output: list[str] = []
 

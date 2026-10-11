@@ -61,7 +61,7 @@ class A2AEndpoint:
 
 def _ensure_sys_path() -> None:
     """Subprocess-side sys.path bootstrap (mirrors integration_ai fixture)."""
-    # deepworker_a2a -> tests -> deep_worker_cli -> the deep_worker package root
+    # tests/deepworker_a2a/ -> tests/ -> deep_worker_cli/ -> deep_worker/
     here = Path(__file__).resolve()
     deep_worker_cli = str(here.parents[2])
     deep_worker_dir = str(here.parents[3])
@@ -322,7 +322,7 @@ def two_a2a_agents(
     cleaned up, and per-agent data dirs are removed.
     """
     if data_root is None:
-        data_root = Path(f"/tmp/a2a_e2e_{os.getpid()}")
+        data_root = Path(f"/tmp/deepworker_a2a_e2e_{os.getpid()}")
     data_root.mkdir(parents=True, exist_ok=True, mode=0o755)
 
     # Clean any leftover state from a previous run with the same names.

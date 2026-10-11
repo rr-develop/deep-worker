@@ -80,22 +80,25 @@ async def test_service_emits_exactly_one_terminal_event_with_request_id() -> Non
     tasks: list[asyncio.Task[None]] = []
 
     def retain_task(
-        awaitable,
+        make_awaitable,
         *,
         success_callback,
         error_callback,
         **kwargs,
     ) -> None:
+        # Mirrors the real helper: it takes a FACTORY (BACKLOG §12) and calls
+        # it INSIDE the task, so the remote call never runs on the caller's
+        # event loop.
         async def run() -> None:
             try:
-                await success_callback(await awaitable)
+                await success_callback(await make_awaitable())
             except BaseException as exc:
                 await error_callback(exc)
 
         tasks.append(asyncio.create_task(run()))
 
     with patch(
-        "rpyc_async.utils.helpers.fire_and_forget_async",
+        "rpyc_async.utils.helpers.fire_and_forget_call",
         side_effect=retain_task,
     ):
         accepted = await service.summarize_agent("test-agent")
@@ -142,7 +145,7 @@ async def test_service_failure_emits_one_correlated_error(response: str) -> None
         tasks.append(asyncio.create_task(run()))
 
     with patch(
-        "rpyc_async.utils.helpers.fire_and_forget_async",
+        "rpyc_async.utils.helpers.fire_and_forget_call",
         side_effect=retain_task,
     ):
         accepted = await service.summarize_agent("test-agent")
@@ -164,13 +167,14 @@ async def test_service_ignores_adversarial_second_terminal_callback() -> None:
     service._broadcast_message = AsyncMock()
     callbacks = {}
 
-    def capture(awaitable, *, success_callback, error_callback, **kwargs) -> None:
-        awaitable.close()
+    def capture(make_awaitable, *, success_callback, error_callback, **kwargs) -> None:
+        # fire_and_forget_call takes a FACTORY (BACKLOG §12), so there is
+        # no un-awaited coroutine to close: never calling it is enough.
         callbacks["success"] = success_callback
         callbacks["error"] = error_callback
 
     with patch(
-        "rpyc_async.utils.helpers.fire_and_forget_async",
+        "rpyc_async.utils.helpers.fire_and_forget_call",
         side_effect=capture,
     ):
         accepted = await service.summarize_agent("test-agent")
@@ -214,7 +218,7 @@ async def test_service_uses_real_fire_and_forget_strong_ref_owner() -> None:
         for task in faf_helpers._INFLIGHT
         if getattr(task, "get_name", lambda: "")() == "summarize_agent_test-agent"
     ]
-    assert owned, "real fire_and_forget_async must pin the summarize task"
+    assert owned, "real fire_and_forget_call must pin the summarize task"
     release.set()
     await asyncio.wait_for(done.wait(), timeout=2.0)
     service._broadcast_message.assert_awaited_once()

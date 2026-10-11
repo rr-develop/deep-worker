@@ -66,7 +66,7 @@ Defence in depth, on the `ClientManager` side:
 `ProxyMCPServer.tool_names` against the incoming `tools_metadata`. On
 mismatch it disconnects the stale client and creates a fresh one with
 the new inventory. See
-`claude_code_provider/client_manager.py::_cache_entry_matches_tools` /
+`claude_code_sdk_provider/client_manager.py::_cache_entry_matches_tools` /
 `_drop_stale_cache_entry`.
 
 ## Why not just "wait longer"

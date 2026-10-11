@@ -236,7 +236,7 @@ even for future mismatches we haven't tabulated yet.
   Verified: no production caller today (only unit-tests reference
   it). It stays as a public API for future use; cleanup is a
   separate scope item.
-- claude-code / codex provider changes — no evidence they emit
+- claude-code-sdk / codex provider changes — no evidence they emit
   wrong-shape tool args (`target_file` did not appear in their
   `[TOOL_ERROR]` lines; their errors were genuine `execute`
   timeouts/backend errors that A already handles correctly).

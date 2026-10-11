@@ -106,7 +106,7 @@ class CodexClientState:
     def forget(self, agent_thread_id: str) -> None:
         """Remove a slot entirely. Intended for tests and explicit
         cleanup (no production caller in current code; matches
-        ``claude_code_provider.client_manager.cleanup_client``)."""
+        ``claude_code_sdk_provider.client_manager.cleanup_client``)."""
         self._states.pop(agent_thread_id, None)
 
 

@@ -7,11 +7,31 @@ TDD: Verifies that:
 """
 
 import json
+from datetime import datetime, timezone
 
 import pytest
 from unittest.mock import AsyncMock, Mock
 
 from deep_worker_cli.rpyc_service.agent_service import AgentService
+
+
+def _session_manager(status_value: str) -> Mock:
+    """A session_manager whose serialized fields are REAL values.
+
+    ``exposed_get_status`` JSON-encodes ``last_activity.isoformat()``,
+    ``message_count`` and ``tasks_completed``. Left as bare ``Mock``s these are
+    not JSON-serializable, so ``json.dumps`` raises and the method returns
+    ``success: False`` — the assertions below would then fail for a reason that
+    has nothing to do with the task_manager fields under test.
+    """
+    session_manager = Mock()
+    session_manager.status = Mock()
+    session_manager.status.value = status_value
+    session_manager.error_message = None
+    session_manager.last_activity = datetime(2026, 10, 7, 12, 0, tzinfo=timezone.utc)
+    session_manager.message_count = 7
+    session_manager.tasks_completed = 3
+    return session_manager
 
 
 class TestGetStatusTaskManagerActive:
@@ -22,10 +42,7 @@ class TestGetStatusTaskManagerActive:
         """When TaskManager is active, status includes task_manager_active=True."""
         service = AgentService()
         mock_agent = Mock()
-        mock_agent.session_manager = Mock()
-        mock_agent.session_manager.status = Mock()
-        mock_agent.session_manager.status.value = "RUNNING"
-        mock_agent.session_manager.error_message = None
+        mock_agent.session_manager = _session_manager("RUNNING")
 
         # TaskManager configured and active (evaluating a task)
         mock_agent.task_manager = Mock()
@@ -45,10 +62,7 @@ class TestGetStatusTaskManagerActive:
         """When TaskManager is configured but not running, task_manager_active=False."""
         service = AgentService()
         mock_agent = Mock()
-        mock_agent.session_manager = Mock()
-        mock_agent.session_manager.status = Mock()
-        mock_agent.session_manager.status.value = "IDLE"
-        mock_agent.session_manager.error_message = None
+        mock_agent.session_manager = _session_manager("IDLE")
 
         mock_agent.task_manager = Mock()
         mock_agent.task_manager.state = "inactive"
@@ -67,10 +81,7 @@ class TestGetStatusTaskManagerActive:
         """When TaskManager is not configured, field should be absent."""
         service = AgentService()
         mock_agent = Mock()
-        mock_agent.session_manager = Mock()
-        mock_agent.session_manager.status = Mock()
-        mock_agent.session_manager.status.value = "IDLE"
-        mock_agent.session_manager.error_message = None
+        mock_agent.session_manager = _session_manager("IDLE")
 
         mock_agent.task_manager = None
 

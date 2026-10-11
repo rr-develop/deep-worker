@@ -23,7 +23,7 @@ deep-worker --restart myagent --model sonnet
 deep-worker --restart myagent --clean
 
 # Restart with a different working directory
-deep-worker --restart myagent --dir /path/to/other-project
+deep-worker --restart myagent --dir /path/to/project
 ```
 
 ## Behavior
@@ -40,7 +40,7 @@ The following fields are restored from `launch_config`:
 
 | Field | Restored as | Notes |
 |-------|-------------|-------|
-| `provider` | `--provider` | e.g. `claude-code`, `deepseek` |
+| `provider` | `--provider` | e.g. `claude-code-sdk`, `deepseek` |
 | `model` | `--model` | e.g. `opus`, `deepseek-chat` |
 | `working_dir` | `--dir` | Absolute path |
 | `skip_permissions` | `-sp` | Boolean flag |
@@ -61,7 +61,7 @@ Any CLI flag explicitly provided alongside `--restart` **overrides** the
 corresponding saved value:
 
 ```bash
-# Saved: --provider claude-code --model opus -sp -tm --dir /path/to/project
+# Saved: --provider claude-code-sdk --model opus -sp -tm --dir /path/to/project
 # Effective: --provider deepseek --model opus -sp -tm --dir /path/to/project
 deep-worker --restart myagent --provider deepseek
 ```
@@ -277,7 +277,7 @@ Error: Agent name is required with --restart
 User: deep-worker --restart myagent --model sonnet
 
   ┌─ Read ~/.deep_worker/myagent/session_metadata.json
-  │   └─ launch_config: {provider: claude-code, model: opus, dir: /path/to/project, ...}
+  │   └─ launch_config: {provider: claude-code-sdk, model: opus, dir: /path/to/project, ...}
   │
   ├─ Check ProcessRegistry
   │   └─ myagent is running (PID 12345)
@@ -289,9 +289,9 @@ User: deep-worker --restart myagent --model sonnet
   ├─ Merge: saved {model: opus} + CLI {model: sonnet} → effective {model: sonnet}
   │
   ├─ Build launch_config from effective params
-  │   └─ {provider: claude-code, model: sonnet, dir: /path/to/project, clean: false, ...}
+  │   └─ {provider: claude-code-sdk, model: sonnet, dir: /path/to/project, clean: false, ...}
   │
-  ├─ Build AgentConfig(provider=claude-code, model=sonnet, working_dir=/path/to/project)
+  ├─ Build AgentConfig(provider=claude-code-sdk, model=sonnet, working_dir=/path/to/project)
   │
   └─ AgentProcess(name=myagent, config=..., launch_config=...).start()
       └─ SessionManager writes new launch_config to session_metadata.json
@@ -329,7 +329,7 @@ python3 -m pytest tests/unit_tests/cli/test_restart_option.py -v
 ### Live verification
 
 Tested with `test_restart_verify` agent:
-1. Start: `deep-worker test_restart_verify -sp --dir /path/to/project --provider claude-code --model opus --memory-only`
+1. Start: `deep-worker test_restart_verify -sp --dir /path/to/project --provider claude-code-sdk --model opus --memory-only`
 2. Kill, then restart: `deep-worker --restart test_restart_verify` → restored all params
 3. Restart with override: `deep-worker --restart test_restart_verify --model sonnet` → model changed, rest preserved
 4. Error case: `deep-worker --restart test_nonexistent_agent_xyz` → clear error in terminal

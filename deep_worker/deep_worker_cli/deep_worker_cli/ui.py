@@ -325,7 +325,7 @@ def show_list_help() -> None:
     console.print("  deepagents list")
     console.print()
     console.print(
-        "List all agents found in ~/.deepagents/. Each agent has its own",
+        "List all agents found in ~/.deep_worker/agents/. Each agent has its own",
     )
     console.print(
         "AGENTS.md system prompt and separate thread history.",
@@ -385,9 +385,9 @@ def show_skills_help() -> None:
         "[dim]Skills are loaded from these directories "
         "(highest precedence first):\n"
         "  1. .agents/skills/                 project skills\n"
-        "  2. .deepagents/skills/             project skills (alias)\n"
+        "  2. .deep_worker/skills/            project skills (alias)\n"
         "  3. ~/.agents/skills/               user skills\n"
-        "  4. ~/.deepagents/<agent>/skills/   user skills (alias)\n"
+        "  4. ~/.deep_worker/agents/<agent>/skills/  user skills (alias)\n"
         "  5. <package>/built_in_skills/      built-in skills[/dim]",
         style=COLORS["dim"],
     )

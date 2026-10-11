@@ -1,6 +1,6 @@
 {
   "include": [
-    "claude_code_provider",
+    "claude_code_sdk_provider",
     "codex_provider",
     "grok_provider"
   ],

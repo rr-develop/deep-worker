@@ -13,6 +13,7 @@ skip = .git,*.pdf,*.svg,*.lock,*.json,*_pb2.py,*_pb2_grpc.py,*.gradle,node_modul
 #   re-uses, re-used, re-declaring, re-declared - inflections of the same
 #                  deliberate hyphenated forms (re-use / re-declare)
 #   pre-pends, pre-empts - likewise hyphenated
+#   pre-empt        - singular of pre-empts (deliberate hyphen)
 #
 # Proper nouns / third-party API names:
 #   iterm         - Apple's iTerm.app, matched via TERM_PROGRAM
@@ -28,4 +29,4 @@ skip = .git,*.pdf,*.svg,*.lock,*.json,*_pb2.py,*_pb2_grpc.py,*.gradle,node_modul
 #
 # Vendored upstream text we do not edit:
 #   auxilary      - Anthropic's skill-creator SKILL.md, shipped as an example
-ignore-words-list = unparseable,overrideable,re-use,re-uses,re-used,re-declaring,re-declared,pre-pends,pre-empts,iterm,uptodate,pyton,hel,te,caf,nd,auxilary
+ignore-words-list = unparseable,overrideable,re-use,re-uses,re-used,re-declaring,re-declared,pre-pends,pre-empts,pre-empt,iterm,uptodate,pyton,hel,te,caf,nd,auxilary

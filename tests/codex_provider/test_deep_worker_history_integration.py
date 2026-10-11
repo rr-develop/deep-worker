@@ -23,7 +23,7 @@ from deep_worker_cli.storage_paths import deep_worker_home
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("CODEX_INTEGRATION_TESTS") != "1",
-    reason="set CODEX_INTEGRATION_TESTS=1 to run live Codex integration tests",
+    reason="set CODEX_INTEGRATION_TESTS=1 to run live Codex/deep-worker tests",
 )
 
 
@@ -62,9 +62,7 @@ def _run(
 
 def _cleanup_agent_files(agent_name: str) -> None:
     shutil.rmtree(deep_worker_home() / agent_name, ignore_errors=True)
-    db_path = Path.home() / ".deepagents" / f"sessions_{agent_name}.db"
-    with contextlib.suppress(FileNotFoundError):
-        db_path.unlink()
+    shutil.rmtree(deep_worker_home() / "agents" / agent_name, ignore_errors=True)
 
 
 def _cleanup_codex_mcp_for_agent(agent_name: str, env: dict[str, str]) -> None:
@@ -94,7 +92,7 @@ def _wait_registered(agent_name: str, env: dict[str, str], timeout: float = 60.0
     )
 
 
-def test_dw_codex_history_contains_proxy_tool_call(tmp_path: Path) -> None:
+def test_deep_worker_codex_history_contains_proxy_tool_call(tmp_path: Path) -> None:
     agent_name = f"test_codex_history_{uuid.uuid4().hex[:10]}"
     env = _env()
     secret = f"DW_CODEX_HISTORY_SECRET_{uuid.uuid4().hex}"

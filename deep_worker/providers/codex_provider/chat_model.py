@@ -1,7 +1,7 @@
 """CodexChatModel — LangChain BaseChatModel that drives Codex CLI.
 
 This module is the public surface of the Codex provider. Same shape as
-``claude_code_provider/chat_model.py:ClaudeCodeChatModel`` — only
+``claude_code_sdk_provider/chat_model.py:ClaudeCodeChatModel`` — only
 ``ainvoke`` is real; ``_generate`` raises (async-only); LangChain
 streaming methods are not implemented.
 
@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from types import TracebackType
 from typing import Any, Awaitable, Callable, Sequence
@@ -124,6 +125,10 @@ DEFAULT_CONFIG_OVERRIDES: tuple[tuple[str, str], ...] = (
 
 _logger = logging.getLogger(__name__)
 
+# Native item types already reported as unknown, so the "new codex tool"
+# notice is logged ONCE per type per process instead of once per call.
+_SEEN_UNKNOWN_NATIVE_TYPES: set[str] = set()
+
 
 # NOTE: The legacy ``BLOCKED_NATIVE_ITEM_TYPES`` / ``_raise_if_blocked_
 # native_item`` defense-in-depth scheme was removed on 2026-05-18. It
@@ -137,9 +142,134 @@ _logger = logging.getLogger(__name__)
 # machinery. See ``docs/DESIGN_NATIVE_TOOL_PASSTHROUGH.md``.
 
 
+def _stamp_provider_context(
+    message: AIMessage, used: Any, messages: list[Any] | None = None
+) -> AIMessage:
+    """Stamp the PROVIDER's own context reading onto the outgoing message.
+
+    The guard and the summarizer decide on this number and on nothing else
+    (owner directive 2026-08-25: provider data only, no estimates, no
+    unapproved fallback). A provider that returns an unstamped message
+    leaves them with UNKNOWN — honest, but unguarded. Best effort: a stamp
+    must never break a turn.
+    """
+    try:
+        if isinstance(used, bool) or not isinstance(used, int) or used <= 0:
+            return message
+        from deep_worker_cli.context_limit.observed_context import (  # noqa: PLC0415
+            annotate_context_observation,
+            first_state_message_id,
+        )
+
+        annotate_context_observation(
+            message,
+            used=used,
+            size=None,
+            first_id=first_state_message_id(messages or []),
+        )
+    except Exception:  # noqa: BLE001 — never break a turn over a stamp
+        pass
+    return message
+
+
 def _get_codex_home() -> Path:
     raw = os.environ.get("CODEX_HOME")
     return Path(raw).expanduser() if raw else Path.home() / ".codex"
+
+
+def _parse_rollout_ts(raw: Any) -> "datetime | None":
+    """Parse a rollout ``timestamp`` into an aware datetime, or ``None``."""
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def last_token_usage_from_rollout(
+    session_uuid: str,
+    emit_ts: str,
+    *,
+    codex_home: Path | None = None,
+) -> dict[str, Any] | None:
+    """This turn's OWN token usage, read from the Codex rollout (§2.1-ter E).
+
+    ``turn.completed.usage`` carries the *process* TOTAL whenever one
+    ``codex exec`` spans several model calls, which inflated a live record
+    to ``prompt=3736695`` against an actual spend of ``113457`` (32.9x).
+    The per-turn datum exists in the rollout as
+    ``token_count.info.last_token_usage``.
+
+    Correlation is on the ``task_complete`` boundary, NOT on recency: the
+    rollout is append-only for the whole session across many exec
+    processes, so "the latest ``token_count``" belongs to a *later* turn
+    (live: ``114460`` instead of ``113457`` — wrong by a small, plausible
+    margin that passes every magnitude rail). We take the last
+    ``task_complete`` at-or-before ``emit_ts`` and return the
+    ``token_count`` immediately preceding it.
+
+    FAIL-CLOSED (mandatory floor): returns ``None`` — never the TOTAL blob
+    — when the file is missing/unreadable, or no ``task_complete`` at or
+    before ``emit_ts`` exists (e.g. ``--ephemeral``, a pruned session, or a
+    turn still in flight). Callers must record ``no_usage`` instead of
+    falling back to ``turn.completed.usage``.
+    """
+    if not session_uuid:
+        return None
+    emit_dt = _parse_rollout_ts(emit_ts)
+    if emit_dt is None:
+        return None
+
+    sessions_dir = (codex_home or _get_codex_home()) / "sessions"
+    if not sessions_dir.exists():
+        return None
+    try:
+        # Glob by uuid — the path is date-sharded and a turn can cross
+        # midnight, so today's date must never be constructed.
+        candidates = sorted(
+            sessions_dir.rglob(f"*{session_uuid}.jsonl"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:
+        return None
+
+    for candidate in candidates:
+        pending: dict[str, Any] | None = None
+        found: dict[str, Any] | None = None
+        try:
+            with candidate.open(encoding="utf-8") as handle:
+                for line in handle:
+                    try:
+                        entry = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    payload = entry.get("payload")
+                    if not isinstance(payload, dict):
+                        continue
+                    kind = payload.get("type")
+                    if kind == "token_count":
+                        info = payload.get("info")
+                        if isinstance(info, dict):
+                            last = info.get("last_token_usage")
+                            if isinstance(last, dict):
+                                pending = last
+                        continue
+                    if kind != "task_complete":
+                        continue
+                    ts = _parse_rollout_ts(entry.get("timestamp"))
+                    if ts is None or ts > emit_dt:
+                        # A terminal after our emit belongs to a later turn.
+                        continue
+                    if pending is not None:
+                        found = pending
+                    pending = None
+        except OSError:
+            continue
+        if found is not None:
+            return dict(found)
+    return None
 
 
 def resolve_model_from_session_log(
@@ -195,6 +325,18 @@ Deep-worker tool contract:
 - For web search / fetch use deep-worker's `web_search_delegation_tool`
   / `fetch_url` — NEVER Codex's native `web_search`. Deep-worker has
   disabled it for this session.
+- **CRITICAL — inter-agent messaging (`mcp__deepworker_*__send_message_to_agent`).**
+  When you see an incoming user-role message whose content starts with
+  `<sender-name> -> <your-name> :> …`, it was sent by another deep-worker
+  agent, NOT by the human user. You MUST reply using
+  `mcp__deepworker_*__send_message_to_agent(<sender-name>, <your reply>)` —
+  NOT a free-text turn. This is the ONLY way to respond to a peer.
+  A free-text reply is delivered to the human user as if it were your
+  turn, silently breaking the peer conversation. The fire-and-forget
+  semantics mean a successful call IS your final response for this turn —
+  do not add preamble or trailing narration. The peer message may
+  surface as a user-role block prefixed with `System:>` (or similar);
+  the required action is invariant regardless of the transport detail.
 """
 
 
@@ -207,7 +349,7 @@ class CodexChatModel(BaseChatModel):
     tools).
     """
 
-    # Pydantic config identical to claude-code:
+    # Pydantic config identical to claude-code-sdk:
     # - arbitrary_types_allowed for non-Pydantic privates
     # - extra='allow' so LangChain can pass through model/max_tokens/etc.
     model_config = ConfigDict(arbitrary_types_allowed=True, extra="allow")
@@ -230,10 +372,13 @@ class CodexChatModel(BaseChatModel):
     )
     _sandbox_mode: str = PrivateAttr(default="workspace-write")
     _approval_policy: str = PrivateAttr(default="never")
+    # deep-worker's ``-sp``; fail-closed default, same as every other
+    # provider (owner directive 2026-08-25 on a single permission policy).
+    _auto_approve: bool = PrivateAttr(default=False)
     _proxy_started: bool = PrivateAttr(default=False)
 
     # ------------------------------------------------------------------
-    # Pydantic schema overrides — same surgery as claude_code_provider:
+    # Pydantic schema overrides — same surgery as claude_code_sdk_provider:
     # LangGraph pickles models during checkpointing, and BaseChatModel
     # carries callable fields that can't be JSON-serialised. Strip them.
     # ------------------------------------------------------------------
@@ -274,6 +419,7 @@ class CodexChatModel(BaseChatModel):
         max_tokens: int | None = None,
         sandbox_mode: str = "workspace-write",
         approval_policy: str = "never",
+        auto_approve: bool = False,
         disabled_features: Sequence[str] | None = None,
         config_overrides: Sequence[tuple[str, str]] | None = None,
         **kwargs: Any,
@@ -290,6 +436,7 @@ class CodexChatModel(BaseChatModel):
         self._resolved_model_name = model
         self._sandbox_mode = sandbox_mode
         self._approval_policy = approval_policy
+        self._auto_approve = auto_approve
         if disabled_features is not None:
             self._disabled_features = tuple(disabled_features)
         if config_overrides is not None:
@@ -337,6 +484,8 @@ class CodexChatModel(BaseChatModel):
         usage: dict[str, Any] | None = None,
         session_id: str | None = None,
         turn_id: str | None = None,
+        context_used: int | None = None,
+        context_size: int | None = None,
     ) -> None:
         """Report a terminal Codex event to the stats callback (§5.2).
 
@@ -349,6 +498,17 @@ class CodexChatModel(BaseChatModel):
         if cb is None:
             return
         try:
+            if usage is not None:
+                # The handed-over ``turn.completed.usage`` is the exec
+                # process TOTAL, not this turn's spend (§2.1-ter). Override
+                # it with the rollout's ``last_token_usage``; fail CLOSED to
+                # ``no_usage`` rather than persist the inflated blob.
+                emit_ts = (
+                    datetime.now(timezone.utc)
+                    .isoformat(timespec="milliseconds")
+                    .replace("+00:00", "Z")
+                )
+                usage = last_token_usage_from_rollout(session_id or "", emit_ts)
             if isinstance(usage, dict):
                 usage = dict(usage)
             await cb(
@@ -358,11 +518,153 @@ class CodexChatModel(BaseChatModel):
                 model=getattr(self, "_resolved_model_name", None) or "",
                 session_id=session_id,
                 turn_id=turn_id,
+                context_used=context_used,
+                context_size=context_size,
             )
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 — best-effort
             _logger.exception("[token-stats] codex usage event callback failed")
+
+    # ------------------------------------------------------------------
+    # Live context gauge (mid-turn)
+    # ------------------------------------------------------------------
+    async def _emit_context_snapshot(
+        self, used: int, total: int | None, *, session_id: str | None
+    ) -> None:
+        """Record one mid-turn context reading.
+
+        ``turn_id=None`` is REQUIRED, not incidental: codex records are
+        de-duplicated on ``session_id|turn_id``
+        (token_stats.UsageEventCallback._event_key), so reusing the turn id
+        would make every reading after the first vanish as a duplicate —
+        exactly the frozen gauge this exists to fix. ``total`` is carried
+        for the record only; it is the cumulative spend across model calls
+        and must never be presented as a context size.
+        """
+        _ = total
+        await self._emit_usage_event(
+            event="terminal",
+            status="ok",
+            usage=None,
+            session_id=session_id,
+            turn_id=None,
+            context_used=used,
+        )
+
+    async def _start_context_watch(self, state: Any) -> None:
+        """Watch this session's rollout so the gauge moves per model call.
+
+        No-op (silently) when the session id is not known yet, when the
+        rollout is absent (``--ephemeral``, pruned sessions), or when the
+        watcher cannot start: the turn is never affected by telemetry.
+        """
+        try:
+            session_uuid = getattr(state, "codex_session_uuid", None)
+            if not session_uuid:
+                return
+            existing = getattr(state, "context_watcher", None)
+            if existing is not None:
+                return
+            from .context_watch import (  # noqa: PLC0415 — keep import cost off the hot path
+                RolloutContextWatcher,
+                rollout_path_for,
+            )
+
+            path = rollout_path_for(str(session_uuid), _get_codex_home())
+            if path is None:
+                return
+
+            async def _on_context(used: int, total: int | None) -> None:
+                # Keep the latest reading so the turn's AIMessage carries it:
+                # the guard and the summarizer read that stamp, never an
+                # estimate.
+                state.last_provider_context = used
+                await self._emit_context_snapshot(
+                    used, total, session_id=str(session_uuid)
+                )
+
+            watcher = RolloutContextWatcher(path=path, on_context=_on_context)
+            await watcher.start()
+            state.context_watcher = watcher
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — best-effort telemetry
+            _logger.debug(
+                "codex_provider: live context watch unavailable", exc_info=True
+            )
+
+    async def _stop_context_watch(self, state: Any) -> None:
+        """Release the watcher and its inotify handle. Idempotent."""
+        watcher = getattr(state, "context_watcher", None)
+        if watcher is None:
+            return
+        state.context_watcher = None
+        try:
+            await watcher.stop()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            _logger.debug(
+                "codex_provider: context watcher stop failed", exc_info=True
+            )
+
+    # ------------------------------------------------------------------
+    # Native tool mapping
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _native_tool_call_for(
+        *, item_id: str, item_type: str, args: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Map a codex ``GenericItem`` to a LangGraph tool_call, or ``None``
+        when the item is purely informational.
+
+        A type we know keeps its own name (there is a bound tool for it). A
+        type we do NOT know is recorded through the generic recorder with
+        its real type preserved in the args — codex ships tools faster than
+        this package is updated, and the alternative (the previous
+        behaviour) was to drop the call silently, leaving history claiming
+        the agent never did the work.
+
+        The first sighting of each unknown type is logged at INFO: new
+        native tooling is expected traffic, not an alarm, but it must be
+        visible — see docs/BACKLOG.md and the 2026-08-25 owner directive.
+        """
+        from .event_pump import (  # noqa: PLC0415 — avoid import cycle
+            NATIVE_TOOL_ITEM_TYPES,
+            is_recordable_tool_item,
+        )
+        from .native_tools import (  # noqa: PLC0415
+            GENERIC_NATIVE_TOOL_NAME,
+            ORIGINAL_TYPE_ARG_KEY,
+        )
+
+        if not is_recordable_tool_item(item_type):
+            return None
+        if item_type in NATIVE_TOOL_ITEM_TYPES:
+            return {
+                "id": item_id,
+                "name": item_type,
+                "args": args,
+                "type": "tool_call",
+            }
+        if item_type not in _SEEN_UNKNOWN_NATIVE_TYPES:
+            _SEEN_UNKNOWN_NATIVE_TYPES.add(item_type)
+            _logger.info(
+                "codex_provider: native tool %r is not known to this "
+                "provider version — recording it via %r so it stays in "
+                "history. Add it to NATIVE_TOOL_ITEM_TYPES for a first-class "
+                "entry, or to INFORMATIONAL_ITEM_TYPES if it should be "
+                "ignored.",
+                item_type,
+                GENERIC_NATIVE_TOOL_NAME,
+            )
+        return {
+            "id": item_id,
+            "name": GENERIC_NATIVE_TOOL_NAME,
+            "args": {**args, ORIGINAL_TYPE_ARG_KEY: item_type},
+            "type": "tool_call",
+        }
 
     # ------------------------------------------------------------------
     # Tools
@@ -375,7 +677,7 @@ class CodexChatModel(BaseChatModel):
         """Extract MCP-compatible metadata from LangChain tools and bind it.
 
         Returns self with the metadata populated (LangChain pattern
-        allows returning self or a clone; claude-code returns a clone,
+        allows returning self or a clone; claude-code-sdk returns a clone,
         we return self to avoid duplicating the proxy MCP server).
         The proxy MCP server is materialised lazily on first ainvoke
         so that bind_tools stays side-effect free.
@@ -397,7 +699,7 @@ class CodexChatModel(BaseChatModel):
 
     @staticmethod
     def _extract_tool_schema(tool: BaseTool) -> dict[str, Any]:
-        """Same algorithm as claude_code_provider.chat_model.bind_tools."""
+        """Same algorithm as claude_code_sdk_provider.chat_model.bind_tools."""
         schema: dict[str, Any] = {}
         if tool.args_schema:
             try:
@@ -458,6 +760,157 @@ class CodexChatModel(BaseChatModel):
         return schema
 
     # ------------------------------------------------------------------
+    # SummarizerPort (deep_worker_cli.context_limit.summarizer_port).
+    #
+    # ``codex`` is in ``SESSION_STATEFUL_PROVIDERS``: Codex owns the
+    # transcript (``CODEX_HOME/sessions/<uuid>.jsonl``) and we send only
+    # ``messages[sent_count:]`` each turn. The middleware therefore REFUSES
+    # the generic identical-prefix fallback for this provider — re-invoking
+    # the agent thread would replay the whole history into a fresh Codex
+    # session, the exact dump the port exists to avoid.
+    #
+    # Until this port existed that refusal made EVERY summarization on codex
+    # deterministically fatal: rg1_worker died with
+    # ``SummarizationFailedError: summarization port unavailable on a
+    # session-stateful provider (CodexChatModel)`` on 2026-08-23, and — being
+    # past its context limit — re-died on each following turn.
+    #
+    #   hot  — resume the live rollout in a SEPARATE, throwaway ``codex exec``
+    #          and send only the instruction. Codex reloads its own transcript
+    #          from disk, so the history is never re-sent by us and never
+    #          re-tokenized on the wire.
+    #   cold — no resume: a fresh one-shot ``codex exec`` carrying the
+    #          instruction plus the already-trimmed message dump.
+    #   both — NEVER touch the agent's live session. The summary turn takes no
+    #          tools and no proxy MCP server, and its own session uuid is
+    #          discarded, so it cannot perturb ``sent_count`` or the rollout
+    #          the next real turn resumes.
+    #
+    # Note on ``codex app-server``: its ``thread/compact/start`` would let
+    # Codex compact its own context server-side, and ``thread/fork`` with
+    # ``ephemeral: true`` would give an even cheaper cold path. That is the
+    # better long-term transport, but this provider drives ``codex exec``, and
+    # the port is implemented on the transport we actually run.
+    # ------------------------------------------------------------------
+
+    async def _arun_summary_turn(
+        self, instruction: str, resume_uuid: str | None
+    ) -> tuple[str, dict[str, Any] | None]:
+        """Run ONE isolated ``codex exec`` and return ``(text, usage)``.
+
+        Deliberately spawns its own handle rather than reusing
+        ``_spawn_turn``: that method records the handle on
+        ``state.current_exec`` and passes the proxy MCP server, both of which
+        would entangle the summary with the agent's live turn.
+        """
+        args = ExecArgs(
+            prompt=instruction,
+            session_uuid=resume_uuid,
+            working_directory=self._working_dir,
+            sandbox_mode=self._sandbox_mode,
+            approval_policy=self._approval_policy,
+            # getattr, not attribute access: a half-constructed model
+            # (``__new__`` without ``__init__`` — the shape several
+            # unit tests build) must fall back to the SAFE value, never
+            # silently inherit bypass.
+            auto_approve=getattr(self, "_auto_approve", False),
+            model=self._model_name,
+            disabled_features=self._disabled_features,
+            config_overrides=self._config_overrides,
+            # No mcp_server_name/port: the summary turn must not be able to
+            # call deep-worker tools.
+        )
+        handle = await self._exec_runner.spawn(args)
+        text = ""
+        usage: dict[str, Any] | None = None
+        try:
+            while True:
+                event = await handle.ainvoke_queue.get()
+                if isinstance(event, ItemCompletedEvent):
+                    if isinstance(event.item, AgentMessageItem):
+                        text = event.item.text
+                elif isinstance(event, TurnCompletedEvent):
+                    usage = event.usage
+                    break
+                elif isinstance(event, TurnFailedEvent):
+                    raise RuntimeError(
+                        f"codex summary turn failed: {event.error_message}"
+                    )
+        finally:
+            with _suppress_errors():
+                await handle.aclose()
+        return text.strip(), usage
+
+    async def asummarize(
+        self,
+        *,
+        thread_id: str,
+        messages: list[Any],
+        instruction: str,
+        decision: Any,
+    ) -> Any:
+        """SummarizerPort: hot rollout-resume or cold one-shot session.
+
+        Raises on failure and on an empty summary — never returns an error
+        string. The caller is about to delete the history this summary
+        replaces, so a soft failure would destroy the conversation silently
+        (POLICIES §12).
+        """
+        from deep_worker_cli.context_limit.hot_cache import (  # noqa: PLC0415
+            SummaryResult,
+        )
+
+        hot = bool(getattr(decision, "hot", False))
+        resume_uuid: str | None = None
+        if hot:
+            state = self._client_state.get_or_create(thread_id)
+            resume_uuid = getattr(state, "codex_session_uuid", None)
+            if not resume_uuid:
+                # Nothing to resume — the caller's "hot" belief is stale
+                # (fresh process, or the session was already reset). Fall back
+                # to cold rather than silently summarizing an empty session.
+                hot = False
+
+        if hot:
+            prompt = instruction
+        else:
+            from deepagents.middleware.message_timestamps import (  # noqa: PLC0415
+                MonotonicUtcClock,
+                format_messages_with_timestamps,
+            )
+
+            dump = format_messages_with_timestamps(
+                list(messages), MonotonicUtcClock()
+            )
+            prompt = f"{instruction}\n\n{dump}"
+
+        text, usage = await self._arun_summary_turn(prompt, resume_uuid)
+        if not text:
+            raise RuntimeError(
+                "codex summarization returned an empty summary "
+                f"(path={'hot' if hot else 'cold'}, thread={thread_id!r})"
+            )
+        return SummaryResult(
+            text=text,
+            path="hot" if hot else "cold",
+            provider_session_id=resume_uuid,
+            usage=usage,
+        )
+
+    async def areset_after_summary(self, *, thread_id: str) -> None:
+        """SummarizerPort: drop the pre-summary Codex session for ``thread_id``.
+
+        ``record_summarization`` clears ``codex_session_uuid``, zeroes
+        ``sent_count`` and persists both, so the next turn starts a fresh
+        rollout and mirrors the new summary-shaped history from index 0. The
+        persist matters: without it a ``--restart`` immediately after a
+        summarization would reload the stale pre-summary uuid.
+
+        Idempotent — it creates an empty slot when none exists.
+        """
+        self._client_state.record_summarization(thread_id)
+
+    # ------------------------------------------------------------------
     # Async-only — _generate raises, _agenerate not provided, ainvoke is real.
     # ------------------------------------------------------------------
     def _generate(self, *args: Any, **kwargs: Any) -> ChatResult:
@@ -509,6 +962,8 @@ class CodexChatModel(BaseChatModel):
 
         # 3. Per-agent_thread_id state
         state = self._client_state.get_or_create(agent_thread_id)
+        # Bind context stamps to the history they measure (first_id).
+        state.last_request_messages = list(messages)
 
         # 4. Summarization detection — drop Codex session, keep agent_thread_id.
         if state.sent_count > len(messages):
@@ -578,7 +1033,7 @@ class CodexChatModel(BaseChatModel):
                 # forwarded via base-instructions, not as a user message
                 pass
 
-        # 8. Update sent_count BEFORE awaiting response (mirror claude-code)
+        # 8. Update sent_count BEFORE awaiting response (mirror claude-code-sdk)
         # and PERSIST it so a restart resumes from the right cursor instead
         # of replaying the whole history into an empty session.
         # See docs/DESIGN_HISTORY_RESTORE_ON_RESTART.md §3.3.
@@ -616,7 +1071,7 @@ class CodexChatModel(BaseChatModel):
         # Resume fallback (DESIGN §6.1): we are about to spawn with whatever
         # ``codex_session_uuid`` is cached. If that uuid points at a stale /
         # missing Codex session (e.g. CODEX_HOME wiped, session pruned),
-        # ``codex exec resume <uuid>`` fails — but, unlike claude-code's
+        # ``codex exec resume <uuid>`` fails — but, unlike claude-code-sdk's
         # synchronous ``connect()``, the failure surfaces ASYNCHRONOUSLY in
         # ``_consume_turn`` as a TurnFailedEvent / END_OF_STREAM pump_error.
         # When we attempted a resume and it failed, fall back ONCE to a fresh
@@ -685,6 +1140,11 @@ class CodexChatModel(BaseChatModel):
             working_directory=self._working_dir,
             sandbox_mode=self._sandbox_mode,
             approval_policy=self._approval_policy,
+            # getattr, not attribute access: a half-constructed model
+            # (``__new__`` without ``__init__`` — the shape several
+            # unit tests build) must fall back to the SAFE value, never
+            # silently inherit bypass.
+            auto_approve=getattr(self, "_auto_approve", False),
             model=self._model_name,
             base_instructions=_augment_base_instructions(system_prompt),
             disabled_features=self._disabled_features,
@@ -729,10 +1189,21 @@ class CodexChatModel(BaseChatModel):
         # dependency between chat_model and event_pump.
         from .event_pump import (
             END_OF_STREAM,
-            NATIVE_TOOL_ITEM_TYPES,
             native_args,
         )
 
+        # Live context gauge. TWO call sites, deliberately: a RESUMED
+        # session already knows its uuid and need not emit ``thread.started``
+        # at all, so hanging the start on that event alone left every
+        # resumed turn — i.e. nearly every turn of a working agent —
+        # without a gauge. ``_start_context_watch`` is idempotent, so the
+        # pair is safe; the other site covers a fresh session, whose uuid
+        # only exists once codex announces it.
+        await self._start_context_watch(state)
+
+        messages_for_stamp = list(
+            getattr(state, "last_request_messages", None) or []
+        )
         final_text = ""
         pending_tool_calls: list[dict[str, Any]] = []
         turn_done = False
@@ -742,6 +1213,17 @@ class CodexChatModel(BaseChatModel):
         try:
             while True:
                 event = await handle.ainvoke_queue.get()
+                # Live gauge, THIRD attempt site — and the one that actually
+                # lands. Codex creates the rollout a beat AFTER announcing
+                # ``thread.started``, so the two sites above routinely probe
+                # a file that does not exist yet, resolve None and return
+                # silently: measured 2026-08-26, a whole turn with zero
+                # readings and an unstamped message, i.e. UNKNOWN for the
+                # guard and the summarizer. Retrying per event costs one
+                # glob only while the watch is still unset — the call
+                # returns immediately once it is.
+                if getattr(state, "context_watcher", None) is None:
+                    await self._start_context_watch(state)
                 # End-of-stream sentinel — pump task is done (process
                 # exited or was cancelled). Stop consuming.
                 if event is END_OF_STREAM:
@@ -763,6 +1245,9 @@ class CodexChatModel(BaseChatModel):
                         # assigns it, so even a crash mid-turn leaves a
                         # resumable uuid on disk (DESIGN §3.3).
                         self._client_state.persist(agent_thread_id)
+                    # The rollout path is keyed by this uuid, so the live
+                    # context gauge can only start once it is known.
+                    await self._start_context_watch(state)
                     if self._model_name is None:
                         await self._record_resolved_model(
                             resolve_model_from_session_log(event.thread_id)
@@ -807,10 +1292,7 @@ class CodexChatModel(BaseChatModel):
                             break
                         if pending_tool_calls:
                             break
-                    elif (
-                        isinstance(it, GenericItem)
-                        and it.type in NATIVE_TOOL_ITEM_TYPES
-                    ):
+                    elif isinstance(it, GenericItem):
                         # Native tool starting. The pump has already
                         # created native_futures[it.id]; emit the
                         # AIMessage.tool_call so LangGraph routes into
@@ -819,15 +1301,19 @@ class CodexChatModel(BaseChatModel):
                         # That body parks on the future and wakes up
                         # event-driven when the pump processes the
                         # matching item.completed.
-                        pending_tool_calls.append({
-                            "id": it.id,
-                            "name": it.type,
-                            "args": native_args(it),
-                            "type": "tool_call",
-                        })
-                        break
-                    # else: harmless GenericItem (reasoning, plan,
-                    # etc.) — ignore.
+                        #
+                        # An item type we do not know is recorded through
+                        # the generic recorder rather than dropped —
+                        # ``_native_tool_call_for`` returns None ONLY for
+                        # the explicitly informational types.
+                        tc = self._native_tool_call_for(
+                            item_id=it.id,
+                            item_type=it.type,
+                            args=native_args(it),
+                        )
+                        if tc is not None:
+                            pending_tool_calls.append(tc)
+                            break
                 elif isinstance(event, ItemCompletedEvent):
                     it = event.item
                     if isinstance(it, AgentMessageItem):
@@ -861,14 +1347,28 @@ class CodexChatModel(BaseChatModel):
                     turn_done = True
                     raise RuntimeError(f"Codex turn failed: {event.error_message}")
         finally:
+            # Always — a cancelled or failed turn must not leak the watcher
+            # task or its inotify handle. The terminal record written by
+            # turn.completed remains the authoritative per-turn number.
+            await self._stop_context_watch(state)
             if turn_done:
                 with _suppress_errors():
                     await handle.aclose()
                 state.current_exec = None
 
+        # The context codex reported for THIS turn — the same number the
+        # status bar shows, read from the rollout the live gauge follows.
+        # Without it the guard/summarizer would treat the turn as UNKNOWN.
+        used = getattr(state, "last_provider_context", None)
         if pending_tool_calls:
-            return AIMessage(content=final_text, tool_calls=pending_tool_calls)
-        return AIMessage(content=final_text)
+            return _stamp_provider_context(
+                AIMessage(content=final_text, tool_calls=pending_tool_calls),
+                used,
+                messages_for_stamp,
+            )
+        return _stamp_provider_context(
+            AIMessage(content=final_text), used, messages_for_stamp
+        )
 
     # ------------------------------------------------------------------
     # Proxy MCP lifecycle
@@ -916,7 +1416,7 @@ class CodexChatModel(BaseChatModel):
 def _build_mcp_content(content: Any) -> list[dict[str, Any]]:
     """Convert a LangChain ToolMessage content into MCP content blocks.
 
-    Same shape as ``claude_code_provider.chat_model._build_mcp_content``.
+    Same shape as ``claude_code_sdk_provider.chat_model._build_mcp_content``.
     """
     if not isinstance(content, list):
         return [{"type": "text", "text": str(content)}]

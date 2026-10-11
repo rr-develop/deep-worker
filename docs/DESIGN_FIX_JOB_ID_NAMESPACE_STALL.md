@@ -40,7 +40,7 @@ The `wait_for_job` / `kill_job` tools (`backends.py:365`, `:410`) resolve ids
 
 The race: the outer bond covers stage-A (dispatch wait of the CLI provider)
 **plus** execution, the inner one covers execution only. With both at 120 s on
-claude-code/codex the outer one expires **first**. Then:
+claude-code-sdk/codex the outer one expires **first**. Then:
 
 1. the middleware parks the task in its own registry under the `toolu_…` key;
 2. the backend has NOT yet reached its timeout → `job_N` is not created, the
@@ -57,7 +57,7 @@ already created `job_N`). It is powerless when `job_N` is never created at all.
 
 ## 3. User requirement (verbatim)
 
-> **The correct fix** — an edit in **claude_code_provider/** or in the
+> **The correct fix** — an edit in **claude_code_sdk_provider/** or in the
 > middleware that registers backgrounded jobs (a real `job_N` must be created,
 > not `toolu_XXX` substituted in).
 
@@ -191,9 +191,9 @@ exists under the current `tool_use_id` alias and reuses its id.
 **Regression tests (must stay green):**
 `tests/unit_tests/test_job_id_tooluse_alias.py`,
 `tests/unit_tests/test_background_jobs.py`,
-`claude_code_provider/tests/test_job_handle_by_default.py`,
-`claude_code_provider/tests/test_job_handle_integration.py`,
-`claude_code_provider/tests/test_stage_a_bounded_single_source.py`.
+`claude_code_sdk_provider/tests/test_job_handle_by_default.py`,
+`claude_code_sdk_provider/tests/test_job_handle_integration.py`,
+`claude_code_sdk_provider/tests/test_stage_a_bounded_single_source.py`.
 
 **Integration test without mocks:** bring up a real agent, give `execute` a
 command that is deliberately longer than the bond with
@@ -286,7 +286,7 @@ Runs:
   the same 8 fail on a clean `HEAD` too (pre-existing: `preferred_provider`,
   checkpointer, launch-config) — **zero regressions**
 - Contract regressions: `test_job_id_tooluse_alias.py` + `test_background_jobs.py`
-  — 15 passed; `claude_code_provider` job-handle/stage-A — 8 passed
+  — 15 passed; `claude_code_sdk_provider` job-handle/stage-A — 8 passed
 - Mock-free integration (`test_parked_job_id_live.py`) — **3 passed in 7.8 s**;
   with the middleware reverted to the old code the test goes red
 
@@ -296,7 +296,7 @@ workflow (old code) emitted `job_id: toolu_019qXvMXxtMv5afCKG6BBndk`, and
 
 ### 9.4 Deliberately NOT done
 
-The stage-A timeout in `claude_code_provider/chat_model.py:1486` and
+The stage-A timeout in `claude_code_sdk_provider/chat_model.py:1486` and
 `codex_provider/chat_model.py:727` also calls `build_in_progress_notice` with a
 non-job identifier (`tool_use_id` / `it.id`). But there **no work is parked at
 all** — there is nothing to wait for or kill, and therefore no `job_N` to hand

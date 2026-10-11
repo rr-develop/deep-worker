@@ -11,8 +11,8 @@ deep-worker"). The upstream tests drive
 default in `deepagents.graph.get_default_model()`), which talks to the
 public Anthropic HTTPS API and is the wrong transport on this host.
 
-This host uses the `claude-code` provider
-(`deep_worker_cli.config.create_model(provider="claude-code", ...)`),
+This host uses the `claude-code-sdk` provider
+(`deep_worker_cli.config.create_model(provider="claude-code-sdk", ...)`),
 which authenticates through the user's Claude Code SDK login session
 and does **not** require any Anthropic env key. `tests/integration_tests/conftest.py`
 therefore identifies the upstream tests that actually drive the
@@ -23,7 +23,7 @@ written on this host (`test_project_memory.py`) run normally.
 
 ### Required
 
-None for the `claude-code` provider (auth comes from the Claude Code
+None for the `claude-code-sdk` provider (auth comes from the Claude Code
 SDK login session).
 
 ### Optional

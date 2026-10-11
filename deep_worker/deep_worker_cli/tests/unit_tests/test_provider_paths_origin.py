@@ -30,13 +30,27 @@ _PKG = "deep_worker.providers.semantic_search"
 
 @pytest.fixture(autouse=True)
 def _clean_resolution_state(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Every test starts with an empty memo cache and no env overrides."""
+    """Every test starts with an empty memo cache and no env overrides.
+
+    ``deep_worker.providers.*`` modules are evicted from ``sys.modules`` so
+    the pre-import code paths are exercised against a cold import state, then
+    RESTORED afterwards — evicting without restoring would leave the whole
+    test session with re-imported provider modules, breaking class identity
+    for later tests (e.g. ``AcpUsageLimitError`` raised by a fresh import is
+    not caught by ``pytest.raises`` on the pre-eviction class object).
+    """
     pp._resolved.clear()
     monkeypatch.delenv(pp._ENV_SOURCE_ROOT, raising=False)
     monkeypatch.delenv(pp._ENV_PROVIDER_SOURCE, raising=False)
+    evicted: dict[str, object] = {}
     for name in list(sys.modules):
         if name.startswith("deep_worker.providers."):
-            del sys.modules[name]
+            evicted[name] = sys.modules.pop(name)
+    yield
+    # Restore the evicted modules so later tests see the SAME class objects
+    # that other already-imported modules hold references to.
+    for name, module in evicted.items():
+        sys.modules.setdefault(name, module)
 
 
 def _fake_spec(origin: str | None, locations: list[str]) -> SimpleNamespace:
@@ -123,11 +137,12 @@ def test_resolve_auto_valid_env_uses_source_root(
     (root / "deep_worker" / "deep_worker_cli").mkdir(parents=True)
     (root / "deep_worker" / "deep_worker_cli" / "pyproject.toml").write_text("")
     for sub in (
-        "claude_code_provider",
         "codex_provider",
         "grok_provider",
         "semantic_search",
         "deepworker_a2a",
+        "acp",
+        "claude_code_provider",
     ):
         (root / "deep_worker" / "providers" / sub).mkdir(parents=True)
     monkeypatch.setenv(pp._ENV_SOURCE_ROOT, str(root))

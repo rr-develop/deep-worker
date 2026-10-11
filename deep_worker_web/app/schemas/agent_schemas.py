@@ -103,6 +103,66 @@ class AgentInfo(BaseModel):
         description="Optional metadata explaining the current base status",
     )
 
+    # Context-size mirror for the status bar (DESIGN_AGENT_CONTEXT_STATUS_BAR.md).
+    # Three fields per kind (agent + TaskManager); ``usage_semantics`` is
+    # either ``"context_snapshot"`` (provider reported both used and size)
+    # or ``"tokens"`` (only used is reported → UI shows ``"…tokens"``,
+    # exact from the provider's tokenizer — no ``"(est.)"`` qualifier).
+    # ``None`` for all three means "no data yet" — UI renders ``"-"``.
+    # The TM-Context fields stay ``None`` when ``has_task_manager is False``
+    # even if the JSONL still contains legacy ``kind="tm"`` records.
+    agent_context_used: int | None = Field(
+        default=None,
+        description="Agent context used (tokens); None when no record",
+    )
+    agent_context_size: int | None = Field(
+        default=None,
+        description="Agent context size (tokens); None when unknown",
+    )
+    agent_context_semantics: str | None = Field(
+        default=None,
+        description="Agent context semantics: 'context_snapshot' or 'tokens'",
+    )
+    tm_context_used: int | None = Field(
+        default=None,
+        description="TaskManager context used (tokens); None when no TM",
+    )
+    tm_context_size: int | None = Field(
+        default=None,
+        description="TaskManager context size (tokens); None when unknown",
+    )
+    tm_context_semantics: str | None = Field(
+        default=None,
+        description="TaskManager context semantics: 'context_snapshot' or 'tokens'",
+    )
+    # Per-turn token totals from the LATEST record — surfaced separately
+    # from ``*_context_used`` so the UI can render a ``Last turn: Xk``
+    # row that is NOT compared with ``context_limit``.  For ACP-style
+    # providers (claude-code) a hybrid record now carries BOTH the
+    # honest snapshot AND the per-turn total, so the two numbers no
+    # longer overwrite each other.  ``None`` when the last record for
+    # that kind has no ``total_tokens`` (older providers / snapshot-only
+    # rows).  Observed 2026-08-22 (Context: 2265.4k vs Limit: 400k).
+    agent_last_turn_tokens: int | None = Field(
+        default=None,
+        description="Agent per-turn total tokens from latest record; None when unknown",
+    )
+    tm_last_turn_tokens: int | None = Field(
+        default=None,
+        description="TaskManager per-turn total tokens from latest record; None when unknown",
+    )
+
+    # Operator-set context limit (the ``-l`` flag value, in tokens).
+    # Sourced from ``session_metadata.json`` ``launch_config.context_limit``.
+    # ``None`` when the operator did not pass ``-l`` (default behaviour).
+    # The web UI status bar renders ``234k / 400k (limit)`` when this
+    # is set, so the operator can visually verify the guard is
+    # holding the limit they asked for. Observed 2026-08-18.
+    context_limit: int | None = Field(
+        default=None,
+        description="Operator-set context limit in tokens (the -l flag); None when default",
+    )
+
 
 class AgentStatusInfo(BaseModel):
     """Detailed status information for a deep-worker agent.

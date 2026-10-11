@@ -72,7 +72,7 @@ async def test_get_metadata_hides_cross_provider_dynamic_model(tmp_path: Path) -
 #
 # ``exposed_get_metadata`` filters config.model / dynamic_display_model /
 # resolved_model through ``model_can_belong_to_provider``. While that
-# predicate carried the stale four-token claude-code whitelist, an agent
+# predicate carried the stale four-token claude-code-sdk whitelist, an agent
 # genuinely running ``fable`` reported model=None — the UI showed nothing,
 # or a stale value, for a perfectly healthy agent.
 #
@@ -84,7 +84,7 @@ async def test_get_metadata_hides_cross_provider_dynamic_model(tmp_path: Path) -
 @pytest.mark.asyncio
 async def test_get_metadata_surfaces_claude_code_fable(tmp_path: Path) -> None:
     """The exact display symptom from that incident."""
-    config = AgentConfig(working_dir=tmp_path, provider="claude-code", model="fable")
+    config = AgentConfig(working_dir=tmp_path, provider="claude-code-sdk", model="fable")
     process = SimpleNamespace(
         config=config,
         started_at=datetime.now(),
@@ -96,7 +96,7 @@ async def test_get_metadata_surfaces_claude_code_fable(tmp_path: Path) -> None:
     response = json.loads(await service.exposed_get_metadata())
 
     assert response["success"] is True
-    assert response["metadata"]["provider"] == "claude-code"
+    assert response["metadata"]["provider"] == "claude-code-sdk"
     assert response["metadata"]["model"] == "fable", (
         "an agent running fable must report it, not a blank/stale model"
     )
@@ -111,7 +111,7 @@ async def test_get_metadata_surfaces_claude_code_fable(tmp_path: Path) -> None:
 async def test_get_metadata_surfaces_every_documented_alias(
     tmp_path: Path, alias: str
 ) -> None:
-    config = AgentConfig(working_dir=tmp_path, provider="claude-code", model=alias)
+    config = AgentConfig(working_dir=tmp_path, provider="claude-code-sdk", model=alias)
     process = SimpleNamespace(
         config=config,
         started_at=datetime.now(),
@@ -128,7 +128,7 @@ async def test_get_metadata_surfaces_every_documented_alias(
 @pytest.mark.asyncio
 async def test_get_metadata_surfaces_dynamic_fable(tmp_path: Path) -> None:
     """A fable picked up at runtime (``/model fable``) must also show."""
-    config = AgentConfig(working_dir=tmp_path, provider="claude-code", model=None)
+    config = AgentConfig(working_dir=tmp_path, provider="claude-code-sdk", model=None)
     config.set_dynamic_display_model("fable")
     process = SimpleNamespace(
         config=config,
@@ -150,7 +150,7 @@ async def test_get_metadata_claude_code_without_model_is_none(tmp_path: Path) ->
     Regression guard for the default change: metadata must NOT invent
     ``sonnet`` for an agent that never asked for it.
     """
-    config = AgentConfig(working_dir=tmp_path, provider="claude-code", model=None)
+    config = AgentConfig(working_dir=tmp_path, provider="claude-code-sdk", model=None)
     process = SimpleNamespace(
         config=config,
         started_at=datetime.now(),
@@ -170,7 +170,7 @@ async def test_get_metadata_still_hides_foreign_model_on_claude_code(
 ) -> None:
     """Widening the alias set must not disable the cross-provider filter."""
     config = AgentConfig(
-        working_dir=tmp_path, provider="claude-code", model="grok-composer-2.5-fast"
+        working_dir=tmp_path, provider="claude-code-sdk", model="grok-composer-2.5-fast"
     )
     process = SimpleNamespace(
         config=config,

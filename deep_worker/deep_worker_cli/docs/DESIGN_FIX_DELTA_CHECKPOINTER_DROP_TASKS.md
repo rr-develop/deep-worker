@@ -141,7 +141,7 @@ Tests follow the existing style in `test_delta_checkpointer.py`.
 
 After the fix lands:
 
-1. Start a fresh test agent (`probe_drop_tasks`) on dev code, claude-code
+1. Start a fresh test agent (`probe_drop_tasks`) on dev code, claude-code-sdk
    provider, local shell, working dir the development codebase.
 2. Drive a sequence of safe operations that historically caused TASKS bloat
    (fan-out to subagents via the `task` tool — e.g. a small parallel grep).

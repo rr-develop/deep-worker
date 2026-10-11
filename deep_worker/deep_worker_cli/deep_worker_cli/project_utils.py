@@ -31,7 +31,7 @@ def find_project_agent_md(project_root: Path) -> list[Path]:
     """Find project-specific agent.md file(s).
 
     Checks two locations and returns ALL that exist:
-    1. project_root/.deepagents/agent.md
+    1. project_root/.deep_worker/agent.md
     2. project_root/agent.md
 
     Both files will be loaded and combined if both exist.
@@ -44,10 +44,13 @@ def find_project_agent_md(project_root: Path) -> list[Path]:
     """
     paths = []
 
-    # Check .deepagents/agent.md (preferred)
-    deepagents_md = project_root / ".deepagents" / "agent.md"
-    if deepagents_md.exists():
-        paths.append(deepagents_md)
+    # Check .deep_worker/agent.md (preferred). ``.deepagents/`` is banned for
+    # reads as well as writes (POLICIES §16), so it is not consulted.
+    from deep_worker_cli.storage_paths import project_config_dir
+
+    project_md = project_config_dir(project_root) / "agent.md"
+    if project_md.exists():
+        paths.append(project_md)
 
     # Check root agent.md (fallback, but also include if both exist)
     root_md = project_root / "agent.md"

@@ -1,6 +1,6 @@
 """Tests for the provider capability guards in ``create_model`` (B2).
 
-Capability-guard contract: the claude-code / codex / grok branches
+Capability-guard contract: the claude-code-sdk / codex / grok branches
 of ``config.create_model`` must resolve the vendored provider through
 ``provider_paths.ensure_provider_importable`` instead of sys.path hacks.
 When the provider package is unavailable (no source root, not installed)
@@ -18,8 +18,6 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 import pytest
-
-pytest.importorskip("claude_agent_sdk")  # optional dependency; skip when absent
 
 from deep_worker_cli.exceptions import CapabilityError
 from deep_worker_cli.provider_paths import ProviderOrigin, ProviderResolution
@@ -54,7 +52,6 @@ def _available_resolution(pkg: str) -> ProviderResolution:
 @pytest.mark.parametrize(
     ("provider", "pkg", "capability"),
     [
-        ("claude-code", "deep_worker.providers.claude_code_provider", "claude-code"),
         ("codex", "deep_worker.providers.codex_provider", "codex"),
         ("grok", "deep_worker.providers.grok_provider", "grok"),
     ],
@@ -85,7 +82,6 @@ def test_create_model_raises_capability_error_when_provider_unavailable(
 @pytest.mark.parametrize(
     ("provider", "pkg", "capability"),
     [
-        ("claude-code", "deep_worker.providers.claude_code_provider", "claude-code"),
         ("codex", "deep_worker.providers.codex_provider", "codex"),
         ("grok", "deep_worker.providers.grok_provider", "grok"),
     ],
@@ -114,11 +110,6 @@ def test_create_model_uses_resolution_remedy_fallback(
 @pytest.mark.parametrize(
     ("provider", "pkg", "model_cls_path"),
     [
-        (
-            "claude-code",
-            "deep_worker.providers.claude_code_provider",
-            "deep_worker.providers.claude_code_provider.ClaudeCodeChatModel",
-        ),
         (
             "codex",
             "deep_worker.providers.codex_provider",

@@ -230,7 +230,7 @@ over different LS.
 Implemented (see `deep_worker/deep_worker_cli/docs/DESIGN_EXTERNAL_MCP_TOOLS.md`
 and the `deep_worker_cli/external_mcp/` package):
 
-- Layers: `<state_dir>/mcp.json` → project `.deepagents/mcp.json` →
+- Layers: `<state_dir>/mcp.json` → project `.deep_worker/mcp.json` →
   per-agent → CLI.
 - `ExternalMCPClientPool` starts stdio/HTTP MCP, gives `BaseTool` to
   `create_cli_agent(..., external_mcp_tools=...)`.

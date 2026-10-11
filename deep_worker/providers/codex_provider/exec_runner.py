@@ -235,6 +235,10 @@ class ExecArgs:
     working_directory: str | None = None
     sandbox_mode: str = "workspace-write"     # Q3: skip-permissions equivalent
     approval_policy: str = "never"            # Q3: skip-permissions equivalent
+    # Mirrors deep-worker's ``-sp``. Fail-closed default: a caller that
+    # forgets it gets the SAFE mode. Only with it set does codex run with
+    # ``--dangerously-bypass-approvals-and-sandbox`` (see _build_argv).
+    auto_approve: bool = False
     skip_git_repo_check: bool = True
     model: str | None = None                  # Q2: None → let Codex pick default
     base_instructions: str | None = None      # system prompt
@@ -503,25 +507,40 @@ class CodexExecRunner:
         if args.model:
             argv.extend(["--model", args.model])
 
-        # Q3: skip-permissions equivalent.
+        # ``-sp``, with the SAME meaning as on every other provider
+        # (owner directive 2026-08-25: "the policy really must be
+        # unified"). This used to be unconditional, which made the operator
+        # flag decoration on codex: an agent launched WITHOUT ``-sp`` still
+        # ran with approvals and sandbox switched off, while grok and
+        # claude-code denied every permission request.
         #
         # ``--dangerously-bypass-approvals-and-sandbox`` is the Codex CLI's
         # one-knob "do not prompt, do not gate, do not sandbox" mode —
-        # equivalent in spirit to claude-code's ``permission_mode=
-        # "bypassPermissions"``. We always pass it because deep-worker
-        # already owns sandboxing/approvals at the LangGraph layer
-        # (``interrupt_on``); Codex must not impose its own gate, in
-        # particular it must not cancel MCP tool calls to our proxy
-        # (which it does by default at approval_policy="never" — that
-        # flag only covers shell commands).
+        # equivalent in spirit to claude-code-sdk's ``permission_mode=
+        # "bypassPermissions"``. It is also what lets codex call MCP tools
+        # on our proxy without prompting (approval_policy alone covers only
+        # shell commands), so WITHOUT ``-sp`` a codex agent is restricted in
+        # exactly the way a grok agent without ``-sp`` is.
         #
-        # We *also* keep -s and approval_policy for explicit symmetry
-        # with the design and so tooling that inspects the argv can
-        # tell what mode the agent is in; the bypass flag is the one
-        # that actually enables MCP tool calls without prompts.
-        argv.append("--dangerously-bypass-approvals-and-sandbox")
-        argv.extend(["-s", args.sandbox_mode])
-        argv.extend(["--config", f'approval_policy="{args.approval_policy}"'])
+        # WITHOUT ``-sp``: ``--approve-for-me`` — codex reviews its own
+        # approval requests automatically inside its workspace-write
+        # sandbox. This is the closest codex equivalent of "restricted but
+        # usable", and it is REQUIRED rather than cosmetic: with neither
+        # flag, codex announces an MCP tool call and never sends the
+        # control request, so every deep-worker tool call hangs for the
+        # full 120 s proxy bound and comes back "not_started" (measured
+        # live 2026-08-25 — 129.5 s for one ``execute``). The CLI rejects
+        # ``--approve-for-me`` together with ``-s`` ("cannot be used with
+        # --sandbox"), so the sandbox/approval-policy pair is passed only
+        # on the bypass path, where it is accepted.
+        if args.auto_approve:
+            argv.append("--dangerously-bypass-approvals-and-sandbox")
+            argv.extend(["-s", args.sandbox_mode])
+            argv.extend([
+                "--config", f'approval_policy="{args.approval_policy}"'
+            ])
+        else:
+            argv.append("--approve-for-me")
 
         # ── Per-agent MCP isolation (observed live) ──
         # Do NOT load the shared ``~/.codex/config.toml``. That file is

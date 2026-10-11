@@ -1,7 +1,7 @@
 # DESIGN: per-agent token and cache usage statistics
 
 **Status:** DESIGN SIGNED OFF v5 (see §12)
-**Scope:** `deep_worker_cli` (collection/storage/aggregation), `claude_code_provider` /
+**Scope:** `deep_worker_cli` (collection/storage/aggregation), `claude_code_sdk_provider` /
 `codex_provider` / `grok_provider` (usage export), the web app (API + UI)
 
 ---
@@ -24,7 +24,7 @@ two provider families and are fixed explicitly:**
 | Family | Record unit | Guarantee | Mechanism |
 |---|---|---|---|
 | **LangChain providers** (deepseek, openai, anthropic, google, vertexai) | **one model invocation** (each `ainvoke`/`astream`, including the tool loop) | **exactly-once per observed invocation** | `AsyncCallbackHandler` (`TokenStatsCallbackHandler`) attached to the actual model instance; `run_id` = invocation key; `on_llm_start`→pending, `on_llm_end`/`on_llm_error`→closes exactly one record |
-| **Custom providers** (claude-code, codex) | **one terminal provider event** (`ResultMessage` / `TurnCompletedEvent` / terminal failure) | **at-most-once per observed terminal event** | event-driven recording; tool sub-turns between two terminal events are packed into one record; state machine in §5.2 |
+| **Custom providers** (claude-code-sdk, codex) | **one terminal provider event** (`ResultMessage` / `TurnCompletedEvent` / terminal failure) | **at-most-once per observed terminal event** | event-driven recording; tool sub-turns between two terminal events are packed into one record; state machine in §5.2 |
 
 The old post-run points (`log_token_usage`) remain only for the compatibility
 text log and are NOT a source of accounting.
@@ -81,7 +81,7 @@ last `AIMessage`; understands two cache formats:
 - `prompt_tokens_details.cached_tokens` (OpenAI-compatible).
 
 Writes **to the log only** (INFO), stores nothing. For providers without
-`token_usage` in `response_metadata` (claude-code, codex, grok) it silently returns.
+`token_usage` in `response_metadata` (claude-code-sdk, codex, grok) it silently returns.
 
 ### 2.3 What providers currently return (usage lifecycle)
 
@@ -108,7 +108,7 @@ Writes **to the log only** (INFO), stores nothing. For providers without
   (`chat_models/base.py`); we always pass an explicit `api_base`. It was
   live-verified that DeepSeek returns usage even without the flag, so the flag
   is a guarantee for endpoints/configurations that would not send usage without it.
-- **claude-code** (`claude_code_provider/chat_model.py`) — usage arrives in
+- **claude-code-sdk** (`claude_code_sdk_provider/chat_model.py`) — usage arrives in
   `ResultMessage.usage` (raw `dict[str, Any] | None`, `types.py:1017`; Anthropic
   format: `input_tokens`/`cache_read_input_tokens`/`cache_creation_input_tokens`/
   `output_tokens` — the keys are untyped, to be confirmed on a live CLI). In the
@@ -148,8 +148,9 @@ Verified against provider documentation (and confirmed by the project code).
 | **openai** (non-stream) | `response_metadata.token_usage` | `prompt_tokens`, `completion_tokens` | `prompt_tokens_details.cached_tokens` | `prompt_tokens - cached` |
 | **anthropic** | `response_metadata.token_usage` | `input_tokens`, `output_tokens` | `cache_read_input_tokens` | `input_tokens + cache_creation_input_tokens` |
 | **google / vertexai** | `response_metadata.usage_metadata` | `prompt_token_count`, `candidates_token_count`, `total_token_count` | `cached_content_token_count` | `prompt_token_count - cached` |
-| **claude-code** | `ResultMessage.usage` (raw dict) | `input_tokens`, `output_tokens` | `cache_read_input_tokens` | `input_tokens + cache_creation_input_tokens` |
-| **codex** | `turn.completed.usage` (Codex CLI) | `input_tokens`, `output_tokens` | `cached_input_tokens` | `input_tokens - cached_input_tokens` |
+| **claude-code-sdk** | `AssistantMessage.usage` — the last one in the turn (raw dict). `ResultMessage.usage` is **cumulative** over `num_turns` and serves only as a fallback if no `AssistantMessage` carried usage (`chat_model.py:1434`, `:1539-1548`) | `input_tokens`, `output_tokens` | `cache_read_input_tokens` | `input_tokens + cache_creation_input_tokens` |
+| **codex** | `token_count.info.last_token_usage` from the rollout file, correlated by the `task_complete` boundary (`last_token_usage_from_rollout`, `chat_model.py:156`, `:470`). `turn.completed.usage` is the **TOTAL of the whole `codex exec` process**, NOT per-turn (live inflation 32.9×: `3736695` vs `113457`) | `input_tokens`, `output_tokens` | `cached_input_tokens` | `input_tokens - cached_input_tokens` |
+| **ACP** (`claude-code`, codex-over-ACP) | `session/prompt` RESULT `_meta` → codex form (`acp/chat_model.py:1539-1557`), hybrid emit together with the `usage_update` gauge (`:1576`) | `inputTokens`, `outputTokens`, `totalTokens` | `cachedReadTokens` | `inputTokens − cachedReadTokens` |
 | **grok** | `session/prompt` RESULT `_meta` (live 0.2.73) | `totalTokens`, `inputTokens`, `outputTokens`, `reasoningTokens` | `cachedReadTokens` | `inputTokens − cachedReadTokens` |
 
 **Canonical prompt (BLOCKER-3 v1):** for Anthropic/Claude Code
@@ -167,10 +168,14 @@ Findings:
 2. **Grok — confirmed (live 0.2.73)**: per-turn usage exists in the `session/prompt`
    RESULT `_meta` (`inputTokens`/`outputTokens`/`cachedReadTokens`/`totalTokens`),
    cache hit = `cachedReadTokens`, miss = `inputTokens − cachedReadTokens`.
-   The ACP `usage_update` (context gauge) does not arrive in practice — the
-   `_apply_session_update` branch is kept as a fallback; `context_snapshot` is
-   also a fallback when `_meta` usage is absent.
-3. **claude-code / codex usage arrives with a delay** relative to the `AIMessage`
+   The ACP `usage_update` (context gauge) does not arrive in practice **with grok CLI
+   0.2.73** — the `_apply_session_update` branch is kept as a fallback;
+   `context_snapshot` is also a fallback when `_meta` usage is absent.
+   This is an observation about grok, NOT about the ACP layer: in `providers/acp`
+   `usage_update` does arrive and is written to `state.usage_snapshot`
+   (`chat_model.py:1437`), from where it goes out in a hybrid emit together with the
+   `_meta` tokens (`:1568-1584`).
+3. **claude-code-sdk / codex usage arrives with a delay** relative to the `AIMessage`
    return (tool branches) → recording happens event-driven when the terminal
    event arrives (state machine §5.2).
 
@@ -184,8 +189,8 @@ Findings:
 {
   "schema_version": 1,
   "record_id": "3f2a…c9",                 // uuid4 hex — RECORD id (not the dedup key)
-  "event_key": "claude-code|sess_123|msg_456",  // stable event key; null = not deduplicated (BLOCKER-1 v3)
-  "session_cumulative": null,             // claude-code cumulative branch: raw session counters (baseline for the delta)
+  "event_key": "claude-code-sdk|sess_123|msg_456",  // stable event key; null = not deduplicated (BLOCKER-1 v3)
+  "session_cumulative": null,             // claude-code-sdk cumulative branch: raw session counters (baseline for the delta)
   "ts": "2026-08-01T12:34:56.789Z",       // record time (UTC)
   "provider": "deepseek",                 // from the model actually invoked
   "model": "deepseek-v4-flash",           // resolved model at call time
@@ -193,7 +198,7 @@ Findings:
   "status": "ok",                         // ok | no_usage | failed (see below)
   "usage_semantics": "tokens",            // tokens | context_snapshot (fallback for grok without _meta)
   "provider_turn_id": null,               // where available: the provider's turn id
-  "provider_session_id": "sess_123",      // claude-code: ResultMessage.session_id — ALWAYS (cumulative baseline); otherwise null
+  "provider_session_id": "sess_123",      // claude-code-sdk: ResultMessage.session_id — ALWAYS (cumulative baseline); otherwise null
   "prompt_tokens": 3000,                  // canonical prompt (see §3); null when usage is absent
   "completion_tokens": 100,
   "cache_hit_tokens": 2500,               // null if the provider gives no cache
@@ -220,7 +225,7 @@ Findings:
   absent (e.g. the `usage_update` branch with gauge data).
 - **`event_key` (BLOCKER-2 from v2, BLOCKER-1 from v3)** — the stable event key
   for deduplication:
-  - claude-code: `"claude-code|<session_id>|<uuid>"` — **ONLY when `uuid` is
+  - claude-code-sdk: `"claude-code-sdk|<session_id>|<uuid>"` — **ONLY when `uuid` is
     non-empty** (`ResultMessage.uuid` is typed `str | None`, `types.py:1023`).
     **Never deduplicate by `session_id|None`** — otherwise all
     `ResultMessage` records of one session without a uuid collapse into
@@ -236,14 +241,14 @@ Findings:
     dedup key, and the `_meta` RESULT has no provider id (MINOR from v3).
   - **Dedup rule:** the aggregator deduplicates ONLY non-null `event_key`.
     Records with `event_key = null` are always considered unique.
-- **`session_cumulative`** (BLOCKER-2 from v3): only for claude-code in the
+- **`session_cumulative`** (BLOCKER-2 from v3): only for claude-code-sdk in the
   cumulative branch (see §5.2) — raw cumulative counters as returned by
   `ResultMessage` (`prompt_tokens`/`completion_tokens`/`cache_*` at event
   time). Used as a crash/restart-safe baseline for the delta.
   In the per-terminal branch the field is absent/null.
 - **`provider_session_id`** (BLOCKER from review v5): an explicit provider
   session id — a separate field, it does NOT overload `provider_turn_id`. For
-  claude-code it is written **always**: `ResultMessage.session_id`, regardless
+  claude-code-sdk it is written **always**: `ResultMessage.session_id`, regardless
   of `uuid`/`event_key` (including `uuid=None`/`event_key=null`). The
   cumulative-delta baseline is looked up by it (§5.2). For the remaining
   providers — `null` if no stable session id is available (codex: thread_id is
@@ -324,7 +329,7 @@ the main path (tokens from the `_meta` RESULT) **does have** cache data
 averages when `requests_with_usage == 0` = `null`.
 
 **Idempotent aggregation (BLOCKER-2 v2, MINOR v3):** the reader/aggregator
-deduplicates records by **non-null `event_key`** (claude-code: `session_id|uuid`
+deduplicates records by **non-null `event_key`** (claude-code-sdk: `session_id|uuid`
 with a non-empty uuid; LangChain: `run_id`). For codex and grok (no stable
 key → `event_key = null`) no dedup is performed — the at-most-once per
 observed terminal event guarantee is provided by the fact that terminal events
@@ -403,7 +408,7 @@ coroutine / executor mismatch.
   time (not from `settings`/config) — after a hot failover every invocation
   writes to its own bucket.
 
-**Custom providers (claude-code / codex / grok): dependency-inversion, WITHOUT a
+**Custom providers (claude-code-sdk / codex / grok): dependency-inversion, WITHOUT a
 LangChain handler (BLOCKER-3 v2, MAJOR-2 from v3):**
 
 - **In `create_model` by provider branch:** standard LangChain providers
@@ -428,7 +433,7 @@ LangChain handler (BLOCKER-3 v2, MAJOR-2 from v3):**
 
 **Review question: "is the next LangGraph ainvoke a new paid request or a
 continuation of the previous provider turn?" — for accounting this is NOT
-distinguishable from the provider data** (claude-code/codex do not return
+distinguishable from the provider data** (claude-code-sdk/codex do not return
 per-sub-turn usage). Therefore the record unit for custom providers is the
 **terminal event**, not the ainvoke. Tool sub-turns between two terminal events
 are packed into one record (this is the documented granularity, §0).
@@ -461,7 +466,7 @@ CANCELLED (user)                  → no record written (no terminal event;
   failure — i.e. when we ALREADY hold the terminal event and know that delayed
   usage for this group of invocations will not come anymore. Between `ainvoke`
   and the terminal event **no** status records are written (no double counting).
-- **Cumulative contract (claude-code, BLOCKER-2 from v3):** on a live CLI it is
+- **Cumulative contract (claude-code-sdk, BLOCKER-2 from v3):** on a live CLI it is
   verified whether `ResultMessage.usage` is cumulative within a session
   (`num_turns`, `session_id` are available, `types.py:1013-1014`). **Both
   contract branches are fixed NOW** (the branch is chosen by a live-probe at
@@ -476,7 +481,7 @@ CANCELLED (user)                  → no record written (no terminal event;
     `provider_session_id` (`ResultMessage.session_id`). **The baseline for the
     delta is persisted in the records themselves**, not in memory: at recorder
     initialization it **lazy-loads from JSONL the last valid physical record**
-    with `provider=claude-code`, the same `provider_session_id` and non-null
+    with `provider=claude-code-sdk`, the same `provider_session_id` and non-null
     `session_cumulative` (the file is append-only and crash/restart-safe).
     **The baseline is chosen by record order in the JSONL (the last matching
     one), NOT by `ts`; malformed/unknown lines are ignored** (non-blocking,
@@ -497,7 +502,7 @@ CANCELLED (user)                  → no record written (no terminal event;
     current=130 → **delta=30** (the baseline is found by `provider_session_id`,
     not by event_key); a record of another session (S′, cumulative=500) does NOT
     become the baseline.
-  For claude-code `ResultMessage.usage` — per-terminal (confirmed by a live-probe
+  For claude-code-sdk `ResultMessage.usage` — per-terminal (confirmed by a live-probe
   2026-08-01: one session, three turns, `input_tokens` stable at 2, `cache_read`
   20399→28599→28616, `cache_creation` 8200→17→17 — usage is NOT cumulative,
   §12), no deltas are needed (**branch A** — write usage as-is, without
@@ -505,7 +510,7 @@ CANCELLED (user)                  → no record written (no terminal event;
   For codex `turn.completed.usage` — per-turn (confirmed on the host,
   `DESIGN_CODEX_PROVIDER.md` §4.1), no deltas are needed (branch A).
 - **Dedup keys (stable, from actually available fields):**
-  - claude-code: `session_id` + `uuid` (`ResultMessage`) — **only with a
+  - claude-code-sdk: `session_id` + `uuid` (`ResultMessage`) — **only with a
     non-empty `uuid`** (`str | None`, `types.py:1023`); with `uuid=None` →
     `event_key = null`, **never deduplicate by `session_id|None`** (BLOCKER-1
     from v3, otherwise all ResultMessage records of one session collapse as
@@ -521,8 +526,12 @@ CANCELLED (user)                  → no record written (no terminal event;
   restart. A crash between the event arrival and our append = a lost record
   (at-most-once, documented). A crash between the append and anything else =
   the record is already on disk, the event will not repeat → no duplicate.
-- **Code edit points:** claude-code — the `ResultMessage` handler
-  (`chat_model.py:1384-1392`); codex — `TurnCompletedEvent` (`chat_model.py:772`);
+- **Code edit points:** claude-code-sdk — the `ResultMessage` handler
+  (`chat_model.py:1384-1392`), but the per-turn value is taken from the accumulated
+  `last_usage` (the last `AssistantMessage.usage`, `:1434`), not from the
+  cumulative `ResultMessage.usage`; codex — `TurnCompletedEvent`
+  (`chat_model.py:772`), where `event.usage` (process TOTAL) is overridden
+  with `last_token_usage_from_rollout` inside `_emit_usage_event`;
   both call `usage_event_callback` (injected via `set_usage_event_callback`,
   §5.1). The deadlock invariant `chat_model.py:1183-1190` is NOT affected.
 
@@ -708,7 +717,7 @@ source of request accounting (BLOCKER-1 from v1).
 - `deep_worker_cli/task_manager/task_manager.py`: passing `kind="tm"`.
 - `deep_worker_cli/process/agent_process.py`: recorder initialization with
   `self.data_dir`, callback injection; post-run `log_token_usage` remains.
-- `claude_code_provider/chat_model.py`: `set_usage_event_callback` + the call on
+- `claude_code_sdk_provider/chat_model.py`: `set_usage_event_callback` + the call on
   `ResultMessage` (§5.2).
 - `codex_provider/chat_model.py`: the same on `TurnCompletedEvent` (§5.2).
 - `grok_provider/chat_model.py`: `_emit_usage_event(..., usage=...)` from the
@@ -769,9 +778,9 @@ source of request accounting (BLOCKER-1 from v1).
 **integration (real providers, no mocks):**
 - **Tool-flow state machine (BLOCKER-2):** one user turn → tool call → tool
   result → final answer; exactly N records by terminal events, without
-  gaps and duplicates; claude-code (tool early-return before ResultMessage) and
+  gaps and duplicates; claude-code-sdk (tool early-return before ResultMessage) and
   codex (tool early-return before TurnCompletedEvent) — separate cases.
-- **Cumulative check (claude-code):** RED-discovery done on a live CLI —
+- **Cumulative check (claude-code-sdk):** RED-discovery done on a live CLI —
   usage is NOT cumulative (one session, three turns, `input_tokens` stable at
   2, `cache_read` grows per-turn, §12). **Branch A is activated**
   (per-terminal, record usage as-is, no baseline/delta; `session_cumulative`
@@ -885,7 +894,7 @@ Refinements from reviews v1–v5 are marked "(refined review v1)" /
    custom providers — via the async `set_usage_event_callback`
    (dependency-inversion, without importing deep_worker_cli; recorder errors
    are best-effort, logged and do not break the provider turn; MAJOR-3 v3).
-10. **claude-code cumulative contract (BLOCKER-2 v3, refined v5)** — a
+10. **claude-code-sdk cumulative contract (BLOCKER-2 v3, refined v5)** — a
     live-probe at the start of implementation chooses branch A (per-terminal,
     no delta) or B (delta from a crash/restart-safe baseline persisted in the
     JSONL records via `session_cumulative` + `provider_session_id`;
@@ -971,9 +980,9 @@ Refinements from reviews v1–v5 are marked "(refined review v1)" /
   `duplicate_records` separate from skipped_records; grok event_key=null
   always; context latest by parsed UTC ts with a tie-break by record order).
 - v4→v5 (2026-08-01): review v4 comments addressed — BLOCKER (an explicit
-  `provider_session_id` field added: for claude-code `ResultMessage.session_id`
+  `provider_session_id` field added: for claude-code-sdk `ResultMessage.session_id`
   is ALWAYS written regardless of `uuid`/`event_key`; the cumulative baseline
-  is found by the last valid raw record `provider=claude-code` +
+  is found by the last valid raw record `provider=claude-code-sdk` +
   `provider_session_id` + non-null `session_cumulative`, by record order in the
   JSONL, NOT by ts; dedup aggregation does not affect the lookup; test:
   `uuid=None`/`event_key=null`/`provider_session_id=S`/cumulative=100 →
@@ -988,10 +997,10 @@ Refinements from reviews v1–v5 are marked "(refined review v1)" /
 - v5 → SIGNED OFF (2026-08-01): review v5 — **DESIGN SIGN OFF**, no
   architectural/correctness comments. Last nit: the §8 gate — "exactly-once
   invariants" → "at-most-once/state-machine invariants (§5.2)" — applied.
-  Next step — RED/TDD; the claude-code branch A/B choice is fixed by the
+  Next step — RED/TDD; the claude-code-sdk branch A/B choice is fixed by the
   result of the live RED-discovery before GREEN (§5.2, §10.10). Implementation
   only after explicit user approval.
-- v5 → LIVE RED-DISCOVERY (2026-08-01, implementation §11.1): a claude-code
+- v5 → LIVE RED-DISCOVERY (2026-08-01, implementation §11.1): a claude-code-sdk
   live-probe confirmed **branch A** — `ResultMessage.usage` is NOT cumulative
   within a session. Proof: one `ClaudeSDKClient`, one session
   (session_id=2722eb3a…), three consecutive turns (live probe script):
@@ -1020,9 +1029,9 @@ Refinements from reviews v1–v5 are marked "(refined review v1)" /
   `test_grok_agent_records_token_usage` is GREEN (1 passed in 26.84s). The
   failover live test was redesigned: automatic failover (usage-limit →
   `_schedule_failover`) is honestly not provocable (a broken model gives
-  `model_not_found`, not usage-limit; the claude-code usage-limit marker is
+  `model_not_found`, not usage-limit; the claude-code-sdk usage-limit marker is
   `"You've hit your session limit"`); the test checks the failover effect —
-  a claude-code agent writes a record, then the same agent (the same data_dir)
+  a claude-code-sdk agent writes a record, then the same agent (the same data_dir)
   is restarted on deepseek → in ONE file there are records from ≥2 providers
   (the recorder is bound to data_dir, not to the provider). GREEN.
   All 6 live tests of §11.4 are green.

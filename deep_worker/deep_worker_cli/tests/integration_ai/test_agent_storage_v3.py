@@ -10,8 +10,9 @@ import pytest
 
 from deep_worker_cli.session.session_manager import SessionManager
 from deep_worker_cli.storage_paths import STORAGE_VERSION_AGENT_ROOT
+
 from deep_worker_cli.storage_paths import deep_worker_home
-def _run_dw_cli(*args: str, home: Path, timeout: int = 20) -> subprocess.CompletedProcess:
+def _run_deep_worker(*args: str, home: Path, timeout: int = 20) -> subprocess.CompletedProcess:
     env = os.environ.copy()
     import pwd
 
@@ -43,7 +44,7 @@ def test_session_manager_creates_v3_metadata_with_private_permissions(
     assert oct(metadata_path.stat().st_mode & 0o777) == "0o600"
 
 
-def test_dw_list_reads_v3_threads_db_without_tm_root(tmp_path: Path) -> None:
+def test_deep_worker_list_reads_v3_threads_db_without_tm_root(tmp_path: Path) -> None:
     agent = "integ_v3_list"
     root = deep_worker_home(tmp_path) / agent
     root.mkdir(parents=True, mode=0o700)
@@ -69,7 +70,7 @@ def test_dw_list_reads_v3_threads_db_without_tm_root(tmp_path: Path) -> None:
     conn.close()
     os.chmod(db, 0o600)
 
-    result = _run_dw_cli("--dev", "--list", "--agent", agent, home=tmp_path)
+    result = _run_deep_worker("--dev", "--list", "--agent", agent, home=tmp_path)
 
     assert result.returncode == 0, result.stderr or result.stdout
     assert f"{agent}:tm" in result.stdout

@@ -3,9 +3,8 @@
 ## Goal
 
 Provide three new tools that give any agent fast, read-only access to its own
-pre-summarization history stored in `summaries/<thread_id>.md` files under
-each agent's local data directory. These tools work for ALL agents — no
-`--history-memory` flag required.
+pre-summarization history stored in `~/.deep_worker/<name>/summaries/<thread_id>.md`.
+These tools work for ALL agents — no `--history-memory` flag required.
 
 ## Data format
 
@@ -177,7 +176,7 @@ Export `HistoryAccessMiddleware`.
 
 ### 5. `deep_worker_cli/summaries.py` (or `storage_paths.py`)
 Shared helper `get_thread_history_path(assistant_id, thread_id, home=None)`
-→ `Path(home)/<data-root>/assistant_id/summaries/<thread_id>.jsonl`.
+→ `Path(home)/.deep_worker/assistant_id/summaries/thread_id.jsonl`.
 
 ### 6. `docs/DESIGN_HISTORY_ACCESS_TOOLS.md`
 This document.

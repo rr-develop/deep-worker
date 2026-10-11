@@ -223,9 +223,9 @@ def _list(agent: str, *, project: bool = False) -> None:
                 "[dim]Skills are loaded from these directories "
                 "(highest precedence first):\n"
                 "  1. .agents/skills/                 project skills\n"
-                "  2. .deepagents/skills/             project skills (alias)\n"
+                "  2. .deep_worker/skills/            project skills (alias)\n"
                 "  3. ~/.agents/skills/               user skills\n"
-                "  4. ~/.deepagents/<agent>/skills/   user skills (alias)\n"
+                "  4. ~/.deep_worker/agents/<agent>/skills/  user skills (alias)\n"
                 "  5. <package>/built_in_skills/      built-in skills[/dim]",
                 style=COLORS["dim"],
             )
@@ -446,7 +446,7 @@ def _create(skill_name: str, agent: str, project: bool = False) -> None:
         "   - langgraph-docs: LangGraph documentation lookup\n"
         "\n"
         "   Copy an example:\n"
-        "   cp -r examples/skills/web-research ~/.deepagents/agent/skills/\n",
+        "   cp -r examples/skills/web-research ~/.deep_worker/agents/<agent>/skills/\n",
         style=COLORS["dim"],
     )
 
@@ -625,9 +625,9 @@ def setup_skills_parser(
         description=(
             "Create a new skill with a template SKILL.md file. "
             "By default, skills are created in "
-            "~/.deepagents/<agent>/skills/. "
+            "~/.deep_worker/agents/<agent>/skills/. "
             "Use --project to create in the project's "
-            ".deepagents/skills/ directory."
+            ".deep_worker/skills/ directory."
         ),
         add_help=False,
         parents=help_parent(show_skills_create_help),

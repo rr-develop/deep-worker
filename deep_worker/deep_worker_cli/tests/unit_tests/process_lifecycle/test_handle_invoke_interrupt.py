@@ -26,6 +26,12 @@ def _make_agent_process():
     process.session_manager = MagicMock()
     process.session_manager.set_status = AsyncMock()
     process.session_manager.set_error = AsyncMock()
+    # A starting turn clears the previous turn's recoverable-error marker
+    # (docs/DESIGN_RECOVERABLE_ERROR_VISIBILITY.md §4.4).
+    process.session_manager.clear_error = AsyncMock()
+    # ...and advances the activity counter, alongside the RUNNING
+    # transition above.
+    process.session_manager.increment_message_count = AsyncMock()
 
     # No TaskManager
     process.task_manager = None

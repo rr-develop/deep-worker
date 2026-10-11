@@ -137,31 +137,31 @@ def test_availability_tracker_round_trip() -> None:
 
     with tempfile.TemporaryDirectory() as tmp:
         tracker = AvailabilityTracker(data_dir=Path(tmp))
-        assert tracker.is_available("claude-code")
+        assert tracker.is_available("claude-code-sdk")
 
         now = datetime.now(timezone.utc)
         later = now + timedelta(hours=2)
         tracker.record_failure(
-            provider="claude-code",
+            provider="claude-code-sdk",
             marker_text="resets 5pm",
             agent_name="test_agent",
             available_after_utc=later,
         )
-        assert not tracker.is_available("claude-code")
-        assert tracker.next_available("claude-code") is not None
+        assert not tracker.is_available("claude-code-sdk")
+        assert tracker.next_available("claude-code-sdk") is not None
 
         # Serialize and deserialize by creating a new tracker
         tracker2 = AvailabilityTracker(data_dir=Path(tmp))
-        assert not tracker2.is_available("claude-code")
+        assert not tracker2.is_available("claude-code-sdk")
 
         # Clear
-        tracker2.clear("claude-code")
-        assert tracker2.is_available("claude-code")
-        assert tracker2.next_available("claude-code") is None
+        tracker2.clear("claude-code-sdk")
+        assert tracker2.is_available("claude-code-sdk")
+        assert tracker2.next_available("claude-code-sdk") is None
 
         # Re-serialize and check
         tracker3 = AvailabilityTracker(data_dir=Path(tmp))
-        assert tracker3.is_available("claude-code")
+        assert tracker3.is_available("claude-code-sdk")
 
 
 def test_availability_tracker_unknown_reset_is_available() -> None:
@@ -195,13 +195,13 @@ def test_availability_tracker_future_reset_not_restore_eligible() -> None:
         tracker = AvailabilityTracker(data_dir=Path(tmp))
         later = datetime.now(timezone.utc) + timedelta(hours=2)
         tracker.record_failure(
-            provider="claude-code",
+            provider="claude-code-sdk",
             marker_text="resets 3:50pm (Europe/Amsterdam)",
             agent_name="test_agent",
             available_after_utc=later,
         )
-        assert not tracker.is_restore_eligible("claude-code")
-        assert tracker.is_available("claude-code") is False
+        assert not tracker.is_restore_eligible("claude-code-sdk")
+        assert tracker.is_available("claude-code-sdk") is False
 
 
 def test_availability_tracker_first_failure_returns_true() -> None:
@@ -211,7 +211,7 @@ def test_availability_tracker_first_failure_returns_true() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         tracker = AvailabilityTracker(data_dir=Path(tmp))
         was = tracker.record_failure(
-            provider="claude-code",
+            provider="claude-code-sdk",
             marker_text="resets 6pm",
             agent_name="test",
             available_after_utc=datetime.now(timezone.utc) + timedelta(hours=1),
@@ -219,7 +219,7 @@ def test_availability_tracker_first_failure_returns_true() -> None:
         assert was is True, "first failure should return True (was available)"
 
         was2 = tracker.record_failure(
-            provider="claude-code",
+            provider="claude-code-sdk",
             marker_text="resets 8pm",
             agent_name="test",
             available_after_utc=datetime.now(timezone.utc) + timedelta(hours=2),
@@ -231,16 +231,234 @@ def test_availability_tracker_first_failure_returns_true() -> None:
 # 3. Provider chain constants
 # =========================================================================
 
-def test_provider_failover_chain() -> None:
-    from deep_worker_cli.runtime.provider_chain import PROVIDER_FAILOVER_CHAIN
+def test_seeded_default_chain(tmp_path) -> None:
+    """The ``default`` chain a fresh install materialises.
 
-    assert PROVIDER_FAILOVER_CHAIN == [
+    Replaces the old assertion on ``PROVIDER_FAILOVER_CHAIN``, which is gone:
+    chains are operator config now, never a Python constant (owner directive
+    2026-09-03). What still needs pinning is the composition an operator gets
+    before they edit anything — otherwise the seed could drift unnoticed.
+
+    ``claude-code-sdk`` is deliberately absent: it and ``claude-code`` are two
+    forms of one provider on one subscription, so a step between them lands in
+    the account that was just exhausted.
+    """
+    from deep_worker_cli.runtime.failover_chains import get_chain
+
+    chain = get_chain(home=tmp_path)
+
+    assert [step.provider for step in chain.steps] == [
         "claude-code",
         "codex",
         "grok",
         "deepseek",
     ]
-    assert PROVIDER_FAILOVER_CHAIN[-1] == "deepseek"
+    # No step pins a model: each provider picks its own default.
+    assert all(step.model is None for step in chain.steps)
+
+
+# =========================================================================
+# 3b. failover_candidates — account affinity (review R2)
+# =========================================================================
+
+def _providers(steps) -> list[str]:
+    """``failover_candidates`` returns steps now; a step carries a model too."""
+    return [step.provider for step in steps]
+
+
+def test_failover_candidates_skips_same_account_group(tmp_path) -> None:
+    """Exhausting claude-code must NOT fall back to claude-code-sdk — both
+    share the same Claude subscription (account-level cap).
+
+    The sibling is absent from the seeded ``default`` chain as well, so this
+    asserts the account filter directly, on a chain that names both.
+    """
+    import json
+
+    from deep_worker_cli.runtime.failover_chains import chains_path, get_chain
+    from deep_worker_cli.runtime.provider_chain import failover_candidates
+
+    path = chains_path(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "chains": {
+                    "default": {
+                        "steps": ["claude-code", "claude-code-sdk", "codex", "deepseek"]
+                    }
+                }
+            }
+        )
+    )
+
+    candidates = failover_candidates(
+        "claude-code", chain=get_chain(home=tmp_path), home=tmp_path
+    )
+
+    assert "claude-code-sdk" not in _providers(candidates)
+    assert _providers(candidates) == ["codex", "deepseek"]
+
+
+def test_failover_candidates_after_codex_keeps_rest(tmp_path) -> None:
+    from deep_worker_cli.runtime.failover_chains import get_chain
+    from deep_worker_cli.runtime.provider_chain import failover_candidates
+
+    got = failover_candidates("codex", chain=get_chain(home=tmp_path), home=tmp_path)
+
+    assert _providers(got) == ["grok", "deepseek"]
+
+
+def test_failover_candidates_last_step_is_terminal(tmp_path) -> None:
+    """Terminality is a chain POSITION now, not the name ``deepseek``."""
+    from deep_worker_cli.runtime.failover_chains import get_chain
+    from deep_worker_cli.runtime.provider_chain import failover_candidates
+
+    got = failover_candidates("deepseek", chain=get_chain(home=tmp_path), home=tmp_path)
+
+    assert got == []
+
+
+def test_failover_candidates_off_chain_provider_starts_at_step_zero(tmp_path) -> None:
+    """Replaces "unknown provider ⇒ []", which was the config-driven dead end.
+
+    An agent on a provider absent from its chain used to get no candidates at
+    all: it could neither leave nor be arrived at, so a usage limit stranded it
+    in ERROR permanently. It now enters the chain at the first step.
+    """
+    from deep_worker_cli.runtime.failover_chains import get_chain
+    from deep_worker_cli.runtime.provider_chain import failover_candidates
+
+    got = failover_candidates(
+        "bogus-provider", chain=get_chain(home=tmp_path), home=tmp_path
+    )
+
+    assert _providers(got) == ["claude-code", "codex", "grok", "deepseek"]
+
+
+# =========================================================================
+# 3c. AcpUsageLimitError is fatal (review R1) — all three exception modules
+# =========================================================================
+
+def test_acp_usage_limit_error_is_fatal() -> None:
+    """AcpUsageLimitError must be in FATAL_EXCEPTION_TYPES so TaskManager
+    propagates it and _handle_invoke transitions to ERROR + failover."""
+    from deep_worker_cli.exceptions import FATAL_EXCEPTION_TYPES, is_fatal_exception
+    from deep_worker.providers.acp.limit_errors import AcpUsageLimitError
+
+    assert "AcpUsageLimitError" in FATAL_EXCEPTION_TYPES
+    assert is_fatal_exception(AcpUsageLimitError("boom"))
+
+
+# =========================================================================
+# 3c. _schedule_failover — the agent's CONFIGURED chain is what gets walked
+#
+# These two pin the WIRING, not the helpers. A test that calls
+# ``failover_candidates`` itself cannot see whether ``_schedule_failover``
+# passes the agent's chain name or the step's model along — mutating those
+# call sites left the rest of the suite green
+# (see a related internal feedback note, not included here).
+# =========================================================================
+
+@pytest.mark.asyncio
+async def test_schedule_failover_walks_the_agents_named_chain(tmp_path) -> None:
+    """A non-default ``failover_chain`` in launch_config must be honoured."""
+    import json
+
+    from deep_worker_cli.runtime.failover_chains import chains_path
+
+    path = chains_path(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "chains": {
+                    "default": {"steps": ["claude-code", "codex"]},
+                    "cheap": {"steps": ["grok", "deepseek"]},
+                }
+            }
+        )
+    )
+
+    agent = _make_agent()
+    agent.data_dir = tmp_path  # write_restart_notice runs before the spawn
+    agent.launch_config["provider"] = "claude-code"
+    agent.launch_config["failover_chain"] = "cheap"
+
+    with (
+        patch(
+            "deep_worker_cli.runtime.failover_chains.deep_worker_home",
+            return_value=tmp_path / ".deep_worker",
+        ),
+        patch(
+            "deep_worker_cli.runtime.availability_tracker.AvailabilityTracker",
+            autospec=True,
+        ) as MockTracker,
+        patch("asyncio.create_subprocess_exec", autospec=True) as mock_subproc,
+    ):
+        MockTracker.return_value.is_available.return_value = True
+        mock_proc = AsyncMock()
+        mock_proc.wait = AsyncMock()
+        mock_subproc.return_value = mock_proc
+
+        await agent._schedule_failover("claude-code", "hit your usage limit")
+
+        assert mock_subproc.called, "no restart was scheduled"
+        argv = list(mock_subproc.call_args[0])
+        # 'cheap' starts at grok; 'default' would have gone to codex.
+        assert "grok" in argv
+        assert "codex" not in argv
+
+
+@pytest.mark.asyncio
+async def test_schedule_failover_passes_the_steps_model_to_restart(tmp_path) -> None:
+    """A step's pinned model must reach the ``--restart`` command line."""
+    import json
+
+    from deep_worker_cli.runtime.failover_chains import chains_path
+
+    path = chains_path(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "chains": {
+                    "default": {
+                        "steps": [
+                            {"provider": "claude-code"},
+                            {"provider": "codex", "model": "gpt-5.2"},
+                        ]
+                    }
+                }
+            }
+        )
+    )
+
+    agent = _make_agent()
+    agent.data_dir = tmp_path  # write_restart_notice runs before the spawn
+    agent.launch_config["provider"] = "claude-code"
+
+    with (
+        patch(
+            "deep_worker_cli.runtime.failover_chains.deep_worker_home",
+            return_value=tmp_path / ".deep_worker",
+        ),
+        patch(
+            "deep_worker_cli.runtime.availability_tracker.AvailabilityTracker",
+            autospec=True,
+        ) as MockTracker,
+        patch("asyncio.create_subprocess_exec", autospec=True) as mock_subproc,
+    ):
+        MockTracker.return_value.is_available.return_value = True
+        mock_proc = AsyncMock()
+        mock_proc.wait = AsyncMock()
+        mock_subproc.return_value = mock_proc
+
+        await agent._schedule_failover("claude-code", "hit your usage limit")
+
+        argv = list(mock_subproc.call_args[0])
+        assert "--model" in argv, f"step model never reached the command: {argv}"
+        assert argv[argv.index("--model") + 1] == "gpt-5.2"
 
 
 # =========================================================================
@@ -268,11 +486,11 @@ async def test_schedule_failover_records_failure() -> None:
             mock_proc.wait = AsyncMock()
             mock_subproc.return_value = mock_proc
 
-            await agent._schedule_failover("claude-code", "resets 10pm UTC")
+            await agent._schedule_failover("claude-code-sdk", "resets 10pm UTC")
 
             # Verify record_failure was called with the right positional args
             call_kwargs = mock_instance.record_failure.call_args[1]
-            assert call_kwargs["provider"] == "claude-code"
+            assert call_kwargs["provider"] == "claude-code-sdk"
             assert call_kwargs["marker_text"] == "resets 10pm UTC"
             assert call_kwargs["agent_name"] == agent.name
 
@@ -369,7 +587,7 @@ async def test_schedule_failover_writes_restart_notice_for_auto_continue() -> No
             assert notice.get("cause") == "failover"
             # The message names the provider switch so the model has context.
             assert "codex" in notice.get("message", "")
-            # failover chain: claude-code → codex → grok → deepseek.
+            # failover chain: claude-code-sdk → codex → grok → deepseek.
             # codex->grok is the immediate next, not deepseek.
             assert "grok" in notice.get("message", "")
 
@@ -494,7 +712,7 @@ def _make_cli_args(**overrides: str | bool | None) -> MagicMock:
 def _make_saved_launch_config(**overrides: str | bool | None) -> dict:
     defaults = {
         "name": "test_agent",
-        "provider": "claude-code",
+        "provider": "claude-code-sdk",
         "model": "sonnet",
         "skip_permissions": False,
         "enable_task_manager": False,
@@ -519,7 +737,7 @@ def test_merge_restart_config_backfill_preferred() -> None:
     args = _make_cli_args()
 
     merged = merge_restart_config(saved, args)
-    assert merged.preferred_provider == "claude-code", (
+    assert merged.preferred_provider == "claude-code-sdk", (
         "backfill: preferred_provider = saved.provider when missing"
     )
 
@@ -528,7 +746,7 @@ def test_merge_restart_config_preferred_provider_overrides_both() -> None:
     """--preferred-provider X overrides BOTH preferred_provider AND provider."""
     from deep_worker_cli.cli.agent_command import merge_restart_config
 
-    saved = _make_saved_launch_config(preferred_provider="claude-code")
+    saved = _make_saved_launch_config(preferred_provider="claude-code-sdk")
     args = _make_cli_args(preferred_provider="codex")
 
     merged = merge_restart_config(saved, args)
@@ -541,12 +759,12 @@ def test_merge_restart_config_no_update_preferred_preserves() -> None:
     provider changes."""
     from deep_worker_cli.cli.agent_command import merge_restart_config
 
-    saved = _make_saved_launch_config(preferred_provider="claude-code")
+    saved = _make_saved_launch_config(preferred_provider="claude-code-sdk")
     # Provider override — but no-update-preferred is set
     args = _make_cli_args(provider="codex", no_update_preferred=True)
 
     merged = merge_restart_config(saved, args)
-    assert merged.preferred_provider == "claude-code", (
+    assert merged.preferred_provider == "claude-code-sdk", (
         "--no-update-preferred must preserve the saved preferred_provider"
     )
     assert merged.provider == "codex", (
@@ -574,16 +792,16 @@ def test_merge_restart_config_restore_keeps_preferred_model() -> None:
     saved = _make_saved_launch_config(
         provider="codex",
         model=None,
-        preferred_provider="claude-code",
+        preferred_provider="claude-code-sdk",
         preferred_model="opus",
     )
     args = _make_cli_args(
-        provider="claude-code",
+        provider="claude-code-sdk",
         model=None,
         no_update_preferred=True,
     )
     merged = merge_restart_config(saved, args)
-    assert merged.provider == "claude-code"
+    assert merged.provider == "claude-code-sdk"
     assert merged.model == "opus"
 
 
@@ -592,7 +810,7 @@ def test_merge_restart_config_preferred_provider_wins_over_provider() -> None:
     should also be updated to match preferred_provider."""
     from deep_worker_cli.cli.agent_command import merge_restart_config
 
-    saved = _make_saved_launch_config(preferred_provider="claude-code")
+    saved = _make_saved_launch_config(preferred_provider="claude-code-sdk")
     args = _make_cli_args(preferred_provider="deepseek")
 
     merged = merge_restart_config(saved, args)
@@ -609,11 +827,11 @@ def test_merge_restart_config_preferred_provider_wins_over_provider() -> None:
 @pytest.mark.asyncio
 async def test_restore_on_idle_skips_when_preferred_still_limited() -> None:
     """Regression (observed live, 2026-06-20): after failover to codex, restore-on-idle
-    must NOT bounce back to claude-code while its session limit is active."""
+    must NOT bounce back to claude-code-sdk while its session limit is active."""
     agent = _make_agent()
     agent.launch_config = {
         "provider": "codex",
-        "preferred_provider": "claude-code",
+        "preferred_provider": "claude-code-sdk",
         "preferred_model": "opus",
         "storage_version": 5,
     }
@@ -626,7 +844,7 @@ async def test_restore_on_idle_skips_when_preferred_still_limited() -> None:
             fromlist=["AvailabilityTracker"],
         ).AvailabilityTracker(data_dir=tracker_dir)
         tracker.record_failure(
-            provider="claude-code",
+            provider="claude-code-sdk",
             marker_text=(
                 "You've hit your session limit · resets 3:50pm (Europe/Amsterdam)"
             ),
@@ -665,8 +883,8 @@ def _make_agent() -> AgentProcess:
     agent.current_thread_id = "default"
     from deep_worker_cli.storage_paths import CURRENT_STORAGE_VERSION
     agent.launch_config = {
-        "provider": "claude-code",
-        "preferred_provider": "claude-code",
+        "provider": "claude-code-sdk",
+        "preferred_provider": "claude-code-sdk",
         "storage_version": CURRENT_STORAGE_VERSION,
     }
     return agent

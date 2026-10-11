@@ -32,15 +32,15 @@
 - Unit (all pass): `tests/unit/test_per_agent_db_resolution.py`
   covers `get_thread_history`, `list_threads`, `clean_agent_history`,
   `clean_agent_history_db_only`, `remove_threads_before` with real
-  temp-dir `<agent-data-dir>` (no mocks of session/sqlite layer).
+  temp-dir legacy storage root (no mocks of session/sqlite layer).
 - Integration (all pass):
-  `test_deep_worker_offline_per_agent_db.py`
+  `tests/integration_ai/test_deep_worker_offline_per_agent_db.py`
   drives the real `deep-worker` CLI binary against a temp `HOME` with
   real per-agent DB files. Exact reproducer of the bug is covered
-  (`test_dw_history_still_works_when_global_db_is_empty`).
+  (`test_deep_worker_history_still_works_when_global_db_is_empty`).
 - Rewrote `tests/integration_ai/test_thread_management_cli.py` to use
   the isolated-HOME pattern so it does not depend on the dev machine's
-  <agent-data-dir> state.
+  legacy user storage state.
 - Full related test suites pass: **146 tests green**.
 
 ---
@@ -53,9 +53,9 @@ Error: Error retrieving thread history: no such table: checkpoints
 ```
 
 The agent `lc4_test` has **6660 checkpoints** stored in
-`<agent-data-dir>/sessions_lc4_test.db` (3.8 GB). But `deep-worker --history`
-reads `<agent-data-dir>/sessions.db` (the **legacy global** file), which on this
-machine is empty (0 bytes, no tables). Hence the error.
+its own per-agent DB in the then-current legacy storage tree (3.8 GB). But
+`deep-worker --history` read the **legacy global** file in that same tree,
+which on this machine was empty (0 bytes, no tables). Hence the error.
 
 This is not a data-loss bug — the data is intact. It's a **read-path bug**:
 the offline CLI commands were never updated when the storage layout switched
@@ -65,8 +65,8 @@ from one global DB to one DB per agent.
 
 The codebase already supports per-agent DBs:
 
-- `get_db_path(agent_name)` → `<agent-data-dir>/sessions_{agent_name}.db`
-- `get_db_path(None)` → `<agent-data-dir>/sessions.db` (legacy)
+- `get_db_path(agent_name)` → the per-agent DB in the legacy tree
+- `get_db_path(None)` → the legacy global DB in that tree
 - `get_checkpointer(agent_name)` writes to the per-agent file and runs a
   one-time migration from the global file
   (`_migrate_from_global_db`, `sessions.py:401`)
@@ -118,7 +118,7 @@ So for a given `thread_id`, the corresponding agent DB is:
 
 ```python
 agent_name = thread_id.split(":")[0]
-db_path    = get_db_path(agent_name)  # <agent-data-dir>/sessions_<agent>.db
+db_path    = get_db_path(agent_name)  # per-agent DB (legacy tree)
 ```
 
 This rule is already used inside `_migrate_from_global_db` (line 433):
@@ -172,7 +172,7 @@ if agent_name is not None:
     db_files = [get_db_path(agent_name)]
 else:
     # All per-agent files + legacy global
-    db_dir = Path.home() / ".deepagents"
+    db_dir = legacy_storage_root()
     db_files = list(db_dir.glob("sessions_*.db"))
     legacy = db_dir / "sessions.db"
     if legacy.exists():
@@ -189,7 +189,7 @@ Then run the existing SELECT against **each** file, concatenate, sort by
 
 **Two-step cleanup** (simpler and bulletproof):
 
-1. If `<agent-data-dir>/sessions_{agent_name}.db` exists → **delete the file**.
+1. If the agent's per-agent DB exists → **delete the file**.
    Returns `(checkpoints_deleted, writes_deleted)` by reading row counts
    beforehand. Deleting the file is atomic, avoids SQLite lock issues with
    a just-exited agent, and is exactly what the user expects from `--clean`.
@@ -251,7 +251,7 @@ Add to `tests/unit/test_thread_management.py`:
 
 ### 7.2 Integration tests (**real agent, real CLI**)
 
-Add `test_deep_worker_offline_history.py`:
+Add `tests/integration_ai/test_deep_worker_offline_history.py`:
 
 1. **`test_deep_worker_history_reads_per_agent_db_after_agent_exit`**
    ```
@@ -259,7 +259,7 @@ Add `test_deep_worker_offline_history.py`:
    # Then run: deep-worker --history <agent>
    # Assert exit_code == 0 and output contains both USER and ASSISTANT lines.
    ```
-2. **`test_dw_history_works_for_tm_thread`**
+2. **`test_deep_worker_history_works_for_tm_thread`**
    ```
    # Same as above but for <agent>:tm thread_id.
    ```
@@ -281,7 +281,7 @@ mocks. They will catch this class of bug in the future.
 
 ### 7.3 Regression test for the reported failure
 
-`test_dw_history_lc4_test_style` — the exact scenario: start an
+`test_deep_worker_history_lc4_test_style` — the exact scenario: start an
 agent whose history ends up in a per-agent file, exit, run
 `deep-worker --history <agent>`, assert success. This is effectively a
 generalized version of (1) above and is the key defence against

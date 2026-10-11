@@ -630,7 +630,7 @@ checkpointer (no RPyC).
    built with. This is the provider-AGNOSTIC role/instruction text produced by
    the CLI's `agent.get_system_prompt()` and passed to
    `create_deep_agent(system_prompt=...)`. It is the SAME text regardless of
-   provider (claude-code / deepseek / openai / …). It deliberately does NOT
+   provider (claude-code-sdk / deepseek / openai / …). It deliberately does NOT
    include the per-provider tool surface — that is mode #5.
 2. **`tools`** — the list of tools currently available to the agent. This MAY
    depend on the active provider (the tool surface is bound per provider /

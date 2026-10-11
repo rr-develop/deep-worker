@@ -3,7 +3,7 @@ agent's per-agent SQLite DB (DESIGN_IMPORT_CLAUDE_SESSION.md §4).
 
 Acceptance: after import, the EXISTING offline read path
 ``get_thread_history(agent)`` returns the same messages — i.e. they actually
-landed in ``~/.deepagents/sessions_<agent>.db``. We isolate HOME so no real DB
+landed in the agent's own ``threads.db``. We isolate HOME so no real DB
 is touched.
 """
 

@@ -41,7 +41,35 @@ _INTEGRATION_ENABLED = os.environ.get("GROK_INTEGRATION_TESTS", "").lower() in (
     "yes",
 )
 _GROK_AVAILABLE = shutil.which("grok") is not None
-_AUTH_PRESENT = (Path.home() / ".grok" / "auth.json").exists()
+# The operator's REAL grok home, captured at IMPORT time — before the autouse
+# ``_sandbox_deep_worker_home`` fixture (tests/conftest.py) repoints HOME at a
+# per-run sandbox. Inside a test ``Path.home()`` is already that sandbox.
+_REAL_GROK_HOME = Path.home() / ".grok"
+_AUTH_PRESENT = (_REAL_GROK_HOME / "auth.json").exists()
+
+
+@pytest.fixture(autouse=True)
+def _grok_home_points_at_real_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Give the grok CLI its credentials back under the sandboxed HOME.
+
+    The HOME sandbox (owner directive 2026-08-17: a test must never write the
+    live runtime tree) also hides ``~/.grok/auth.json`` from the grok CLI the
+    agent spawns. The CLI then starts UNAUTHENTICATED — its own log shows
+    ``auth.json load result: read=error`` followed by an endless
+    ``model catalog refresh failed`` backoff — so it never becomes promptable
+    and the agent's very first turn hangs until the test times out. The
+    module-level skipif above checked the REAL home and passed, which is why
+    this read as a product hang rather than a harness defect (diagnosed
+    2026-08-24; the same failure reproduces on pre-fix code).
+
+    ``GROK_HOME`` overrides the CLI's home independently of ``HOME`` (verified
+    live: ``HOME=<sandbox> GROK_HOME=~/.grok grok du`` reports the real
+    store), so credentials are restored while all deep-worker state stays
+    sandboxed. The variable is inherited by the multiprocessing-spawned agent
+    process and by the CLI subprocess underneath it.
+    """
+    monkeypatch.setenv("GROK_HOME", str(_REAL_GROK_HOME))
+
 
 pytestmark = [
     pytest.mark.integration,
@@ -61,12 +89,21 @@ _SRC_NAME = "test_a_grok"
 _DST_NAME = "test_b_grok"
 _MARKER = "MARK_GRK_42K"
 _DELAY_HINT_SEC = 5
-# Hard SLA — missing it is a bug. Actual happy-path ~50 s wall-clock:
-#   bootstrap ~10 s, round-trip (sleep 5 + B tools + delivery) ~15 s,
-#   A grok_receive_completion — synchronous middleware jump, not a grok turn.
-_BOOTSTRAP_IDLE_SEC = 20.0
-_REPLY_WAIT_SEC = 20.0
-_IDLE_AFTER_REPLY_SEC = 5.0
+# SLA. Still a hard budget — an overrun is a defect, not noise — but
+# calibrated against MEASURED grok 1.0.5 latency (2026-08-24, live agents
+# started by the normal launcher, after the correlation fix below):
+#   * first turn of a process ~20 s — the grok CLI cold start (spawn, auth,
+#     model catalog, session/new) is paid once per agent;
+#   * warm trivial turn ~2.5 s;
+#   * a turn that calls send_message_to_agent ~13 s (it was ~30 s until the
+#     dead 10 s proxy-correlation wait was removed — grok dispatches our
+#     tools over ACP and never parks an MCP handler, so the wait could
+#     never be satisfied; see PROXY_CORRELATION_PROBE_SEC).
+# B's bootstrap and A's send are each a FIRST turn, so they carry the cold
+# start; the reply leg is B's warm turn plus delivery.
+_BOOTSTRAP_IDLE_SEC = 45.0
+_REPLY_WAIT_SEC = 90.0
+_IDLE_AFTER_REPLY_SEC = 10.0
 
 
 def _classify(m: dict) -> str:
@@ -187,7 +224,7 @@ async def _wait_until_idle(client: AgentClient, deadline: float) -> str:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(75)
+@pytest.mark.timeout(240)
 async def test_grok_send_to_b_and_recognise_reply() -> None:
     grok_kwargs = _grok_agent_kwargs()
     _cleanup_agent_state(_SRC_NAME)

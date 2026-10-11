@@ -25,9 +25,13 @@ from deep_worker_cli.external_mcp.config import (
 
 
 def _scope_to_path(scope: str) -> Path:
-    home = Path.home()
-    if scope == "user":
-        return home / ".deepagents" / "mcp.json"
+    """Resolve a ``--scope`` string via the shared resolver (POLICIES §16)."""
+    from deep_worker_cli.external_mcp.config_store import (
+        UnknownScopeError,
+        scope_to_path,
+    )
+
+    project_root = None
     if scope == "project":
         from deep_worker_cli.project_utils import find_project_root
 
@@ -35,16 +39,11 @@ def _scope_to_path(scope: str) -> Path:
         # the launcher does ``cd "$SCRIPT_DIR"``, which made project-scope
         # resolve to the install directory (writing into another repo). See cli/cwd.py.
         start = invocation_cwd()
-        root = find_project_root(start) or start
-        return root / ".deepagents" / "mcp.json"
-    if scope.startswith("agent:"):
-        name = scope.split(":", 1)[1].strip()
-        if not name:
-            raise SystemExit("--scope agent:<name> requires a non-empty agent name")
-        return home / ".deepagents" / name / "mcp.json"
-    raise SystemExit(
-        f"unknown --scope {scope!r}; expected user | project | agent:<name>"
-    )
+        project_root = find_project_root(start) or start
+    try:
+        return scope_to_path(scope, project_root=project_root)
+    except UnknownScopeError as exc:
+        raise SystemExit(str(exc)) from None
 
 
 def _read(path: Path) -> dict:
@@ -124,11 +123,8 @@ def handle_mcp_command(args: argparse.Namespace) -> int:
 
 
 def _cmd_list(scope: str) -> int:
-    home = Path.home()
-    user_path = home / ".deepagents" / "mcp.json"
+    user_path = _scope_to_path("user")
     project_path = _scope_to_path("project")
-    # ``agent:<n>`` and ``all`` cases are folded into the same dump below by
-    # walking ~/.deepagents/*/mcp.json explicitly.
     if scope in ("user", "project"):
         path = _scope_to_path(scope)
         if not path.exists():
@@ -145,12 +141,19 @@ def _cmd_list(scope: str) -> int:
         print(f"# {path}")
         print(path.read_text(encoding="utf-8"))
         return 0
-    # all: dump effective merge for the current cwd.
+    # all: dump effective merge for the current cwd. That cwd is also
+    # what resolves ``${agent:working_dir}`` here: this listing already
+    # claims to show the merge "for the current cwd", so an agent-scoped
+    # placeholder is shown as it would resolve for an agent working in
+    # this directory. Passing nothing would make one placeholder entry
+    # abort the whole listing, including unrelated servers — an
+    # inspection command that stops inspecting.
     try:
         merged = load_mcp_config(
             user_path=user_path,
             project_path=project_path,
             agent_path=None,
+            working_dir=invocation_cwd(),
         )
     except Exception as e:
         print(f"error: {e}")

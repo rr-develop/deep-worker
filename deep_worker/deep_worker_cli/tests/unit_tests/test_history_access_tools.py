@@ -34,8 +34,8 @@ def _make_md(sections: str) -> str:
 
 
 def _write_summary(base: Path, agent: str, thread: str, content: str) -> Path:
-    """Write a summary .md file under deep_worker_home(base)/<agent>/summaries/<thread>.md."""
-    d = deep_worker_home(base) / agent / "summaries"
+    """Write a summary .md file under deep_worker_home(base)/agents/<agent>/summaries/<thread>.md."""
+    d = deep_worker_home(base) / "agents" / agent / "summaries"
     d.mkdir(parents=True, exist_ok=True)
     os.chmod(d, 0o700)
     p = d / f"{thread}.md"

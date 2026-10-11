@@ -204,3 +204,101 @@ class TestMessageDictCache:
         assert stats["size"] == 1
         assert stats["misses"] == 1
         assert stats["hits"] == 1
+
+
+# ---------------------------------------------------------------------------
+# The recoverable-error flag must survive the trip to the web
+#
+# The runtime stamps ``recoverable_error`` on the SystemMessage it appends
+# for a failed-but-recoverable turn. Before this, ``additional_kwargs`` was
+# read for exactly one key (``created_at``), so the flag never left the
+# agent and the web could not tell a runtime failure from an ordinary
+# system message. See docs/DESIGN_RECOVERABLE_ERROR_VISIBILITY.md §5.3.
+# ---------------------------------------------------------------------------
+
+
+def _flagged_message() -> SystemMessage:
+    return SystemMessage(
+        content="[runtime] The previous turn failed (MaxIterationsExceeded).",
+        additional_kwargs={
+            "recoverable_error": True,
+            "exc_name": "MaxIterationsExceeded",
+            "input_message_id": "abc123",
+        },
+    )
+
+
+def test_recoverable_error_flag_is_forwarded():
+    out = serialize_message(_flagged_message())
+
+    assert out["recoverable_error"] is True
+
+
+def test_other_internals_are_not_forwarded_with_it():
+    """Whitelisted key by key — ``additional_kwargs`` carries internals.
+
+    Emitting the whole dict would ship ``input_message_id`` and friends
+    on every polling ``get_history``.
+    """
+    out = serialize_message(_flagged_message())
+
+    assert "input_message_id" not in out
+    assert "exc_name" not in out
+    assert "additional_kwargs" not in out
+
+
+def test_an_ordinary_message_gains_no_new_key():
+    """No extra bytes on the common path."""
+    out = serialize_message(SystemMessage(content="You are a helpful agent."))
+
+    assert "recoverable_error" not in out
+
+
+def test_a_stale_entry_is_not_served_after_the_shape_changes():
+    """The cache must not mask a new field for the life of the process.
+
+    The probe uses a message WITH an id on purpose: an id-less message is
+    never cached at all, which would make this test vacuous. In production
+    the id is assigned by the ``add_messages`` reducer during
+    ``aupdate_state``, so these messages really are cached.
+    """
+    import deep_worker_cli.process.message_dict_cache as mdc
+
+    msg = _flagged_message()
+    msg.id = "msg-1"
+
+    cache = MessageDictCache()
+    # An entry serialised under an older shape, as a long-lived process
+    # would hold after the code changed under it.
+    cache._by_id[msg.id] = (
+        mdc._SERIALIZATION_VERSION - 1,
+        {"type": "SystemMessage", "id": msg.id, "content": "stale"},
+    )
+
+    out = cache.serialize(msg)
+
+    assert out["recoverable_error"] is True, "a stale dict was served"
+    assert cache.serialize(msg) is out, "the fresh entry should now be cached"
+
+
+def test_prune_to_still_prunes_by_plain_id():
+    """The version lives beside the entry, NOT inside the key.
+
+    ``prune_to`` is called on every ``get_history`` with a set of plain
+    string ids. Had the version gone into the key, no key would ever match
+    and the whole cache would be evicted on each poll — no error, no
+    failing test, just a silently dead cache.
+    """
+    kept = _flagged_message()
+    kept.id = "live-1"
+    dropped = SystemMessage(content="gone")
+    dropped.id = "dead-1"
+
+    cache = MessageDictCache()
+    cache.serialize(kept)
+    cache.serialize(dropped)
+
+    evicted = cache.prune_to({"live-1"})
+
+    assert evicted == 1
+    assert set(cache._by_id) == {"live-1"}, "a live entry was evicted"

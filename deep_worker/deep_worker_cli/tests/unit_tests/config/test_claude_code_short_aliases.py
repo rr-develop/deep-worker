@@ -57,30 +57,30 @@ FULL_MODEL_IDS = [
 
 
 class TestClaudeCodeShortAliases:
-    """The documented alias set must be accepted for claude-code."""
+    """The documented alias set must be accepted for claude-code-sdk."""
 
     @pytest.mark.parametrize("alias", DOCUMENTED_ALIASES)
     def test_documented_alias_accepted(self, alias: str):
-        assert model_can_belong_to_provider("claude-code", alias) is True, (
+        assert model_can_belong_to_provider("claude-code-sdk", alias) is True, (
             f"{alias!r} is a documented Claude Code alias and must not be "
             "dropped; dropping it silently substitutes the provider default"
         )
 
     def test_fable_accepted_regression(self):
         """The exact failure from that incident."""
-        assert model_can_belong_to_provider("claude-code", "fable") is True
+        assert model_can_belong_to_provider("claude-code-sdk", "fable") is True
 
     @pytest.mark.parametrize("model_id", FULL_MODEL_IDS)
     def test_full_model_id_accepted(self, model_id: str):
-        assert model_can_belong_to_provider("claude-code", model_id) is True
+        assert model_can_belong_to_provider("claude-code-sdk", model_id) is True
 
     def test_legacy_inherit_still_accepted(self):
         """Backward compat: older persisted configs may carry ``inherit``."""
-        assert model_can_belong_to_provider("claude-code", "inherit") is True
+        assert model_can_belong_to_provider("claude-code-sdk", "inherit") is True
 
     @pytest.mark.parametrize("alias", DOCUMENTED_ALIASES)
     def test_alias_case_insensitive(self, alias: str):
-        assert model_can_belong_to_provider("claude-code", alias.upper()) is True
+        assert model_can_belong_to_provider("claude-code-sdk", alias.upper()) is True
 
     @pytest.mark.parametrize(
         "foreign",
@@ -88,15 +88,15 @@ class TestClaudeCodeShortAliases:
          "gemini-3-pro-preview"],
     )
     def test_foreign_model_rejected(self, foreign: str):
-        assert model_can_belong_to_provider("claude-code", foreign) is False
+        assert model_can_belong_to_provider("claude-code-sdk", foreign) is False
 
     @pytest.mark.parametrize("empty", ["", "   ", None])
     def test_empty_rejected(self, empty):
-        assert model_can_belong_to_provider("claude-code", empty) is False
+        assert model_can_belong_to_provider("claude-code-sdk", empty) is False
 
     def test_unknown_sentinel_rejected(self):
         """``unknown`` is the poison string from a past incident."""
-        assert model_can_belong_to_provider("claude-code", "unknown") is False
+        assert model_can_belong_to_provider("claude-code-sdk", "unknown") is False
 
 
 class TestLeafDelegation:
@@ -104,8 +104,8 @@ class TestLeafDelegation:
 
     @pytest.mark.parametrize("alias", DOCUMENTED_ALIASES + FULL_MODEL_IDS)
     def test_config_matches_leaf_for_claude_code(self, alias: str):
-        assert model_can_belong_to_provider("claude-code", alias) is leaf_predicate(
-            "claude-code", alias
+        assert model_can_belong_to_provider("claude-code-sdk", alias) is leaf_predicate(
+            "claude-code-sdk", alias
         )
 
     @pytest.mark.parametrize(
@@ -122,7 +122,7 @@ class TestLeafDelegation:
         ],
     )
     def test_other_providers_unchanged(self, provider: str, model: str):
-        """Widening claude-code must not perturb any other provider."""
+        """Widening claude-code-sdk must not perturb any other provider."""
         assert model_can_belong_to_provider(provider, model) is leaf_predicate(
             provider, model
         )
@@ -145,7 +145,7 @@ class TestLeafHasNoHeavyDependencies:
         code = (
             "import sys;"
             "import deep_worker_cli.model_predicate as m;"
-            "assert m.model_can_belong_to_provider('claude-code', 'fable');"
+            "assert m.model_can_belong_to_provider('claude-code-sdk', 'fable');"
             "heavy=[n for n in sys.modules"
             " if n.split('.')[0] in ('langchain','transformers','torch','deepagents')];"
             "print('HEAVY:'+','.join(sorted(heavy)))"

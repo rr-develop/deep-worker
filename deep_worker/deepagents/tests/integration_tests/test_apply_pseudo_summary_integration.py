@@ -59,11 +59,14 @@ async def test_apply_pseudo_summary_writes_agent_jsonl_no_graph(tmp_path: Path) 
     assert "user 1" in content
     assert "user 3" in content
 
-    # The summary-shape message references the exact JSONL path and carries
-    # the sum-query text and the summarization marker.
+    # The message the model receives is the sum-query BYTE FOR BYTE: the
+    # offload happened and is reported via ``file_path``, but the model is not
+    # told about it. Framing the task as a recap of the past is what made
+    # deepseek spend a whole turn inspecting this JSONL instead of working
+    # (repo_graph stage 2, 2026-10-01).
     assert len(new_msgs) == 1
-    assert "/conversation_history/myagent.jsonl" in new_msgs[0].content
-    assert "brand new task" in new_msgs[0].content
+    assert new_msgs[0].content == "brand new task"
+    assert "/conversation_history/myagent.jsonl" not in new_msgs[0].content
     assert new_msgs[0].additional_kwargs.get("lc_source") == "summarization"
 
 
@@ -78,4 +81,6 @@ async def test_apply_pseudo_summary_empty_history_writes_nothing(tmp_path: Path)
     assert file_path is None
     assert not (tmp_path / "conversation_history" / "myagent.jsonl").exists()
     assert ".jsonl" not in new_msgs[0].content
-    assert "hello" in new_msgs[0].content
+    # Verbatim on this branch too: the old code prefixed "Here is a summary of
+    # the conversation to date:" even with no history to summarize.
+    assert new_msgs[0].content == "hello"

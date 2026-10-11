@@ -1,7 +1,7 @@
 # grok_provider
 
 xAI **Grok** CLI provider for deep-worker — a sibling of `codex_provider` /
-`claude_code_provider`. Exposes `GrokChatModel`, a LangChain `BaseChatModel`
+`claude_code_sdk_provider`. Exposes `GrokChatModel`, a LangChain `BaseChatModel`
 that drives the Grok CLI in its `grok agent stdio` mode (the **Agent Client
 Protocol**, ACP v1, JSON-RPC over stdio).
 
@@ -45,5 +45,5 @@ GROK_INTEGRATION_TESTS=1 pytest tests/test_integration.py -v
 
 `--provider grok`. Wired in `deep_worker_cli`: `agent_config.py`,
 `agent_command.py`, `config.py` (factory + default model), `provider_chain.py`
-(failover `claude-code → codex → grok → deepseek`), and the built-in
+(failover `claude-code-sdk → codex → grok → deepseek`), and the built-in
 passthrough binding in `agent_process.py` / `task_manager.py`.

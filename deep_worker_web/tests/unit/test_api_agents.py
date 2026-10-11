@@ -243,6 +243,7 @@ class TestDialogTextEndpoint:
         async def fake_dialog(
             agent_name: str,
             verbosity: str = "final",
+            timestamps: str = "local",
         ) -> str:
             captured["agent_name"] = agent_name
             captured["verbosity"] = verbosity
@@ -271,7 +272,7 @@ class TestDialogTextEndpoint:
     ) -> None:
         captured: dict[str, Any] = {}
 
-        async def fake_dialog(agent_name: str, verbosity: str = "final") -> str:
+        async def fake_dialog(agent_name: str, verbosity: str = "final", timestamps: str = "local") -> str:
             captured["verbosity"] = verbosity
             return ""
 
@@ -292,7 +293,7 @@ class TestDialogTextEndpoint:
     ) -> None:
         captured: dict[str, Any] = {}
 
-        async def fake_dialog(agent_name: str, verbosity: str = "final") -> str:
+        async def fake_dialog(agent_name: str, verbosity: str = "final", timestamps: str = "local") -> str:
             captured["verbosity"] = verbosity
             return ""
 
@@ -311,7 +312,7 @@ class TestDialogTextEndpoint:
         mock_agent_service: AgentService,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        async def fake_dialog(agent_name: str, verbosity: str = "final") -> str:
+        async def fake_dialog(agent_name: str, verbosity: str = "final", timestamps: str = "local") -> str:
             return "anything"
 
         monkeypatch.setattr(mock_agent_service, "is_connected", AsyncMock(return_value=True))

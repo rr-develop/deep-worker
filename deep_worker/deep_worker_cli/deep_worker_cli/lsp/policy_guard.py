@@ -57,8 +57,18 @@ HEAVY_BINARIES: Final[frozenset[str]] = frozenset(
     }
 )
 
-#: The ONLY package permitted to spawn a heavy backend (policy §8).
-_ALLOWED_SPAWNER: Final = ("deep_worker_cli", "lsp", "service")
+#: The ONLY packages permitted to spawn a heavy backend (policy §8).
+#:
+#: A closed set, not an open rule: the policy is "spawning lives in a
+#: ``service/`` package", and every entry here is one. Adding the second
+#: entry does not widen that — semantic_memory's supervisor sits inside
+#: ``service/`` for the same reason the LSP one does.
+_ALLOWED_SPAWNERS: Final = frozenset(
+    {
+        ("deep_worker_cli", "lsp", "service"),
+        ("deep_worker_cli", "semantic_memory", "service"),
+    }
+)
 
 #: Transports that keep the process out of the agent. Anything else
 #: (including an omitted ``type``) is treated as stdio.
@@ -162,9 +172,10 @@ def _in_allowlisted_package(path: Path, repo_root: Path) -> bool:
         parts = Path(path).resolve().relative_to(Path(repo_root).resolve()).parts
     except ValueError:
         parts = Path(path).parts
-    n = len(_ALLOWED_SPAWNER)
     return any(
-        parts[i : i + n] == _ALLOWED_SPAWNER for i in range(len(parts) - n + 1)
+        parts[i : i + len(allowed)] == allowed
+        for allowed in _ALLOWED_SPAWNERS
+        for i in range(len(parts) - len(allowed) + 1)
     )
 
 

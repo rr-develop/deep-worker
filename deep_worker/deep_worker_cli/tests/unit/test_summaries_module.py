@@ -37,7 +37,9 @@ def _write_summary(path: Path, timestamps: list[str], body_per_ts: str = "body")
 class TestGetSummariesDir:
     def test_returns_home_deep_worker_agent_summaries(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HOME", str(tmp_path))
-        assert get_summaries_dir("foo") == deep_worker_home(tmp_path) / "foo" / "summaries"
+        # Post-v6: agent summaries live under ``agents/<name>/summaries/``
+        # (DESIGN_AGENT_DBS_UNDER_AGENTS_SUBDIR §3).
+        assert get_summaries_dir("foo") == deep_worker_home(tmp_path) / "agents" / "foo" / "summaries"
 
     def test_does_not_create_directory_on_its_own(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HOME", str(tmp_path))

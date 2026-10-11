@@ -6,7 +6,7 @@ No other mocks. The ProxyMCPServer, its handler, the asyncio Future, and
 the wait/job-handle logic are all real. Only the event-loop clock is
 advanced so the production ``long_running_wait_seconds`` (120s) deadline
 fires instantly. This mirrors
-``claude_code_provider/tests/test_job_handle_integration.py`` — the
+``claude_code_sdk_provider/tests/test_job_handle_integration.py`` — the
 mechanism is COMMON to all providers (HARD POLICY, 2026-06-16).
 
 Pins the policy: EVERY tool gets the job-handle mechanism by default; a

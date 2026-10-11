@@ -14,7 +14,7 @@ and internal design/process notes.
 | [`dw_hist/README.md`](../dw_hist/README.md) | `dw-hist` — browse agent history |
 | [`lsp/README.md`](../lsp/README.md) | LSP code navigation for agents |
 | [`codex_provider/README.md`](../codex_provider/README.md) | Codex CLI provider |
-| [`claude_code_provider/README.md`](../claude_code_provider/README.md) | Claude Code provider |
+| [`claude_code_sdk_provider/README.md`](../claude_code_sdk_provider/README.md) | Claude Code provider |
 | [`grok_provider/README.md`](../grok_provider/README.md) | Grok CLI provider |
 | [`deep_worker_web/README.md`](../deep_worker_web/README.md) | Local web UI |
 

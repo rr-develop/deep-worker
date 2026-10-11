@@ -86,9 +86,11 @@ class TestApplyPseudoSummaryOffloadPath:
         written_path = backend.write_calls[0][0]
         assert written_path == "/conversation_history/agent7.jsonl"
         assert "session_" not in written_path
-        # Summary-shape message references the JSONL file.
+        # The offload path is reported to the CALLER, but it must never leak
+        # into the message handed to the model: ``sum_query`` goes in verbatim.
         assert len(new_msgs) == 1
-        assert "/conversation_history/agent7.jsonl" in new_msgs[0].content
+        assert new_msgs[0].content == "start fresh"
+        assert "/conversation_history/agent7.jsonl" not in new_msgs[0].content
 
     @pytest.mark.asyncio
     async def test_offload_helpers_default_thread_id_none_preserves_contextvar_behaviour(

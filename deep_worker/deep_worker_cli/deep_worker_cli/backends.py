@@ -40,6 +40,7 @@ When the SDK adds this natively, these subclasses can be removed.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import itertools
 import logging
 import subprocess  # noqa: S404
@@ -135,7 +136,7 @@ class CLIShellBackend(LocalShellBackend):
     def _current_tool_use_id() -> str | None:
         """The tool_use_id of the in-flight tool call, if a provider set it.
 
-        The claude-code provider stashes it in a ContextVar (vendored SDK
+        The claude-code-sdk provider stashes it in a ContextVar (vendored SDK
         ``_mcp_context``) for the duration of each tool handler. Best-effort:
         returns ``None`` when the provider/context is absent (other providers,
         direct backend use, tests) — the job is then reachable only by its
@@ -515,6 +516,17 @@ class CLIShellBackend(LocalShellBackend):
         handle = parked.handle
         return getattr(handle, "task", handle)
 
+    def _release_parked(self, parked: "ParkedJob") -> None:
+        """Hand a served job back to the registry to erase.
+
+        The registry owns the record's lifetime, including any bookkeeping its
+        parking owner registered — this call must not take that apart itself
+        (project policy).
+        """
+        registry = self._shared_registry()
+        if registry is not None:
+            registry.complete(parked.job_id)
+
     async def _wait_parked_tool(
         self, parked: "ParkedJob", timeout: int | None
     ) -> ExecuteResponse:
@@ -565,22 +577,62 @@ class CLIShellBackend(LocalShellBackend):
                     exit_code=1,
                     truncated=False,
                 )
+            # Served: the caller now has the result, so the entry may go. It is
+            # kept alive until exactly this point (never dropped on completion)
+            # so a caller arriving after the work ended still gets its result.
+            self._release_parked(parked)
             return ExecuteResponse(
                 output=self._render_tool_result(job_id, name, result),
                 exit_code=self._tool_exit_code(result),
                 truncated=False,
             )
 
-        # Sync path: a thread-backed future cannot be awaited without blocking
-        # the loop, so only report its state. It is never cancellable.
-        done = bool(getattr(task, "done", lambda: False)())
-        if done:
-            finished = getattr(task, "result", lambda: None)()
-            return ExecuteResponse(
-                output=self._render_tool_result(job_id, name, finished),
-                exit_code=self._tool_exit_code(finished),
-                truncated=False,
-            )
+        # Sync path: a thread-backed future. It cannot be cancelled, but it CAN
+        # be awaited — ``asyncio.wrap_future`` bridges it onto the loop without
+        # blocking. Reading ``done()`` once and returning instantly ignored the
+        # caller's timeout entirely: a request for 300s was answered in ~0.000s
+        # with "STILL running", which is how a user report (2026-08-28)
+        # became unconfirmable while its worker thread sat idle.
+        if isinstance(task, concurrent.futures.Future):
+            # No ``shield`` here: ``wrap_future`` already returns a SEPARATE
+            # asyncio future, and cancelling it on timeout does not touch the
+            # worker thread (a thread is not cancellable anyway). Wrapping it
+            # in ``shield`` as the asyncio.Task branch does made ``wait_for``
+            # return TimeoutError instantly instead of waiting.
+            try:
+                finished = await asyncio.wait_for(
+                    asyncio.wrap_future(task), timeout=effective_timeout
+                )
+            except asyncio.TimeoutError:
+                pass
+            except Exception as exc:  # noqa: BLE001 — surface the tool's error
+                return ExecuteResponse(
+                    output=(
+                        f"Job '{job_id}' (tool '{name}') failed: "
+                        f"{type(exc).__name__}: {exc}"
+                    ),
+                    exit_code=1,
+                    truncated=False,
+                )
+            else:
+                # The caller has now been served its result, so the entry may
+                # be erased. Retiring without ever dropping would leak one
+                # record per parked sync tool call for the process lifetime.
+                self._release_parked(parked)
+                return ExecuteResponse(
+                    output=self._render_tool_result(job_id, name, finished),
+                    exit_code=self._tool_exit_code(finished),
+                    truncated=False,
+                )
+        else:
+            done = bool(getattr(task, "done", lambda: False)())
+            if done:
+                finished = getattr(task, "result", lambda: None)()
+                return ExecuteResponse(
+                    output=self._render_tool_result(job_id, name, finished),
+                    exit_code=self._tool_exit_code(finished),
+                    truncated=False,
+                )
         return ExecuteResponse(
             output=(
                 f"Job '{job_id}' (tool '{name}') is STILL running on a worker "
@@ -620,6 +672,17 @@ class CLIShellBackend(LocalShellBackend):
         task = self._parked_tool_task(parked)
 
         if not isinstance(task, asyncio.Task):
+            # A worker thread cannot be cancelled. But if the work has ALREADY
+            # finished, the caller is owed its result, not a refusal — and the
+            # entry may now be dropped, because this call serves it.
+            if bool(getattr(task, "done", lambda: False)()):
+                finished = getattr(task, "result", lambda: None)()
+                self._release_parked(parked)
+                return ExecuteResponse(
+                    output=self._render_tool_result(job_id, name, finished),
+                    exit_code=self._tool_exit_code(finished),
+                    truncated=False,
+                )
             return ExecuteResponse(
                 output=(
                     f"Job '{job_id}' (tool '{name}') runs on a worker thread "
@@ -637,9 +700,7 @@ class CLIShellBackend(LocalShellBackend):
         except Exception:  # noqa: BLE001 — the tool's own failure is fine here
             pass
 
-        registry = self._shared_registry()
-        if registry is not None:
-            registry.drop(job_id)
+        self._release_parked(parked)
 
         if task.done():
             return ExecuteResponse(
@@ -896,7 +957,7 @@ class CLIFilesystemMiddleware(FilesystemMiddleware):
         # ``self.tools`` is built by the base ``__init__`` (it already
         # includes our overridden ``execute``); appending here means the
         # new tools flow through the same registration path that surfaces
-        # ``execute`` to the model (incl. the claude-code proxy MCP).
+        # ``execute`` to the model (incl. the claude-code-sdk proxy MCP).
         self.tools = [*self.tools, self._create_wait_for_job_tool(), self._create_kill_job_tool()]
 
     def _resolve_sandbox(

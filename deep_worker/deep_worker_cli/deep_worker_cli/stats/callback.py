@@ -3,7 +3,7 @@ LangChain-backed providers (DESIGN_AGENT_TOKEN_STATS.md §5.1).
 
 Attached to the model instance in :func:`deep_worker_cli.config.create_model`
 for the standard LangChain providers (deepseek/openai/anthropic/google/vertexai).
-Custom providers (claude-code/codex/grok) never receive this handler — they use
+Custom providers (claude-code-sdk/codex/grok) never receive this handler — they use
 the state-machine event callback (see ``UsageEventCallback``).
 
 Contract (§5.1):

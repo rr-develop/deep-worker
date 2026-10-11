@@ -20,6 +20,32 @@ import pytest
 from deep_worker_cli.backends import CLIShellBackend
 
 
+def _live_group_members(pgid: int) -> list[int]:
+    """PIDs in process group ``pgid`` that are not zombies (Linux /proc)."""
+    import os
+
+    if not os.path.isdir("/proc/self"):
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return []
+        return [pgid]
+    live: list[int] = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/stat", encoding="utf-8") as fh:
+                stat = fh.read()
+        except OSError:
+            continue
+        fields = stat.rsplit(")", 1)[1].split()
+        state, pgrp = fields[0], int(fields[2])
+        if pgrp == pgid and state != "Z":
+            live.append(int(entry))
+    return live
+
+
 @pytest.mark.asyncio
 async def test_fast_command_returns_normally() -> None:
     """A command that finishes within the timeout behaves as before."""
@@ -125,10 +151,11 @@ async def test_kill_job_kills_child_not_just_shell() -> None:
 
     await backend.kill_job(job_id)
 
-    # The process group must be gone: killpg(pgid, 0) raises ProcessLookupError.
+    # No LIVE member of the process group may survive. A killed child that was
+    # reparented to PID 1 can linger as a zombie when PID 1 does not reap
+    # (containers without an init); a zombie is dead, not a leak.
     await asyncio.sleep(0.2)
-    with pytest.raises(ProcessLookupError):
-        os.killpg(pgid, 0)
+    assert _live_group_members(pgid) == []
 
 
 @pytest.mark.asyncio

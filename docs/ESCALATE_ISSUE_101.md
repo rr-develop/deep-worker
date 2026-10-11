@@ -35,5 +35,5 @@ This is a known bug in the MCP Python SDK:
 ## Verification
 
 - **grep for `CancelScope`, `anyio.`, `create_task_group` in our codebase** → no matches.
-- **All relevant tests pass** (137 passed, 5 skipped in codex_provider; 241 passed, 1 skipped in claude_code_provider).
+- **All relevant tests pass** (137 passed, 5 skipped in codex_provider; 241 passed, 1 skipped in claude_code_sdk_provider).
 - Error traceback confirms it's purely in the `mcp` library's generator cleanup path.

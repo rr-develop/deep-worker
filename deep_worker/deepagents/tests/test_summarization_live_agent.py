@@ -8,14 +8,76 @@ from __future__ import annotations
 
 import tempfile
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
-from langchain_core.messages import HumanMessage
+from langchain_core.callbacks import CallbackManagerForLLMRun
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
+from langchain_core.outputs import ChatGeneration, ChatResult
 from langgraph.checkpoint.memory import InMemorySaver
 
 from deepagents import create_deep_agent
 from deepagents.backends import StateBackend
+
+
+_SUMMARY_TEXT = """<session_intent>
+Testing summarization in live agent.
+</session_intent>
+
+<summary>
+User sent test messages. Agent responded to each message.
+</summary>
+
+<artifacts>
+None
+</artifacts>
+
+<next_steps>
+Continue testing agent functionality.
+</next_steps>"""
+
+
+class _SummarizingFakeModel(BaseChatModel):
+    """A chat model double that answers summarization prompts differently.
+
+    The surface is finite on purpose: it is a real ``BaseChatModel`` returning
+    real ``AIMessage`` objects, so code that probes a response for optional
+    attributes gets an honest "absent" instead of a freshly minted mock. See
+    the note in ``test_agent_summarization_with_low_trigger``.
+    """
+
+    @property
+    def _llm_type(self) -> str:
+        return "summarizing-fake"
+
+    @property
+    def model_name(self) -> str:
+        return "claude-sonnet-4.5"
+
+    @property
+    def profile(self) -> dict[str, int]:
+        return {"max_input_tokens": 200000}
+
+    def bind_tools(self, tools, **kwargs):  # noqa: ANN001, ANN003, ANN201, ARG002
+        return self
+
+    def with_structured_output(self, schema, **kwargs):  # noqa: ANN001, ANN003, ANN201, ARG002
+        return self
+
+    def _generate(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,  # noqa: ARG002
+        run_manager: CallbackManagerForLLMRun | None = None,  # noqa: ARG002
+        **kwargs: Any,  # noqa: ARG002, ANN401
+    ) -> ChatResult:
+        if "Extract the following information from the conversation" in str(messages):
+            message = AIMessage(content=_SUMMARY_TEXT)
+        else:
+            message = AIMessage(content="Test response")
+        return ChatResult(generations=[ChatGeneration(message=message)])
 
 
 class TestSummarizationLiveAgent:
@@ -31,44 +93,16 @@ class TestSummarizationLiveAgent:
         4. Verifies that summary is NOT empty
         5. Verifies agent can continue working after summarization
         """
-        # GIVEN: Mock model with summarization support
-        mock_model = MagicMock()
-        mock_model.model_name = "claude-sonnet-4.5"
-        mock_model.profile = {"max_input_tokens": 200000}
-        mock_model.bind_tools = MagicMock(return_value=mock_model)
-        mock_model.with_structured_output = MagicMock(return_value=mock_model)
-
-        # Mock responses
-        def mock_invoke(messages, **kwargs):
-            # Check if this is a summarization call
-            msg_str = str(messages)
-            if "Extract the following information from the conversation" in msg_str:
-                # This is summarization prompt
-                response = MagicMock()
-                response.text = """<session_intent>
-Testing summarization in live agent.
-</session_intent>
-
-<summary>
-User sent test messages. Agent responded to each message.
-</summary>
-
-<artifacts>
-None
-</artifacts>
-
-<next_steps>
-Continue testing agent functionality.
-</next_steps>"""
-                return response
-            else:
-                # Normal agent response
-                response = MagicMock()
-                response.content = "Test response"
-                response.tool_calls = []
-                return response
-
-        mock_model.invoke = mock_invoke
+        # GIVEN: a model double with a DEFINED surface.
+        #
+        # Deliberately not a bare MagicMock. The agent hands every response to
+        # `_stamp_response`, which probes it with `getattr(value, "result")`; on
+        # a MagicMock that attribute always exists and yields another MagicMock,
+        # so the probe recursed forever. The RecursionError traceback then cost
+        # 19.5 GB to format under pytest and took the host down twice
+        # (see a related internal incident analysis, not included here). A real
+        # AIMessage has no `.result`, so the probe stops immediately.
+        mock_model = _SummarizingFakeModel()
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmppath = Path(tmpdir)

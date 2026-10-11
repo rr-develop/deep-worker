@@ -5,7 +5,7 @@ subscription cached at ``~/.grok/auth.json``. They are slow (each spawns a
 real ``grok agent stdio`` subprocess and talks to the remote API over ACP).
 
 Skipped unless ``GROK_INTEGRATION_TESTS=1`` is set, mirroring codex/
-claude-code. Run with::
+claude-code-sdk. Run with::
 
     GROK_INTEGRATION_TESTS=1 pytest grok_provider/tests/test_integration.py -v
 

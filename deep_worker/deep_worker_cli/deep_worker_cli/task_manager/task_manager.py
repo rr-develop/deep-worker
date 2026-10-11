@@ -100,6 +100,10 @@ class TaskManager:
         session_manager: 'SessionManager',
         checkpointer: BaseCheckpointSaver | None = None,
         token_stats_recorder: Any | None = None,
+        auto_approve: bool = False,
+        commit: str | None = None,
+        dirty: bool | None = None,
+        disabled: bool = False,
     ):
         """
         Initialize TaskManager.
@@ -117,12 +121,35 @@ class TaskManager:
                          main AgentProcess) so TM invocations land in the same
                          ``token_stats.jsonl`` with ``kind="tm"``
                          (token-stats design §5.1).
+            auto_approve: Mirrors the operator's ``-sp`` flag (owner-gate
+                         Q2/Q5): permission prompts are auto-approved ONLY
+                         when the OPERATOR opted in. The TaskManager never
+                         grants auto-approval on its own — it inherits the
+                         main agent's explicit flag.
+            commit: Git SHA of the tree this process was started from, or
+                         None when it could not be determined. Forwarded so
+                         infrastructure feedback filed by the TaskManager
+                         carries the same code revision as the main agent's.
+            dirty: Whether that tree had uncommitted changes at startup.
+                         Tri-state: False = clean, True = modified,
+                         None = undetermined (never fabricate "clean").
+            disabled: The operator's persisted off switch, replayed on start.
+                         This is NOT a launch flag: whether a TaskManager
+                         exists at all is ``launch_config.task_manager``. This
+                         argument restores a ``set_task_manager(enabled=False)``
+                         that the operator issued in an earlier process, so a
+                         restart does not silently resurrect the manager
+                         (reported 2026-10-10). Default False
+                         applies only when the switch was never set.
         """
         self.agent_name = agent_name
         self.config = config
         self.session_manager = session_manager
         self.checkpointer = checkpointer
         self.token_stats_recorder = token_stats_recorder
+        self.auto_approve = auto_approve
+        self.commit = commit
+        self.dirty = dirty
 
         # Manager agent components (initialized in start())
         self.manager_agent: Pregel | None = None
@@ -141,7 +168,9 @@ class TaskManager:
 
         # Runtime control flags
         self._running = False
-        self.disabled = False
+        # Seeded from the persisted operator switch, not hardcoded False:
+        # a restart must not re-enable a manager the operator turned off.
+        self.disabled = disabled
 
     async def start(self) -> None:
         """
@@ -246,7 +275,7 @@ class TaskManager:
             logger.info(f"[TaskManager] Initializing manager agent...")
 
             # Create model using same provider and model as subordinate agent.
-            # This ensures TaskManager uses the same AI backend (e.g. claude-code)
+            # This ensures TaskManager uses the same AI backend (e.g. claude-code-sdk)
             # as the main agent, not auto-detected DeepSeek.
             # Pass user=f"{self.agent_name}:tm" for KV-cache isolation so the
             # TaskManager thread does NOT share a cache with the main agent
@@ -267,10 +296,11 @@ class TaskManager:
                 provider=self.config.provider,
                 model_name=self.config.model,
                 user=f"{self.agent_name}:tm",
+                auto_approve=self.auto_approve,
                 **stats_kwargs,
             )
 
-            # Set working_dir on model for providers that need it (e.g. claude-code
+            # Set working_dir on model for providers that need it (e.g. claude-code-sdk
             # uses it for MCP tool execution with project_memory)
             # Uses setattr() because create_model() returns BaseChatModel
             # but only ClaudeCodeChatModel has _working_dir attribute.
@@ -358,6 +388,55 @@ class TaskManager:
                 )
                 manager_tools.extend(build_passthrough_tools())
 
+            # Every OTHER ACP provider: same channel-B recording, selected by
+            # CAPABILITY rather than by provider name. The model carries the
+            # profile, and the profile declares which built-ins the CLI runs
+            # locally, so nothing here needs to know who the provider is.
+            #
+            # Without this the manager thread loses every native tool result
+            # the same way the main thread did (2026-09-28):
+            # ToolNode takes its unknown-name path and checkpoints
+            # ``ToolMessage(status="error", "Error: Bash is not a valid
+            # tool...")`` WITHOUT running anything, while the CLI had already
+            # executed the command.
+            #
+            # grok is handled above by its own pinned entry point (it must keep
+            # the ``GrokBuiltin`` name, a public contract), so it is excluded
+            # here. codex is NOT excluded by name: it reaches this branch and
+            # binds nothing because it declares no ACP built-ins. Its native
+            # tools were already added via ``NATIVE_TOOLS`` above.
+            elif self.config.provider != "grok":
+                from deep_worker.providers.acp.builtin_tool_passthrough import (
+                    build_passthrough_tools_for_profile,
+                )
+
+                # ``_profile`` FIRST, and it is load-bearing.
+                #
+                # ``AcpChatModel`` exposes the profile as a ``@property`` while
+                # ALSO inheriting ``profile`` as a pydantic field. Pydantic
+                # strips the property off the class and the instance
+                # ``__dict__`` shadows it, so ``getattr(model, "profile")``
+                # hands back the raw ``property`` OBJECT — not the profile. It
+                # is not None, so the guard below passed, and
+                # ``build_passthrough_tools_for_profile`` then read no
+                # ``known_builtins`` off it and returned ``()``: ZERO recorders
+                # in the manager thread too, and ToolNode resumed fabricating
+                # "Error: Bash is not a valid tool" without running anything.
+                # See the twin fix in ``process/agent_process.py``.
+                #
+                # NB: ``profile`` is also a field on langchain's BaseChatModel,
+                # so every model HAS the attribute — it is the VALUE that
+                # discriminates. Non-ACP providers leave it at its ``None``
+                # default, and even a populated upstream ``ModelProfile``
+                # (a plain dict, no ``known_builtins``) yields ``()``.
+                _profile = getattr(model, "_profile", None) or getattr(
+                    model, "profile", None
+                )
+                if _profile is not None:
+                    manager_tools.extend(
+                        build_passthrough_tools_for_profile(_profile)
+                    )
+
             # Create manager agent with TaskManager system prompt
             # CRITICAL: Use colon ':' not underscore '_' to avoid conflicts
             # with agent names that contain '_tm' suffix
@@ -372,6 +451,8 @@ class TaskManager:
                 enable_shell=False,  # Manager doesn't execute shell commands
                 project_memory_dir=project_memory_dir,
                 checkpointer=self.checkpointer,  # Same as main agent
+                commit=self.commit,
+                dirty=self.dirty,
             )
 
             logger.info(f"[TaskManager] Manager agent initialized")

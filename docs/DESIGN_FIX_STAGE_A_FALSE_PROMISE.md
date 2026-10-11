@@ -18,8 +18,8 @@ different root: the work was not even parked, yet the promise was already given.
 
 ## 1. Facts from the code
 
-### 1.1 Location 1 — claude-code provider
-`claude_code_provider/chat_model.py:1477-1490`. When the CLI declared a
+### 1.1 Location 1 — claude-code-sdk provider
+`claude_code_sdk_provider/chat_model.py:1477-1490`. When the CLI declared a
 `ToolUseBlock` with a `tool_use_id`, but the control request never arrived
 within the single timeout (`resolve_tool_wait_seconds()`, default 120 s),
 `wait_for_pending_call_by_id` raises `DispatchTimeout`. The handler does:
@@ -108,7 +108,7 @@ The key difference from `build_in_progress_notice`:
 correctly serves real parks in the middleware.
 
 ### 3.2 Targeted call-site edits
-`claude_code_provider/chat_model.py:1481-1490`:
+`claude_code_sdk_provider/chat_model.py:1481-1490`:
 
 ```python
 except DispatchTimeout:
@@ -165,7 +165,7 @@ out of scope.
    - **Regression**: `test_in_progress_notice_still_has_job_id_and_actions`
      — `build_in_progress_notice(…)` still contains `job_id`,
      `wait_for_job`, `kill_job`. Guarantees the fix does not break real parks.
-2. `claude_code_provider/tests/test_stage_a_no_false_job_promise.py`
+2. `claude_code_sdk_provider/tests/test_stage_a_no_false_job_promise.py`
    - `test_dispatch_timeout_uses_dispatch_timeout_notice` — we run ainvoke
      with a proxy that never resolves the control request; `response_text`
      contains `not_started`, lacks `wait_for_job` and `toolu_`.
@@ -191,7 +191,7 @@ contract test of the string.
   `build_dispatch_timeout_notice(tool_name, wait_seconds)`; the docstring of
   `build_in_progress_notice` was supplemented with a warning — to use only
   after a REAL park under a canonical `job_N`.
-- `claude_code_provider/chat_model.py`: `except DispatchTimeout` now calls the
+- `claude_code_sdk_provider/chat_model.py`: `except DispatchTimeout` now calls the
   new notice instead of `build_in_progress_notice`. `response_text` no longer
   contains `toolu_…` in the `job_id` field.
 - `codex_provider/chat_model.py`: `except asyncio.TimeoutError` — the same.
@@ -202,7 +202,7 @@ contract test of the string.
     contains the tool name and seconds, `status: not_started`, a retry
     request) + a regress-guard that `build_in_progress_notice` still carries
     `job_id` and actions;
-  * `claude_code_provider/tests/test_stage_a_no_false_job_promise.py` — AST
+  * `claude_code_sdk_provider/tests/test_stage_a_no_false_job_promise.py` — AST
     call-site + end-to-end via `wait_for_pending_call_by_id` + skew clock;
   * `codex_provider/tests/test_stage_a_no_false_job_promise.py` — AST
     call-site (symmetric to claude).
@@ -212,7 +212,7 @@ All four mutations are caught: (1) reverting the claude call-site to
 `job_id` into the new notice, (4) breaking the `build_in_progress_notice`
 contract.
 
-Runs: `deepagents` 700 passed (+5); `claude_code_provider` 300 passed
+Runs: `deepagents` 700 passed (+5); `claude_code_sdk_provider` 300 passed
 (1 pre-existing flake checked on baseline); `codex_provider` 144 passed;
 `deep_worker_cli` unchanged vs baseline. No regressions.
 

@@ -40,6 +40,11 @@ class ProviderDescriptor:
 
 PROVIDER_DESCRIPTORS: tuple[ProviderDescriptor, ...] = (
     ProviderDescriptor(
+        "deep_worker.providers.acp",
+        "deep_worker/providers/acp",
+        ".",
+    ),
+    ProviderDescriptor(
         "deep_worker.providers.claude_code_provider",
         "deep_worker/providers/claude_code_provider",
         ".",

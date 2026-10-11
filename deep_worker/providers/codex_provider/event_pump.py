@@ -41,11 +41,21 @@ from .exec_runner import (
 )
 
 
-# Codex JSONL ``item.type`` values that carry tool-call semantics and
-# therefore must be recorded into LangGraph as ``AIMessage.tool_calls``
-# + ``ToolMessage`` pairs. The Codex docs and live captures on
-# codex-cli 0.130.0 confirm these names; new types can be added in a
-# single line as Codex evolves.
+# Codex JSONL ``item.type`` values that carry tool-call semantics and are
+# recorded into LangGraph as ``AIMessage.tool_calls`` + ``ToolMessage``
+# pairs UNDER THEIR OWN NAME. Live captures on codex-cli 0.130.0 confirm
+# these names.
+#
+# This set is now an OPTIMISATION, not a gate: an item type missing from it
+# is still recorded, through the generic recorder (see
+# :func:`is_recordable_tool_item` and ``native_tools.codex_native_tool``).
+# It used to be the gate, and that was a silent-data-loss bug waiting on the
+# calendar: the list is a snapshot of one CLI version, the installed CLI is
+# already 0.149.1, and an unlisted type was dropped by a bare ``else:
+# ignore`` — the tool ran inside codex while its call and result never
+# reached the agent's history, with nothing logged (owner directive
+# 2026-08-25: log new native tools, do not silently drop or auto-forbid
+# them — "they are more often useful than harmful").
 NATIVE_TOOL_ITEM_TYPES: frozenset[str] = frozenset({
     "command_execution",
     "apply_patch",          # name observed in API tools=[...] list
@@ -56,6 +66,43 @@ NATIVE_TOOL_ITEM_TYPES: frozenset[str] = frozenset({
     "function_call",
     "function_call_output",
 })
+
+
+# Item types that are NOT tool calls and must stay out of history: they
+# carry no call/result pair, so recording them would litter every turn with
+# empty tool messages.
+#
+# This is the ONLY way an item is dropped, and every entry is a deliberate
+# decision — the same shape as claude-code's blocked "ready while waiting"
+# built-ins (CronCreate/Monitor/PushNotification/RemoteTrigger), which park
+# the session in idle and break the LangGraph turn loop. If a codex native
+# tool ever turns out to disrupt the agent the same way, it is added HERE,
+# by name, with the reason — never by omission from the set above.
+INFORMATIONAL_ITEM_TYPES: frozenset[str] = frozenset({
+    "reasoning",
+    "agent_reasoning",
+    "plan",
+    "plan_update",
+    "todo_list",
+    "thread_settings_applied",
+    "turn_context",
+    "world_state",
+    "session_meta",
+    "token_count",
+    "error",
+})
+
+
+def is_recordable_tool_item(item_type: str) -> bool:
+    """Should a ``GenericItem`` of ``item_type`` become a tool call?
+
+    ``True`` for every type except the explicitly informational ones — so a
+    native tool codex ships tomorrow lands in history (under the generic
+    recorder) instead of disappearing.
+    """
+    if not item_type:
+        return False
+    return item_type not in INFORMATIONAL_ITEM_TYPES
 
 
 # Sentinel pushed onto ainvoke_queue when the pump task finishes for
@@ -149,7 +196,7 @@ async def route_event(
     #    the event to ainvoke so it can emit the AIMessage.tool_call.
     if isinstance(ev, ItemStartedEvent) \
             and isinstance(ev.item, GenericItem) \
-            and ev.item.type in NATIVE_TOOL_ITEM_TYPES:
+            and is_recordable_tool_item(ev.item.type):
         loop = asyncio.get_running_loop()
         # Pre-create BEFORE delivering to ainvoke so the tool body
         # never races and finds an empty map.
@@ -163,7 +210,7 @@ async def route_event(
     #    own and ToolNode will produce the ToolMessage.
     if isinstance(ev, ItemCompletedEvent) \
             and isinstance(ev.item, GenericItem) \
-            and ev.item.type in NATIVE_TOOL_ITEM_TYPES:
+            and is_recordable_tool_item(ev.item.type):
         fut = handle.native_futures.get(ev.item.id)
         if fut is not None and not fut.done():
             fut.set_result(native_result_text(ev.item))

@@ -1,4 +1,4 @@
-"""Codex provider for deep-worker — sibling of claude_code_provider.
+"""Codex provider for deep-worker — sibling of claude_code_sdk_provider.
 
 Public surface re-exports CodexChatModel for ``deep_worker_cli/config.py``.
 """

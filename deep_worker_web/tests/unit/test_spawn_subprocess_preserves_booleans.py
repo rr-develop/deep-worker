@@ -61,7 +61,7 @@ def _capture(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
 
 
 BASE = {
-    "provider": "claude-code",
+    "provider": "claude-code-sdk",
     "model": "opus",
     "working_dir": "/path/to/production",
 }

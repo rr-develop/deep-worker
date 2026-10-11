@@ -433,17 +433,20 @@ def _resolve_embed_and_tokenizer(
 ) -> tuple[Any, Any, int, int]:
     """Resolve the embedding model + tokenizer and wire them into Settings.
 
+    The model itself is resolved via the process-wide shared cache in
+    ``._embed_cache`` — see a related internal incident analysis (not included
+    here). Prior to that change this function built a
+    fresh 449 MB ``HuggingFaceEmbedding`` on every summarization; the
+    shared resolver enforces the single-load invariant across every
+    semantic-search call site (retriever, history_retriever, this file,
+    and ``indexer``).
+
     Returns ``(embed_model, tokenize_fn, model_max_length,
     special_tokens_reserve)``.
     """
-    if embed_model is None:
-        # Lazy import — only when actually indexing
-        from llama_index.embeddings.huggingface import HuggingFaceEmbedding  # type: ignore[import-untyped]  # noqa: PLC0415
+    from ._embed_cache import resolve_embed_model  # noqa: PLC0415
 
-        embed_model = HuggingFaceEmbedding(
-            model_name=config.embedding_model,
-            model_kwargs={"local_files_only": True},
-        )
+    embed_model = resolve_embed_model(config, embed_model)
 
     Settings.embed_model = embed_model  # type: ignore[assignment]
     Settings.llm = None  # type: ignore[assignment]

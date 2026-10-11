@@ -47,7 +47,7 @@ RuntimeError: No pending native call registered for id='apply_patch_136_13671697
 The id `apply_patch_136_136716975835008` is NOT a fresh Codex `item.id` (Codex
 emits `item_N`). It has the proxy-MCP shape `f"{tool_name}_{counter}_{id(args)}"`
 (`codex_provider/proxy_mcp_server.py:199`, identical in
-`claude_code_provider/proxy_mcp_server.py`). It is a tool-call id **persisted in
+`claude_code_sdk_provider/proxy_mcp_server.py`). It is a tool-call id **persisted in
 the LangGraph checkpoint** from an earlier turn whose `ToolMessage` was never
 produced (the turn was interrupted — e.g. a Claude CLI subprocess hung and was
 killed, per the persisted `error_message`).
@@ -84,7 +84,7 @@ uncontrolled side effects and must never happen implicitly.
   truth; tool calls still flow through `ToolNode`; the checkpoint schema is
   unchanged (we only append normal `ToolMessage`s).
 - Provider-agnostic where it can be: Bug B affects ANY provider (the same
-  `{name}_{counter}_{id(args)}` ids exist in claude-code too), so its fix lives
+  `{name}_{counter}_{id(args)}` ids exist in claude-code-sdk too), so its fix lives
   in the shared `deep_worker_cli` layer, not inside a provider.
 
 ---

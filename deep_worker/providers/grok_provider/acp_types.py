@@ -83,7 +83,9 @@ IMAGINE_GROK_BUILTINS: frozenset[str] = frozenset(
     }
 )
 
-KNOWN_GROK_BUILTINS: frozenset[str] = frozenset(
+# grok ≤1.0.4 vocabulary (PascalCase). Kept: checkpointed histories contain
+# these names, and replaying them must not fall back to the generic recorder.
+_LEGACY_GROK_BUILTINS: frozenset[str] = frozenset(
     {
         "Shell",
         "Read",
@@ -97,27 +99,67 @@ KNOWN_GROK_BUILTINS: frozenset[str] = frozenset(
         "Task",
         "Plan",
     }
-) | IMAGINE_GROK_BUILTINS
+)
+
+# grok 1.0.5 vocabulary (snake_case), live-observed 2026-08-24
+# (a related internal incident analysis, not included here). ONLY the names that
+# do NOT collide with deep-worker base tools belong here: every name in this
+# set becomes a real LangGraph passthrough tool
+# (``build_passthrough_tools``), and a colliding name would shadow the
+# deep-worker tool of the same name in the ToolNode.
+_GROK_105_BUILTINS: frozenset[str] = frozenset(
+    {
+        "run_terminal_command",
+        "list_dir",
+        "search_tool",
+        "search_replace",
+        "todo_write",
+        "get_command_or_subagent_output",
+    }
+)
+
+# grok 1.0.5 NATIVE built-ins whose names are IDENTICAL to deep-worker base
+# tools. They run locally inside the grok CLI; routing them into our bound
+# tools double-executes them with the CLI's arguments, and registering them
+# as passthrough tools would shadow ours — so they are segregated: the
+# passthrough layer records them via the GENERIC recorder (GrokBuiltin,
+# original title preserved) and the dispatch layer must never treat them as
+# channel A. Disjoint from KNOWN_GROK_BUILTINS by construction (enforced by
+# test).
+GROK_COLLIDING_BUILTINS: frozenset[str] = frozenset(
+    {
+        "read_file",
+        "write_file",
+        "edit_file",
+        "execute",
+        "grep",
+        "ls",
+    }
+)
+
+# NOTE: ``use_tool`` (1.0.5) and ``CallMcpTool`` (≤1.0.4) are DELIBERATELY
+# absent from every set above — they are grok's MCP dispatch wrappers
+# (channel A), never local built-ins to record.
+KNOWN_GROK_BUILTINS: frozenset[str] = (
+    _LEGACY_GROK_BUILTINS | _GROK_105_BUILTINS | IMAGINE_GROK_BUILTINS
+)
 
 
 def is_proxy_mcp_dispatch(update: dict[str, Any], proxy_server_name: str) -> bool:
     """True iff this ``tool_call`` update is grok dispatching one of OUR
     proxy MCP tools (channel A), not a built-in.
 
-    Grok wraps an MCP tool call in a ``CallMcpTool`` built-in whose
-    ``rawInput.server`` names the MCP server. When that server is our
-    in-agent proxy, the inner tool is a deep-worker tool already parked on
-    a Future by the proxy MCP handler — so the passthrough layer must NOT
-    treat it as a local built-in.
+    Thin delegation to the shared ACP-layer predicate so both wrapper forms
+    are recognised in one place (see the related 2026-08-24 incident analysis):
+
+    * grok ≤1.0.4 — ``CallMcpTool{server, toolName, arguments}``;
+    * grok 1.0.5+ — ``use_tool{tool_name="<server>__<tool>", tool_input}``.
     """
-    if not isinstance(update, dict):
-        return False
-    if update.get("title") != "CallMcpTool":
-        return False
-    raw_input = update.get("rawInput")
-    if not isinstance(raw_input, dict):
-        return False
-    return raw_input.get("server") == proxy_server_name
+    from ..acp import acp_types as _shared  # noqa: PLC0415 — avoid import cycle at module load
+
+    return _shared.is_proxy_mcp_dispatch(
+        update, proxy_server_name, "dispatch_builtin"
+    )
 
 
 # ---------------------------------------------------------------------------

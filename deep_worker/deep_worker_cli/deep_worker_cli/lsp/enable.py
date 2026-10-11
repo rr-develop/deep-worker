@@ -103,8 +103,13 @@ def enable_lsp_at_path(
     workspace_root: Path | str,
     force: bool = False,
     auto_approve: bool = True,
+    follow_agent_cwd: bool = False,
 ) -> bool:
     """Enable LSP by appending the Serena entry to ``path``.
+
+    ``follow_agent_cwd`` writes the root as the ``${agent:working_dir}``
+    placeholder instead of a literal — the form for user scope, where the
+    config is shared by all agents and must not name one specific project.
 
     Returns:
         ``True`` if the file was modified, ``False`` if the entry already
@@ -120,8 +125,11 @@ def enable_lsp_at_path(
     # backend binary. One shared service per project; N agents attach
     # to it instead of spawning N language servers.
     servers[SERENA_SERVER_NAME] = build_bridge_mcp_entry(
-        workspace_root=resolve_workspace_root(workspace_root),
+        workspace_root=(
+            None if follow_agent_cwd else resolve_workspace_root(workspace_root)
+        ),
         auto_approve=auto_approve,
+        follow_agent_cwd=follow_agent_cwd,
     )
     _atomic_write(path, config)
     return True

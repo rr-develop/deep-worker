@@ -402,7 +402,7 @@ Multiple threads accessing same SQLite database:
 
 ### 3. Database Path Consistency
 Ensure `get_checkpointer()` always returns same database path:
-- Currently uses `~/.deepagents/sessions.db`
+- At the time of writing this used the legacy global sessions DB, since removed (see POLICIES §16)
 - Should be consistent across all agent instances
 - No need for per-agent databases (thread_id provides isolation)
 

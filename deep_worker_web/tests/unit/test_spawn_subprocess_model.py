@@ -113,7 +113,7 @@ def test_provider_still_passed(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_provider_override_drops_saved_model(monkeypatch: pytest.MonkeyPatch) -> None:
     captured = _capture_cmd(monkeypatch)
-    cfg = {**BASE_CONFIG, "provider": "claude-code", "model": "opus"}
+    cfg = {**BASE_CONFIG, "provider": "claude-code-sdk", "model": "opus"}
 
     _spawn_subprocess("agent1", cfg, model=None, provider="codex", clean=False)
 
@@ -139,7 +139,7 @@ def test_provider_override_drops_saved_model(monkeypatch: pytest.MonkeyPatch) ->
 # ---------------------------------------------------------------------------
 
 CLAUDE_CONFIG = {
-    "provider": "claude-code",
+    "provider": "claude-code-sdk",
     "working_dir": "/tmp/agent_work",
     "skip_permissions": True,
 }
@@ -158,7 +158,7 @@ def test_claude_code_aliases_passed_through(
     cfg = {**CLAUDE_CONFIG, "model": alias}
     _spawn_subprocess("agent1", cfg, model=None, provider=None, clean=False)
     assert _model_value_after_flag(captured[0]) == alias, (
-        f"web spawn dropped the valid claude-code alias {alias!r}; "
+        f"web spawn dropped the valid claude-code-sdk alias {alias!r}; "
         f"cmd was {captured[0]}"
     )
 

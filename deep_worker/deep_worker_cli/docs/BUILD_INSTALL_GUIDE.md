@@ -86,17 +86,16 @@ Install the wheel into a fresh virtualenv **without** the source tree on
 `PYTHONPATH`:
 
 ```bash
-python3 -m venv .venv-check
-source .venv-check/bin/activate
-pip install dist/*.whl
+python3 -m venv /tmp/dw-venv
+/tmp/dw-venv/bin/pip install dist/deep_worker-<version>-py3-none-any.whl
 ```
 
 Smoke-test the entry points:
 
 ```bash
-deep-worker --help      # exit 0
-dwcli --help            # exit 0
-deep-worker-cli --help  # exit 0
+/tmp/dw-venv/bin/deep-worker --help      # exit 0
+/tmp/dw-venv/bin/dwcli --help            # exit 0
+/tmp/dw-venv/bin/deep-worker-cli --help  # exit 0
 ```
 
 ## 6. Vendored provider packages (prefixed imports)
@@ -106,22 +105,22 @@ namespace — they are NOT installed as top-level importable packages:
 
 | Legacy top-level name | Canonical import in the wheel |
 |---|---|
-| `claude_code_provider` | `deep_worker.providers.claude_code_provider` |
+| `claude_code_sdk_provider` | `deep_worker.providers.claude_code_sdk_provider` |
 | `codex_provider` | `deep_worker.providers.codex_provider` |
 | `grok_provider` | `deep_worker.providers.grok_provider` |
 | `semantic_search` | `deep_worker.providers.semantic_search` |
 | `deepworker_a2a` | `deep_worker.providers.deepworker_a2a` |
 
 This prefixed scheme avoids collisions with real PyPI distributions that own
-the legacy top-level names (e.g. `claude-code-provider` from Microsoft Agent
+the legacy top-level names (e.g. `claude-code-sdk-provider` from Microsoft Agent
 Framework, `semantic-search`). The top-level names are deliberately **not**
-provided by the wheel (`import claude_code_provider` → `ModuleNotFoundError`
+provided by the wheel (`import claude_code_sdk_provider` → `ModuleNotFoundError`
 from an installed wheel). In the source checkout the legacy top-level aliases
 still work and emit a `DeprecationWarning` (see §8).
 
 The provider roots are **lazy** (PEP 562): importing
 `deep_worker.providers.semantic_search` does not load llama-index; importing
-`deep_worker.providers.claude_code_provider` does not load the Claude Agent
+`deep_worker.providers.claude_code_sdk_provider` does not load the Claude Agent
 SDK. Heavy optional dependencies load only when you actually use the
 capability.
 
@@ -133,10 +132,10 @@ capability.
 |---|---|---|---|
 | deepseek / openai / anthropic / google | API (langchain-*) | core | — |
 | vertexai | `deep_worker.providers.vertexai_*` | extra `[vertexai]` | `pip install deep-worker[vertexai]` |
-| claude-code | `deep_worker.providers.claude_code_provider` + SDK fork | `claude` CLI + SDK fork (`CLAUDE_AGENT_SDK_SRC`) | set `CLAUDE_AGENT_SDK_SRC=…`; install the claude CLI |
+| claude-code-sdk | `deep_worker.providers.claude_code_sdk_provider` + SDK fork | `claude` CLI + SDK fork (`CLAUDE_AGENT_SDK_SRC`) | set `CLAUDE_AGENT_SDK_SRC=…`; install the claude CLI |
 | codex | `deep_worker.providers.codex_provider` + `codex` CLI | `codex` in PATH + auth | install the codex CLI |
 | grok | `deep_worker.providers.grok_provider` + `grok` CLI | `grok` in PATH + auth | install the grok CLI |
-| web_search (delegation) | `deep_worker.providers.claude_code_provider` + SDK fork | tri-state policy (§7.4) | auto: warn + skip; `--enable-web-search`: `CapabilityError` |
+| web_search (delegation) | `deep_worker.providers.claude_code_sdk_provider` + SDK fork | tri-state policy (§7.4) | auto: warn + skip; `--enable-web-search`: `CapabilityError` |
 | semantic-search | `deep_worker.providers.semantic_search` + llama-index | extra `[semantic-search]` | `pip install deep-worker[semantic-search]` |
 | a2a | `deep_worker.providers.deepworker_a2a` + a2a-sdk | extra `[a2a]`; core starts without it | `pip install deep-worker[a2a]` |
 
@@ -172,19 +171,19 @@ extra API key. Its availability is controlled by a tri-state policy:
 
 ## 8. Source checkout aliases (development only)
 
-In the source checkout the legacy top-level names (`claude_code_provider`,
+In the source checkout the legacy top-level names (`claude_code_sdk_provider`,
 `codex_provider`, `grok_provider`, `semantic_search`, `deepworker_a2a`) still
 resolve through deprecated alias packages at the repo root. They emit exactly
 one `DeprecationWarning` per process and re-export the canonical API from
 `deep_worker.providers.*` (root identity is preserved — no double loading).
-Old submodule paths (`import claude_code_provider.web_search`,
+Old submodule paths (`import claude_code_sdk_provider.web_search`,
 `from codex_provider.native_tools import …`) are **not** supported.
 
 And the vendored fork + rpyc API used by the runtime:
 
 ```bash
-python -c "from rpyc_async.core.protocol import DEFAULT_CONFIG; from rpyc_async.utils.async_server import AsyncioServer; print('rpyc OK')"
-python -c "from deepagents.graph import create_deep_agent; print('deepagents OK')"
+/tmp/dw-venv/bin/python -c "from rpyc_async.core.protocol import DEFAULT_CONFIG; from rpyc_async.utils.async_server import AsyncioServer; print('rpyc OK')"
+/tmp/dw-venv/bin/python -c "from deepagents.graph import create_deep_agent; print('deepagents OK')"
 ```
 
 ## 6. Known limitations of the installed wheel
@@ -194,24 +193,24 @@ The wheel is intentionally a **subset** of the monorepo. The following are
 
 ### 6.1 `--import-claude` is unavailable
 
-`deep-worker --import-claude` requires the `claude_code_provider` package,
+`deep-worker --import-claude` requires the `claude_code_sdk_provider` package,
 which lives **only in the source checkout** and is **not** shipped in the
 wheel. On an installed wheel the flag exits with code 2 and a clear message:
 
 ```
---import-claude requires the claude_code_provider package, which is only
+--import-claude requires the claude_code_sdk_provider package, which is only
 available in the source checkout (not in the PyPI wheel).
 ```
 
 Every entry-point help path (`deep-worker --help`, `dwcli --help`,
-`deep-worker-cli --help`) works without `claude_code_provider`. Commands
+`deep-worker-cli --help`) works without `claude_code_sdk_provider`. Commands
 that do not reach the documented lazy `tools.py` dependency (see §6.2)
 remain available; the full feature set is only guaranteed from the source
 checkout.
 
 ### 6.2 Agent startup with `web_search` tools
 
-`tools.py` also hard-requires `claude_code_provider` for certain
+`tools.py` also hard-requires `claude_code_sdk_provider` for certain
 `web_search`-related tools. That import is **lazy** (it happens only when an
 agent is actually created), so entry points and `--help` are unaffected, but
 starting an agent from an installed wheel with those tools may fail with a
@@ -236,10 +235,16 @@ For development inside the monorepo, `deepagents` is provided via a
 so it never leaks into the built wheel's METADATA:
 
 ```bash
-uv sync --all-groups          # installs the test group incl. local deepagents
-uv run --all-groups ty check deep_worker_cli
-uv run --group test pytest
+# Route every invocation through the cleanup-safe wrapper: a bare call
+# creates a project `.venv` and LEAVES IT BEHIND, which the pre-commit hook
+# hard-blocks (2026-04-22 incident: a stale rpyc inside a leaked venv
+# shadowed the local rpyc_async source checkout for every running agent). The wrapper resolves
+# the same dependency groups and always removes the venv afterwards.
+../scripts/uv-run.sh --all-groups ty check deep_worker_cli
+../scripts/uv-run.sh --group test pytest
 ```
+
+`make type` and `make test` already wrap these for you — prefer them.
 
 ## 9. Publishing
 

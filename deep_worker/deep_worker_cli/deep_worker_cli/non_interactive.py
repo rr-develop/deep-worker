@@ -628,6 +628,14 @@ async def run_non_interactive(
             enable_shell = bool(settings.shell_allow_list)
             use_auto_approve = not enable_shell
 
+            # Provenance identifies the deep_worker CODE that produced a
+            # report, resolved from the module path — NOT cwd, which for an
+            # installed dwcli is some unrelated project repo.
+            from deep_worker_cli.process.agent_process import (
+                get_code_tree_revision,
+            )
+
+            _commit, _dirty = get_code_tree_revision()
             agent, composite_backend = create_cli_agent(
                 model=model,
                 assistant_id=assistant_id,
@@ -637,6 +645,8 @@ async def run_non_interactive(
                 auto_approve=use_auto_approve,
                 enable_shell=enable_shell,
                 checkpointer=checkpointer,
+                commit=_commit,
+                dirty=_dirty,
             )
 
             file_op_tracker = FileOpTracker(

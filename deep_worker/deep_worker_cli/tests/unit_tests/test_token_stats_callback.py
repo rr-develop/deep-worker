@@ -27,6 +27,35 @@ def _llm_result(metadata: dict) -> LLMResult:
 
 class TestTokenStatsCallbackHandler:
     @pytest.mark.asyncio
+    async def test_every_record_pushes_one_model_context_event(self, tmp_path):
+        events = []
+
+        async def on_record(event):
+            events.append(event)
+
+        rec = TokenUsageRecorder(tmp_path, on_record=on_record)
+        handler = TokenStatsCallbackHandler(rec, provider="deepseek", kind="agent")
+        for prompt_tokens in (100, 125):
+            run_id = uuid4()
+            await handler.on_llm_start(
+                {"kwargs": {"model": "deepseek-v4-flash"}}, ["hi"], run_id=run_id
+            )
+            await handler.on_llm_end(
+                _llm_result({
+                    "token_usage": {
+                        "prompt_tokens": prompt_tokens,
+                        "completion_tokens": 5,
+                        "total_tokens": prompt_tokens + 5,
+                    }
+                }),
+                run_id=run_id,
+            )
+
+        assert len(events) == 2
+        assert all(event["type"] == "model_context_changed" for event in events)
+        assert [event["prompt_tokens"] for event in events] == [100, 125]
+
+    @pytest.mark.asyncio
     async def test_on_llm_end_records_one_record(self, tmp_path):
         rec = TokenUsageRecorder(tmp_path)
         handler = TokenStatsCallbackHandler(rec, provider="deepseek", kind="agent")
@@ -176,7 +205,7 @@ class TestAttachTokenStats:
         model = FakeCustom()
         _attach_token_stats(
             model,
-            provider="claude-code",
+            provider="claude-code-sdk",
             model_name="sonnet",
             kind="agent",
             stats_callback_factory=self._handler_factory(rec),

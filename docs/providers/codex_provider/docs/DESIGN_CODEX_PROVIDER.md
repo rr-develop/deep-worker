@@ -17,7 +17,7 @@ exercised it live against `codex-cli 0.130.0`:
    alone only suppresses prompts for *shell commands* — Codex
    auto-cancels every MCP `tools/call` with "user cancelled MCP tool
    call" unless the bypass flag is set. This is the Codex CLI analog
-   of claude-code's ``permission_mode="bypassPermissions"``. Safe in
+   of claude-code-sdk's ``permission_mode="bypassPermissions"``. Safe in
    our setup because deep-worker owns sandboxing/approvals at the
    LangGraph layer (`interrupt_on`).
 2. **The break point in `ainvoke` is `item.started`, not
@@ -139,7 +139,6 @@ exercised it live against `codex-cli 0.130.0`:
      the CLI's `task_manager/task_manager.py`
      (`-tm` manager agent — symmetric injection so a native tool call
      during a manager turn does not crash it).
-
    - the tool body parks on an `asyncio.Future` that the background
      event-pump task created at the same `item.started` event,
    - when Codex emits `item.completed` the pump resolves the
@@ -180,7 +179,7 @@ exercised it live against `codex-cli 0.130.0`:
 |---|---|
 | Q1 | **D2** — own subprocess + JSONL parser; no runtime dep on Agents SDK. |
 | Q2 | **Do not pin a model version.** Default = "let Codex CLI choose its own default" (do NOT pass `--model` to `codex exec` unless user explicitly set `CODEX_MODEL` env or `--model` flag). This way we automatically pick up Codex's evolving default. Concretely: `_PROVIDER_DEFAULT_MODELS["codex"] = ("CODEX_MODEL", None)` and `chat_model.py` omits `--model` when `model_name is None`. |
-| Q3 | **`-sp` / `skip_permissions` is the default operating mode for deep-worker agents** and MUST work for Codex too. Mirror claude-code's pattern: claude-code unconditionally sets `permission_mode="bypassPermissions"` (`client_manager.py:259-275`) — i.e. the provider always tells the upstream CLI "do not prompt for approvals, ever; deep-worker's HITL via `interrupt_on` decides what to allow at the LangGraph layer". For Codex this translates to: provider **always** passes `--config approval_policy="never"` and `--sandbox workspace-write`. Approval / HITL stays at the LangGraph level (via `interrupt_on` middleware), exactly where it lives today. |
+| Q3 | **`-sp` / `skip_permissions` is the default operating mode for deep-worker agents** and MUST work for Codex too. Mirror claude-code-sdk's pattern: claude-code-sdk unconditionally sets `permission_mode="bypassPermissions"` (`client_manager.py:259-275`) — i.e. the provider always tells the upstream CLI "do not prompt for approvals, ever; deep-worker's HITL via `interrupt_on` decides what to allow at the LangGraph layer". For Codex this translates to: provider **always** passes `--config approval_policy="never"` and `--sandbox workspace-write`. Approval / HITL stays at the LangGraph level (via `interrupt_on` middleware), exactly where it lives today. |
 | Q4 | **HTTP** transport for the proxy MCP server (loopback, in-agent-process). |
 | Q5 | Codex built-in deny-list MUST strip every native tool that overlaps a default deep-worker tool, so the model never picks a native bypass over the proxy MCP. Implementation (post-2026-05-18, see Implementation note 6): pass one `--disable <feature>` per relevant Codex feature flag (`shell_tool`, `unified_exec`, `multi_agent`, `image_generation`, `tool_search`, `apps`, `plugins`) plus a top-level `-c 'web_search="disabled"'` override. The older `--config disabled_tools=[...]` channel was empirically verified to be silently ignored by Codex 0.130 and is no longer used. In addition, reject native tool-like Codex item types at runtime if the CLI still emits them — `apply_patch` in particular cannot be stripped via config on 0.130. |
 
@@ -189,7 +188,7 @@ lifecycle, leak surface, concurrency invariants, integration
 touchpoints with the CLI.
 
 **Scope (out, explicitly):** writing the provider package, tests,
-packaging changes, modifications to `claude_code_provider` or to any
+packaging changes, modifications to `claude_code_sdk_provider` or to any
 deep-worker contract.
 
 ---
@@ -216,7 +215,7 @@ brackets.
 4. **Conversation history is read incrementally and cached.**
    The provider must NOT rebuild the message list from scratch on
    every turn; the same "send only the tail `messages[sent_count:]`"
-   rule as `claude-code` applies. No periodic full reads, no
+   rule as `claude-code-sdk` applies. No periodic full reads, no
    "is anything new" polling. [§6]
 5. **No polling, no blocking operations on the event loop, no
    high-CPU steady-state.** Architecture is event-driven end to
@@ -229,7 +228,7 @@ brackets.
 ## 1. Motivation
 
 The user wants to use OpenAI's **Codex CLI** as an AI backend for
-deep-worker agents, in the same slot as the existing `claude-code`
+deep-worker agents, in the same slot as the existing `claude-code-sdk`
 provider:
 
 ```
@@ -249,10 +248,10 @@ all, and what's the right shape". The implementation is a follow-up.
 
 The CLI's `config.py:1404-1670`
 holds the single provider registry — `create_model(provider,
-model_name)`. The `claude-code` branch lives at `config.py:1647-1666`
+model_name)`. The `claude-code-sdk` branch lives at `config.py:1647-1666`
 and sets the precedent for a "local sibling package" provider.
 
-The string `"claude-code"` appears in exactly five places — every one
+The string `"claude-code-sdk"` appears in exactly five places — every one
 needs a sibling entry for a new provider:
 
 1. `agent_config_pkg/agent_config.py:52` — `valid_providers` list;
@@ -288,7 +287,7 @@ contract and we don't touch it. On summarization, **only the
 in the same checkpointer thread, dwcli and the web UI continue
 subscribing to the same agent.
 
-`claude_code_provider` already follows this discipline: it maps
+`claude_code_sdk_provider` already follows this discipline: it maps
 `thread_id` → `effective_session_id`, and the `effective_session_id`
 mutates (`<thread_id>__epoch_N`) without ever changing `thread_id`
 itself. We mirror that, with the rename above to keep names
@@ -412,7 +411,7 @@ The wire protocol underneath is 4 event types and one prompt stream.
 
 ---
 
-## 5. What `claude-code` provider actually does (the slot we mirror)
+## 5. What `claude-code-sdk` provider actually does (the slot we mirror)
 
 Distilled lessons:
 
@@ -429,6 +428,48 @@ process-global singleton. After each turn `sent_count = len(messages)`.
 **L3. On LangGraph summarization, rotate the underlying provider
 session — but never touch `agent_thread_id`.**
 Detected by `sent_count > len(messages)`.
+
+> **Updated 2026-08-24 — `SummarizerPort` implemented.** Detection by
+> `sent_count > len(messages)` remains as the safety net, but the rotation is
+> now driven EXPLICITLY: `CodexChatModel.areset_after_summary()` calls
+> `client_state.record_summarization()` right after the middleware installs the
+> new summary-shaped history.
+>
+> This was not an optimization. `codex` is in `SESSION_STATEFUL_PROVIDERS`, so
+> the middleware refuses the generic identical-prefix fallback (re-invoking the
+> agent thread would replay the whole history into a fresh Codex session).
+> Without the port that refusal made **every** summarization on codex
+> deterministically fatal — an agent died on 2026-08-23 with
+> `SummarizationFailedError: summarization port unavailable on a
+> session-stateful provider (CodexChatModel)` and, already past its context
+> limit, re-died on every following turn.
+>
+> `asummarize` runs ONE isolated `codex exec` that never touches the live turn
+> (its own handle, no proxy MCP server, so the summary turn cannot call
+> deep-worker tools):
+>
+> * **hot** — `codex exec resume <uuid>` carrying the instruction ALONE. Codex
+>   reloads its own transcript from `CODEX_HOME/sessions/<uuid>.jsonl`, so the
+>   history is never re-sent by us and never re-tokenized on the wire. If the
+>   uuid is missing (fresh process / earlier reset) the call degrades to cold
+>   rather than summarizing an empty session.
+> * **cold** — a fresh one-shot `codex exec` with the instruction plus the
+>   already-trimmed message dump.
+>
+> An empty or failed summary RAISES (POLICIES §12): the caller is about to
+> delete the history the summary replaces, so a soft failure would destroy the
+> conversation silently.
+>
+> **Note on `codex app-server`.** The native app-server protocol (95 JSON-RPC
+> methods, generated from the installed binary via
+> `codex app-server generate-json-schema`) offers `thread/compact/start` —
+> Codex compacting its own context server-side, params `{threadId}` only — and
+> `thread/fork` with `ephemeral: true` for an even cheaper cold path. That is
+> the better long-term transport and is strictly richer than ACP (Codex has no
+> first-class ACP: `openai/codex#9085` was closed as not planned, and the only
+> ACP route is the community `@agentclientprotocol/codex-acp` bridge). The port
+> above is implemented on the transport this provider actually drives
+> (`codex exec`); moving to app-server is a separate change.
 
 **L4. Tools execute via LangGraph ToolNode — never inside the MCP
 handler.** The MCP handler blocks on an `asyncio.Future`; LangGraph's
@@ -462,14 +503,14 @@ Every turn: spawn fresh `codex exec` (no `resume`), serialize the
 
 **Rejected.**
 
-### Option B — Stateful-heavy (mirror `claude-code` closely)
+### Option B — Stateful-heavy (mirror `claude-code-sdk` closely)
 
 Long-lived Codex subprocess per `agent_thread_id` (e.g. via
 `codex app-server`), mirror `sent_count`, rotate session on
 summarization.
 
 - ✅ Maximum prompt-cache reuse.
-- ❌ Inherits every claude-code bug class (stale long-lived client,
+- ❌ Inherits every claude-code-sdk bug class (stale long-lived client,
   sent_count corruption between agent / TaskManager / subagents,
   deadlocks).
 - ❌ `codex app-server` is marked experimental.
@@ -503,11 +544,11 @@ Per-turn flow:
   the same, dwcli/web UI subscriptions are not interrupted.**
 
 After each successful turn: `sent_count = len(messages)`. Updated
-**before** awaiting the response (mirroring claude-code at
+**before** awaiting the response (mirroring claude-code-sdk at
 `chat_model.py:598`), so a failed `recv` does not cause re-sending
 on retry.
 
-This is **the same incremental-mirror pattern** that claude-code
+This is **the same incremental-mirror pattern** that claude-code-sdk
 uses, with the only differences that the "session id" being rotated
 is a UUID instead of a string, and the "client" is a short-lived
 `codex exec` instead of a long-lived `ClaudeSDKClient`.
@@ -517,7 +558,8 @@ is a UUID instead of a string, and the "client" is a short-lived
 restarted agent does not "forget" — without it, a fresh process starts at
 `sent_count=0` / `codex_session_uuid=None`, replays the whole history into an
 empty Codex session, and drops every AIMessage / tool result. The on-disk
-layer (`codex_provider/session_state.py`, stored in the agent's local
+layer (`codex_provider/session_state.py`,
+stored in the agent's local
 state directory as `codex_session_state.json`), the lazy-seed in
 `CodexClientState.get_or_create`, the `persist()` call sites, and the
 single resume fallback (stale/missing session → one fresh-session retry with
@@ -612,7 +654,7 @@ This is **not** "external process for the proxy" — it's "TCP loopback
 between two things in the same agent process, plus a Codex subprocess
 that connects to the listener". The listener itself is asyncio.
 
-### 7.4 The Future-based handler — job-handle by default (identical to `claude_code_provider/proxy_mcp_server.py`)
+### 7.4 The Future-based handler — job-handle by default (identical to `claude_code_sdk_provider/proxy_mcp_server.py`)
 
 **HARD POLICY (2026-06-16, common to ALL providers — no exceptions; see
 `docs/POLICIES.md` §7.1.)** Every tool is waited on with a FINITE bound so
@@ -722,20 +764,20 @@ Both the `tool_calls` and the matching `ToolMessage` are in
 `state["messages"]`. The broadcast code at
 `agent_process.py:1542-1592` reads them and pushes them to dwcli /
 web UI subscribers. The checkpointer persists them. TaskManager reads
-them. Full history — **identical guarantee to `claude-code`**.
+them. Full history — **identical guarantee to `claude-code-sdk`**.
 
 ### 7.6 What deep-worker tools Codex sees
 
 `CodexChatModel.bind_tools(tools)` extracts metadata (name,
 description, args schema) from each `BaseTool` — exact same algorithm
-as `claude_code_provider/chat_model.py:291-378` (Pydantic schema
+as `claude_code_sdk_provider/chat_model.py:291-378` (Pydantic schema
 first, fallback to `inspect.signature` for StructuredTool-via-
 ToolRuntime). Each tool is registered as an MCP tool on the proxy.
 Codex's view: a single MCP server named e.g. `deepworker_<pid>`
 exposing N tools.
 
 A Codex-side built-in deny-list (counterpart of
-`claude_code_provider/client_manager.py:58-140` `BUILT_IN_TOOLS`) may
+`claude_code_sdk_provider/client_manager.py:58-140` `BUILT_IN_TOOLS`) may
 be needed once we see which Codex built-ins (its own shell, patch
 tool, web_search, etc.) compete with the deep-worker toolset and
 should be disabled. Open question Q5.
@@ -744,7 +786,7 @@ should be disabled. Open question Q5.
 
 ## 8. Module layout
 
-Sibling of `claude_code_provider/`. The package is empty today —
+Sibling of `claude_code_sdk_provider/`. The package is empty today —
 only this `docs/` directory exists.
 
 ```
@@ -767,7 +809,7 @@ codex_provider/
     └── test_integration.py
 ```
 
-Mirrors `claude_code_provider/` one-for-one.
+Mirrors `claude_code_sdk_provider/` one-for-one.
 
 ---
 
@@ -778,7 +820,7 @@ class CodexChatModel(BaseChatModel):
     # model_config and __get_pydantic_json_schema__ / model_dump
     # overrides are MANDATORY (LangGraph pickles models during
     # checkpointing; raw BaseChatModel fails on callable fields).
-    # Mirror claude_code_provider/chat_model.py:132-246 verbatim,
+    # Mirror claude_code_sdk_provider/chat_model.py:132-246 verbatim,
     # changing only the class name and _llm_type.
 
     _client_state: Any = PrivateAttr(default=None)
@@ -794,7 +836,7 @@ class CodexChatModel(BaseChatModel):
                  approval_policy="never", **kwargs): ...
 
     def bind_tools(self, tools, **kwargs) -> "CodexChatModel":
-        # 1. Extract tool metadata, identical to claude_code_provider.
+        # 1. Extract tool metadata, identical to claude_code_sdk_provider.
         # 2. Ensure the in-process proxy MCP server is initialised in
         #    the singleton with this tool set.
         # 3. Start the proxy server (bind a port). We do NOT register it
@@ -869,7 +911,7 @@ async def ainvoke(self, input, config=None, **kwargs) -> AIMessage:
         elif isinstance(msg, (AIMessage, SystemMessage)):
             pass  # AIMessage already in Codex's session; SystemMessage via --config
 
-    # 8. Update sent_count BEFORE awaiting (mirror claude-code).
+    # 8. Update sent_count BEFORE awaiting (mirror claude-code-sdk).
     state.sent_count = len(messages)
 
     # 9. Mid-turn vs new-turn:
@@ -992,9 +1034,9 @@ design respects that.
 
 ---
 
-## 12. Five claude-code lessons restated for Codex
+## 12. Five claude-code-sdk lessons restated for Codex
 
-| # | claude-code rule | Codex restatement |
+| # | claude-code-sdk rule | Codex restatement |
 |---|---|---|
 | L1 | `thread_id` mandatory, unique per caller | Same — we read `config["configurable"]["thread_id"]` (the agent name) and require it. Subagent / TaskManager get suffixed `agent_thread_id`s. Each maps to its own `(codex_session_uuid, sent_count)` slot. **The deep-worker `thread_id` itself is never mutated.** |
 | L2 | Mirror only `messages[sent_count:]` | Same — Codex's `resume` keeps server-side history; we send only the delta into the prompt. **Incremental, cached, never rebuilt.** |
@@ -1007,7 +1049,7 @@ design respects that.
 ## 13. Auth, env, and provider registration
 
 - Provider registration in `config.py:create_model` skips API-key
-  validation (mirroring `claude-code` at `:1453`).
+  validation (mirroring `claude-code-sdk` at `:1453`).
 - No `CODEX_API_KEY` is set. Codex CLI uses `~/.codex/auth.json`
   automatically.
 - `_PROVIDER_DEFAULT_MODELS["codex"]` — open question Q2.
@@ -1015,13 +1057,13 @@ design respects that.
   because the obvious patterns (`gpt-5`, `o3`, ...) already belong to
   the `openai` provider. Users opt in explicitly with `--provider codex`.
 - The factory branch in `config.py` is a clean copy of the
-  `claude-code` branch with class/import renames.
+  `claude-code-sdk` branch with class/import renames.
 
 ---
 
 ## 14. What this design EXPLICITLY does NOT do
 
-- **No changes to `claude_code_provider`.**
+- **No changes to `claude_code_sdk_provider`.**
 - **No changes to LangGraph wiring** in `deepagents/`.
 - **No changes to deep-worker contracts** —
   `config["configurable"]["thread_id"] == self.name` is fixed.
@@ -1033,10 +1075,10 @@ design respects that.
 - **No new tests in this PR** — test plan in §16 lands with the
   implementation PR.
 - **No packaging changes** — provider is a sibling folder imported
-  by `config.py` exactly like `claude_code_provider`.
+  by `config.py` exactly like `claude_code_sdk_provider`.
 - **No auto-detection from model name.**
 - **No web-search re-implementation** — Codex provider reuses
-  `claude_code_provider.web_search.WebSearchDelegationTool`, as
+  `claude_code_sdk_provider.web_search.WebSearchDelegationTool`, as
   deepseek/openai/gemini already do.
 
 ---
@@ -1089,7 +1131,7 @@ process. **Recommended: HTTP.**
 
 ### Q5. Codex built-in tool deny-list
 
-`claude_code_provider/client_manager.py:58-140` maintains
+`claude_code_sdk_provider/client_manager.py:58-140` maintains
 `BUILT_IN_TOOLS` to disable Claude Code's own built-ins so all tool
 execution flows through LangGraph. Codex has its own set of built-ins
 (shell, patch tool, web_search, memory, todo_list, …). Which should
@@ -1161,10 +1203,10 @@ A reviewer can validate this document without running anything:
    it reads `tool_calls` and `ToolMessage`s from `result["messages"]`.
    Design routes all tool round-trips through LangGraph, so they
    appear there.
-6. Read `claude_code_provider/proxy_mcp_server.py:103-159` and
+6. Read `claude_code_sdk_provider/proxy_mcp_server.py:103-159` and
    confirm the Future pattern. The Codex proxy implements the same
    pattern with HTTP transport instead of in-process SDK handlers.
-7. Read `claude_code_provider/client_manager.py:319-355` for the
+7. Read `claude_code_sdk_provider/client_manager.py:319-355` for the
    `effective_session_id` / `rotate_session` precedent — Codex design
    renames these to `codex_session_uuid` and "drop on summarization",
    same effect, clearer names.
@@ -1178,13 +1220,13 @@ If every check passes, the design is grounded.
 
 ## 18. Summary recommendation
 
-Build the Codex provider as a sibling of `claude_code_provider/` with
+Build the Codex provider as a sibling of `claude_code_sdk_provider/` with
 the **Stateful-light** state model: per `agent_thread_id`, hold
 `(codex_session_uuid, sent_count)` in a process-global singleton; one
 short-lived `codex exec` per Codex turn; one **in-agent-process HTTP
 MCP server** (asyncio task bound to `127.0.0.1:<random-port>`, **not**
 a separate OS process) per agent process; ToolMessage → Future-resolve
-bridge identical in spirit to claude-code's; **every tool call and
+bridge identical in spirit to claude-code-sdk's; **every tool call and
 every tool result remains in `result["messages"]`**.
 
 Use **D2** (own subprocess + JSONL parser) unless the user has a

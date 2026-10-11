@@ -155,7 +155,7 @@ Integration test:
   The existing catch-all at `_handle_invoke` already routes fatal
   exceptions to `AgentStatus.ERROR`. Adding `HistoryOffloadError` to
   `FATAL_EXCEPTION_TYPES` is sufficient.
-- **Providers** (claude-code, codex, grok, langchain, a2a): none. The
+- **Providers** (claude-code-sdk, codex, grok, langchain, a2a): none. The
   raise happens in the middleware, above provider code.
 - **Web UI**: agents that hit this now show as ERROR. The error banner
   will include the underlying cause. This is a UX improvement — today

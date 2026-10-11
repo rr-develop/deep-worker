@@ -151,12 +151,9 @@ If you create a test with `skip_permissions=False`:
 | Test File | Fixture | Skip Permissions | Status |
 |-----------|---------|------------------|--------|
 | `test_agent_basic_example.py` | `agent_fixture` | ✅ True (default) | CORRECT |
-| `test_claude_code_integration.py` | `agent_fixture` | ✅ True (explicit) | CORRECT |
 | `test_interactive_real.py` | `agent_fixture` | ✅ True (explicit) | CORRECT |
 | `test_agent_tool_call_duplication_deepseek.py` | `clean_agent` | ✅ True (default) | CORRECT |
-| `test_agent_tool_call_duplication_claude_code.py` | `clean_agent` | ✅ True (default) | CORRECT |
 | `test_websearch_delegation_deepseek.py` | `clean_agent` | ✅ True (default) | CORRECT |
-| `test_agent_multiple_queries.py` | `clean_agent` | ✅ True (default) | CORRECT |
 | `test_terminal_emulator.py` | subprocess (manual) | ✅ True (`--skip-permissions`) | CORRECT |
 | `test_agent_process_lifecycle.py` | subprocess (manual) | ✅ True (`--skip-permissions`) | CORRECT |
 | `test_slow_tool_display.py` | subprocess (manual) | ✅ True (`--skip-permissions`) | CORRECT |

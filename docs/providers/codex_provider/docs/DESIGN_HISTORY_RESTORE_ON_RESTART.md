@@ -1,10 +1,10 @@
 # DESIGN: Restoring conversation history for Codex agents on restart
 
-**Status:** design — under review (branch `dev`). Mirrors the claude-code fix
-in `claude_code_provider/docs/DESIGN_HISTORY_RESTORE_ON_RESTART.md`.
+**Status:** design — under review (branch `dev`). Mirrors the claude-code-sdk fix
+in `claude_code_sdk_provider/docs/DESIGN_HISTORY_RESTORE_ON_RESTART.md`.
 
 **Author context:** the Codex provider was analysed (code-only) for
-parity with the claude-code restart support we already shipped, and the
+parity with the claude-code-sdk restart support we already shipped, and the
 same "forgets everything on restart" class of bug was found, unfixed. This
 document specifies the fix and is sent for review before implementation.
 
@@ -39,7 +39,7 @@ send deltas; Codex remembers the rest.
 ### 1.2 What breaks on restart
 
 `codex_provider/client_state.py` has **no persistence layer at all** — there is
-no `session_state.py` analog (that file exists only in `claude_code_provider`).
+no `session_state.py` analog (that file exists only in `claude_code_sdk_provider`).
 `ThreadState` (`sent_count`, `codex_session_uuid`, `current_exec`) is in-memory
 only. So:
 
@@ -55,7 +55,7 @@ only. So:
 
 **Result:** after restart Codex receives only the raw user prompts — none of
 its assistant turns, none of the tool results. Same correctness gap as
-claude-code had. This is NOT an LLM quirk.
+claude-code-sdk had. This is NOT an LLM quirk.
 
 ---
 
@@ -69,7 +69,7 @@ claude-code had. This is NOT an LLM quirk.
   their integrity itself. `--ignore-user-config` does NOT affect resume —
   sessions live under `CODEX_HOME`, not in `config.toml` (exec_runner.py:509).
 
-**Consequence — a key simplification vs claude-code.** claude-code needed a
+**Consequence — a key simplification vs claude-code-sdk.** claude-code-sdk needed a
 *tail-match* / *synthesis* step (`session_tail_match`, `session_synthesis`)
 because its CLI transcript files are fragile and the resume target must be
 verified. Codex owns its session store and resumes by uuid natively, so for
@@ -81,18 +81,17 @@ the safety argument and the fallback).
 
 ## 3. The fix — persist + lazily reload `sent_count` and `codex_session_uuid`
 
-Mirror the claude-code mechanism, minus tail-match/synthesis.
+Mirror the claude-code-sdk mechanism, minus tail-match/synthesis.
 
 ### 3.1 New module `codex_provider/session_state.py`
 
-A near-verbatim analog of `claude_code_provider/session_state.py`:
+A near-verbatim analog of `claude_code_sdk_provider/session_state.py`:
 
-- Storage: the per-agent state file (`codex_session_state.json`) under the
-  agent's data directory, a dict
+- Storage: `~/.deep_worker/<thread-base>/codex_session_state.json`, a dict
   keyed by full `agent_thread_id` (so `agent` and `agent:tm` keep separate
   entries while sharing the agent data dir).
 - `_thread_base(thread_id)` — strip `:tm` role suffix (Codex has no
-  `__epoch_N` rotation suffix; claude-code's epoch handling is dropped). Keep
+  `__epoch_N` rotation suffix; claude-code-sdk's epoch handling is dropped). Keep
   the `__epoch_` strip too, defensively, in case a future suffix is added — it
   is a harmless no-op for current Codex thread_ids.
 - `session_state_path(thread_id) -> Path`
@@ -108,7 +107,7 @@ two providers never collide in a shared agent data dir.
 ### 3.2 Lazy seed + persist in `CodexClientState`
 
 Persistence lives in the singleton (the natural owner of `sent_count` /
-`codex_session_uuid`), exactly where claude-code put it (`ClientManager`).
+`codex_session_uuid`), exactly where claude-code-sdk put it (`ClientManager`).
 
 - `get_or_create(agent_thread_id)`: when creating a NEW slot (i.e. first access
   in a fresh process), lazily seed it from disk:
@@ -135,7 +134,7 @@ Persistence lives in the singleton (the natural owner of `sent_count` /
 
 ### 3.3 Call sites in `CodexChatModel.ainvoke`
 
-Two persistence points, mirroring claude-code's `update_sent_count` /
+Two persistence points, mirroring claude-code-sdk's `update_sent_count` /
 `record_session_uuid`:
 
 1. Right after `state.sent_count = len(messages)` (chat_model.py:453) →
@@ -159,7 +158,7 @@ needed in `ainvoke`.
 
 ## 4. Why persist on the singleton, not the model
 
-Same reason as claude-code: LangGraph rebuilds `CodexChatModel` instances
+Same reason as claude-code-sdk: LangGraph rebuilds `CodexChatModel` instances
 during checkpoint (de)serialization. Per-instance state would be lost on every
 rebuild. The singleton lives at module scope and survives. Persistence belongs
 next to the in-memory state it backs.
@@ -170,7 +169,7 @@ next to the in-memory state it backs.
 
 New test file `codex_provider/tests/test_session_state_persistence.py`:
 
-1. `session_state.py` unit tests (mirror claude-code's
+1. `session_state.py` unit tests (mirror claude-code-sdk's
    `test_session_state_persistence.py`):
    - save → load round-trips `sent_count` + `session_uuid`.
    - `load_session_state` returns `None` for a missing file.
@@ -190,7 +189,7 @@ New test file `codex_provider/tests/test_session_state_persistence.py`:
    - `record_summarization()` persists the reset (a subsequent fresh
      `get_or_create` seeds `sent_count=0`, `codex_session_uuid=None`).
 
-3. Restart-path test in `chat_model` (mirror claude-code
+3. Restart-path test in `chat_model` (mirror claude-code-sdk
    `test_restore_trigger_in_ainvoke.py`), using the existing fake exec-runner
    pattern from `tests/test_chat_model.py`:
    - Simulate a "restart": persist `sent_count=N`, `session_uuid=U`; build a
@@ -219,7 +218,7 @@ reuse the fake `CodexExecRunner` / proxy already used in
 
 If the Codex session file is gone (e.g. `CODEX_HOME` wiped, or the session
 expired/was pruned by Codex), `codex exec resume <uuid>` fails. Unlike
-claude-code — where resume failure surfaces synchronously at
+claude-code-sdk — where resume failure surfaces synchronously at
 `ClaudeSDKClient.connect()` and is retried right there
 (`client_manager.py:344-355`) — for Codex the failure surfaces **inside the
 ainvoke event-consumption loop**, asynchronously, as a `TurnFailedEvent` or an
@@ -269,7 +268,7 @@ Constraints / correctness:
   must keep its current error semantics.
 - The fallback prompt is the same human-text replay we already build; AIMessage
   turns are still `pass`-ed (a truly fresh Codex session cannot be given the
-  assistant turns back). This matches claude-code's accepted first-cut limit:
+  assistant turns back). This matches claude-code-sdk's accepted first-cut limit:
   the agent restarts working with the user prompts, rather than ERROR-ing.
 - `current_exec` from the failed resume attempt is closed before re-spawn
   (reuse the existing `_suppress_errors()` + `aclose()` cleanup).

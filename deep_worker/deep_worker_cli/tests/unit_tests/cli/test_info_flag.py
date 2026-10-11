@@ -24,7 +24,7 @@ def temp_data_dir():
 
 
 LAUNCH_CONFIG = {
-    "provider": "claude-code",
+    "provider": "claude-code-sdk",
     "model": "opus",
     "working_dir": "/tmp/agent_work",
     "tree_root": "/tmp/agent_work",
@@ -127,7 +127,7 @@ class TestHappyPath:
         out = capsys.readouterr().out
 
         assert "agent: sysagent" in out
-        assert "provider: claude-code" in out
+        assert "provider: claude-code-sdk" in out
         assert "model: opus" in out
         assert "working_dir: /tmp/agent_work" in out
         assert "tree_root:" in out
@@ -288,10 +288,10 @@ class TestParser:
         from deep_worker_cli.cli.agent_command import create_parser
 
         parser = create_parser()
-        args = parser.parse_args(["--provider", "claude-code", "--limits-info"])
+        args = parser.parse_args(["--provider", "claude-code-sdk", "--limits-info"])
 
         assert args.limits_info is True
-        assert args.provider == "claude-code"
+        assert args.provider == "claude-code-sdk"
         assert args.name is None
 
 

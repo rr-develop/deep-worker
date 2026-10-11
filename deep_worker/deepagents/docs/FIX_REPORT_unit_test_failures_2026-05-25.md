@@ -130,7 +130,7 @@ Type check: `deep_worker/scripts/pre-commit-type-check.sh` passes
 | the web app | 271 passed, 10 skipped |
 | deep_worker_cli | 1564 passed, 5 skipped |
 | semantic_search | 147 passed |
-| claude_code_provider | 220 passed, 1 deselected |
+| claude_code_sdk_provider | 220 passed, 1 deselected |
 | codex_provider | 110 passed, 5 skipped |
 | root tests/test_agents.py | 5 passed |
 | **Total** | **2944 passed, 0 failed** |

@@ -11,7 +11,7 @@ DESIGN_EXTERNAL_MCP_TOOL_NAME_MANGLING.md.
 
 Names:
 * ``name`` — provider-safe (``.``/``/`` → ``__``); ToolNode and each provider
-  (claude-code/codex/grok/deepseek/openai/gemini) route by it; satisfies
+  (claude-code-sdk/codex/grok/deepseek/openai/gemini) route by it; satisfies
   ``^[a-zA-Z0-9_-]+$``.
 * ``canonical_name`` — the original ``<server>.<tool>`` (for UI/introspection).
 * ``_bare_tool_name`` — the bare tool_name from MCP ``list_tools`` (no server

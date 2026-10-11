@@ -2,7 +2,7 @@
 
 Used by the cross-process integration tests in this directory to honour
 the project-wide rule that **rpyc_async MUST NEVER drive server+client
-in the same process** (see the agent instructions and
+in the same process** (see ``docs/POLICIES.md`` and
 ``docs/RPYC_NETREF_DEADLOCK_ANALYSIS.md`` for the deadlock that
 otherwise triggers on the first ``HANDLE_INSPECT``).
 
@@ -19,7 +19,7 @@ Lifecycle
 * Then waits on a ``shutdown_event`` that is set by SIGTERM/SIGINT.
   Closes the server cleanly on shutdown.
 
-No claude-code provider, no checkpointer, no agent graph — this is a
+No claude-code-sdk provider, no checkpointer, no agent graph — this is a
 *protocol-only* harness for AsyncioServer + AgentService round-trips.
 """
 

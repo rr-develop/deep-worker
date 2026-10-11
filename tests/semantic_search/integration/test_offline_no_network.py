@@ -33,6 +33,7 @@ from pathlib import Path
 import pytest
 
 import deep_worker.providers.semantic_search.retriever as retriever
+from deep_worker.providers.semantic_search import _embed_cache
 from deep_worker.providers.semantic_search.indexer import index_repository
 from deep_worker.providers.semantic_search.retriever import search
 
@@ -104,8 +105,10 @@ def test_search_succeeds_with_network_hard_blocked(
             raise RuntimeError(f"NETWORK BLOCKED: outbound connect to {address!r}")
         return real_connect(self, address)  # type: ignore[arg-type]
 
-    # Force a cold embedder build under the kill-switch.
-    retriever._embedding_cache.clear()
+    # Force a cold embedder build under the kill-switch. The embedder cache
+    # lives in the shared resolver (``_embed_cache``) after the §7.1 hoist;
+    # ``retriever._index_cache`` is a separate per-repo LanceDB cache.
+    _embed_cache._reset_cache_for_tests()
     retriever._index_cache.clear()
 
     monkeypatch.setattr(socket.socket, "connect", blocked_connect)

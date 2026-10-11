@@ -287,7 +287,7 @@ the concrete tool-calls (the dispatcher abstracts them).
 
 ## 4. Touch points in the CLI (5 files)
 
-These files know about `claude-code` and `codex`; the new `grok` provider
+These files know about `claude-code-sdk` and `codex`; the new `grok` provider
 requires targeted edits in each:
 
 1. `agent_config_pkg/agent_config.py:53` — `valid_providers = [..., "grok"]`
@@ -296,7 +296,7 @@ requires targeted edits in each:
 3. `config.py:1390` — `_PROVIDER_DEFAULT_MODELS["grok"] = ("GROK_MODEL", None)`
    `:1719` — factory branch `elif provider == "grok": ... GrokChatModel(...)`
 4. `runtime/availability_tracker.py:11` — add `"grok": null`
-5. `runtime/provider_chain.py:4` — `["claude-code", "codex", "grok", "deepseek"]`
+5. `runtime/provider_chain.py:4` — `["claude-code-sdk", "codex", "grok", "deepseek"]`
 
 `process/agent_process.py` — if grok does not need native passthrough
 tools (as codex does), then there is no need for the `if provider == "codex"

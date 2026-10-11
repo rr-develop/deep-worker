@@ -27,7 +27,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
-from deep_worker_cli.storage_paths import deep_worker_home
+from deep_worker_cli.storage_paths import deep_worker_home, read_agent_file
 
 logger = logging.getLogger(__name__)
 
@@ -55,11 +55,13 @@ def _read_status_file(agent_name: str) -> str:
     NEVER used to gate stop — just surfaced in event payloads so the UI
     can show which agents were "officially" idle vs running.
     """
-    path = deep_worker_home() / agent_name / "session_metadata.json"
+    raw = read_agent_file(agent_name, "session_metadata.json")
+    if raw is None:
+        return "unknown"
     try:
-        data = json.loads(path.read_text())
+        data = json.loads(raw)
         return str(data.get("status", "unknown"))
-    except (OSError, json.JSONDecodeError, ValueError):
+    except (json.JSONDecodeError, ValueError):
         return "unknown"
 
 

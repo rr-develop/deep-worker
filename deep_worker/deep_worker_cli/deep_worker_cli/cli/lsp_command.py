@@ -43,20 +43,19 @@ _INSTALL_HINT = "uv tool install -p 3.13 serena-agent"
 
 
 def _scope_to_path(scope: str) -> Path:
-    """The same scope contract as ``deep-worker mcp``."""
-    home = Path.home()
-    if scope == "user":
-        return home / ".deepagents" / "mcp.json"
-    if scope == "project":
-        return resolve_workspace_root(invocation_cwd()) / ".deepagents" / "mcp.json"
-    if scope.startswith("agent:"):
-        name = scope.split(":", 1)[1].strip()
-        if not name:
-            raise SystemExit("--scope agent:<name> requires a non-empty agent name")
-        return home / ".deepagents" / name / "mcp.json"
-    raise SystemExit(
-        f"unknown --scope {scope!r}; expected user | project | agent:<name>"
+    """The same scope contract as ``deep-worker mcp`` (POLICIES §16)."""
+    from deep_worker_cli.external_mcp.config_store import (
+        UnknownScopeError,
+        scope_to_path,
     )
+
+    project_root = (
+        resolve_workspace_root(invocation_cwd()) if scope == "project" else None
+    )
+    try:
+        return scope_to_path(scope, project_root=project_root)
+    except UnknownScopeError as exc:
+        raise SystemExit(str(exc)) from None
 
 
 def _config_path(args: argparse.Namespace) -> Path:
@@ -387,12 +386,22 @@ def _cmd_languages_show(
 def _cmd_enable(args: argparse.Namespace) -> int:
     path = _config_path(args)
     workspace_root = _workspace_root(args)
+    # USER scope means "every project", so it must not bake in the root
+    # of whatever directory this command happened to run in — that is
+    # the defect fixed by the placeholder form. An explicit
+    # ``--project-root`` is still honoured: the user is then naming a
+    # project on purpose.
+    follow_agent_cwd = (
+        getattr(args, "scope", "project") == "user"
+        and not getattr(args, "project_root", None)
+    )
     try:
         changed = enable_lsp_at_path(
             path,
             workspace_root=workspace_root,
             force=bool(getattr(args, "force", False)),
             auto_approve=not bool(getattr(args, "no_auto_approve", False)),
+            follow_agent_cwd=follow_agent_cwd,
         )
     except (OSError, ValueError) as e:
         print(f"error: {e}")
@@ -405,8 +414,14 @@ def _cmd_enable(args: argparse.Namespace) -> int:
             f"LSP navigation already enabled in {path} (use --force to overwrite)"
         )
     # Print the resolved root explicitly: its silent substitution was
-    # exactly the bug (the config drifted into the install directory).
-    print(f"workspace root: {workspace_root}")
+    # exactly the bug (the config drifted into the install directory). For
+    # user scope the root is not pinned at all, and we must not lie about
+    # it — otherwise the output would promise a binding to the current
+    # directory that does not exist.
+    if follow_agent_cwd:
+        print("workspace root: each agent's own working directory")
+    else:
+        print(f"workspace root: {workspace_root}")
 
     if not bool(getattr(args, "no_gradle_init", False)):
         _install_gradle_init(force=bool(getattr(args, "force", False)))

@@ -20,7 +20,7 @@ The preferred_model cascade matrix (C1-C6 in the design) is pinned here too,
 including both ``--no-update-preferred`` paths, because a reset that leaves a
 stale ``preferred_model`` behind re-poisons the next restart.
 
-Design: docs/DESIGN_FIX_CLAUDE_CODE_MODEL_ALIASES_AND_DEFAULT.md
+Design: docs/DESIGN_FIX_CLAUDE_CODE_SDK_MODEL_ALIASES_AND_DEFAULT.md
 """
 
 from __future__ import annotations
@@ -50,14 +50,14 @@ def _merge_capturing(argv: list[str], saved: dict, capsys):
 
 @pytest.fixture
 def saved_claude() -> dict:
-    """A saved claude-code config exactly like the incident's."""
+    """A saved claude-code-sdk config exactly like the incident's."""
     return {
-        "provider": "claude-code",
+        "provider": "claude-code-sdk",
         "model": "sonnet",
-        "model_provider": "claude-code",
+        "model_provider": "claude-code-sdk",
         "working_dir": "/path/to/checkout",
         "skip_permissions": True,
-        "preferred_provider": "claude-code",
+        "preferred_provider": "claude-code-sdk",
         "preferred_model": "sonnet",
         "storage_version": 5,
     }
@@ -114,7 +114,7 @@ class TestInvalidModelWarns:
     ):
         """(g) The disambiguation bug.
 
-        ``saved["model_provider"]`` is ``"claude-code"`` — truthy, and EQUAL
+        ``saved["model_provider"]`` is ``"claude-code-sdk"`` — truthy, and EQUAL
         to the target provider. A naive ``"stale-provider" if
         saved_model_provider else "unknown-alias"`` mislabels this rejection
         as a provider mismatch. It is not: the operator typed a token this
@@ -137,10 +137,10 @@ class TestStaleProviderReason:
 
     def test_cross_provider_saved_model_reports_stale_provider(self, capsys):
         saved = {
-            "provider": "claude-code",
+            "provider": "claude-code-sdk",
             "model": "grok-composer-2.5-fast",
             "model_provider": "grok",
-            "preferred_provider": "claude-code",
+            "preferred_provider": "claude-code-sdk",
             "storage_version": 5,
         }
         merged, err = _merge_capturing(["a1", "--restart"], saved, capsys)
@@ -154,7 +154,7 @@ class TestBareProviderDeclarationWarns:
 
     def test_bare_provider_resets_and_warns(self, saved_claude, capsys):
         merged, err = _merge_capturing(
-            ["agent", "--restart", "--provider", "claude-code"],
+            ["agent", "--restart", "--provider", "claude-code-sdk"],
             saved_claude,
             capsys,
         )
@@ -198,7 +198,7 @@ class TestReplacementIsTruthful:
         )
 
     def test_unpinned_provider_says_cli_resolves(self, saved_claude, capsys):
-        """claude-code pins nothing, so the honest text IS "resolved by the
+        """claude-code-sdk pins nothing, so the honest text IS "resolved by the
         provider CLI"."""
         _, err = _merge_capturing(
             ["agent", "--restart", "--model", "bogusXYZ"], saved_claude, capsys
@@ -220,10 +220,10 @@ class TestExactlyOneEmission:
     def test_single_reset_reported_once(self, capsys):
         """A config with no preferred_model produces exactly one reset."""
         saved = {
-            "provider": "claude-code",
+            "provider": "claude-code-sdk",
             "model": "sonnet",
-            "model_provider": "claude-code",
-            "preferred_provider": "claude-code",
+            "model_provider": "claude-code-sdk",
+            "preferred_provider": "claude-code-sdk",
             "preferred_model": None,
             "storage_version": 5,
         }
@@ -253,10 +253,10 @@ class TestPreferredCascadeMatrix:
     def test_c1_invalid_explicit_collapses_active_and_preferred(self, capsys):
         """C1: the old preference must NOT be silently resurrected."""
         saved = {
-            "provider": "claude-code",
+            "provider": "claude-code-sdk",
             "model": "sonnet",
-            "model_provider": "claude-code",
-            "preferred_provider": "claude-code",
+            "model_provider": "claude-code-sdk",
+            "preferred_provider": "claude-code-sdk",
             "preferred_model": "opus",
             "storage_version": 5,
         }
@@ -277,10 +277,10 @@ class TestPreferredCascadeMatrix:
         replacement request was invalid, not because opus is unrecognised.
         Mislabelling sends the operator debugging the wrong thing."""
         saved = {
-            "provider": "claude-code",
+            "provider": "claude-code-sdk",
             "model": "sonnet",
-            "model_provider": "claude-code",
-            "preferred_provider": "claude-code",
+            "model_provider": "claude-code-sdk",
+            "preferred_provider": "claude-code-sdk",
             "preferred_model": "opus",
             "storage_version": 5,
         }
@@ -307,10 +307,10 @@ class TestPreferredCascadeMatrix:
         """C3: a temporary failover must not destroy the operator's
         long-term preference on a DIFFERENT provider."""
         saved = {
-            "provider": "claude-code",
+            "provider": "claude-code-sdk",
             "model": "sonnet",
-            "model_provider": "claude-code",
-            "preferred_provider": "claude-code",
+            "model_provider": "claude-code-sdk",
+            "preferred_provider": "claude-code-sdk",
             "preferred_model": "opus",
             "storage_version": 5,
         }
@@ -321,7 +321,7 @@ class TestPreferredCascadeMatrix:
         )
         assert merged.provider == "codex"
         assert merged.model is None, "the claude model is stale for codex"
-        assert merged.preferred_provider == "claude-code"
+        assert merged.preferred_provider == "claude-code-sdk"
         assert merged.preferred_model == "opus", (
             "failover must preserve the preferred provider's model; got "
             f"{merged.preferred_model!r}"
@@ -334,16 +334,16 @@ class TestPreferredCascadeMatrix:
             "provider": "codex",
             "model": None,
             "model_provider": "codex",
-            "preferred_provider": "claude-code",
+            "preferred_provider": "claude-code-sdk",
             "preferred_model": "opus",
             "storage_version": 5,
         }
         merged, err = _merge_capturing(
-            ["a1", "--restart", "--provider", "claude-code", "--no-update-preferred"],
+            ["a1", "--restart", "--provider", "claude-code-sdk", "--no-update-preferred"],
             saved,
             capsys,
         )
-        assert merged.provider == "claude-code"
+        assert merged.provider == "claude-code-sdk"
         assert merged.model == "opus", (
             f"restore-on-idle must bring back opus; got {merged.model!r}"
         )
@@ -355,10 +355,10 @@ class TestPreferredCascadeMatrix:
     def test_c5_invalid_saved_preferred_is_dropped(self, capsys):
         """C5: a legacy-poisoned preferred_model must not survive."""
         saved = {
-            "provider": "claude-code",
+            "provider": "claude-code-sdk",
             "model": "sonnet",
-            "model_provider": "claude-code",
-            "preferred_provider": "claude-code",
+            "model_provider": "claude-code-sdk",
+            "preferred_provider": "claude-code-sdk",
             "preferred_model": "grok-composer-2.5-fast",
             "storage_version": 5,
         }
@@ -368,7 +368,7 @@ class TestPreferredCascadeMatrix:
     def test_c6_bare_provider_collapses_both(self, saved_claude, capsys):
         """C6: RC-1 — preferred must track the reset of active."""
         merged, err = _merge_capturing(
-            ["agent", "--restart", "--provider", "claude-code"],
+            ["agent", "--restart", "--provider", "claude-code-sdk"],
             saved_claude,
             capsys,
         )
@@ -383,10 +383,10 @@ class TestNoRegressionOnExistingBehaviour:
     def test_unknown_string_still_rejected(self, capsys):
         """The literal ``unknown`` must never reach a launch config."""
         saved = {
-            "provider": "claude-code",
+            "provider": "claude-code-sdk",
             "model": "unknown",
-            "model_provider": "claude-code",
-            "preferred_provider": "claude-code",
+            "model_provider": "claude-code-sdk",
+            "preferred_provider": "claude-code-sdk",
             "storage_version": 5,
         }
         merged, _ = _merge_capturing(["a1", "--restart"], saved, capsys)
@@ -395,10 +395,10 @@ class TestNoRegressionOnExistingBehaviour:
     def test_saved_fable_survives_plain_restart(self, capsys):
         """Once persisted, ``fable`` must survive a plain restart untouched."""
         saved = {
-            "provider": "claude-code",
+            "provider": "claude-code-sdk",
             "model": "fable",
-            "model_provider": "claude-code",
-            "preferred_provider": "claude-code",
+            "model_provider": "claude-code-sdk",
+            "preferred_provider": "claude-code-sdk",
             "preferred_model": "fable",
             "storage_version": 5,
         }

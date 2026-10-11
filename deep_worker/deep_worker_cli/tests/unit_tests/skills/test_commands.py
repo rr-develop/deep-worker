@@ -291,13 +291,14 @@ class TestCreateSkillPermissions:
 
         _create("private-skill", agent="test_v3", project=False)
 
-        skill_dir = deep_worker_home(tmp_path) / "test_v3" / "data" / "skills" / "private-skill"
+        agent_root = deep_worker_home(tmp_path) / "agents" / "test_v3"
+        skill_dir = agent_root / "data" / "skills" / "private-skill"
         skill_md = skill_dir / "SKILL.md"
         assert skill_dir.is_dir()
         assert skill_md.is_file()
-        assert oct((deep_worker_home(tmp_path) / "test_v3").stat().st_mode & 0o777) == "0o700"
-        assert oct((deep_worker_home(tmp_path) / "test_v3" / "data").stat().st_mode & 0o777) == "0o700"
-        assert oct((deep_worker_home(tmp_path) / "test_v3" / "data" / "skills").stat().st_mode & 0o777) == "0o700"
+        assert oct(agent_root.stat().st_mode & 0o777) == "0o700"
+        assert oct((agent_root / "data").stat().st_mode & 0o777) == "0o700"
+        assert oct((agent_root / "data" / "skills").stat().st_mode & 0o777) == "0o700"
         assert oct(skill_dir.stat().st_mode & 0o777) == "0o700"
         assert oct(skill_md.stat().st_mode & 0o777) == "0o600"
 

@@ -26,7 +26,7 @@ def temp_data_dir():
 def sample_launch_config():
     """Sample launch_config dict matching real CLI args."""
     return {
-        "provider": "claude-code",
+        "provider": "claude-code-sdk",
         "model": "opus",
         "working_dir": "/path/to/project",
         "skip_permissions": True,
@@ -36,7 +36,7 @@ def sample_launch_config():
         "clean": True,
         "started_at": "2026-04-11T16:59:41.692129",
         "pid": 3726921,
-        "cli_args": "lc4_test -sp -tm --dir /path/to/project --provider claude-code --model opus --clean",
+        "cli_args": "lc4_test -sp -tm --dir /path/to/project --provider claude-code-sdk --model opus --clean",
     }
 
 
@@ -55,7 +55,7 @@ class TestLaunchConfigSavedOnInit:
         data = json.loads(metadata_file.read_text())
 
         assert "launch_config" in data
-        assert data["launch_config"]["provider"] == "claude-code"
+        assert data["launch_config"]["provider"] == "claude-code-sdk"
         assert data["launch_config"]["model"] == "opus"
         assert data["launch_config"]["working_dir"] == "/path/to/project"
         assert data["launch_config"]["skip_permissions"] is True
@@ -71,7 +71,7 @@ class TestLaunchConfigSavedOnInit:
         )
 
         assert manager.launch_config is not None
-        assert manager.launch_config["provider"] == "claude-code"
+        assert manager.launch_config["provider"] == "claude-code-sdk"
         assert manager.launch_config["model"] == "opus"
 
     def test_no_launch_config_is_ok(self, temp_data_dir):
@@ -95,7 +95,7 @@ class TestLaunchConfigSavedOnInit:
         data = json.loads(metadata_file.read_text())
 
         assert "cli_args" in data["launch_config"]
-        assert "--provider claude-code" in data["launch_config"]["cli_args"]
+        assert "--provider claude-code-sdk" in data["launch_config"]["cli_args"]
 
 
 class TestLaunchConfigPreservedAcrossStatusUpdates:
@@ -120,7 +120,7 @@ class TestLaunchConfigPreservedAcrossStatusUpdates:
         data = json.loads(metadata_file.read_text())
 
         assert "launch_config" in data
-        assert data["launch_config"]["provider"] == "claude-code"
+        assert data["launch_config"]["provider"] == "claude-code-sdk"
         assert data["launch_config"]["model"] == "opus"
 
     @pytest.mark.asyncio
@@ -138,7 +138,7 @@ class TestLaunchConfigPreservedAcrossStatusUpdates:
         data = json.loads(metadata_file.read_text())
 
         assert "launch_config" in data
-        assert data["launch_config"]["provider"] == "claude-code"
+        assert data["launch_config"]["provider"] == "claude-code-sdk"
 
     @pytest.mark.asyncio
     async def test_increment_tasks_preserves_launch_config(
@@ -228,7 +228,7 @@ class TestLaunchConfigSurvivesReload:
         manager2 = SessionManager(data_dir=temp_data_dir)
 
         assert manager2.launch_config is not None
-        assert manager2.launch_config["provider"] == "claude-code"
+        assert manager2.launch_config["provider"] == "claude-code-sdk"
         assert manager2.launch_config["model"] == "opus"
         assert manager2.launch_config["working_dir"] == "/path/to/project"
         assert manager2.launch_config["skip_permissions"] is True

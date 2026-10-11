@@ -13,7 +13,9 @@ from rich.table import Table
 
 from deep_worker_cli.config import COLORS, console
 from deep_worker_cli.storage_paths import (
+    DeepagentsPathForbiddenError,
     agent_name_from_thread_id,
+    agent_root,
     deep_worker_home,
     ensure_private_file,
     iter_thread_db_paths,
@@ -79,6 +81,22 @@ def get_db_path(agent_name: str | None = None) -> Path:
     return threads_db_path(agent_name)
 
 
+def _legacy_global_db_or_none() -> Path | None:
+    """The legacy global DB, or ``None`` when it is out of reach.
+
+    The v1 global ``sessions.db`` lived in the ancestor's tree, which is
+    banned for reads (POLICIES §16), so ``get_db_path(None)`` raises. Tests
+    may still monkey-patch it onto a temp file; this helper lets the call
+    sites treat "banned" and "absent" the same way instead of each guarding
+    the exception itself.
+    """
+    try:
+        legacy = get_db_path(None)
+    except DeepagentsPathForbiddenError:
+        return None
+    return legacy if legacy.exists() else None
+
+
 def _agent_name_from_thread_id(thread_id: str) -> str:
     """Derive an agent name from a thread_id.
 
@@ -104,17 +122,19 @@ def iter_all_db_paths() -> list[Path]:
     monkey-patch ``get_db_path`` to point into ``tmp_path`` transparently
     restrict discovery to that directory.
     """
-    legacy = get_db_path(None)
-    default_legacy = Path.home() / ".deepagents" / "sessions.db"
-    if legacy != default_legacy:
-        db_dir = legacy.parent
-        if not db_dir.exists():
-            return []
-        paths: list[Path] = sorted(db_dir.glob("sessions_*.db"))
-        if legacy.exists() and legacy not in paths:
-            paths.append(legacy)
-        return paths
-    return iter_thread_db_paths()
+    # ``get_db_path(None)`` raises unless a test has monkey-patched it, so
+    # an unpatched call falls straight through to the product-tree walk.
+    try:
+        legacy = get_db_path(None)
+    except DeepagentsPathForbiddenError:
+        return iter_thread_db_paths()
+    db_dir = legacy.parent
+    if not db_dir.exists():
+        return []
+    paths: list[Path] = sorted(db_dir.glob("sessions_*.db"))
+    if legacy.exists() and legacy not in paths:
+        paths.append(legacy)
+    return paths
 
 
 def _resolve_db_path_for_thread(thread_id: str) -> Path | None:
@@ -129,10 +149,7 @@ def _resolve_db_path_for_thread(thread_id: str) -> Path | None:
     per_agent = get_db_path(agent)
     if per_agent.exists():
         return per_agent
-    legacy = get_db_path(None)
-    if legacy.exists():
-        return legacy
-    return None
+    return _legacy_global_db_or_none()
 
 
 def generate_thread_id() -> str:
@@ -298,7 +315,7 @@ async def list_threads(
 ) -> list[dict]:
     """List threads from the pre-aggregated ``thread_metadata`` table.
 
-    Iterates across every ``sessions_*.db`` file in ``~/.deepagents``
+    Iterates across every ``sessions_*.db`` file in the discovery dir
     plus the legacy global ``sessions.db`` and merges results, so offline
     threads of all agents are visible (not only those in the legacy
     global DB). Reads the small ``thread_metadata`` index (backfilling it
@@ -322,8 +339,8 @@ async def list_threads(
         per_agent = get_db_path(agent_name)
         if per_agent.exists():
             db_paths.append(per_agent)
-        legacy = get_db_path(None)
-        if legacy.exists():
+        legacy = _legacy_global_db_or_none()
+        if legacy is not None:
             db_paths.append(legacy)
     else:
         db_paths = iter_all_db_paths()
@@ -431,8 +448,8 @@ async def list_all_threads(
         per_agent = get_db_path(agent_name)
         if per_agent.exists():
             db_paths.append(per_agent)
-        legacy = get_db_path(None)
-        if legacy.exists():
+        legacy = _legacy_global_db_or_none()
+        if legacy is not None:
             db_paths.append(legacy)
     else:
         db_paths = iter_all_db_paths()
@@ -628,63 +645,6 @@ async def delete_thread(thread_id: str) -> bool:
         return deleted
 
 
-def _migrate_from_global_db(agent_name: str, agent_db_path: Path) -> None:
-    """Migrate agent data from legacy global sessions.db to per-agent DB.
-
-    Called once when a per-agent DB is first created. Copies checkpoints and
-    writes for the agent (including :tm thread) from the global file.
-
-    This is a one-time migration — subsequent runs skip it because the
-    per-agent DB already has data.
-
-    Args:
-        agent_name: Agent name to migrate.
-        agent_db_path: Path to the per-agent DB file.
-    """
-    import sqlite3
-
-    global_path = get_db_path()  # Legacy sessions.db
-    if not global_path.exists():
-        return
-
-    # Skip if per-agent DB already has data (migration already done)
-    if agent_db_path.exists() and agent_db_path.stat().st_size > 8192:
-        return
-
-    try:
-        src = sqlite3.connect(str(global_path))
-        dst = sqlite3.connect(str(agent_db_path))
-
-        # Create tables from source schema
-        for row in src.execute("SELECT sql FROM sqlite_master WHERE type='table'").fetchall():
-            if row[0]:
-                dst.execute(row[0].replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS"))
-
-        tids = [agent_name, f"{agent_name}:tm"]
-        migrated_any = False
-
-        for table in ["checkpoints", "writes"]:
-            try:
-                rows = src.execute(
-                    f"SELECT * FROM {table} WHERE thread_id IN (?,?)", tids
-                ).fetchall()
-            except sqlite3.OperationalError:
-                continue
-            if rows:
-                ph = ",".join(["?"] * len(rows[0]))
-                dst.executemany(f"INSERT OR REPLACE INTO {table} VALUES ({ph})", rows)
-                migrated_any = True
-
-        if migrated_any:
-            dst.commit()
-
-        dst.close()
-        src.close()
-    except Exception:
-        # Migration is best-effort — don't crash the agent
-        pass
-
-
 @asynccontextmanager
 async def get_checkpointer(agent_name: str | None = None) -> AsyncIterator["DeltaSqliteCheckpointer"]:
     """Get DeltaSqliteCheckpointer for a database.
@@ -694,10 +654,12 @@ async def get_checkpointer(agent_name: str | None = None) -> AsyncIterator["Delt
     existing v1 (full snapshot) data from AsyncSqliteSaver.
 
     When ``agent_name`` is provided, uses a per-agent database file to avoid
-    SQLite lock contention between concurrent agents. On first use, migrates
-    existing data from the legacy global ``sessions.db``.
+    SQLite lock contention between concurrent agents.
 
-    When ``None``, uses the legacy global ``sessions.db``.
+    There is no import from a legacy global ``sessions.db``: it lived in the
+    ancestor's ``~/.deepagents`` tree, which POLICIES §16 bans for reads and
+    writes alike. Migrating an existing install is a one-time, out-of-band
+    action, never a branch inside this lookup path.
 
     Args:
         agent_name: Agent name for per-agent DB isolation.
@@ -708,10 +670,6 @@ async def get_checkpointer(agent_name: str | None = None) -> AsyncIterator["Delt
     from deep_worker_cli.delta_checkpointer import DeltaSqliteCheckpointer
 
     db_path = get_db_path(agent_name)
-
-    # One-time migration from global DB to per-agent DB
-    if agent_name is not None:
-        _migrate_from_global_db(agent_name, db_path)
 
     async with DeltaSqliteCheckpointer.from_conn_string(str(db_path)) as checkpointer:
         ensure_private_file(db_path)
@@ -808,7 +766,7 @@ async def clean_agent_history_db_only(
     writes_deleted = 0
 
     per_agent_path = get_db_path(agent_name)
-    legacy_path = get_db_path(None)
+    legacy_path = _legacy_global_db_or_none()
 
     # 1. Per-agent DB: count then delete the file entirely (atomic, no lock
     # contention, exactly what the user expects from --clean).  Skip when
@@ -842,7 +800,9 @@ async def clean_agent_history_db_only(
             pass
 
     # 2. Legacy global DB: remove any rows still tagged for this agent.
-    if legacy_path.exists():
+    # ``None`` means the layer is out of reach (POLICIES §16) — nothing to
+    # scrub, and nothing may be written there.
+    if legacy_path is not None and legacy_path.exists():
         try:
             thread_ids: list[str] = []
             async with aiosqlite.connect(
@@ -908,9 +868,9 @@ async def clean_agent_history(
     - Agent log files (~/.deep_worker/logs/{agent_name}.*)
 
     This does NOT remove:
-    - User configuration (~/.deepagents/{agent_name}/AGENTS.md)
-    - User skills (~/.deepagents/{agent_name}/skills/)
-    - User subagents (~/.deepagents/{agent_name}/agents/)
+    - User configuration (~/.deep_worker/agents/{agent_name}/AGENTS.md)
+    - User skills (~/.deep_worker/agents/{agent_name}/skills/)
+    - User subagents (~/.deep_worker/agents/{agent_name}/agents/)
 
     Args:
         agent_name: Name of the agent to clean
@@ -927,30 +887,15 @@ async def clean_agent_history(
     checkpoints_deleted = 0
     writes_deleted = 0
 
-    # Resolve DB paths.  In the common runtime case both paths come from
-    # ``get_db_path`` and point at ``home_dir/.deepagents/sessions_<agent>.db``
-    # and ``home_dir/.deepagents/sessions.db`` respectively.  Two special
-    # situations:
-    #   - Unit tests that pass ``_home_dir`` without patching ``get_db_path``:
-    #     use the home_dir-relative paths so the fake home is honoured.
-    #   - Unit tests that patch ``get_db_path`` to return one specific file
-    #     regardless of arg: both resolve to the same path, the guard
-    #     ``per_agent_path != legacy_path`` below skips the per-agent
-    #     unlink step and the legacy scrub cleans the rows.
-    if _home_dir is not None:
-        # Prefer the monkey-patched ``get_db_path`` if the patch collapses
-        # both paths onto a single file outside home_dir (legacy tests).
-        patched_per_agent = get_db_path(agent_name)
-        patched_legacy = get_db_path(None)
-        if patched_per_agent == patched_legacy:
-            per_agent_path = patched_per_agent
-            legacy_path = patched_legacy
-        else:
-            per_agent_path = home_dir / ".deepagents" / f"sessions_{agent_name}.db"
-            legacy_path = home_dir / ".deepagents" / "sessions.db"
-    else:
-        per_agent_path = get_db_path(agent_name)
-        legacy_path = get_db_path(None)
+    # Resolve DB paths.  ``get_db_path`` is the only spelling; the v1 global
+    # DB lived in the ancestor's tree and is banned for reads (POLICIES §16),
+    # so ``_legacy_global_db_or_none`` reports it as absent rather than
+    # raising.  Tests that monkey-patch ``get_db_path`` onto a single temp
+    # file for both arguments still work: the two paths then compare equal
+    # and the ``per_agent_path != legacy_path`` guard below skips the
+    # per-agent unlink so the scrub step cleans the rows instead.
+    per_agent_path = get_db_path(agent_name)
+    legacy_path = _legacy_global_db_or_none()
 
     # 1. Per-agent DB: count rows then remove the file.  Skip when
     # per-agent and legacy point at the same file (monkey-patched tests).
@@ -979,8 +924,9 @@ async def clean_agent_history(
             pass
 
     # 2. Legacy global DB: scrub any rows tagged with this agent's name
-    # (pre-migration data that may still be lying around).
-    if legacy_path.exists():
+    # (pre-migration data that may still be lying around).  ``None`` means
+    # the layer is out of reach (POLICIES §16) — nothing to scrub.
+    if legacy_path is not None and legacy_path.exists():
         try:
             thread_ids: list[str] = []
             async with aiosqlite.connect(
@@ -1028,7 +974,7 @@ async def clean_agent_history(
             pass
 
     # 3. Remove agent data directory
-    data_dir = deep_worker_home(home_dir) / agent_name
+    data_dir = agent_root(agent_name, home=home_dir, create=False)
     data_dir_removed = False
     if data_dir.exists():
         shutil.rmtree(data_dir)
@@ -1054,7 +1000,7 @@ async def clean_agent_history(
             f"  [dim]- Removed {log_files_removed} log file(s)[/dim]"
         )
     console.print(
-        f"  [dim]- Preserved user config: ~/.deepagents/{agent_name}/[/dim]"
+        f"  [dim]- Preserved user config: ~/.deep_worker/agents/{agent_name}/[/dim]"
     )
 
 
@@ -1289,11 +1235,8 @@ async def get_thread_history(
             candidate = get_db_path(derived_agent)
             if candidate.exists():
                 resolved = candidate
-        # Priority 3: legacy global.
-        if resolved is None:
-            legacy = get_db_path(None)
-            if legacy.exists():
-                resolved = legacy
+        # There is no priority 3: the legacy global DB lived in the
+        # ancestor's tree, which is banned for reads (POLICIES §16).
 
         if resolved is None:
             return {
@@ -1301,8 +1244,7 @@ async def get_thread_history(
                 "thread_id": thread_id,
                 "error": (
                     f"Thread '{thread_id}' not found: no session database "
-                    f"exists (looked for sessions_<agent>.db and "
-                    f"legacy sessions.db under ~/.deepagents)."
+                    f"exists for this agent."
                 ),
             }
         db_path = str(resolved)
@@ -1372,7 +1314,7 @@ async def remove_threads_before(
     """Remove all threads older than the specified date.
 
     When ``db_path`` is not provided, the operation is applied to every
-    per-agent ``sessions_<name>.db`` file in ``~/.deepagents`` **and** the
+    per-agent ``sessions_<name>.db`` file in the discovery dir **and** the
     legacy global ``sessions.db``.  Counts are summed across all files.
 
     Args:
@@ -1525,7 +1467,7 @@ async def import_history(
     This is the injection point for ``--import-claude``
     (DESIGN_IMPORT_CLAUDE_SESSION.md §4): the parsed Claude transcript becomes
     the agent's conversation history (its *memory*). The messages land in
-    ``~/.deepagents/sessions_<agent>.db`` so ``deep-worker --history <agent>``
+    the per-agent DB so ``deep-worker --history <agent>``
     shows them and the agent sees them on its first turn — independent of which
     provider the agent later runs under.
 

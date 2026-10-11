@@ -52,7 +52,7 @@ from langchain.agents.middleware.summarization import (
 )
 from langchain.tools import ToolRuntime
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, RemoveMessage
-from langchain_core.messages.utils import count_tokens_approximately, get_buffer_string, trim_messages
+from langchain_core.messages.utils import count_tokens_approximately, trim_messages
 from langgraph.config import get_config
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from typing_extensions import TypedDict, override
@@ -91,6 +91,38 @@ class HistoryOffloadError(RuntimeError):
     """
 
 
+class SummarizationFailedError(RuntimeError):
+    """Raised when producing the summary itself fails.
+
+    Sibling of :class:`HistoryOffloadError`: that one covers a failure to
+    PERSIST the evicted history, this one covers a failure to PRODUCE the
+    summary that replaces it. They are kept distinct so the operator can tell
+    which stage lost data — by the time this is raised the offload has already
+    succeeded, so the history is safe on disk.
+
+    The failure text must never be substituted for the summary, and the
+    history must not be evicted behind it: an agent that wakes up holding
+    ``Error generating summary: …`` in place of its context, with the real
+    messages already deleted, cannot recover and cannot even tell that
+    anything went wrong.
+
+    Fatal — the agent runtime's fatal-exception catch-all matches the class
+    name ``SummarizationFailedError`` in
+    :data:`deep_worker_cli.exceptions.FATAL_EXCEPTION_TYPES` and transitions
+    the agent into ``AgentStatus.ERROR`` with the error message.
+
+    See ``docs/POLICIES.md`` §12 and ``docs/DESIGN_SUMMARIZATION_HOT_COLD.md``.
+    """
+
+
+# The langchain base class swallows summarization failures and returns this
+# prefix as if it were the summary. We detect it in ``_create_summary`` and
+# convert it back into a raised ``SummarizationFailedError`` (POLICIES.md §12).
+# Kept as a constant so the string exists in exactly one place; the guard in
+# ``test_summarization_fatal_visible.py`` allows it here and nowhere else.
+_SUMMARY_ERROR_MARKER = "Error generating summary"
+
+
 class TruncateArgsSettings(TypedDict, total=False):
     """Settings for truncating large tool arguments in old messages.
 
@@ -110,7 +142,7 @@ class TruncateArgsSettings(TypedDict, total=False):
 class SummarizationDefaults(TypedDict):
     """Default settings computed from model profile."""
 
-    trigger: ContextSize
+    trigger: ContextSize | list[ContextSize]
     keep: ContextSize
     truncate_args_settings: TruncateArgsSettings
 
@@ -122,28 +154,250 @@ class RequestedSummaryResult:
     history_path: str | None
 
 
-def _compute_summarization_defaults(model: BaseChatModel) -> SummarizationDefaults:
+def _instruction_from_prompt(prompt: str | None, default: str) -> str:
+    raw = prompt if prompt else default
+    if "{messages}" in raw:
+        raw = raw.replace("{messages}", "").rstrip()
+    return raw
+
+
+def _utc_now_iso() -> str:
+    """Current time as ISO-8601 with an explicit ``Z``.
+
+    UTC is a hard project rule for anything that lands in a report or a log:
+    a downstream consumer correlates this against its own run timeline, and
+    a local-time stamp would silently shift an incident by the host's offset.
+    """
+    return (
+        datetime.now(UTC)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def _describe_trigger(trigger: Any) -> str:
+    """Render the configured trigger as ``kind:value`` for the incident report.
+
+    Purely descriptive — the operator reading the incident needs to know WHICH
+    threshold fired (``fraction:0.85`` vs ``tokens:170000``), and a trigger may
+    be a single spec or a list of them.
+    """
+    def _one(spec: Any) -> str:
+        if isinstance(spec, (tuple, list)) and len(spec) == 2:
+            return f"{spec[0]}:{spec[1]}"
+        return str(spec)
+
+    if isinstance(trigger, list):
+        return ",".join(_one(spec) for spec in trigger)
+    return _one(trigger)
+
+
+def _has_summarizer_port(model: Any) -> bool:
+    """Whether ``model`` implements the SummarizerPort.
+
+    Delegates to the port's own predicate so "what counts as implementing it"
+    has ONE definition. The local fallback keeps deepagents importable without
+    the CLI package, and matches the delegate's semantics: check the TYPE (an
+    instance probe reads truthy on any ``MagicMock``) and require BOTH halves
+    (``asummarize`` without ``areset_after_summary`` is a half-migrated
+    provider — claude-code-sdk sat in exactly that state until 2026-08-24,
+    unnoticed precisely because this check only looked at one half).
+    """
+    try:
+        from deep_worker_cli.context_limit.summarizer_port import (
+            implements_summarizer_port,
+        )
+    except Exception:  # noqa: BLE001 — deepagents may run standalone
+        model_type = type(model)
+        return all(
+            asyncio.iscoroutinefunction(getattr(model_type, name, None))
+            for name in ("asummarize", "areset_after_summary")
+        )
+    return implements_summarizer_port(model)
+
+
+def _is_session_stateful(model: Any) -> bool:
+    """Whether the provider keeps conversation state on ITS side.
+
+    For such providers (ACP/CLI-backed) re-invoking the model replays the
+    whole history into a new provider session, so losing the summarizer
+    port must fail loudly instead of falling through. Reuses
+    ``hot_cache.SESSION_STATEFUL_PROVIDERS`` — the single source of truth
+    for this classification; do not duplicate the list here.
+
+    Deliberately an ALLOW-LIST, and deliberately string-only. Answering
+    "is it NOT stateless?" made every unknown provider AND every
+    ``MagicMock`` (whose attribute access yields a truthy mock) look
+    session-stateful, which broke seven unrelated summarization tests
+    (reviewer B2, 2026-08-21). Anything we cannot positively identify as a
+    CLI-session provider takes the normal path.
+    """
+    try:
+        from deep_worker_cli.context_limit.hot_cache import (
+            SESSION_STATEFUL_PROVIDERS,
+        )
+    except Exception:  # noqa: BLE001 — deepagents may run standalone
+        return False
+    provider, _model_id, _adapter = _current_provider_model(model)
+    # Must be a real string: a mock/sentinel is not a provider identity.
+    if not isinstance(provider, str) or not provider.strip():
+        return False
+    return provider.strip().lower() in SESSION_STATEFUL_PROVIDERS
+
+
+def _current_provider_model(model: Any) -> tuple[str, str | None, str | None]:
+    # ``_profile`` FIRST, and it is load-bearing.
+    #
+    # ``AcpChatModel`` exposes the profile as a ``@property``, but it is a
+    # pydantic model: pydantic strips the property off the class and the
+    # instance ``__dict__`` shadows it, so ``getattr(model, "profile")`` hands
+    # back the raw ``property`` OBJECT rather than the profile. Reading
+    # ``.provider`` off that yields None, so EVERY ACP provider — claude-code
+    # included — resolved to "unknown" here, and ``_is_session_stateful`` was
+    # therefore always False for them.
+    #
+    # That made the session-stateful guard dead code for the exact providers it
+    # was written to protect. It looked fine only because those providers also
+    # happened to implement the summarizer port, so the dump never triggered.
+    # Verified directly: ``_is_session_stateful`` returned False for
+    # AcpChatModel, ClaudeCodeAcpChatModel and GrokChatModel alike.
+    profile = getattr(model, "_profile", None) or getattr(model, "profile", None)
+    provider = (
+        getattr(model, "_deep_worker_provider", None)
+        or getattr(model, "provider", None)
+        or getattr(profile, "provider", None)
+    )
+    if isinstance(profile, dict):
+        provider = provider or profile.get("provider")
+    if not provider:
+        hint = str(
+            getattr(model, "model_name", None) or getattr(model, "model", None) or ""
+        ).lower()
+        if "deepseek" in hint:
+            provider = "deepseek"
+        elif "grok" in hint:
+            provider = "grok"
+    model_name = (
+        getattr(model, "model_name", None)
+        or getattr(model, "_model_name", None)
+        or getattr(profile, "model", None)
+    )
+    model_id = getattr(model, "resolved_model_name", None)
+    if provider:
+        provider = str(provider).strip().lower()
+        if provider == "unknown":
+            provider = None
+    return str(provider or "unknown"), (str(model_name) if model_name else None), (
+        str(model_id) if model_id else None
+    )
+
+
+def _session_id_for(model: Any, thread_id: str | None) -> str | None:
+    if not thread_id:
+        return None
+    client_state = getattr(model, "_client_state", None)
+    getter = getattr(client_state, "get", None)
+    if getter is None:
+        return None
+    try:
+        slot = getter(thread_id)
+    except Exception:  # noqa: BLE001
+        return None
+    session_id = getattr(slot, "session_id", None)
+    return session_id if isinstance(session_id, str) else None
+
+
+def _hot_cold_decision(
+    model: Any,
+    messages: list[AnyMessage],
+    thread_id: str | None,
+    ttl_overrides: dict[str, int] | None = None,
+) -> Any:
+    try:
+        from deep_worker_cli.context_limit.hot_cache import decide
+    except ImportError:
+        return None
+    provider, model_name, model_id = _current_provider_model(model)
+    state_last = None
+    client_state = getattr(model, "_client_state", None)
+    if client_state is not None and thread_id:
+        slot = getattr(client_state, "get", lambda _tid: None)(thread_id)
+        state_last = getattr(slot, "last_response_at", None) if slot is not None else None
+    overrides = ttl_overrides if ttl_overrides is not None else getattr(
+        model, "_hot_cache_ttl_overrides", None
+    )
+    return decide(
+        current_provider=provider,
+        current_model=model_name,
+        current_model_id=model_id,
+        messages=messages,
+        state_last_response_at=state_last,
+        session_id=_session_id_for(model, thread_id),
+        ttl_overrides=overrides,
+    )
+
+
+def _compute_summarization_defaults(
+    model: BaseChatModel,
+    context_limit: int | None = None,
+) -> SummarizationDefaults:
     """Compute default summarization settings based on model profile.
 
     This is an internal helper function used by middleware implementations.
 
     Args:
         model: A resolved chat model instance.
+        context_limit: Optional operator-set effective window in tokens.
+            When set, trigger is the OR of ``int(L * 0.85)`` tokens and the
+            model default; keep and truncate_args are derived from ``L``.
 
     Returns:
         Default settings for trigger, keep, and truncate_args_settings.
         If the model has a profile with max_input_tokens, uses fraction-based
         settings. Otherwise, uses fixed token/message counts.
     """
-    has_profile = (
-        model.profile is not None
-        and isinstance(model.profile, dict)
-        and "max_input_tokens" in model.profile
-        and isinstance(model.profile["max_input_tokens"], int)
-    )
+    raw_profile = getattr(model, "profile", None)
+    max_input_tokens: int | None = None
+    if isinstance(raw_profile, dict):
+        candidate = raw_profile.get("max_input_tokens")
+        if isinstance(candidate, int):
+            max_input_tokens = candidate
+    else:
+        candidate = getattr(raw_profile, "max_input_tokens", None)
+        if isinstance(candidate, int):
+            max_input_tokens = candidate
+    has_profile = max_input_tokens is not None
 
     if has_profile:
-        return {
+        model_trigger: ContextSize = ("fraction", 0.85)
+    else:
+        model_trigger = ("tokens", 170000)
+
+    if context_limit:
+        limit_trigger: ContextSize = ("tokens", int(context_limit * 0.85))
+        limit_keep: ContextSize = ("tokens", int(context_limit * 0.10))
+        # When ``-l`` is set the fixed 170k fallback MUST NOT fire (an
+        # earlier incident: AcpProfile is a dataclass so has_profile was False and
+        # 170k OR-ed with 340k, causing a second summarization of a 224k
+        # dump-session). Keep the model fraction trigger only when the
+        # profile actually has max_input_tokens.
+        trigger: ContextSize | list[ContextSize]
+        if has_profile:
+            trigger = [limit_trigger, model_trigger]
+        else:
+            trigger = limit_trigger
+        limited: SummarizationDefaults = {
+            "trigger": trigger,
+            "keep": limit_keep,
+            "truncate_args_settings": {
+                "trigger": limit_trigger,
+                "keep": limit_keep,
+            },
+        }
+        return limited
+
+    if has_profile:
+        profile_defaults: SummarizationDefaults = {
             "trigger": ("fraction", 0.85),
             "keep": ("fraction", 0.10),
             "truncate_args_settings": {
@@ -151,7 +405,9 @@ def _compute_summarization_defaults(model: BaseChatModel) -> SummarizationDefaul
                 "keep": ("fraction", 0.10),
             },
         }
-    return {
+        return profile_defaults
+
+    no_profile: SummarizationDefaults = {
         "trigger": ("tokens", 170000),
         "keep": ("messages", 6),
         "truncate_args_settings": {
@@ -159,6 +415,49 @@ def _compute_summarization_defaults(model: BaseChatModel) -> SummarizationDefaul
             "keep": ("messages", 20),
         },
     }
+    return no_profile
+
+
+def _apply_keep_override(
+    defaults: SummarizationDefaults,
+    keep_override: tuple[str, int | float],
+) -> SummarizationDefaults:
+    """Fold an operator ``--summary-keep`` spec into computed defaults.
+
+    A token spec is a CEILING: it may only lower the computed share, never
+    raise it. ``("tokens", 0)`` is exact (empty tail) and is never min()-ed.
+    Fraction and message specs replace the computed value outright.
+
+    ``truncate_args_settings.keep`` deliberately keeps its own computed value:
+    it governs tool-argument trimming of *older* messages, not the preserved
+    tail, and zeroing it would truncate arguments everywhere.
+
+    ``kind`` is one of ``fraction`` / ``messages`` / ``tokens`` — the only
+    three ``parse_summary_keep`` emits. Anything else is treated as a token
+    spec rather than silently widening ``ContextSize``.
+    """
+    kind, value = keep_override
+    computed = defaults["keep"]
+    resolved: ContextSize
+    if kind == "fraction":
+        resolved = ("fraction", value)
+    elif kind == "messages":
+        resolved = ("messages", int(value))
+    else:
+        # ``0`` needs no special case: min(0, N) == 0 against a token default,
+        # and the pass-through branch yields 0 against a fraction/message
+        # default. Both land on ("tokens", 0) — an empty tail.
+        computed_kind, computed_value = computed
+        if computed_kind == "tokens":
+            resolved = ("tokens", min(int(value), int(computed_value)))
+        else:
+            resolved = ("tokens", int(value))
+    out: SummarizationDefaults = {
+        "trigger": defaults["trigger"],
+        "keep": resolved,
+        "truncate_args_settings": defaults["truncate_args_settings"],
+    }
+    return out
 
 
 class SummarizationMiddleware(BaseSummarizationMiddleware):
@@ -171,12 +470,20 @@ class SummarizationMiddleware(BaseSummarizationMiddleware):
         backend: BACKEND_TYPES,
         trigger: ContextSize | list[ContextSize] | None = None,
         keep: ContextSize = ("messages", _DEFAULT_MESSAGES_TO_KEEP),
+        # NOTE: deep_worker ALWAYS passes an explicit ``token_counter``
+        # (``provider_context_token_counter``) so that this middleware and
+        # the context-limit guard decide on the SAME number — the one the
+        # PROVIDER reported. This langchain default counts characters; using
+        # it inside deep_worker means summarizing on a number nobody
+        # measured, which is exactly what the project owner forbade
+        # (measured cost: 214613 estimated vs 90k real).
         token_counter: TokenCounter = count_tokens_approximately,
         summary_prompt: str = DEFAULT_SUMMARY_PROMPT,
         trim_tokens_to_summarize: int | None = _DEFAULT_TRIM_TOKEN_LIMIT,
         history_path_prefix: str = "/conversation_history",
         truncate_args_settings: TruncateArgsSettings | None = None,
         on_summarized: Callable[[str], None] | None = None,
+        hot_cache_ttl_overrides: dict[str, int] | None = None,
         **deprecated_kwargs: Any,
     ) -> None:
         """Initialize summarization middleware with backend support.
@@ -222,18 +529,43 @@ class SummarizationMiddleware(BaseSummarizationMiddleware):
             )
             ```
         """
+        # ``keep=("tokens", 0)`` means "no tail at all — summary only".
+        # The upstream base class cannot represent it: ``_validate_context_size``
+        # rejects non-positive values outright, and even if it did not,
+        # ``_find_token_based_cutoff`` coerces a non-positive budget to 1 token
+        # while ``_find_safe_cutoff_point`` walks the boundary back to keep an
+        # AIMessage(tool_calls)/ToolMessage pair together. Both would leave at
+        # least one message behind. Hand the base class a benign placeholder and
+        # honour the real intent in ``_determine_cutoff_index``.
+        self._keep_nothing = keep == ("tokens", 0)
         super().__init__(
             model=model,
             trigger=trigger,
-            keep=keep,
+            keep=("messages", _DEFAULT_MESSAGES_TO_KEEP) if self._keep_nothing else keep,
             token_counter=token_counter,
             summary_prompt=summary_prompt,
             trim_tokens_to_summarize=trim_tokens_to_summarize,
             **deprecated_kwargs,
         )
+        if self._keep_nothing:
+            # Restore the operator-visible value so ``self.keep`` never lies.
+            self.keep = ("tokens", 0)
         self._backend = backend
         self._history_path_prefix = history_path_prefix
         self._on_summarized = on_summarized
+        # Per-turn observability (downstream requirement REQ-90): set by ``abefore_model``
+        # when a REAL size-based compaction fired during the turn, read and
+        # cleared by the turn owner (agent_process). Deliberately NOT set by
+        # ``apply_pseudo_summary`` (the operator's per-document context reset,
+        # a normal mode) nor by ``apply_requested_summary`` (force=True, an
+        # explicit operator command with its own report). A flag on either of
+        # those would fail EVERY document of EVERY run downstream.
+        self.last_turn_compaction: dict[str, Any] | None = None
+        self._hot_cache_ttl_overrides = (
+            dict(hot_cache_ttl_overrides) if hot_cache_ttl_overrides else None
+        )
+        if self._hot_cache_ttl_overrides:
+            setattr(self.model, "_hot_cache_ttl_overrides", self._hot_cache_ttl_overrides)
 
         # Parse truncate_args_settings
         if truncate_args_settings is None:
@@ -446,19 +778,133 @@ class SummarizationMiddleware(BaseSummarizationMiddleware):
         """
         return [msg for msg in messages if not self._is_summary_message(msg)]
 
-    def _build_new_messages_with_path(self, summary: str, file_path: str | None) -> list[AnyMessage]:
+    def _origin_for_offload(
+        self,
+        messages: list[AnyMessage],
+        filtered_messages: list[AnyMessage],
+    ) -> dict[str, Any] | None:
+        """Resolve v5 segment origin, including previous-summary stamps.
+
+        Filtering summaries before lookup dropped origin on chained
+        offloads (observed in live chained offloads).
+        """
+        try:
+            from deep_worker_cli.context_limit.hot_cache import effective_origin
+        except ImportError:
+            return None
+        origin = effective_origin(messages)
+        if origin is None:
+            origin = effective_origin(filtered_messages)
+        if origin is None:
+            provider, model_name, model_id = _current_provider_model(self.model)
+            if provider and provider != "unknown":
+                origin = {
+                    "provider": provider,
+                    "model": model_name,
+                    "model_id": model_id,
+                    "adapter": None,
+                    "since": datetime.now(UTC).isoformat(timespec="microseconds"),
+                }
+        return origin
+
+    def _stamp_preserved_origin(
+        self,
+        preserved: list[AnyMessage],
+        origin: dict[str, Any] | None,
+    ) -> list[AnyMessage]:
+        """Copy effective origin onto the first AIMessage of the kept tail."""
+        if not origin:
+            return preserved
+        out = list(preserved)
+        for i, msg in enumerate(out):
+            if not isinstance(msg, AIMessage):
+                continue
+            rm = dict(getattr(msg, "response_metadata", None) or {})
+            existing = rm.get("deep_worker_origin")
+            if isinstance(existing, dict) and existing.get("provider"):
+                break
+            stamped = msg.model_copy()
+            rm["deep_worker_origin"] = dict(origin)
+            stamped.response_metadata = rm
+            out[i] = stamped
+            break
+        return out
+
+    @staticmethod
+    def _drop_pre_summary_usage(preserved: list[AnyMessage]) -> list[AnyMessage]:
+        """Strip ``usage_metadata`` from the tail we are about to keep.
+
+        Those numbers measure the prompt that produced the message — a
+        prompt built from the history summarization is discarding. Kept on
+        a preserved message they describe a conversation that no longer
+        exists, and ``provider_context_tokens`` reads
+        ``usage_metadata.input_tokens`` as "the context the provider
+        reported for THIS history".
+
+        One agent deadlocked on exactly that: a preserved
+        AIMessage reporting 450132 input tokens against a six-message
+        state. The guard blocked every turn, so no model call ever
+        produced a fresh measurement to replace it — sixteen identical
+        failures, the number frozen while the history grew.
+
+        The stamped ``deep_worker_context`` observation does not need this
+        treatment: it carries a ``first_id`` validity key and is rejected
+        on its own once the history it measured is gone. ``usage_metadata``
+        has no such key, so the association has to be broken where the tail
+        is chosen. That happens in TWO places — the automatic trigger in
+        ``before_model`` and the requested one in ``_arun_compaction`` — and
+        both must call this. Cleaning only one leaves the same deadlock
+        reachable through the other entrance (review finding, 2026-08-30).
+
+        Per-turn accounting keeps working — ``ProvenanceMiddleware`` copies
+        these numbers into ``response_metadata['deep_worker_usage']`` as
+        the model returns, which is what the web UI and token stats read.
+        Every other reader (stream processor, stats callback, textual
+        adapter) takes them from the live stream, never from history.
+        """
+        out = list(preserved)
+        for i, msg in enumerate(out):
+            if getattr(msg, "usage_metadata", None) is None:
+                continue
+            # ``update=`` rather than attribute assignment: ``preserved`` is
+            # typed as the union of message classes and only ``AIMessage``
+            # declares ``usage_metadata``, so assigning through the union is
+            # a type error even though the value is a legal ``None``.
+            out[i] = msg.model_copy(update={"usage_metadata": None})
+        return out
+
+    def _build_new_messages_with_path(
+        self,
+        summary: str,
+        file_path: str | None,
+        *,
+        origin: dict[str, Any] | None = None,
+        usage: dict[str, Any] | None = None,
+        verbatim: bool = False,
+    ) -> list[AnyMessage]:
         """Build the summary message with optional file path reference.
 
         Args:
-            summary: The generated summary text.
-            file_path: Path where conversation history was stored, or `None`.
-
-                Optional since offloading may fail.
-
-        Returns:
-            List containing the summary `HumanMessage`.
+            summary: The summary text.
+            file_path: JSONL path to reference, or ``None``.
+            origin: Optional provenance stamp.
+            usage: Optional per-turn usage stamp.
+            verbatim: When True, ``content`` is EXACTLY ``summary`` — no
+                framing, no ``<summary>`` tags, no history-file reference.
+                Used by the pseudo-summary path, where ``summary`` is not a
+                recap of the past at all but the agent's actual task, and it
+                becomes the model's FIRST user request. Framing it as "a
+                conversation that has been summarized" made deepseek read the
+                task as history and spend its whole turn trying to inspect the
+                JSONL file (observed in a downstream pipeline: 20 consecutive
+                `execute` calls, zero links added, and the same in another
+                pipeline). The offload still happens — the model is simply
+                not told about it. Real size-based summarization keeps the
+                framing and MUST NOT pass this flag.
         """
-        if file_path is not None:
+        if verbatim:
+            content = summary
+        elif file_path is not None:
             content = f"""\
 You are in the middle of a conversation that has been summarized.
 
@@ -472,9 +918,16 @@ A condensed summary follows:
         else:
             content = f"Here is a summary of the conversation to date:\n\n{summary}"
 
+        extra: dict[str, Any] = {"lc_source": "summarization"}
+        if origin:
+            extra["deep_worker_origin"] = origin
+        metadata: dict[str, Any] = {}
+        if usage:
+            metadata["deep_worker_usage"] = usage
         summary_message = HumanMessage(
             content=content,
-            additional_kwargs={"lc_source": "summarization"},
+            additional_kwargs=extra,
+            response_metadata=metadata,
         )
         ensure_message_created_at(summary_message, MonotonicUtcClock())
         return [summary_message]
@@ -508,6 +961,18 @@ A condensed summary follows:
             return total_tokens >= threshold
 
         return False
+
+    def _determine_cutoff_index(self, messages: list[AnyMessage]) -> int:
+        """Cutoff honouring ``keep=("tokens", 0)`` — an empty preserved tail.
+
+        For every other retention policy this defers to the base class, which
+        preserves AIMessage(tool_calls)/ToolMessage pairs. With ``keep=0`` there
+        is no tail to keep pairs *in*: the whole history is summarized and the
+        resulting state is ``[summary]`` alone.
+        """
+        if self._keep_nothing:
+            return len(messages)
+        return super()._determine_cutoff_index(messages)
 
     def _determine_truncate_cutoff_index(self, messages: list[AnyMessage]) -> int:  # noqa: PLR0911
         """Determine the cutoff index for argument truncation based on keep policy.
@@ -678,9 +1143,12 @@ A condensed summary follows:
 
         timestamp = datetime.now(UTC).isoformat(timespec="microseconds")
         ensure_messages_created_at(filtered_messages, MonotonicUtcClock())
+        origin = self._origin_for_offload(messages, filtered_messages)
         new_section = serialize_summarized_messages_jsonl(
             filtered_messages,
             summarized_at=timestamp,
+            thread_id=thread_id,
+            origin=origin,
         )
 
         # Read existing content (if any) and append
@@ -768,9 +1236,12 @@ A condensed summary follows:
 
         timestamp = datetime.now(UTC).isoformat(timespec="microseconds")
         ensure_messages_created_at(filtered_messages, MonotonicUtcClock())
+        origin = self._origin_for_offload(messages, filtered_messages)
         new_section = serialize_summarized_messages_jsonl(
             filtered_messages,
             summarized_at=timestamp,
+            thread_id=thread_id,
+            origin=origin,
         )
 
         # Read existing content (if any) and append
@@ -873,9 +1344,11 @@ A condensed summary follows:
         Returns:
             ``(new_messages, file_path)`` where ``new_messages`` is exactly
             one summary-shape ``HumanMessage`` (``lc_source='summarization'``)
-            — with a JSONL reference line when an offload write occurred, and
-            without one when the (filtered) history was empty. ``file_path``
-            is the JSONL path when a write occurred, else ``None``.
+            whose content is ``summary_text`` VERBATIM — no framing, no
+            ``<summary>`` tags and no history-file reference, on both the
+            offloaded and the empty-history branch. ``file_path`` is the JSONL
+            path when a write occurred, else ``None``; it is reported to the
+            caller but never shown to the model.
 
         Raises:
             RuntimeError: When the middleware holds a factory backend rather
@@ -900,7 +1373,12 @@ A condensed summary follows:
         # message WITHOUT a JSONL reference (no dangling file link).
         filtered = self._filter_summary_messages(current_messages)
         if not filtered:
-            return self._build_new_messages_with_path(summary_text, None), None
+            return (
+                self._build_new_messages_with_path(
+                    summary_text, None, verbatim=True
+                ),
+                None,
+            )
 
         # Offload the SAME filtered list we emptiness-checked (NIT-1: "what we
         # checked is what we write" — one filtration, no ambiguity).
@@ -909,7 +1387,12 @@ A condensed summary follows:
         file_path = await self._aoffload_to_backend(
             backend, filtered, thread_id
         )
-        new_messages = self._build_new_messages_with_path(summary_text, file_path)
+        # ``file_path`` is still returned to the caller (the offload is real and
+        # worth logging), but it is deliberately NOT woven into the message:
+        # the model must receive the sum-query byte for byte.
+        new_messages = self._build_new_messages_with_path(
+            summary_text, file_path, verbatim=True
+        )
         return new_messages, file_path
 
     @override
@@ -972,6 +1455,11 @@ A condensed summary follows:
             return None
 
         messages_to_summarize, preserved_messages = self._partition_messages(truncated_messages, cutoff_index)
+        # Both paths that choose a tail must drop the pre-summary measurement
+        # (see ``_drop_pre_summary_usage``); this is the automatic trigger,
+        # ``_arun_compaction`` is the requested one. Cleaning only one of them
+        # leaves the same deadlock reachable through the other entrance.
+        preserved_messages = self._drop_pre_summary_usage(preserved_messages)
 
         # Offload to backend FIRST — abort summarization if this fails to prevent data loss.
         # ``_offload_to_backend`` now raises ``HistoryOffloadError`` on any failure; the raise
@@ -982,10 +1470,31 @@ A condensed summary follows:
         file_path = self._offload_to_backend(backend, messages_to_summarize)
 
         # Generate summary — only reached when the offload succeeded.
+        # ``_create_summary`` is overridden below to raise instead of returning
+        # the base class's ``"Error generating summary: …"`` string, so a
+        # failure here never reaches ``_build_new_messages_with_path`` and the
+        # ``RemoveMessage`` below is never constructed.
         summary = self._create_summary(messages_to_summarize)
 
         # Build summary message with file path reference
         new_messages = self._build_new_messages_with_path(summary, file_path)
+
+        # REQ-90, same contract as ``abefore_model``. Production always runs the
+        # async hook, but a size-based firing on THIS path is the same incident,
+        # and leaving it unstamped would make the gap silent if it ever runs.
+        replacement = [*new_messages, *preserved_messages]
+        self.last_turn_compaction = {
+            "occurred": True,
+            "observable": True,
+            "reason": "size_trigger",
+            "trigger": _describe_trigger(self.trigger),
+            "tokens_before": total_tokens,
+            "tokens_after": self._cached_total_tokens(replacement),
+            "messages_before": len(messages),
+            "messages_after": len(replacement),
+            "history_path": file_path,
+            "at_utc": _utc_now_iso(),
+        }
 
         return {
             "messages": [
@@ -995,10 +1504,59 @@ A condensed summary follows:
             ]
         }
 
+    @override
+    def _create_summary(self, messages_to_summarize: list[AnyMessage]) -> str:
+        """Summarise ``messages_to_summarize``, raising instead of swallowing.
+
+        DELIBERATE DIVERGENCE FROM THE LANGCHAIN BASE CLASS (POLICIES.md §12).
+
+        The base implementation ends with::
+
+            except Exception as e:
+                return f"Error generating summary: {e!s}"
+
+        The caller cannot tell that string from a real summary, so it gets
+        wrapped by ``_build_new_messages_with_path`` and returned alongside
+        ``RemoveMessage(REMOVE_ALL_MESSAGES)``: the agent wakes up holding the
+        error text as its entire context, status ``IDLE``, nothing reporting a
+        fault. That is the 2026-08-23 incident, and it is the reason the async
+        path was fixed — this override closes the same hole on the sync path.
+
+        Matching upstream is not a reason to lose user data. We diverge, and
+        this docstring is the divergence site the policy asks for.
+
+        Overriding the helper rather than patching the one call site in
+        ``before_model`` means any current or future caller of
+        ``_create_summary`` inherits the guarantee, including one added
+        upstream in a base-class method we do not override.
+
+        Raises:
+            SummarizationFailedError: if the underlying model call fails, or if
+                the base class swallowed the failure into its marker string.
+        """
+        try:
+            summary = super()._create_summary(messages_to_summarize)
+        except SummarizationFailedError:
+            raise
+        except Exception as e:
+            msg = f"Failed to generate conversation summary: {type(e).__name__}: {e}"
+            logger.error(msg)
+            raise SummarizationFailedError(msg) from e
+
+        # Belt and braces: the base class catches internally, so a failure
+        # arrives as a RETURN VALUE, not an exception. Detect the marker and
+        # convert it back into the fault it always was. Pinned by
+        # ``test_sync_before_model_raises_instead_of_summarising_the_error``.
+        if isinstance(summary, str) and summary.startswith(_SUMMARY_ERROR_MARKER):
+            msg = f"Failed to generate conversation summary: {summary}"
+            logger.error(msg)
+            raise SummarizationFailedError(msg)
+        return summary
+
     def _format_requested_summary_prompt(
         self,
         prompt: str,
-        messages: list[AnyMessage],
+        messages: list[AnyMessage],  # noqa: ARG002 — signature kept for callers
     ) -> str:
         fields = [
             field_name
@@ -1009,8 +1567,63 @@ A condensed summary follows:
             raise ValueError(
                 "summary prompt may contain at most one {messages} field"
             )
-        template = prompt if fields else f"{prompt}\n\n{{messages}}"
-        return template.format(messages=get_buffer_string(messages)).rstrip()
+        return prompt if fields else prompt
+
+    def _trim_for_prompt(
+        self,
+        messages_to_summarize: list[AnyMessage],
+        summary_prompt: str | None,
+    ) -> list[AnyMessage]:
+        if summary_prompt is None:
+            return self._trim_messages_for_summary(messages_to_summarize)
+        if self.trim_tokens_to_summarize is None:
+            return messages_to_summarize
+        prompt_for_budget = (
+            summary_prompt
+            if "{messages}" in summary_prompt
+            else f"{summary_prompt}\n\n{{messages}}"
+        )
+        prompt_tokens = self.token_counter([HumanMessage(content=prompt_for_budget)])
+        adjusted_limit = max(1000, self.trim_tokens_to_summarize - prompt_tokens)
+        return cast(
+            "list[AnyMessage]",
+            trim_messages(
+                messages_to_summarize,
+                max_tokens=adjusted_limit,
+                token_counter=self.token_counter,
+                start_on="human",
+                strategy="last",
+                allow_partial=True,
+                include_system=True,
+            ),
+        )
+
+    async def _ainvoke_identical_prefix(
+        self,
+        trimmed_messages: list[AnyMessage],
+        instruction: str,
+        thread_id: str | None,
+    ) -> str:
+        # Fail loud rather than dump. This path re-``ainvoke``s the model on
+        # the AGENT's own thread_id. For a session-stateful provider (ACP)
+        # that means the 4b net re-sends the whole history into a fresh CLI
+        # session — the very dump the summarizer port exists to avoid. Today
+        # ``AcpChatModel.bind_tools`` returns ``self`` so the port survives
+        # binding, but any wrapper that does not preserve ``asummarize``
+        # would silently regress to dumping. Refuse instead.
+        if _is_session_stateful(self.model) and not _has_summarizer_port(self.model):
+            raise RuntimeError(
+                "summarization port unavailable on a session-stateful "
+                f"provider ({type(self.model).__name__}); refusing to "
+                "re-invoke the agent session, which would dump the full "
+                "history. The model wrapper must preserve `asummarize`."
+            )
+        payload: list[AnyMessage] = [*trimmed_messages, HumanMessage(content=instruction)]
+        config: RunnableConfig = {"metadata": {"lc_source": "summarization"}}
+        if thread_id is not None:
+            config["configurable"] = {"thread_id": thread_id}
+        response = await self.model.ainvoke(payload, config=config)
+        return response.text.strip()
 
     async def _acreate_summary_for_prompt(
         self,
@@ -1018,80 +1631,108 @@ A condensed summary follows:
         summary_prompt: str | None,
         thread_id: str | None,
         *,
-        fail_loud: bool = False,
-    ) -> str:
+        decision: Any = None,
+    ) -> tuple[str, Any]:
         if not messages_to_summarize:
-            return "No previous conversation history."
-        if summary_prompt is None:
-            trimmed_messages = self._trim_messages_for_summary(
-                messages_to_summarize
-            )
-            if not trimmed_messages:
-                return "Previous conversation was too long to summarize."
-            formatted_prompt = self.summary_prompt.format(
-                messages=get_buffer_string(trimmed_messages)
-            ).rstrip()
-            config: RunnableConfig = {
-                "metadata": {"lc_source": "summarization"},
-            }
-            if thread_id is not None:
-                config["configurable"] = {"thread_id": thread_id}
-            try:
-                response = await self.model.ainvoke(
-                    formatted_prompt, config=config
-                )
-                return response.text.strip()
-            except Exception as e:
-                if fail_loud:
-                    raise
-                return f"Error generating summary: {e!s}"
-        prompt_for_budget = (
-            summary_prompt
-            if "{messages}" in summary_prompt
-            else f"{summary_prompt}\n\n{{messages}}"
-        )
-        if self.trim_tokens_to_summarize is None:
-            trimmed_messages = messages_to_summarize
-        else:
-            prompt_tokens = self.token_counter(
-                [HumanMessage(content=prompt_for_budget)]
-            )
-            adjusted_limit = max(
-                1000,
-                self.trim_tokens_to_summarize - prompt_tokens,
-            )
-            trimmed_messages = cast(
-                "list[AnyMessage]",
-                trim_messages(
-                    messages_to_summarize,
-                    max_tokens=adjusted_limit,
-                    token_counter=self.token_counter,
-                    start_on="human",
-                    strategy="last",
-                    allow_partial=True,
-                    include_system=True,
-                ),
-            )
+            return "No previous conversation history.", None
+        if summary_prompt is not None:
+            self._format_requested_summary_prompt(summary_prompt, messages_to_summarize)
+        trimmed_messages = self._trim_for_prompt(messages_to_summarize, summary_prompt)
         if not trimmed_messages:
-            return "Previous conversation was too long to summarize."
-        formatted_prompt = self._format_requested_summary_prompt(
-            summary_prompt,
-            trimmed_messages,
-        )
-        custom_config: RunnableConfig = {
-            "metadata": {"lc_source": "summarization"},
-        }
-        if thread_id is not None:
-            custom_config["configurable"] = {"thread_id": thread_id}
-        try:
-            response = await self.model.ainvoke(
-                formatted_prompt, config=custom_config
+            return "Previous conversation was too long to summarize.", None
+        instruction = _instruction_from_prompt(summary_prompt, self.summary_prompt)
+        if decision is None:
+            decision = _hot_cold_decision(
+                self.model,
+                messages_to_summarize,
+                thread_id,
+                ttl_overrides=self._hot_cache_ttl_overrides,
             )
-            return response.text.strip()
+        # Hot API path must keep the live prefix (no trim). Cold may trim.
+        prefix_messages = (
+            messages_to_summarize
+            if decision is not None and getattr(decision, "hot", False)
+            else trimmed_messages
+        )
+        if decision is not None:
+            logger.info(
+                "summarization.decision reason=%s elapsed=%s N=%s",
+                decision.reason,
+                decision.elapsed_sec,
+                decision.n_sec,
+            )
+            logger.info("summarization.decision hot=%s", decision.hot)
+
+        async def _via_port(chosen: Any) -> Any:
+            # Call through the unbound attribute, matching how
+            # ``_has_summarizer_port`` probes for it: ``asummarize`` is an
+            # optional port, absent from BaseChatModel, so a direct
+            # ``self.model.asummarize(...)`` is an unresolved-attribute error.
+            summarize = getattr(type(self.model), "asummarize")  # noqa: B009
+            return await summarize(
+                self.model,
+                thread_id=thread_id or "",
+                messages=prefix_messages,
+                instruction=instruction,
+                decision=chosen,
+            )
+
+        try:
+            if _has_summarizer_port(self.model) and decision is not None:
+                logger.info(
+                    "summarization.path=port hot=%s reason=%s",
+                    getattr(decision, "hot", None),
+                    getattr(decision, "reason", None),
+                )
+                try:
+                    result = await _via_port(decision)
+                    if not str(getattr(result, "text", "")).strip():
+                        raise RuntimeError("empty summary")
+                except Exception as exc:
+                    if not getattr(decision, "hot", False):
+                        raise
+                    logger.warning("summarization.hot_path_failed reason=%s", exc)
+                    from deep_worker_cli.context_limit.hot_cache import HotColdDecision
+
+                    decision = HotColdDecision(
+                        False,
+                        f"hot_path_failed:{exc}",
+                        decision.elapsed_sec,
+                        decision.n_sec,
+                        decision.last_origin,
+                    )
+                    result = await _via_port(decision)
+                    if not str(getattr(result, "text", "")).strip():
+                        raise RuntimeError("empty summary") from exc
+                return result.text.strip(), result
+            logger.info(
+                "summarization.path=identical_prefix hot=%s reason=%s",
+                getattr(decision, "hot", None),
+                getattr(decision, "reason", None),
+            )
+            text = await self._ainvoke_identical_prefix(
+                prefix_messages, instruction, thread_id
+            )
+            return text, None
+        except SummarizationFailedError:
+            raise
         except Exception as e:
-            if fail_loud:
-                raise
-            return f"Error generating summary: {e!s}"
+            # Fail loud on EVERY path, automatic included (POLICIES.md §12).
+            #
+            # This used to soft-return f"Error generating summary: {e}" when
+            # ``fail_loud`` was False — i.e. on the automatic ``abefore_model``
+            # path, the one that runs unattended. The caller cannot distinguish
+            # that string from a real summary, so it was written into state and
+            # the real history was evicted alongside it. Agents woke up after a
+            # restart holding the error text instead of their context, status
+            # IDLE, with nothing reporting a fault.
+            #
+            # ``SummarizationFailedError`` is in FATAL_EXCEPTION_TYPES, so this
+            # bubbles through ``abefore_model`` into the runtime catch-all →
+            # ``AgentStatus.ERROR`` with the message visible in the CLI/web UI.
+            msg = f"Failed to generate conversation summary: {type(e).__name__}: {e}"
+            logger.error(msg)
+            raise SummarizationFailedError(msg) from e
 
     async def _arun_compaction(
         self,
@@ -1136,13 +1777,35 @@ A condensed summary follows:
             messages_to_summarize,
             thread_id,
         )
-        summary = await self._acreate_summary_for_prompt(
+        decision = _hot_cold_decision(
+            self.model,
+            messages,
+            thread_id,
+            ttl_overrides=self._hot_cache_ttl_overrides,
+        )
+        summary, port_result = await self._acreate_summary_for_prompt(
             messages_to_summarize,
             summary_prompt,
             thread_id,
-            fail_loud=force,
+            decision=decision,
         )
-        new_messages = self._build_new_messages_with_path(summary, file_path)
+        origin = None
+        usage = None
+        if port_result is not None:
+            usage = getattr(port_result, "usage", None)
+        if decision is not None:
+            origin = getattr(decision, "last_origin", None)
+        new_messages = self._build_new_messages_with_path(
+            summary, file_path, origin=origin, usage=usage
+        )
+        preserved_messages = self._stamp_preserved_origin(preserved_messages, origin)
+        preserved_messages = self._drop_pre_summary_usage(preserved_messages)
+        reset = getattr(type(self.model), "areset_after_summary", None)
+        if asyncio.iscoroutinefunction(reset) and thread_id:
+            # Call through the bound attribute: the port is optional and not on
+            # BaseChatModel, so a direct self.model.areset_after_summary(...)
+            # is an unresolved-attribute error for the type checker.
+            await reset(self.model, thread_id=thread_id)
         return RequestedSummaryResult(
             True,
             [*new_messages, *preserved_messages],
@@ -1191,11 +1854,42 @@ A condensed summary follows:
         Returns:
             Updated state with truncated/summarized messages if processing was performed.
         """
+        thread_id = None
+        try:
+            cfg = get_config()
+            thread_id = (cfg.get("configurable") or {}).get("thread_id")
+        except Exception:  # noqa: BLE001
+            thread_id = None
+        incoming = state["messages"]
+        tokens_before = self._cached_total_tokens(incoming)
         result = await self._arun_compaction(
-            state["messages"],
+            incoming,
             runtime,
             force=False,
+            thread_id=thread_id,
         )
+        if result.summarized:
+            # REQ-90: a REAL size-based compaction fired mid-turn. Record it on
+            # the instance so the turn owner can report it alongside the turn's
+            # result; the caller cannot see it otherwise, because this hook's
+            # return value goes into the graph state, not into the turn reply.
+            #
+            # Stamped here rather than inside _arun_compaction on purpose: that
+            # body is shared with apply_requested_summary (force=True), which is
+            # an explicit operator command and must NOT look like an incident.
+            replacement = result.replacement_messages or []
+            self.last_turn_compaction = {
+                "occurred": True,
+                "observable": True,
+                "reason": "size_trigger",
+                "trigger": _describe_trigger(self.trigger),
+                "tokens_before": tokens_before,
+                "tokens_after": self._cached_total_tokens(replacement),
+                "messages_before": len(incoming),
+                "messages_after": len(replacement),
+                "history_path": result.history_path,
+                "at_utc": _utc_now_iso(),
+            }
         if result.replacement_messages is None:
             return None
         return {

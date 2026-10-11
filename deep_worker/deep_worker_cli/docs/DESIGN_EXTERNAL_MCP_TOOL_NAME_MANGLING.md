@@ -23,7 +23,7 @@ Real MCP servers use them, and we must support that.
 | Provider class | Reaction to a dot in the tool name | Confirmation |
 |---|---|---|
 | OpenAI-compatible (deepseek/openai/gemini) | **HTTP 400**, the whole request is rejected: `Invalid 'tools[N].function.name': does not match '^[a-zA-Z0-9_-]+$'` | live repro on deepseek |
-| claude-code CLI | silently mangles `.`→`_`: we register `chrome.browser.status`, the model calls `mcp__deepworker__chrome_browser_status` → our match against `proxy_tool_names` (with dots) does not fire → tool_call does NOT reach ToolNode → Future is not resolved → 120s in_progress → job disappears | live repro + py-spy + internal diagnostics |
+| claude-code-sdk CLI | silently mangles `.`→`_`: we register `chrome.browser.status`, the model calls `mcp__deepworker__chrome_browser_status` → our match against `proxy_tool_names` (with dots) does not fire → tool_call does NOT reach ToolNode → Future is not resolved → 120s in_progress → job disappears | live repro + py-spy + internal diagnostics |
 
 The symptom for the user is the same on both classes: the external
 MCP-tool call hangs and/or the agent crashes.
@@ -107,7 +107,7 @@ Key observation: **both ToolNode and all providers route the tool by
 `BaseTool.name`**:
 - OpenAI class: `bind_tools` serializes `tool.name` into the API; the
   returned tool_call comes with the same name → ToolNode looks up the BaseTool by it.
-- CLI providers (claude-code/codex/grok): `bind_tools` puts `tool.name`
+- CLI providers (claude-code-sdk/codex/grok): `bind_tools` puts `tool.name`
   into `ToolMetadata`; ProxyMCPServer registers the tool under that name; the
   stream match goes against `tools_metadata` names; `pending_calls[...]["name"]`
   (= the name from metadata) is surfaced into ToolNode.
@@ -161,7 +161,7 @@ This is correct: both interrupt_on and middleware see the mangled name.
 
 The alternative (egress-mangle/ingress-demangle in each of the 4
 providers) would require:
-- claude-code: edits in `bind_tools` + `proxy_blocks` classification +
+- claude-code-sdk: edits in `bind_tools` + `proxy_blocks` classification +
   surfacing `pending → tool_calls`;
 - codex/grok: similar edits in their `chat_model` + proxy;
 - openai class: a wrapper subclass over `ChatOpenAI`/`ChatGoogleGenerativeAI`
@@ -196,7 +196,7 @@ graph sees. The canon is preserved for wire (`_bare_tool_name`) and UI
 ### Integration (NO mocks, real providers)
 4. `test_external_mcp_deepseek_live.py`: raise a deepseek agent with a real
    chrome MCP, invoke the tool, check that there is NO 400 and a result comes back.
-5. `test_external_mcp_claude_code_live.py`: the same on claude-code, check
+5. `test_external_mcp_claude_code_live.py`: the same on claude-code-sdk, check
    that the tool_handler reaches AND the Future is resolved (no 120s in_progress).
 
 ## 7. Compatibility and risks

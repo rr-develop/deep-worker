@@ -22,25 +22,6 @@ from deep_worker_cli.history_memory_tool import history_memory
 _append_to_system_message = None
 
 
-def _history_index_exists(summaries_dir: Path) -> bool:
-    """Check if a history index exists under *summaries_dir*.
-
-    Auto path: when the semantic-search
-    extra is unavailable the probe resolves lazily and reports ``False``
-    (no raise) — the middleware simply stays disabled.
-    """
-    try:
-        from deep_worker_cli.provider_paths import ensure_provider_importable
-
-        resolution = ensure_provider_importable("deep_worker.providers.semantic_search")
-        if resolution.unavailable:
-            return False
-        from deep_worker.providers.semantic_search.history_indexer import history_index_exists  # noqa: E402
-        return history_index_exists(summaries_dir)
-    except ImportError:
-        return False
-
-
 class HistoryMemoryState(AgentState):
     """State schema for HistoryMemoryMiddleware.
 
@@ -74,6 +55,12 @@ COGNITIVE_HINT = """### Conversation History Memory
 
 **Note**: Do NOT use this tool for the current conversation context (messages still visible to you) — use it only for information that was summarized and is no longer in your visible history."""
 
+MISSING_INDEX_HINT = """### Conversation History Memory
+
+This agent has no local history index. Use `history_memory` only with an explicit `agent_name` that appears below:
+
+{tenants}"""
+
 
 class HistoryMemoryMiddleware(AgentMiddleware):
     """Conditionally enable history memory based on flag and index availability.
@@ -92,33 +79,40 @@ class HistoryMemoryMiddleware(AgentMiddleware):
 
     state_schema = HistoryMemoryState
 
-    def __init__(self, assistant_id: str, enabled: bool = False):
+    def __init__(
+        self,
+        assistant_id: str,
+        enabled: bool = False,
+        client: Any = None,
+        owner_loop: Any = None,
+    ):
         """Initialize middleware with agent identity and enable flag.
 
         Args:
             assistant_id: Agent identifier used to find summaries directory
                 at ``~/.deep_worker/{assistant_id}/summaries/``.
             enabled: Whether the user passed ``--history-memory`` CLI flag.
+            client: Semantic-memory client (injected in tests).
+            owner_loop: Holder for the agent's event loop. The
+                post-summarization callback runs on a worker thread and
+                cannot look the loop up itself, so this middleware — which
+                the graph awaits ON the loop — records it here.
         """
         self.assistant_id = assistant_id
         self._enabled = enabled
+        self._owner_loop = owner_loop
         self._summaries_dir: Path | None = None
         self._has_index = False
+        self._client = client
 
         if enabled:
             try:
                 self._summaries_dir = get_summaries_dir(assistant_id)
-                self._has_index = _history_index_exists(self._summaries_dir)
             except Exception:  # noqa: BLE001
-                self._has_index = False
+                self._summaries_dir = None
 
-        self._cognitive_hint = COGNITIVE_HINT if (enabled and self._has_index) else None
-
-        # Create tools list (empty if not enabled or no index)
-        if enabled and self._has_index:
-            self.tools = [history_memory]
-        else:
-            self.tools = []
+        self._cognitive_hint: str | None = None
+        self.tools = [history_memory] if enabled else []
 
     def before_agent(self, state: AgentState, runtime: Any) -> dict[str, str] | None:
         """Set summaries_dir in state for the history_memory tool.
@@ -133,9 +127,42 @@ class HistoryMemoryMiddleware(AgentMiddleware):
         Returns:
             Dict with summaries_dir if enabled, or ``None``.
         """
+        if self._owner_loop is not None:
+            self._owner_loop.bind()
         if self._enabled and self._summaries_dir:
             return {"summaries_dir": str(self._summaries_dir)}
         return None
+
+    async def abefore_agent(
+        self, state: AgentState, runtime: Any
+    ) -> dict[str, str] | None:
+        # Runs on the agent loop: the only place that can hand the
+        # worker-thread callback a loop it may schedule on.
+        if self._owner_loop is not None:
+            self._owner_loop.bind()
+        if not self._enabled or self._summaries_dir is None:
+            return None
+        from deep_worker_cli.semantic_memory import client as memory_client
+        from deep_worker_cli.semantic_memory.service.proto import semantic_memory_pb2 as pb
+
+        client = self._client or memory_client.SemanticMemoryClient()
+        try:
+            status = await client.index_status(
+                pb.INDEX_KIND_HISTORY, self._summaries_dir.resolve()
+            )
+            self._has_index = bool(status.exists and status.complete)
+            if self._has_index:
+                self._cognitive_hint = COGNITIVE_HINT
+            else:
+                tenants = await client.list_tenants(pb.INDEX_KIND_HISTORY)
+                listed = memory_client.format_tenants(tenants) or "(none)"
+                self._cognitive_hint = MISSING_INDEX_HINT.format(tenants=listed)
+        except Exception:
+            self._has_index = False
+            self._cognitive_hint = MISSING_INDEX_HINT.format(
+                tenants="(service unavailable)"
+            )
+        return self.before_agent(state, runtime)
 
     def wrap_model_call(
         self,

@@ -22,19 +22,21 @@
 
 | Version | Name | Layout | DB path | Notes |
 |---|---|---|---|---|
-| 1 | `STORAGE_VERSION_GLOBAL_DB` | ~/.deepagents/sessions.db | Single global DB | Deprecated |
-| 2 | `STORAGE_VERSION_DEEPAGENTS_PER_AGENT` | ~/.deepagents/sessions_\<name\>.db | Per-agent legacy DB | Legacy |
+| 1 | `STORAGE_VERSION_GLOBAL_DB` | legacy ancestor tree, `sessions.db` | Single global DB | Deprecated |
+| 2 | `STORAGE_VERSION_DEEPAGENTS_PER_AGENT` | legacy ancestor tree, `sessions_\<name\>.db` | Per-agent legacy DB | Legacy |
 | 3 | `STORAGE_VERSION_AGENT_ROOT` | ~/.deep_worker/\<name\>/threads.db | Per-agent in agent root | Previous current |
 | **4** | `STORAGE_VERSION_AGENT_ROOT_WITH_JSONL` | ~/.deep_worker/\<name\>/threads.db | Same as v3 | **New current** |
 
 **Rollback note:** v2→v4 migration copies data and sets the new version. There is no automated rollback path — manual restoration from backup (or re-creation) is required if the user needs to revert.
+
+**Superseded (2026-08-31):** v1 and v2 lived in the ancestor project's config directory, which has since been removed and banned for reads and writes (POLICIES §16). The v2→v4 leg described below can no longer run — its source files are unreachable. Only v3→v4 remains live.
 
 ## Migration Rules
 
 | From | Physical changes | Metadata change |
 |---|---|---|
 | v1 → v4 | Not supported (v1 is ancient global DB) | — |
-| v2 → v4 | Copy `sessions_\<name\>.db` → `threads.db` (atomic: temp dir + rename); copy `~/.deepagents/\<name\>/` → `~/.deep_worker/\<name\>/data/` | `storage_version` → 4 |
+| v2 → v4 | Copy `sessions_\<name\>.db` → `threads.db` (atomic: temp dir + rename); copy the agent's subdirectory in the legacy ancestor tree → `~/.deep_worker/\<name\>/data/` | `storage_version` → 4 |
 | v3 → v4 | None (same layout) | `storage_version` → 4 (atomic write: tmp + rename) |
 
 ## Implementation
@@ -109,7 +111,7 @@ Unit tests (`test_storage_paths.py`):
 - `test_new_agent_starts_on_v4`: fresh agent → `detect_storage_version` returns 4.
 - `test_v3_agent_auto_migrate_to_v4`: agent with v3 metadata → `migrate_agent_storage_to_v4` bumps to 4.
 - `test_v2_agent_auto_migrate_to_v4`: agent with legacy DB → copies to new location + sets version 4.
-- `test_v2_to_v4_preserves_data_dir`: verify `~/.deepagents/\<name\>/` content appears in `data/`.
+- `test_v2_to_v4_preserves_data_dir`: verify the legacy per-agent directory's content appears in `data/`.
 
 Integration test (`test_storage_version_migration.py`, no mocks):
 - Create a test agent via `deep-worker --restart test_agent_v4`. Stop it.

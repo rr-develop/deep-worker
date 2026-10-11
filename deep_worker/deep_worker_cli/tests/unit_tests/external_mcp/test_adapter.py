@@ -309,7 +309,7 @@ async def test_explicit_falsy_values_are_sent() -> None:
 # Regression: the `_UNSET` sentinel must not leak into the JSON schema
 # that the adapter hands to the LLM. In a live run, pydantic raised
 # PydanticJsonSchemaWarning ("Default value <UNSET> is not JSON
-# serializable"), which made the claude-code provider filter out such tools
+# serializable"), which made the claude-code-sdk provider filter out such tools
 # and made Serena invisible in bind_tools proxying.
 #
 # Contract (strict):

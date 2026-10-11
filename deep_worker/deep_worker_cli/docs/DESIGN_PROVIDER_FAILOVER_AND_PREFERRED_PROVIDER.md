@@ -1,20 +1,23 @@
 # DESIGN: Provider failover on usage limit + preferred-provider memory
 
-**Status:** PROPOSAL (not implemented)
+**Status:** IMPLEMENTED (§1–§8 shipped; §9 hot-swap remains out of scope)
+**Superseded in part:** §5 (chain as a module constant) is obsolete — chains are
+now named and operator-configurable, see
+`DESIGN_CONFIGURABLE_FAILOVER_CHAINS.md`.
 **Date:** 2026-06-05
 **Scope:** `deep_worker_cli/cli/agent_command.py`, `deep_worker_cli/session/session_manager.py`,
-`deep_worker_cli/process/agent_process.py`, `claude_code_provider/chat_model.py`,
+`deep_worker_cli/process/agent_process.py`, `claude_code_sdk_provider/chat_model.py`,
 `codex_provider/exec_runner.py`, `codex_provider/chat_model.py`, plus a new
 provider-availability tracker.
 
 ## 0. Motivation
 
-Two providers we use in production — `claude-code` (Claude Pro/Max via the
+Two providers we use in production — `claude-code-sdk` (Claude Pro/Max via the
 local `claude` CLI) and `codex` (OpenAI Codex via the local `codex` CLI on a
 ChatGPT account) — periodically refuse work because the account-level usage
 window is exhausted. When that happens:
 
-- the agent transitions to `status=ERROR` (claude-code, via the typed
+- the agent transitions to `status=ERROR` (claude-code-sdk, via the typed
   `ClaudeUsageLimitError` we added);
 - or it dies with a generic `CodexProtocolError` whose message contains the
   upstream marker (codex — currently NOT typed as a dedicated error class);
@@ -46,7 +49,7 @@ mechanism, and the concrete plan for adding failover.
 Inventory from 10 days of logs across ~25 agents
 (an ad-hoc log-scanning script):
 
-### 1.1 claude-code: session-window exhaustion
+### 1.1 claude-code-sdk: session-window exhaustion
 
 **Raw marker emitted by the `claude` CLI:**
 
@@ -61,9 +64,9 @@ Total occurrences in scanned logs: **317**.
 
 **Already wired** in code:
 
-- `claude_code_provider/chat_model.py:50` — `class ClaudeUsageLimitError(RuntimeError)`.
-- `claude_code_provider/chat_model.py:66` — `_SESSION_LIMIT_MARKER = "You've hit your session limit"`.
-- `claude_code_provider/chat_model.py:1049` — `ainvoke` detects the marker
+- `claude_code_sdk_provider/chat_model.py:50` — `class ClaudeUsageLimitError(RuntimeError)`.
+- `claude_code_sdk_provider/chat_model.py:66` — `_SESSION_LIMIT_MARKER = "You've hit your session limit"`.
+- `claude_code_sdk_provider/chat_model.py:1049` — `ainvoke` detects the marker
   on a text-only turn and raises `ClaudeUsageLimitError`.
 - `agent_process.py:2352–2356` — `_handle_invoke` catches by class name
   (provider-agnostic), sets `status=ERROR`, error_message =
@@ -230,11 +233,23 @@ What's missing for failover:
 
 ## 5. Provider chain & failover order
 
-The user-specified default order is:
+> **Superseded.** This section described the chain as a hard-coded module
+> constant. Chains are now **named and operator-configurable**; hard-coding a
+> chain is forbidden (owner directive 2026-09-03). See
+> `DESIGN_CONFIGURABLE_FAILOVER_CHAINS.md` for the current model. The rules
+> below are kept because they still describe how a chain is *walked* — only
+> the source of the chain changed.
+
+The default order — the chain named `default` — is:
 
 ```
 claude-code  →  codex  →  grok  →  deepseek
 ```
+
+`claude-code-sdk` is deliberately absent from the walked order: it and
+`claude-code` are two forms of the same provider drawing on one Claude
+subscription, so failing over between them would re-hit the exhausted
+account (owner directive 2026-09-03).
 
 Rules:
 
@@ -242,24 +257,20 @@ Rules:
 2. On failover, advance to the next provider in the chain that the
    availability tracker currently considers `available_after_utc <= now`
    (or `unknown`).
-3. `deepseek` is the **terminal** provider — it doesn't have a usage cap
-   we've observed, so an agent that reaches it stays there until either
-   `preferred_provider` reopens or the operator manually intervenes.
-4. If `preferred_provider == deepseek`, no failover is ever triggered
-   (we have nowhere better to go — surface the ERROR honestly).
-5. The chain is a **module constant**, not a per-agent setting (keep
-   complexity in check; if a use case appears, add per-agent override
-   later).
-
-```python
-# deep_worker_cli/runtime/provider_chain.py
-PROVIDER_FAILOVER_CHAIN: list[str] = ["claude-code", "codex", "grok", "deepseek"]
-```
+3. `deepseek` is the **terminal** provider of the `default` chain — it
+   doesn't have a usage cap we've observed, so an agent that reaches it
+   stays there until either `preferred_provider` reopens or the operator
+   manually intervenes. "Terminal" means *last in the chain*, not a
+   privileged provider name.
+4. If the agent's provider is the last step of its chain, no failover is
+   triggered (nowhere better to go — surface the ERROR honestly).
+5. The chain is selected **by name per agent**; the set of chains lives in
+   operator configuration, never in Python.
 
 ## 6. Availability tracker
 
 A single in-process singleton per `deep-worker` host (the same process
-that supervises agents). Backed by a JSON file at
+that supervises agents). Backed by a JSON file under
 `provider_availability.json` under each user's data directory so that
 supervisor restarts don't forget reset times.
 
@@ -267,7 +278,7 @@ Schema:
 
 ```json
 {
-  "claude-code": {
+  "claude-code-sdk": {
     "available_after_utc": "2026-06-04T18:10:00+00:00",
     "last_failure_marker": "You've hit your session limit · resets 7pm (Europe/Amsterdam)",
     "last_failure_at_utc":  "2026-06-04T13:55:11+00:00",
@@ -335,7 +346,7 @@ Hard invariants:
 
 ### 7.3 Operator overrides
 
-- `deep-worker --restart NAME --preferred-provider claude-code` →
+- `deep-worker --restart NAME --preferred-provider claude-code-sdk` →
   updates BOTH `preferred_provider` AND `provider`. Use when the operator
   explicitly wants a new preference.
 - `deep-worker --restart NAME --provider codex` → updates ONLY
@@ -386,7 +397,7 @@ Risks to validate before committing:
   args). If we naïvely swap chat_model, the tools attached to the
   LangGraph agent stay the same, which may not be valid for the new
   provider. Need to check `create_cli_agent` carefully.
-- **Resume state.** claude-code uses session import via a session file;
+- **Resume state.** claude-code-sdk uses session import via a session file;
   codex uses a session uuid; deepseek uses SQLite checkpointer. A
   hot-swap has to either drop the resume info and replay full history
   (loses some context) or translate it (hard).
@@ -415,7 +426,7 @@ For the §7 (restart-based) implementation:
    restarts. The JSON file is honestly missing fields when reset can't
    be parsed (no synthesised guesses).
 5. Failover trigger fires within one event of a limit error and runs the
-   correct `--restart` invocation. End-to-end test: agent on claude-code
+   correct `--restart` invocation. End-to-end test: agent on claude-code-sdk
    with injected limit response → after the failover, the SAME agent
    process name is alive on codex with the same conversation thread.
 6. Restore-on-idle fires only on real `→ idle` transitions, never on
@@ -478,7 +489,7 @@ Tests: `tests/unit_tests/task_manager/test_session_limit_propagates.py`
 
 - Log inventory of provider failure markers: this document §1 (raw data
   collected by an ad-hoc log-scanning script).
-- Existing typed exception: `claude_code_provider/chat_model.py:50,66,1049`.
+- Existing typed exception: `claude_code_sdk_provider/chat_model.py:50,66,1049`.
 - Existing handler: `deep_worker_cli/process/agent_process.py:2352-2356`.
 - Existing restart merger: `deep_worker_cli/cli/agent_command.py:149+`.
 - Persistence layer: `deep_worker_cli/session/session_manager.py` (the

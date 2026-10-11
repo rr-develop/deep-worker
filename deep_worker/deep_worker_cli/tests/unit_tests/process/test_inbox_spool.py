@@ -243,7 +243,7 @@ async def test_concurrent_enqueues_never_overwrite_each_other(
 
     config = AgentConfig(
         working_dir=tmp_path,
-        provider="claude-code",
+        provider="claude-code-sdk",
         model="claude-3-5-sonnet-20241022",
     )
     proc = AgentProcess(
@@ -322,7 +322,7 @@ async def test_failed_priming_cannot_publish_seq_zero_over_survivors(
     from deep_worker_cli.process.agent_process import AgentProcess
 
     config = AgentConfig(
-        working_dir=tmp_path, provider="claude-code",
+        working_dir=tmp_path, provider="claude-code-sdk",
         model="claude-3-5-sonnet-20241022",
     )
     # A record from a previous life survives at seq 7.
@@ -376,7 +376,7 @@ async def test_second_init_does_not_reset_a_live_counter(
     from deep_worker_cli.process.agent_process import AgentProcess
 
     config = AgentConfig(
-        working_dir=tmp_path, provider="claude-code",
+        working_dir=tmp_path, provider="claude-code-sdk",
         model="claude-3-5-sonnet-20241022",
     )
     proc = AgentProcess(
@@ -404,7 +404,7 @@ async def test_seq_continues_after_restart(data_dir: Path, tmp_path: Path) -> No
 
     config = AgentConfig(
         working_dir=tmp_path,
-        provider="claude-code",
+        provider="claude-code-sdk",
         model="claude-3-5-sonnet-20241022",
     )
 

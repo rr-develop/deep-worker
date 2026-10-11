@@ -17,7 +17,7 @@ want to see WHAT command the launcher decided to run. So we:
          <fake_dev>/deep_worker/deep_worker_cli/deep_worker_cli/__init__.py
          <fake_dev>/deep_worker/deep_worker_cli/deep_worker_cli/cli/__init__.py
          <fake_dev>/deep_worker/deep_worker_cli/deep_worker_cli/cli/agent_command.py    ← prints argv + env, exits 0
-         deep_worker/deepagents/                                         (empty stub)
+         <fake_dev>/deep_worker/deepagents/                              (empty stub)
 
   2. Point the launcher at this fake tree via the
      ``DEEP_WORKER_DEV_TREE_ROOT_OVERRIDE`` env var (an explicit testing

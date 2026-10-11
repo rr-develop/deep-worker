@@ -1,3 +1,4 @@
+import json
 import re
 import uuid
 from datetime import UTC, datetime
@@ -16,7 +17,11 @@ from tests.unit_tests.chat_model import GenericFakeChatModel
 from deepagents import create_deep_agent
 from deepagents.backends.filesystem import FilesystemBackend
 from deepagents.middleware.summarization import SummarizationMiddleware
-from deepagents.middleware.summarization_history import deserialize_summarized_messages_jsonl
+from deepagents.middleware.summarization_history import (
+    KIND,
+    SEGMENT_KIND,
+    deserialize_summarized_messages_jsonl,
+)
 
 # URL for a large file that will trigger summarization
 LARGE_FILE_URL = "https://raw.githubusercontent.com/langchain-ai/langchain/3356d0555725c3e0bbb9408c2b3f554cad2a6ee2/libs/partners/openai/langchain_openai/chat_models/base.py"
@@ -125,8 +130,17 @@ def test_jsonl_history_offload_appends_to_real_filesystem_backend(tmp_path: Path
 
     history_file = tmp_path / "conversation_history" / "integration-jsonl-thread.jsonl"
     content = history_file.read_text()
-    lines = [line for line in content.splitlines() if line.strip()]
-    assert len(lines) == 3
+    records = [json.loads(line) for line in content.splitlines() if line.strip()]
+
+    # Two offloads append two segment headers plus the three messages. Count the
+    # kinds separately: asserting a bare line total silently breaks whenever the
+    # envelope gains a record, which is exactly how this test rotted unnoticed
+    # after 07354c3 introduced segment headers.
+    headers = [r for r in records if r.get("kind") == SEGMENT_KIND]
+    message_lines = [r for r in records if r.get("kind") == KIND]
+    assert len(headers) == 2
+    assert len(message_lines) == 3
+    assert len(headers) + len(message_lines) == len(records)
 
     restored = deserialize_summarized_messages_jsonl(content)
     assert [message.id for message in restored] == ["h-jsonl-1", "a-jsonl-1", "t-jsonl-1"]

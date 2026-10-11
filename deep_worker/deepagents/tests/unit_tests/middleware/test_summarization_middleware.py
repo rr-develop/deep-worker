@@ -9,10 +9,20 @@ from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    ToolMessage,
+    messages_to_dict,
+)
 
 from deepagents.backends.protocol import BackendProtocol, EditResult, FileDownloadResponse, WriteResult
-from deepagents.middleware.summarization import HistoryOffloadError, SummarizationMiddleware
+from deepagents.middleware.summarization import (
+    HistoryOffloadError,
+    SummarizationFailedError,
+    SummarizationMiddleware,
+)
 from deepagents.middleware.summarization_history import (
     deserialize_summarized_messages_jsonl,
     serialize_summarized_messages_jsonl,
@@ -304,9 +314,10 @@ async def test_requested_summary_uses_custom_prompt_without_mutating_default() -
         "Focus on decisions",
     )
 
-    invoked_prompt = model.ainvoke.await_args.args[0]
-    assert invoked_prompt.startswith("Focus on decisions\n\n")
-    assert "User message 0" in invoked_prompt
+    invoked = model.ainvoke.await_args.args[0]
+    assert isinstance(invoked, list)
+    assert invoked[-1].content.startswith("Focus on decisions")
+    assert any("User message 0" in str(getattr(m, "content", "")) for m in invoked)
     assert middleware.summary_prompt == default_prompt
 
 
@@ -348,7 +359,21 @@ async def test_requested_summary_rejects_invalid_custom_prompt(prompt: str) -> N
 
 
 @pytest.mark.asyncio
-async def test_automatic_model_failure_soft_errors_after_offload() -> None:
+async def test_automatic_model_failure_is_fatal_after_offload() -> None:
+    """The automatic path fails LOUD — it must not soft-return an error string.
+
+    Replaces ``test_automatic_model_failure_soft_errors_after_offload``, which
+    asserted the opposite: that ``"Error generating summary: model down"``
+    landed in the replacement message. That assertion pinned a data-loss
+    defect — the error text was written into state as if it were the summary
+    and the real history was evicted alongside it (POLICIES.md §12,
+    incident 2026-08-23).
+
+    The offload must still have happened: history is safe on disk before the
+    summary is attempted, which is precisely why raising here is recoverable
+    for the operator. Full invariant coverage lives in
+    ``test_summarization_fatal_visible.py``.
+    """
     messages = make_conversation_messages(num_old=6, num_recent=2)
     backend = MockBackend()
     model = make_mock_model()
@@ -360,15 +385,14 @@ async def test_automatic_model_failure_soft_errors_after_offload() -> None:
         keep=("messages", 2),
     )
 
-    with mock_get_config("auto-fail-thread"):
-        result = await middleware.abefore_model(
+    with mock_get_config("auto-fail-thread"), pytest.raises(SummarizationFailedError) as excinfo:
+        await middleware.abefore_model(
             cast("AgentState[Any]", {"messages": messages}),
             make_mock_runtime(),
         )
 
-    assert result is not None
-    replacement = result["messages"][1:]
-    assert "Error generating summary: model down" in replacement[0].content
+    assert "model down" in str(excinfo.value)
+    assert "Error generating summary" not in str(excinfo.value)
     assert backend.write_calls, "offload still happens before model failure"
 
 
@@ -441,7 +465,8 @@ async def test_requested_and_automatic_async_compaction_are_equivalent() -> None
     )
     assert automatic_model.ainvoke.await_args.args == requested_model.ainvoke.await_args.args
     assert automatic_model.ainvoke.await_args.kwargs["config"] == {
-        "metadata": {"lc_source": "summarization"}
+        "configurable": {"thread_id": "equivalent-thread"},
+        "metadata": {"lc_source": "summarization"},
     }
     assert requested_model.ainvoke.await_args.kwargs["config"] == {
         "configurable": {"thread_id": "equivalent-thread"},
@@ -481,10 +506,14 @@ class TestSummarizationHistoryJsonl:
         content = serialize_summarized_messages_jsonl(messages, summarized_at="2026-05-29T10:01:00.000000+00:00")
         lines = content.splitlines()
 
-        assert len(lines) == len(messages)
-        entries = [json.loads(line) for line in lines]
+        assert len(lines) == len(messages) + 1
+        header = json.loads(lines[0])
+        assert header["schema_version"] == 5
+        assert header["kind"] == "deepagents.summarization_history.segment"
+        assert header["summarized_at"] == "2026-05-29T10:01:00.000000+00:00"
+        entries = [json.loads(line) for line in lines[1:]]
         assert [entry["message_index"] for entry in entries] == [0, 1, 2]
-        assert all(entry["schema_version"] == 4 for entry in entries)
+        assert all(entry["schema_version"] == 5 for entry in entries)
         # message is plain JSON, not msgpack/base64
         assert all(isinstance(entry["message"], dict) for entry in entries)
         assert all("type" in entry["message"] and "data" in entry["message"] for entry in entries)
@@ -516,6 +545,98 @@ class TestSummarizationHistoryJsonl:
         assert restored[0].response_metadata["cost"] == "1.25"
         # created_at was already a string, preserved as-is
         assert restored[0].additional_kwargs["created_at"] == "2026-05-29T10:00:00.000001+00:00"
+
+    def test_v5_segment_header_carries_origin(self) -> None:
+        message = AIMessage(
+            content="ok",
+            id="a-origin",
+            response_metadata={
+                "deep_worker_origin": {
+                    "provider": "claude-code",
+                    "model": "fable",
+                    "model_id": "claude-fable-5",
+                    "adapter": None,
+                    "since": "2026-08-19T11:07:00+00:00",
+                }
+            },
+        )
+        content = serialize_summarized_messages_jsonl(
+            [message],
+            summarized_at="2026-08-19T15:16:00+00:00",
+            thread_id="rg1_worker",
+            reason="cold",
+        )
+        header = json.loads(content.splitlines()[0])
+        assert header["kind"] == "deepagents.summarization_history.segment"
+        assert header["origin"]["provider"] == "claude-code"
+        assert header["origin"]["model"] == "fable"
+        assert header["thread_id"] == "rg1_worker"
+        assert header["reason"] == "cold"
+
+    def test_v5_header_keeps_origin_from_filtered_summary(self) -> None:
+        """Chained offload: origin lives on the previous summary, not the tail.
+
+        ``_origin_for_offload`` resolves origin via
+        ``deep_worker_cli.context_limit.hot_cache.effective_origin`` and
+        returns ``None`` when that optional dependency is absent. deepagents
+        is installed standalone, and a bare ``pytest`` from this package can
+        resolve ``deep_worker_cli`` to a DIFFERENT checkout that predates
+        ``hot_cache`` — in which case this test was silently asserting the
+        import-failure path. Skip loudly instead of failing on sys.path.
+        """
+        pytest.importorskip(
+            "deep_worker_cli.context_limit.hot_cache",
+            reason="origin resolution requires the matching deep_worker_cli checkout",
+        )
+        summary = HumanMessage(
+            content="summary",
+            additional_kwargs={
+                "lc_source": "summarization",
+                "deep_worker_origin": {
+                    "provider": "deepseek",
+                    "model": "deepseek-v4-flash",
+                    "model_id": None,
+                    "adapter": None,
+                    "since": "2026-08-19T23:39:27+00:00",
+                },
+            },
+        )
+        tail = AIMessage(content="later", id="tail-1")
+        middleware = SummarizationMiddleware(model=make_mock_model(), backend=MockBackend())
+        origin = middleware._origin_for_offload(
+            [summary, tail],
+            middleware._filter_summary_messages([summary, tail]),
+        )
+        assert origin is not None
+        assert origin["provider"] == "deepseek"
+        blob = serialize_summarized_messages_jsonl(
+            [tail],
+            summarized_at="2026-08-19T23:39:52+00:00",
+            origin=origin,
+        )
+        header = json.loads(blob.splitlines()[0])
+        assert header["origin"] is not None
+        assert header["origin"]["provider"] == "deepseek"
+
+    def test_v4_files_without_segment_header_still_deserialize(self) -> None:
+        v4 = (
+            json.dumps(
+                {
+                    "schema_version": 4,
+                    "kind": "deepagents.summarization_history.message",
+                    "summarized_at": "2026-05-29T10:01:00.000000+00:00",
+                    "message_index": 0,
+                    "message_type": "human",
+                    "message": messages_to_dict(
+                        [HumanMessage(content="legacy", id="h-legacy")]
+                    )[0],
+                }
+            )
+            + "\n"
+        )
+        restored = deserialize_summarized_messages_jsonl(v4)
+        assert len(restored) == 1
+        assert restored[0].content == "legacy"
 
 
 class TestSummarizationMiddlewareInit:
@@ -579,7 +700,7 @@ class TestOffloadingBasic:
         assert path == "/conversation_history/test-thread-123.jsonl"
 
         lines = content.splitlines()
-        assert len(lines) == 6
+        assert len(lines) == 7  # v5 segment header + 6 messages
         restored = deserialize_summarized_messages_jsonl(content)
         assert [message.id for message in restored] == ["human-0", "ai-1", "tool-2", "human-3", "ai-4", "tool-5"]
 
@@ -615,7 +736,7 @@ class TestOffloadingBasic:
         assert restored[0].id == "prev-human"
         assert len(restored) == 7
         assert [message.id for message in restored[1:]] == ["human-0", "ai-1", "tool-2", "human-3", "ai-4", "tool-5"]
-        assert len(new_string.splitlines()) == 7
+        assert len(new_string.splitlines()) == 9  # two v5 headers + 7 messages
 
     def test_typical_tool_heavy_conversation(self) -> None:
         """Test with a realistic tool-heavy conversation pattern.
@@ -1153,7 +1274,7 @@ class TestJsonlFormatting:
         restored = deserialize_summarized_messages_jsonl(content)
         assert restored[0].content == "User message 0"
         assert restored[0].additional_kwargs["created_at"].endswith("+00:00")
-        assert len(content.splitlines()) == len(restored)
+        assert len(content.splitlines()) == len(restored) + 1
 
 
 class TestDownloadFilesException:
@@ -2074,3 +2195,101 @@ async def test_truncate_async_works() -> None:
 
     first_ai_msg = cleaned_messages[0]
     assert first_ai_msg.tool_calls[0]["args"]["content"] == "x" * 20 + "...(argument truncated)"
+
+
+# ---------------------------------------------------------------------------
+# The web UI "Summarize context" button must respect hot/cold (owner question,
+# 2026-08-24), not pin one path.
+#
+# The button reaches `AgentProcess.request_summarization` ->
+# `apply_requested_summary` -> `_arun_compaction(force=True)`. `force` short-
+# circuits the *threshold* check only; the hot/cold decision is computed
+# independently right before the summary call. These tests pin that, so a
+# future "requested summaries are always cold" shortcut cannot land quietly.
+# ---------------------------------------------------------------------------
+
+
+def _port_model(*, summary: str = "port summary") -> MagicMock:
+    """A model exposing SummarizerPort, recording the decision it receives."""
+    model = make_mock_model()
+    seen: list[Any] = []
+
+    # `self` arrives POSITIONALLY: production calls the unbound
+    # `type(model).asummarize(model, ...)` (summarization.py:1533-1540).
+    async def _asummarize(_self, *, thread_id, messages, instruction, decision):
+        seen.append(decision)
+        return MagicMock(
+            text=summary,
+            path="hot" if getattr(decision, "hot", False) else "cold",
+            provider_session_id="sess-1",
+            usage=None,
+        )
+
+    # Set on the TYPE: the port is probed via `type(model)` (an optional
+    # attribute absent from BaseChatModel), exactly as production does.
+    model_type = type(model)
+    model_type.asummarize = AsyncMock(side_effect=_asummarize)
+    model_type.areset_after_summary = AsyncMock()
+    model.seen_decisions = seen
+    return model
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("hot", [True, False])
+async def test_requested_summary_forwards_hot_cold_decision_to_port(hot: bool) -> None:
+    """The button must hand the REAL decision to the provider, either way."""
+    model = _port_model()
+    middleware = SummarizationMiddleware(
+        model=model,
+        backend=MockBackend(),
+        trigger=("messages", 100),
+        keep=("messages", 2),
+    )
+    messages = make_conversation_messages(num_old=6, num_recent=2)
+
+    with patch(
+        "deepagents.middleware.summarization._hot_cold_decision"
+    ) as decide:
+        decide.return_value = MagicMock(
+            hot=hot, reason="hot" if hot else "ttl_expired", elapsed_sec=1.0,
+            n_sec=240, last_origin={},
+        )
+        result = await middleware.apply_requested_summary("t-hotcold", messages)
+
+    assert result.summarized is True
+    assert model.seen_decisions, (
+        "the requested-summary path never reached the SummarizerPort — the "
+        "button would fall back to re-invoking the agent session (a full "
+        "history dump on a session-stateful provider)"
+    )
+    assert getattr(model.seen_decisions[-1], "hot") is hot, (
+        f"requested summary forced the wrong path: asked hot={hot}, provider "
+        f"got hot={getattr(model.seen_decisions[-1], 'hot')}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_requested_summary_decision_is_computed_not_hardcoded() -> None:
+    """`force=True` must not imply a fixed path.
+
+    Pins that the requested path CALLS the decision function rather than
+    constructing a cold decision inline.
+    """
+    model = _port_model()
+    middleware = SummarizationMiddleware(
+        model=model,
+        backend=MockBackend(),
+        trigger=("messages", 100),
+        keep=("messages", 2),
+    )
+    messages = make_conversation_messages(num_old=6, num_recent=2)
+
+    with patch(
+        "deepagents.middleware.summarization._hot_cold_decision"
+    ) as decide:
+        decide.return_value = MagicMock(
+            hot=True, reason="hot", elapsed_sec=1.0, n_sec=240, last_origin={}
+        )
+        await middleware.apply_requested_summary("t-decide", messages)
+
+    decide.assert_called_once()

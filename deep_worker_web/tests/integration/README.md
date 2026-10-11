@@ -70,7 +70,7 @@ with agent_fixture() as agent_info:
 - **model/provider**: Default is deepseek-v4-flash/deepseek (no API key needed for basic tests)
 
 ### API Key Requirements
-Most integration tests don't require API keys because they test infrastructure (connections, routing) rather than AI responses. Tests that send actual messages to agents may require API keys configured in `~/.deepagents/.env`.
+Most integration tests don't require API keys because they test infrastructure (connections, routing) rather than AI responses. Tests that send actual messages to agents may require API keys configured in `~/.deep_worker/.env`.
 
 ### Test Performance
 Integration tests are slower than unit tests because they:
@@ -123,7 +123,7 @@ python3 -m pytest tests/integration/test_my_feature.py -v -m integration
 ### Test hangs
 - Check if agent process started (look for `[AGENT_INIT]` logs)
 - Verify RPyC port is available
-- Check ~/.deepagents/.env for API key (if test requires AI)
+- Check ~/.deep_worker/.env for API key (if test requires AI)
 
 ### Connection refused
 - Agent may not have started in time (increase timeout in fixture)

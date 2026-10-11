@@ -16,6 +16,7 @@ This module holds no project state and spawns nothing. Only
 """
 from __future__ import annotations
 
+import json
 from typing import Any, Final, Protocol
 
 import mcp.types as types
@@ -156,7 +157,26 @@ def build_mcp_server(session: _SessionLike) -> Server:
         # Any exception raised here is turned into an MCP error result
         # by the framework, which is exactly what we want: the model
         # must see a failure as a failure, never as "no matches".
-        return await session.call_tool(name, arguments or {})
+        result = await session.call_tool(name, arguments or {})
+        if result is None:
+            # Not wrapped on purpose: the SDK turns ``None`` into an
+            # error result. A payload-shaped envelope here would turn a
+            # visible failure into an empty success, and an empty string
+            # cannot be told apart from a genuinely empty answer.
+            return result
+        # The backend already flattened Serena's blocks into one JSON
+        # string, so the shape is a plain payload, not MCP content. It
+        # has to be put back into an envelope: the SDK only builds one
+        # for a ``dict``; every other iterable (a list of symbols, say)
+        # is taken as ready-made content and fails validation.
+        return [
+            types.TextContent(
+                type="text",
+                text=json.dumps(
+                    result, indent=2, ensure_ascii=False, default=str
+                ),
+            )
+        ]
 
     return server
 

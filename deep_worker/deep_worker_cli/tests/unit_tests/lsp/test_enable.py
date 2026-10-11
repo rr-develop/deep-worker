@@ -26,7 +26,7 @@ def _read(path: Path) -> dict:
 
 
 def test_creates_config_with_serena_entry(tmp_path: Path) -> None:
-    cfg = tmp_path / ".deepagents" / "mcp.json"
+    cfg = tmp_path / ".deep_worker" / "mcp.json"
     enable_lsp_at_path(cfg, workspace_root=tmp_path)
 
     data = _read(cfg)
@@ -40,7 +40,7 @@ def test_creates_config_with_serena_entry(tmp_path: Path) -> None:
 
 def test_file_mode_is_0600_and_dir_0700(tmp_path: Path) -> None:
     """Anti-regression against 666/777 (project policy + daemon umask incident)."""
-    cfg = tmp_path / ".deepagents" / "mcp.json"
+    cfg = tmp_path / ".deep_worker" / "mcp.json"
     enable_lsp_at_path(cfg, workspace_root=tmp_path)
 
     assert stat.S_IMODE(cfg.stat().st_mode) == 0o600
@@ -49,7 +49,7 @@ def test_file_mode_is_0600_and_dir_0700(tmp_path: Path) -> None:
 
 def test_preserves_other_servers(tmp_path: Path) -> None:
     """Other MCP servers must survive enabling LSP."""
-    cfg = tmp_path / ".deepagents" / "mcp.json"
+    cfg = tmp_path / ".deep_worker" / "mcp.json"
     cfg.parent.mkdir(parents=True)
     cfg.write_text(
         json.dumps({"mcpServers": {"github": {"command": "npx", "args": ["gh"]}}}),
@@ -65,7 +65,7 @@ def test_preserves_other_servers(tmp_path: Path) -> None:
 
 
 def test_is_idempotent_and_does_not_clobber(tmp_path: Path) -> None:
-    cfg = tmp_path / ".deepagents" / "mcp.json"
+    cfg = tmp_path / ".deep_worker" / "mcp.json"
     enable_lsp_at_path(cfg, workspace_root=tmp_path)
     # The user manually tweaked the entry:
     data = _read(cfg)
@@ -79,7 +79,7 @@ def test_is_idempotent_and_does_not_clobber(tmp_path: Path) -> None:
 
 
 def test_force_overwrites_existing_entry(tmp_path: Path) -> None:
-    cfg = tmp_path / ".deepagents" / "mcp.json"
+    cfg = tmp_path / ".deep_worker" / "mcp.json"
     enable_lsp_at_path(cfg, workspace_root=tmp_path)
     data = _read(cfg)
     data["mcpServers"][SERENA_SERVER_NAME]["args"] = ["bogus"]
@@ -97,7 +97,7 @@ def test_force_overwrites_existing_entry(tmp_path: Path) -> None:
 def test_flat_cursor_style_config_is_migrated_not_lost(tmp_path: Path) -> None:
     """A flat root (cursor-style) is supported by the loader — when
     merging we must not lose existing entries."""
-    cfg = tmp_path / ".deepagents" / "mcp.json"
+    cfg = tmp_path / ".deep_worker" / "mcp.json"
     cfg.parent.mkdir(parents=True)
     cfg.write_text(json.dumps({"github": {"command": "npx"}}), encoding="utf-8")
 
@@ -109,7 +109,7 @@ def test_flat_cursor_style_config_is_migrated_not_lost(tmp_path: Path) -> None:
 
 
 def test_enabled_predicate_and_disable_roundtrip(tmp_path: Path) -> None:
-    cfg = tmp_path / ".deepagents" / "mcp.json"
+    cfg = tmp_path / ".deep_worker" / "mcp.json"
     assert is_lsp_enabled_at_path(cfg) is False
 
     enable_lsp_at_path(cfg, workspace_root=tmp_path)
@@ -122,7 +122,7 @@ def test_enabled_predicate_and_disable_roundtrip(tmp_path: Path) -> None:
 
 
 def test_disable_keeps_other_servers(tmp_path: Path) -> None:
-    cfg = tmp_path / ".deepagents" / "mcp.json"
+    cfg = tmp_path / ".deep_worker" / "mcp.json"
     cfg.parent.mkdir(parents=True)
     cfg.write_text(
         json.dumps({"mcpServers": {"github": {"command": "npx"}}}), encoding="utf-8"
@@ -136,7 +136,7 @@ def test_disable_keeps_other_servers(tmp_path: Path) -> None:
 
 def test_no_temp_file_left_behind(tmp_path: Path) -> None:
     """Atomic writes must not leave .tmp litter behind."""
-    cfg = tmp_path / ".deepagents" / "mcp.json"
+    cfg = tmp_path / ".deep_worker" / "mcp.json"
     enable_lsp_at_path(cfg, workspace_root=tmp_path)
 
     leftovers = [p.name for p in cfg.parent.iterdir() if p.name != "mcp.json"]

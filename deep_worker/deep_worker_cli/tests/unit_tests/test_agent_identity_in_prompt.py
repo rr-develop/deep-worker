@@ -95,7 +95,7 @@ class TestProviderToolInvocationNoteInPrompt:
             assistant_id="adam",
             sandbox_type=None,
             project_memory_dir=None,
-            provider="claude-code",
+            provider="claude-code-sdk",
         )
         # The MCP form must appear, not just the bare name, so the model
         # uses the resolvable invocation name.

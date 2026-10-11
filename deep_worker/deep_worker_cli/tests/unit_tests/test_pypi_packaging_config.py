@@ -53,8 +53,19 @@ def test_no_direct_reference_dependencies() -> None:
     assert not offenders, f"direct-reference deps present: {offenders}"
 
 
-def test_rpyc_async_from_pypi() -> None:
-    """rpyc-async must come from PyPI (>=1.0.0), not from a local path."""
+def test_rpyc_async_declared_as_a_publishable_pin() -> None:
+    """The rpyc-async DECLARATION must stay publishable: a plain version pin.
+
+    This is a packaging constraint on this file, nothing more. A ``file://``
+    or ``@`` direct reference cannot be uploaded to PyPI, so the declaration
+    has to be a version pin — and that pin is the FALLBACK.
+
+    It is NOT a prohibition on running from sources: a local source checkout
+    of rpyc_async takes priority over any installed distribution at
+    runtime (owner decision 2026-10-11, implemented in
+    ``deep_worker_cli/rpyc_async_source.py`` — see its module docstring,
+    which also corrects the retracted "PyPI only (D5)" claim).
+    """
     deps = _load_pyproject()["project"]["dependencies"]
     rpyc = [d for d in deps if d.lower().startswith("rpyc-async")]
     assert len(rpyc) == 1, f"expected exactly one rpyc-async dep, got {rpyc}"
@@ -147,7 +158,16 @@ def test_no_allow_direct_references() -> None:
 
 
 def test_no_repos_rpyc_async_in_extra_paths() -> None:
-    """ty extra-paths must not hard-code a local rpyc_async path (PyPI dep now)."""
+    """``ty`` extra-paths must not hard-code a local rpyc_async path.
+
+    A checked-in absolute path would make type checking depend on one
+    machine's layout, which breaks CI (it runs under ``$GITHUB_WORKSPACE``).
+    ``ty`` therefore resolves rpyc_async from the installed distribution.
+
+    Again a type-checking arrangement only, not a statement about runtime:
+    the checkout wins at runtime via ``rpyc_async_source``, so ``ty`` may be
+    reading an older API surface than the code runs against.
+    """
     p = _load_pyproject()
     extra = p.get("tool", {}).get("ty", {}).get("environment", {}).get(
         "extra-paths", []

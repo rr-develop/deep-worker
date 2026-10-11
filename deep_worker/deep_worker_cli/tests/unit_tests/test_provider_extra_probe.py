@@ -4,9 +4,9 @@ In the wheel all 5 vendor packages are always present, so the real gate for
 an optional capability is its heavy extra stack (llama-index for
 semantic-search). ``provider_paths.ensure_provider_importable`` must report
 ``unavailable`` + remedy when the package resolves but the extra is missing —
-otherwise explicit call sites (``_history_indexer_funcs``,
-``enable_history_memory``, reindex) raise a raw ``ModuleNotFoundError``
-instead of ``CapabilityError``.
+otherwise explicit call sites (``enable_history_memory``, the
+``history_memory`` tool) raise a raw ``ModuleNotFoundError`` instead of
+``CapabilityError``.
 """
 
 from __future__ import annotations
@@ -134,9 +134,9 @@ def test_apply_extra_probe_does_not_overwrite_unavailable_resolution() -> None:
 
 
 def test_apply_extra_probe_noop_for_providers_without_probe() -> None:
-    """Providers without an extra probe (e.g. claude_code_provider) are
+    """Providers without an extra probe (e.g. codex_provider) are
     untouched."""
-    pkg = "deep_worker.providers.claude_code_provider"
+    pkg = "deep_worker.providers.codex_provider"
     resolution = _installed_resolution(pkg)
 
     with patch("importlib.util.find_spec", return_value=None):

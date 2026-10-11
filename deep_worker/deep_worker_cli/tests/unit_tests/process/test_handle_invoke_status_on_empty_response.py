@@ -36,6 +36,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from langchain_core.messages import AIMessage, ToolMessage
 
 from deep_worker_cli.process.agent_process import AgentProcess
 from deep_worker_cli.session.session_manager import SessionManager
@@ -250,6 +251,304 @@ async def test_successful_response_lands_idle() -> None:
 
     result = await agent._handle_invoke(
         {"command": "invoke", "message": "q", "stream": False},
+        connection=None,
+        notify_callback=None,
+        approval_callback=None,
+    )
+
+    assert result["success"] is True
+    assert agent.session_manager.status == AgentStatus.IDLE
+
+
+# ---------------------------------------------------------------------------
+# Turn-ending tools: successful ToolMessage tail is a legitimate turn end.
+#
+# Regression reported internally (2026-08-22, repo_graph extractor).
+#
+# ``ToolCompletionMiddleware`` (deep_worker_cli/middleware/tool_completion.py)
+# ends the LangGraph turn immediately after a registered tool succeeds by
+# returning ``{"jump_to": "end"}`` with NO subsequent ``AIMessage``. The tail
+# of ``state["messages"]`` is therefore a SUCCESSFUL ``ToolMessage`` — that
+# IS the completed turn.
+#
+# The old ``_handle_invoke`` only recognised a non-empty AI text as a final
+# response, so a successful turn-ending tool_call landed in the "no final
+# content" recovery path with ``success=False`` and the operator saw
+# "Agent did not produce a response" — while the turn had, in fact,
+# succeeded. Symptom: repo_graph's ``repo_graph__submit_fragments`` /
+# ``repo_graph__submit_relations`` closing a DocumentSession left the
+# client with ``success:false``.
+#
+# The fix reads ``ToolMessage.status`` (LangChain's own signal for
+# whether the tool call itself succeeded or errored). It MUST be
+# fail-closed: a message with a missing / unrecognised ``status`` is
+# NOT a success. LangChain's default of ``status='success'`` is not
+# safe to inherit here — a tool that forgets to set status on error
+# would silently return success.
+# ---------------------------------------------------------------------------
+
+
+def _tool_call_ai(name: str, tool_call_id: str) -> AIMessage:
+    """AIMessage whose only output is the turn-ending tool call — no text.
+
+    This is the exact shape the model produces when it delegates the
+    entire turn to the tool (the submit_* pattern).
+    """
+    return AIMessage(
+        content="",
+        tool_calls=[{"name": name, "args": {}, "id": tool_call_id}],
+    )
+
+
+@pytest.mark.asyncio
+async def test_terminal_successful_toolmessage_ends_turn_as_success() -> None:
+    """A trailing ToolMessage(status='success') from a turn-ending tool
+    is a legitimate turn end, NOT ``"Agent did not produce a response"``.
+
+    Repro: `ToolCompletionMiddleware` jumps to ``end``
+    after the tool succeeds, so state["messages"] tail is
+    ``[AIMessage(tool_calls=[...]), ToolMessage(status='success')]``
+    with NO subsequent AIMessage.
+    """
+    agent = _make_agent_with_real_session_manager()
+
+    ai = _tool_call_ai("repo_graph__submit_fragments", "call_1")
+    # A registered turn-ending tool succeeded; ToolCompletionMiddleware
+    # emitted no echo (echo_field=None), so this is the tail.
+    tool = ToolMessage(
+        content='{"success": true, "document_closed": true}',
+        tool_call_id="call_1",
+        name="repo_graph__submit_fragments",
+        status="success",
+    )
+
+    fake_graph = MagicMock()
+    fake_graph.ainvoke = AsyncMock(return_value={"messages": [ai, tool]})
+    fake_graph.aupdate_state = AsyncMock()
+    fake_graph.aget_state = AsyncMock()
+    agent.agent = fake_graph
+
+    result = await agent._handle_invoke(
+        {"command": "invoke", "message": "extract", "stream": False},
+        connection=None,
+        notify_callback=None,
+        approval_callback=None,
+    )
+
+    assert result["success"] is True, (
+        "a successful turn-ending ToolMessage tail must be recognised as a "
+        "completed turn — this is the 2026-08-22 defect: without "
+        "this, the client sees 'Agent did not produce a response' every time "
+        "a turn-ending tool closes the turn"
+    )
+    assert agent.session_manager.status == AgentStatus.IDLE
+
+
+@pytest.mark.asyncio
+async def test_terminal_error_toolmessage_still_settles_as_no_response() -> None:
+    """Fail-closed: ToolMessage(status='error') is NOT a successful turn end.
+
+    The whole point of the fix is to distinguish "the tool succeeded and
+    the middleware ended the turn" from "the tool errored". Middleware
+    does NOT end the turn on error (that surfaces to the model), but if
+    ``_handle_invoke`` ever sees an error-tail (e.g. non-registered tool
+    erroring at the end of a turn), it must NOT declare success.
+    """
+    agent = _make_agent_with_real_session_manager()
+
+    ai = _tool_call_ai("repo_graph__submit_fragments", "call_2")
+    tool = ToolMessage(
+        content='{"success": false, "error": "closed session already"}',
+        tool_call_id="call_2",
+        name="repo_graph__submit_fragments",
+        status="error",
+    )
+
+    fake_graph = MagicMock()
+    fake_graph.ainvoke = AsyncMock(return_value={"messages": [ai, tool]})
+    fake_graph.aupdate_state = AsyncMock()
+    fake_graph.aget_state = AsyncMock()
+    agent.agent = fake_graph
+
+    result = await agent._handle_invoke(
+        {"command": "invoke", "message": "extract", "stream": False},
+        connection=None,
+        notify_callback=None,
+        approval_callback=None,
+    )
+
+    assert result["success"] is False, (
+        "an ERROR-status trailing ToolMessage must NOT be treated as a "
+        "completed turn — that would hide real tool failures behind a "
+        "silent success and reintroduce the fail-open behaviour rejected "
+        "in the design of this fix"
+    )
+    # The settled-not-RUNNING invariant still holds.
+    assert agent.session_manager.status != AgentStatus.RUNNING
+    assert agent.session_manager.status == AgentStatus.IDLE
+
+
+@pytest.mark.asyncio
+async def test_terminal_toolmessage_with_error_status_is_not_success() -> None:
+    """Fail-closed: ``status='error'`` must NOT slip through.
+
+    Distinct from the earlier error-tail test: that one uses a real
+    ``ToolMessage(status='error')`` object; this one uses the dict-form
+    to pin the same fail-closed rule on the OTHER shape ``_handle_invoke``
+    reads. Both shapes must reject ``'error'`` and both must require an
+    EXPLICIT ``'success'`` (rejecting missing, ``None``, and anything
+    other than the LangChain literal).
+    """
+    agent = _make_agent_with_real_session_manager()
+
+    ai = _tool_call_ai("some_tool", "call_3")
+    tool_dict_error = {
+        "role": "tool",
+        "content": '{"success": false}',
+        "tool_call_id": "call_3",
+        "name": "some_tool",
+        "status": "error",
+    }
+
+    fake_graph = MagicMock()
+    fake_graph.ainvoke = AsyncMock(
+        return_value={"messages": [ai, tool_dict_error]},
+    )
+    fake_graph.aupdate_state = AsyncMock()
+    fake_graph.aget_state = AsyncMock()
+    agent.agent = fake_graph
+
+    result = await agent._handle_invoke(
+        {"command": "invoke", "message": "extract", "stream": False},
+        connection=None,
+        notify_callback=None,
+        approval_callback=None,
+    )
+
+    assert result["success"] is False, (
+        "a ToolMessage with an explicit error status must NOT be "
+        "treated as a completed turn on any shape"
+    )
+    assert agent.session_manager.status == AgentStatus.IDLE
+
+
+@pytest.mark.asyncio
+async def test_terminal_toolmessage_with_missing_status_key_is_not_success() -> None:
+    """Fail-closed: a dict-form tool tail WITHOUT a ``status`` key must
+    NOT be treated as success — even though LangChain would default it
+    to ``'success'`` on the model side.
+
+    This is what rejects the prototype form
+    ``last_msg.get("status", "success")``: with a missing key, that call
+    returns ``'success'`` and lets an unmarked tool silently claim the
+    turn. The consumer-side rule is explicit: only the LangChain literal
+    ``'success'`` counts, and that literal must be present.
+    """
+    agent = _make_agent_with_real_session_manager()
+
+    ai = _tool_call_ai("some_tool", "call_4")
+    # Deliberately omit the ``status`` key. A dict tail with no status
+    # signal MUST NOT end the turn on a fail-open default.
+    tool_dict_no_status = {
+        "role": "tool",
+        "content": '{"success": true}',
+        "tool_call_id": "call_4",
+        "name": "some_tool",
+    }
+
+    fake_graph = MagicMock()
+    fake_graph.ainvoke = AsyncMock(
+        return_value={"messages": [ai, tool_dict_no_status]},
+    )
+    fake_graph.aupdate_state = AsyncMock()
+    fake_graph.aget_state = AsyncMock()
+    agent.agent = fake_graph
+
+    result = await agent._handle_invoke(
+        {"command": "invoke", "message": "extract", "stream": False},
+        connection=None,
+        notify_callback=None,
+        approval_callback=None,
+    )
+
+    assert result["success"] is False, (
+        "a tool tail with NO status key must NOT be treated as success "
+        "— the fail-open default (``.get('status', 'success')``) would "
+        "silently accept it; the fix must be fail-closed"
+    )
+    assert agent.session_manager.status == AgentStatus.IDLE
+
+
+@pytest.mark.asyncio
+async def test_terminal_toolmessage_success_not_last_still_recovers() -> None:
+    """A successful ToolMessage that is NOT the last message does not
+    end the turn: the real terminal is whatever comes after.
+
+    This nails the 'terminal' part of the fix down: only the tail
+    counts. Parallel tool batches (multiple trailing ToolMessages) and
+    intermediate successful tool calls must not be misread as the end
+    of the turn.
+    """
+    agent = _make_agent_with_real_session_manager()
+
+    ai1 = _tool_call_ai("some_tool", "call_a")
+    tool_ok = ToolMessage(
+        content='{"success": true}',
+        tool_call_id="call_a", name="some_tool", status="success",
+    )
+    # An empty AI trails after — the intermediate success should NOT
+    # short-circuit into a "turn ended" declaration.
+    trailing_empty_ai = AIMessage(content="", tool_calls=[])
+
+    fake_graph = MagicMock()
+    fake_graph.ainvoke = AsyncMock(
+        return_value={"messages": [ai1, tool_ok, trailing_empty_ai]},
+    )
+    fake_graph.aupdate_state = AsyncMock()
+    fake_graph.aget_state = AsyncMock()
+    agent.agent = fake_graph
+
+    result = await agent._handle_invoke(
+        {"command": "invoke", "message": "x", "stream": False},
+        connection=None,
+        notify_callback=None,
+        approval_callback=None,
+    )
+
+    # Trailing empty AI ⇒ the "no final content" path still fires.
+    assert result["success"] is False
+    assert agent.session_manager.status == AgentStatus.IDLE
+
+
+@pytest.mark.asyncio
+async def test_terminal_toolmessage_success_dict_form_is_recognised() -> None:
+    """Dict-form messages (some serialisation paths) must also be
+    recognised: a trailing ``{"role": "tool", "status": "success"}``
+    ends the turn as success.
+
+    The production tool node emits real ``ToolMessage`` objects, but
+    ``_handle_invoke`` also handles dict-form messages elsewhere in
+    the loop; the check must be consistent.
+    """
+    agent = _make_agent_with_real_session_manager()
+
+    ai = _tool_call_ai("some_tool", "call_d")
+    tool_dict = {
+        "role": "tool",
+        "content": '{"success": true}',
+        "tool_call_id": "call_d",
+        "name": "some_tool",
+        "status": "success",
+    }
+
+    fake_graph = MagicMock()
+    fake_graph.ainvoke = AsyncMock(return_value={"messages": [ai, tool_dict]})
+    fake_graph.aupdate_state = AsyncMock()
+    fake_graph.aget_state = AsyncMock()
+    agent.agent = fake_graph
+
+    result = await agent._handle_invoke(
+        {"command": "invoke", "message": "x", "stream": False},
         connection=None,
         notify_callback=None,
         approval_callback=None,

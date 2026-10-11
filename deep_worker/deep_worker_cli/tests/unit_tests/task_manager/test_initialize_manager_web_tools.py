@@ -5,8 +5,6 @@ or to look up documentation/specs that the subordinate's solution should
 match, the manager needs read-only access to the web. The same set
 goes into every provider's manager:
 
-- ``web_search_delegation_tool`` (``name="web_search"``) — universal
-  web search via Claude Code SDK (no extra API key required).
 - ``fetch_url`` — fetch a known URL and return its content as markdown.
 
 The manager does NOT get:
@@ -29,8 +27,6 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
-
-pytest.importorskip("claude_agent_sdk")  # optional private fork; skip when absent
 
 # Make ``codex_provider`` importable without installing it.
 _REPO_ROOT = Path(__file__).resolve().parents[5]
@@ -82,34 +78,7 @@ def _bound_tool_names(mock_create_cli_agent: MagicMock) -> set[str]:
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "provider",
-    ["codex", "claude-code", "deepseek", "openai", "anthropic", "google", "vertexai"],
-)
-async def test_initialize_manager_includes_web_search_tool(provider: str) -> None:
-    """``web_search_delegation_tool`` MUST be in the manager bound tool
-    set for every provider — it has no per-provider quirks (it uses
-    Claude Code SDK under the hood for all callers)."""
-    tm = _make_tm(provider)
-    fake_model = MagicMock()
-    fake_agent = (MagicMock(), MagicMock())
-
-    with patch(
-        "deep_worker_cli.config.create_model", return_value=fake_model,
-    ), patch(
-        "deep_worker_cli.agent.create_cli_agent", return_value=fake_agent,
-    ) as mock_create:
-        await tm._initialize_manager()
-
-    names = _bound_tool_names(mock_create)
-    assert "web_search" in names, (
-        f"manager bound tools must include web_search_delegation_tool "
-        f"(name='web_search') for provider={provider!r}. Got: {names!r}"
-    )
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "provider",
-    ["codex", "claude-code", "deepseek", "openai", "anthropic", "google", "vertexai"],
+    ["codex", "deepseek", "openai", "anthropic", "google", "vertexai"],
 )
 async def test_initialize_manager_includes_fetch_url_tool(provider: str) -> None:
     """``fetch_url`` MUST be in the manager bound tool set for every
@@ -183,8 +152,8 @@ async def test_initialize_manager_does_not_include_send_message_to_agent() -> No
 
 @pytest.mark.asyncio
 async def test_codex_manager_carries_web_tools_AND_native_passthrough() -> None:
-    """Cross-check: a codex-provider manager carries BOTH web tools
-    (web_search / fetch_url) AND every Codex native passthrough tool
+    """Cross-check: a codex-provider manager carries BOTH the web tool
+    (fetch_url) AND every Codex native passthrough tool
     in the same bound list. Regression guard against accidentally
     overwriting one set with the other.
     """
@@ -202,7 +171,6 @@ async def test_codex_manager_carries_web_tools_AND_native_passthrough() -> None:
         await tm._initialize_manager()
 
     names = _bound_tool_names(mock_create)
-    assert "web_search" in names, names
     assert "fetch_url" in names, names
     for nt in NATIVE_TOOLS:
         assert nt.name in names, (

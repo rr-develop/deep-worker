@@ -257,9 +257,11 @@ async def main():
     parser.add_argument("--delete-backups", action="store_true", help="Delete .bak files after verification")
     args = parser.parse_args()
 
-    db_dir = Path.home() / ".deepagents"
+    from deep_worker_cli.storage_paths import deep_worker_home
+
+    db_dir = deep_worker_home() / "agents"
     if not db_dir.exists():
-        print("No .deepagents directory found")
+        print(f"No agents directory found under {db_dir}")
         return
 
     # Find DB files

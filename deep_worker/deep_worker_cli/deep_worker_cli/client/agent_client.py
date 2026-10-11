@@ -6,29 +6,39 @@ All communication is done via native rpyc with AsyncioServer.
 
 import asyncio
 import json
-import sys
 import uuid
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from deep_worker_cli.exceptions import AgentNotFoundError, IPCConnectionError
 from deep_worker_cli.process.registry import ProcessRegistry
 
 # ============================================================================
-# rpyc-async is a regular PyPI dependency (>=1.0.0) providing the
-# AsyncioServer-based protocol (rpyc_async.core.async_connect and
-# rpyc_async.utils.classic.obtain). The previous sys.path injection of a
-# local rpyc_async checkout was removed: on a developer machine it shadowed
-# the PyPI package with sources, making "clean env" wheel installs test the
-# wrong code.
+# RPYC_ASYNC — LOCAL SOURCES FIRST, INSTALLED PACKAGE AS FALLBACK
+# ============================================================================
+# A local rpyc_async checkout takes priority over any installed
+# distribution; without one we fall back to `pip install rpyc-async`.
+# Owner decision 2026-10-11. The imports below must stay BELOW this one,
+# which is what puts the checkout on sys.path. See rpyc_async_source for the
+# rationale and for the correction of the "PyPI only (D5)" claim.
 # ============================================================================
 
+import deep_worker_cli.rpyc_async_source  # noqa: F401  (import for side effect)
 import rpyc_async as rpyc
 from rpyc_async.core.async_connect import async_connect
 from rpyc_async.utils.classic import obtain
 
 if TYPE_CHECKING:
     from deep_worker_cli.basesession.protocol_types import SessionInfo
+
+
+async def _as_awaitable(async_result: Any) -> Any:
+    """Wrap an ``AsyncResult`` so it can be driven as a Task.
+
+    ``AsyncResult`` implements ``__await__`` but is not a coroutine, so
+    ``asyncio.ensure_future`` rejects it directly. Awaiting it inside a
+    coroutine gives ``asyncio.wait`` something schedulable.
+    """
+    return await async_result
 
 
 class AgentClient:
@@ -171,6 +181,99 @@ class AgentClient:
 
         self.connected = False
 
+    async def _await_reply(self, async_result: Any) -> Any:
+        """Await an in-flight RPyC reply, failing loudly if the transport dies.
+
+        ⚠️ DO NOT `await async_result` DIRECTLY — USE THIS. ⚠️
+
+        ``Connection._cleanup`` does ``self._request_callbacks.clear()``
+        (rpyc_async protocol.py:714): on transport death every pending
+        ``AsyncResult`` is DISCARDED, not failed. Nobody calls
+        ``set_result``/``set_exception``/``cancel`` on its future, so a
+        coroutine already parked in ``AsyncResult.__await__`` is never
+        woken — it stays in ``ep_poll`` forever. The 2026-04-27
+        cancel-aware cleanup in ``__await__`` cannot help: it fires when
+        the future reaches a done state, and here it never does.
+
+        Observed (repo_graph ingest, 2026-09-23): the agent finished its
+        turn in ~1.5s and wrote ``token_stats.jsonl``, but the caller's
+        ``converse()`` never returned — 69 minutes parked on this await
+        after a ``ClosedResourceError`` killed the channel. A silence
+        watchdog could not catch it either: the successful tool-call had
+        already re-armed the progress window, so from the outside there
+        was "progress, but no answer" — the worst shape, indistinguishable
+        from healthy work.
+
+        This is the same defect class the ``connect()`` banner already
+        guards (an unbounded await against a peer that will never
+        answer), so the cure matches: make the wait bounded by an EVENT.
+
+        Event-driven, NOT polling (POLICIES: no ``while not conn.closed``
+        loops, no status polling). ``add_close_callback`` is rpyc_async's
+        one-shot close notification and fires from ``_cleanup`` via
+        ``_fire_close_notifications`` — including the already-closed case,
+        which it invokes immediately. We race the real reply against that
+        event; whichever lands first wins. A healthy call is unaffected:
+        it resolves on the reply and the close-waiter is cancelled.
+
+        Args:
+            async_result: The pending ``AsyncResult`` from ``async_request``.
+
+        Returns:
+            The RPC reply value.
+
+        Raises:
+            IPCConnectionError: If the connection closed before the reply
+                arrived. The caller's ``except`` in ``_send_command``
+                resets connection state and re-raises, so the turn fails
+                VISIBLY instead of hanging.
+        """
+        loop = asyncio.get_running_loop()
+        closed_future: asyncio.Future[None] = loop.create_future()
+
+        def _on_closed() -> None:
+            # May fire from another thread (rpyc_async documents
+            # add_close_callback as thread-safe), so hop to our loop.
+            loop.call_soon_threadsafe(
+                lambda: None if closed_future.done() else closed_future.set_result(None)
+            )
+
+        conn = self._conn
+        # No connection object to watch: fall back to the bare await rather
+        # than inventing a failure. The `not self.connected` guard above
+        # already rejects the disconnected case.
+        if conn is None or not hasattr(conn, "add_close_callback"):
+            return await async_result
+
+        conn.add_close_callback(_on_closed)
+
+        reply_task = asyncio.ensure_future(_as_awaitable(async_result))
+        try:
+            done, _ = await asyncio.wait(
+                {reply_task, closed_future},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            # Close wins ties. When the connection is ALREADY closed at entry,
+            # ``add_close_callback`` fires synchronously AND ``__await__``
+            # raises RuntimeError ("requires asyncio serving to be enabled" —
+            # ``close()`` calls ``disable_asyncio_serving()``), so both members
+            # can be done in the same pass. Reporting that RuntimeError would
+            # leak an rpyc_async internal as the cause of a plainly dead
+            # transport, so the close verdict takes precedence.
+            if closed_future in done:
+                raise IPCConnectionError(
+                    f"Connection to agent '{self.agent_name}' closed while awaiting "
+                    f"the reply (in-flight request discarded by RPyC cleanup). "
+                    f"The agent may have finished its work — check its history — "
+                    f"but this call cannot observe the result."
+                )
+            return reply_task.result()
+        finally:
+            if not reply_task.done():
+                reply_task.cancel()
+            if not closed_future.done():
+                closed_future.cancel()
+
     async def _send_command(self, command: dict[str, Any]) -> dict[str, Any]:
         """Send a command via RPyC.
 
@@ -219,7 +322,7 @@ class AgentClient:
                     ()                       # kwargs list (empty)
                 )
                 # Wait for result (still JSON string from server)
-                response_json_str = await async_result
+                response_json_str = await self._await_reply(async_result)
                 # Deserialize JSON string to local dict (no RPC overhead for field access)
                 response = json.loads(response_json_str)
                 return response
@@ -233,7 +336,7 @@ class AgentClient:
                     (prompt,),
                     (),
                 )
-                response_json_str = await async_result
+                response_json_str = await self._await_reply(async_result)
                 return json.loads(response_json_str)
 
             elif command_type == "invoke":
@@ -252,7 +355,7 @@ class AgentClient:
                     (message, stream, sum_query, query),  # args tuple
                     ()                       # kwargs list (empty)
                 )
-                response_json_str = await async_result
+                response_json_str = await self._await_reply(async_result)
                 # Deserialize JSON string to local dict
                 response = json.loads(response_json_str)
                 return response
@@ -270,7 +373,7 @@ class AgentClient:
                     (message, reply_back),
                     ()
                 )
-                response_json_str = await async_result
+                response_json_str = await self._await_reply(async_result)
                 response = json.loads(response_json_str)
                 return response
 
@@ -285,7 +388,7 @@ class AgentClient:
                     (limit, offset),         # args tuple
                     ()                       # kwargs list (empty)
                 )
-                response_json_str = await async_result
+                response_json_str = await self._await_reply(async_result)
                 # Deserialize JSON string to local dict
                 response = json.loads(response_json_str)
                 return response
@@ -306,7 +409,7 @@ class AgentClient:
                     (),
                     (),
                 )
-                response_json_str = await async_result
+                response_json_str = await self._await_reply(async_result)
                 response = json.loads(response_json_str)
                 return response
 
@@ -318,7 +421,7 @@ class AgentClient:
                     (),
                     (),
                 )
-                response_json_str = await async_result
+                response_json_str = await self._await_reply(async_result)
                 response = json.loads(response_json_str)
                 return response
 
@@ -336,7 +439,7 @@ class AgentClient:
                     (),
                     (),
                 )
-                response_json_str = await async_result
+                response_json_str = await self._await_reply(async_result)
                 response = json.loads(response_json_str)
                 return response
 
@@ -444,17 +547,27 @@ class AgentClient:
     async def get_task_manager_info(self) -> dict[str, Any] | None:
         """Return TaskManager state from the agent, or ``None`` on error.
 
-        Agent's ``exposed_get_status`` includes
-        ``task_manager_active`` / ``task_manager_disabled`` ONLY when
-        the agent was launched with ``--task-manager`` (see
-        ``rpyc_service/agent_service.py``). We surface three distinct
-        states to the caller:
+        Agent's ``exposed_get_status`` reports attachment in
+        ``task_manager_attached`` (see ``rpyc_service/agent_service.py``)
+        and adds ``task_manager_active`` only when a TaskManager is
+        actually attached. We surface three distinct states:
 
         * ``{"configured": True, "active": bool, "disabled": bool}``
           — agent has a TaskManager and told us its state;
         * ``{"configured": False, "active": None, "disabled": None}``
-          — agent has no TaskManager (fields absent in the response);
+          — agent has no TaskManager;
         * ``None`` — we could not reach the agent / RPC error.
+
+        Attachment is read from the explicit field when the agent sends
+        it, and only otherwise from the legacy encoding (the key was
+        omitted entirely iff no TaskManager was attached). Probing for
+        mere KEY PRESENCE is wrong now that a detached agent reports
+        ``task_manager_disabled: None`` to say "there is no switch":
+        that probe called such an agent configured, and ``bool(None)``
+        then asserted "the switch exists and is on" — printing
+        ``TaskManager: inactive`` where the truth is ``not
+        configured``. A long-running agent started before the explicit
+        field keeps working through the fallback, without a restart.
 
         No guessing, no defaults: the UI decides what to display.
         """
@@ -464,11 +577,13 @@ class AgentClient:
             return None
         if not response.get("success"):
             return None
-        has_tm_fields = (
-            "task_manager_active" in response
-            or "task_manager_disabled" in response
-        )
-        if not has_tm_fields:
+        attached = response.get("task_manager_attached")
+        if attached is None:
+            attached = (
+                "task_manager_active" in response
+                or "task_manager_disabled" in response
+            )
+        if not attached:
             return {"configured": False, "active": None, "disabled": None}
         return {
             "configured": True,

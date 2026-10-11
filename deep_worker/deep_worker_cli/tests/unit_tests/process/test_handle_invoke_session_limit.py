@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -37,7 +38,24 @@ class CodexUsageLimitError(Exception):
 
 
 class GrokUsageLimitError(RuntimeError):
-    """Stand-in matching ``grok_provider.limit_errors.GrokUsageLimitError``."""
+    """Stand-in matching ``grok_provider.limit_errors.GrokUsageLimitError``.
+
+    LEGACY shape. Since 2026-08-24 grok runs on the shared ACP client and its
+    cap raises ``AcpUsageLimitError`` instead — see
+    ``test_acp_usage_limit_fails_over_to_the_CONFIGURED_provider`` below, which
+    drives the path grok actually takes now. This class is kept because the
+    branch that handles it is still reachable from a stale record.
+    """
+
+
+class AcpUsageLimitError(RuntimeError):
+    """Stand-in matching ``providers.acp.limit_errors.AcpUsageLimitError``.
+
+    Raised by the SHARED ACP client, so it names the transport rather than the
+    account: claude-code, grok and any future ACP provider all raise this one
+    class. The handler must therefore resolve the failover target from
+    ``config.provider``.
+    """
 
 
 def _make_agent() -> AgentProcess:
@@ -170,6 +188,106 @@ async def test_session_limit_error_message_reaches_notify_callback() -> None:
     error_events = [e for e in events if e.get("type") == "error"]
     assert error_events, "limit must be broadcast as an error event"
     assert "usage limit" in error_events[-1]["content"].lower()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("configured_provider", "expected_failover_arg"),
+    [("grok", "grok"), ("claude-code", "claude-code")],
+)
+async def test_acp_usage_limit_fails_over_to_the_CONFIGURED_provider(
+    configured_provider: str, expected_failover_arg: str
+) -> None:
+    """An ACP cap must be attributed to the account, not to the transport.
+
+    ``AcpUsageLimitError`` is raised by the SHARED ACP client, so its class
+    name identifies the transport and says nothing about WHICH provider hit the
+    cap. The handler used to hardcode ``_schedule_failover("claude-code")``,
+    which was fine only while ACP had a single provider.
+
+    When grok moved onto the shared client (2026-08-24) it stopped raising
+    ``GrokUsageLimitError``, so a grok cap would have:
+      1. recorded the failure against claude-code — poisoning the availability
+         of a provider that never failed, and
+      2. failed over along ``failover_candidates("claude-code")`` =
+         [codex, grok, deepseek] — possibly straight back to grok, the
+         provider that had just capped — instead of
+         ``failover_candidates("grok")`` = [deepseek].
+
+    The pre-existing grok test could not catch this: it raises a LOCAL
+    ``GrokUsageLimitError`` stand-in, a class production no longer produces, so
+    it stayed green while the real path routed to claude-code.
+    """
+    agent = _make_agent()
+    agent._schedule_failover = AsyncMock()  # type: ignore[method-assign]
+    agent.config = SimpleNamespace(provider=configured_provider)
+
+    fake_graph = MagicMock()
+    fake_graph.ainvoke = AsyncMock(
+        side_effect=AcpUsageLimitError("You have hit your usage limit")
+    )
+    agent.agent = fake_graph
+
+    result = await agent._handle_invoke(
+        {"command": "invoke", "message": "do work", "stream": False},
+        connection=None,
+        notify_callback=None,
+        approval_callback=None,
+    )
+
+    assert result["success"] is False
+    assert agent.session_manager.status == AgentStatus.ERROR
+    agent._schedule_failover.assert_awaited_once()
+    assert agent._schedule_failover.await_args.args[0] == expected_failover_arg
+
+
+@pytest.mark.asyncio
+async def test_acp_usage_limit_without_config_still_attributes_claude_code() -> None:
+    """No config → keep the historical target rather than crash or skip failover."""
+    agent = _make_agent()
+    agent._schedule_failover = AsyncMock()  # type: ignore[method-assign]
+
+    fake_graph = MagicMock()
+    fake_graph.ainvoke = AsyncMock(
+        side_effect=AcpUsageLimitError("You have hit your usage limit")
+    )
+    agent.agent = fake_graph
+
+    await agent._handle_invoke(
+        {"command": "invoke", "message": "do work", "stream": False},
+        connection=None,
+        notify_callback=None,
+        approval_callback=None,
+    )
+
+    agent._schedule_failover.assert_awaited_once()
+    assert agent._schedule_failover.await_args.args[0] == "claude-code"
+
+
+def test_grok_cap_routes_to_deepseek_not_back_to_grok(tmp_path) -> None:
+    """The consequence the routing exists to produce, pinned on the real chain.
+
+    Asserting the ``_schedule_failover`` ARGUMENT proves attribution; this
+    proves the argument actually yields a different, safe destination — and
+    that the buggy target would have offered grok itself as a candidate.
+
+    ``failover_candidates`` returns steps rather than names since chains became
+    operator config; the property under test is unchanged.
+    """
+    from deep_worker_cli.runtime.failover_chains import get_chain
+    from deep_worker_cli.runtime.provider_chain import failover_candidates
+
+    chain = get_chain(home=tmp_path)
+
+    def providers(after: str) -> list[str]:
+        return [
+            step.provider
+            for step in failover_candidates(after, chain=chain, home=tmp_path)
+        ]
+
+    assert providers("grok") == ["deepseek"]
+    assert "grok" not in providers("grok")
+    assert "grok" in providers("claude-code")
 
 
 if __name__ == "__main__":

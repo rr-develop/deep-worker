@@ -72,7 +72,7 @@ def test_is_fatal_exception_for_recoverable_exceptions():
 def test_is_fatal_exception_matches_by_class_name_only():
     """Provider-agnostic match: a sibling class with the same name in any
     module must be treated as fatal so codex agents don't import
-    claude-code symbols just for classification."""
+    claude-code-sdk symbols just for classification."""
 
     class ClaudeUsageLimitError(Exception):  # noqa: N818 — mimicking the real class
         pass

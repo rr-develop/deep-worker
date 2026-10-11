@@ -1,10 +1,10 @@
-"""TDD: auto-load of ``~/.deepagents/env.d/*.env`` at agent start.
+"""TDD: auto-load of ``~/.deep_worker/env.d/*.env`` at agent start.
 
 Design (see DESIGN_EXTERNAL_MCP_TOOLS.md §7):
 
-* For each ``*.env`` file in ``~/.deepagents/env.d/`` (sorted), agent start
+* For each ``*.env`` file in ``~/.deep_worker/env.d/`` (sorted), agent start
   loads variables into ``os.environ``.
-* Already-set variables (incl. those from ``~/.deepagents/.env`` loaded
+* Already-set variables (incl. those from ``~/.deep_worker/.env`` loaded
   *before* this step, and anything inherited from the parent shell) are
   NOT overridden. The main ``.env`` keeps priority.
 * Files with permissions wider than ``0o600`` are SKIPPED with a warning
@@ -68,7 +68,7 @@ def test_existing_variable_is_not_overridden(
     """The main ``.env`` (and shell-inherited vars) MUST keep priority.
 
     This is the safety net that lets a user override a stale env.d-supplied
-    value just by editing ``~/.deepagents/.env`` without removing the
+    value just by editing ``~/.deep_worker/.env`` without removing the
     drop-in.
     """
     env_d = tmp_path / "env.d"

@@ -27,7 +27,7 @@ time:
   ``llama_index.core.Settings.embed_model`` global indirection) keep
   the Python objects alive past the function return.
 
-The original incident (deep_worker_web 2026-04-25) showed RSS growing
+The original incident (2026-04-25) showed RSS growing
 by ~390 MB on every ``project_memory`` call until the agent reached
 multiple GB. The regression test
 ``tests/integration/test_search_no_leak_per_call.py`` enforces the
@@ -62,9 +62,13 @@ from .exceptions import IndexNotFoundError
 # Process-wide caches (see module docstring for rationale)
 # ---------------------------------------------------------------------------
 
-# model_name -> embedding model instance.
-# Holds the torch storage + the mmap of the model blob.
-_embedding_cache: dict[str, Any] = {}
+# NOTE: the embedding-model cache used to live here (a module-level
+# ``_embedding_cache`` dict). It has been hoisted into
+# ``._embed_cache.resolve_embed_model`` so all four semantic-search call
+# sites (this file, ``history_retriever``, ``history_indexer``, ``indexer``)
+# share one instance per model name. See a related internal incident
+# analysis (not included here) for why the duplicated per-file caches
+# were dangerous.
 
 # (repo_path_str, model_name) -> (VectorStoreIndex, StorageContext).
 # StorageContext is kept alongside the index because AutoMergingRetriever
@@ -214,42 +218,20 @@ def search(
     if config is None:
         config = IndexConfig()
 
-    # Resolve embedding model.
-    #
-    # When the caller supplies their own ``embedding_model`` (e.g. tests
-    # passing MockEmbedding) we honour it and bypass the cache — we do
-    # NOT poison ``_embedding_cache`` with caller-provided models since
-    # those may have an arbitrary life-cycle.
-    #
-    # When no model is supplied we resolve through ``_embedding_cache``:
-    # the FIRST call for a given model name pays the full cost of
-    # instantiating ``HuggingFaceEmbedding`` (download check + weight
-    # load + mmap of the model blob); subsequent calls return the same
-    # instance, so no extra mmap / no extra torch storage is allocated.
-    if embedding_model is None:
-        cached_embed = _embedding_cache.get(config.embedding_model)
-        if cached_embed is None:
-            from llama_index.embeddings.huggingface import HuggingFaceEmbedding  # type: ignore[import-untyped]  # noqa: PLC0415
+    # Resolve embedding model via the shared process-wide cache in
+    # ``._embed_cache``. Caller-supplied models bypass the cache (tests
+    # pass e.g. ``MockEmbedding`` with arbitrary lifetimes; storing them
+    # would poison the cache). When no model is supplied the FIRST call
+    # for a given model name pays the full cost of instantiating
+    # ``HuggingFaceEmbedding`` (weight load + mmap of the model blob) —
+    # every subsequent call across every semantic-search entry point
+    # returns the same instance, so no extra mmap / no extra torch storage
+    # is allocated. ``local_files_only=True`` is enforced inside the
+    # resolver (offline guarantee, see
+    # ``docs/DESIGN_FIX_PROJECT_MEMORY_OFFLINE_MODEL_LOAD.md``).
+    from ._embed_cache import resolve_embed_model  # noqa: PLC0415
 
-            # Force STRICTLY-OFFLINE model resolution. ``local_files_only=True``
-            # is forwarded to ``SentenceTransformer`` (and thus to every
-            # ``huggingface_hub`` call), so loading the embedder performs NO
-            # network HEAD/metadata/download request — it uses only the
-            # already-cached model. This is the engine behind the agents'
-            # ``project_memory`` tool, which must never hit the network: a
-            # transient HF Hub outage previously hung an agent turn indefinitely
-            # (see docs/DESIGN_FIX_PROJECT_MEMORY_OFFLINE_MODEL_LOAD.md).
-            #
-            # Scoped, not global: this is a per-instance kwarg — it does NOT set
-            # any ``os.environ`` and does NOT affect other libraries/processes on
-            # the host. No explicit ``cache_folder`` is passed; llama_index's
-            # default cache dir already contains the model.
-            cached_embed = HuggingFaceEmbedding(
-                model_name=config.embedding_model,
-                model_kwargs={"local_files_only": True},
-            )
-            _embedding_cache[config.embedding_model] = cached_embed
-        embedding_model = cached_embed
+    embedding_model = resolve_embed_model(config, embedding_model)
 
     # ``Settings.embed_model`` is a global llama_index singleton. We
     # keep updating it so that any code path that reads from

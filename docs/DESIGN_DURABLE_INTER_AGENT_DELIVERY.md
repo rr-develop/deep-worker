@@ -353,6 +353,17 @@ async def _drain_once():
 
 #### 3.3.1a Retry policy **[r3 — review BLOCKER]**
 
+> **AMENDED 2026-08-27** by
+> [`DESIGN_INBOX_STALE_REDELIVERY.md`](DESIGN_INBOX_STALE_REDELIVERY.md).
+> The no-self-rearm rule below stands. What this section got wrong is
+> *retention*: a record retained here is retried on **every** future arrival,
+> forever, ahead of fresh traffic — so one lost `unlink` degrades the channel
+> permanently rather than producing a single documented duplicate (see the
+> crash-window table below, observed live; see
+> a related internal incident analysis, not included here).
+> Superseded by: a `delivery_id` dedup ledger, an attempt cap, a record TTL,
+> retirement to `expired/`, and fresh-before-retained attempt order.
+
 r2 combined "a failed record stays on disk" (§3.3.1) with "re-arm if any
 pending entry exists" (§3.4.1). Together those form a **hot retry loop**: a
 deterministically failing record re-arms the event immediately, with no new
@@ -553,6 +564,16 @@ A record that fails to parse is renamed into `inbox/corrupt/` (same atomic
 discipline) and logged. It is never retried and never re-scanned as pending,
 so it cannot wake the drain forever or block later records — the review's
 "corrupt must not spin" requirement.
+
+> **AMENDED 2026-08-27** by
+> [`DESIGN_INBOX_STALE_REDELIVERY.md`](DESIGN_INBOX_STALE_REDELIVERY.md) §3.4.
+> This path also swallows **foreign files**: `pending_records()` returns any
+> non-`.tmp-` entry, so a file another component wrote into the spool is read,
+> fails to parse, and is quarantined with no notice to its author — observed in
+> practice (a `0644` review-request `.md`). Intake is now name-gated to
+> `<seq>-<uuid4hex>.json`; foreign files are reported at WARNING and left in
+> place. `corrupt/` keeps its meaning here: a correctly-named record whose
+> *contents* are unparseable.
 
 ### 3.4 Waking the recipient (goal 3)
 

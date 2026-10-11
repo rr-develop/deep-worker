@@ -15,7 +15,6 @@ from typing_extensions import TypedDict
 
 from deepagents.middleware._utils import append_to_system_message
 from deepagents.tools.project_memory import project_memory
-from deepagents.utils.project_index import has_semantic_index
 
 
 class ProjectMemoryState(AgentState):
@@ -52,6 +51,12 @@ COGNITIVE_HINT = """### Project Knowledge Memory
 
 **Note**: Only use `grep`/`read_file` for unindexed files or very recent changes. For everything else, START with `project_memory`."""
 
+MISSING_INDEX_HINT = """### Project Knowledge Memory
+
+This working directory has no semantic index. Use `project_memory` only with an explicit `repo_path` that appears below:
+
+{tenants}"""
+
 
 class ProjectMemoryMiddleware(AgentMiddleware):
     """Conditionally enable project memory based on index availability.
@@ -73,7 +78,7 @@ class ProjectMemoryMiddleware(AgentMiddleware):
 
     state_schema = ProjectMemoryState
 
-    def __init__(self, working_dir: Path | None = None):
+    def __init__(self, working_dir: Path | None = None, client: Any = None):
         """Initialize middleware with working directory.
 
         Args:
@@ -81,14 +86,10 @@ class ProjectMemoryMiddleware(AgentMiddleware):
                         If None, defaults to Path.cwd().
         """
         self.working_dir = working_dir if working_dir is not None else Path.cwd()
-        self._has_index = has_semantic_index(self.working_dir)
-        self._cognitive_hint = COGNITIVE_HINT if self._has_index else None
-
-        # Create tools list (empty if no index)
-        if self._has_index:
-            self.tools = [project_memory]
-        else:
-            self.tools = []
+        self._has_index = False
+        self._cognitive_hint: str | None = None
+        self._client = client
+        self.tools = [project_memory]
 
     def before_agent(self, state: AgentState, runtime: Any) -> dict[str, str] | None:
         """Set working_dir in state before agent execution.
@@ -114,6 +115,31 @@ class ProjectMemoryMiddleware(AgentMiddleware):
         # ALWAYS set working_dir in state, regardless of index existence
         # This is critical for tools that need to know the working directory
         return {"working_dir": str(self.working_dir)}
+
+    async def abefore_agent(
+        self, state: AgentState, runtime: Any
+    ) -> dict[str, str] | None:
+        from deep_worker_cli.semantic_memory import client as memory_client
+        from deep_worker_cli.semantic_memory.service.proto import semantic_memory_pb2 as pb
+
+        client = self._client or memory_client.SemanticMemoryClient()
+        try:
+            status = await client.index_status(
+                pb.INDEX_KIND_PROJECT, self.working_dir.resolve()
+            )
+            self._has_index = bool(status.exists and status.complete)
+            if self._has_index:
+                self._cognitive_hint = COGNITIVE_HINT
+            else:
+                tenants = await client.list_tenants(pb.INDEX_KIND_PROJECT)
+                listed = memory_client.format_tenants(tenants) or "(none)"
+                self._cognitive_hint = MISSING_INDEX_HINT.format(tenants=listed)
+        except Exception:
+            self._has_index = False
+            self._cognitive_hint = MISSING_INDEX_HINT.format(
+                tenants="(service unavailable)"
+            )
+        return self.before_agent(state, runtime)
 
     def wrap_model_call(
         self,

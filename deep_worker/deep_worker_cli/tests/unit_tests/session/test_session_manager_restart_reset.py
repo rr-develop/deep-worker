@@ -31,14 +31,14 @@ class TestStatusResetOnRestart:
             "message_count": 42,
             "error_message": "Agent invocation failed: database is locked",
             "last_activity": "2026-04-18T22:00:00",
-            "launch_config": {"provider": "claude-code", "model": "opus"},
+            "launch_config": {"provider": "claude-code-sdk", "model": "opus"},
         }
         (tmp_path / "session_metadata.json").write_text(json.dumps(metadata))
 
         # WHEN: Agent restarts with new launch_config
         sm = SessionManager(
             data_dir=tmp_path,
-            launch_config={"provider": "claude-code", "model": "opus", "started_at": "2026-04-18T23:00:00"},
+            launch_config={"provider": "claude-code-sdk", "model": "opus", "started_at": "2026-04-18T23:00:00"},
         )
 
         # THEN: Status must be idle, error must be cleared
@@ -62,7 +62,7 @@ class TestStatusResetOnRestart:
 
         sm = SessionManager(
             data_dir=tmp_path,
-            launch_config={"provider": "claude-code"},
+            launch_config={"provider": "claude-code-sdk"},
         )
 
         assert sm.tasks_completed == 5
@@ -98,7 +98,7 @@ class TestStatusResetOnRestart:
 
         SessionManager(
             data_dir=tmp_path,
-            launch_config={"provider": "claude-code"},
+            launch_config={"provider": "claude-code-sdk"},
         )
 
         # Verify persisted file
@@ -110,7 +110,7 @@ class TestStatusResetOnRestart:
         """First start (no metadata file) should be idle."""
         sm = SessionManager(
             data_dir=tmp_path,
-            launch_config={"provider": "claude-code"},
+            launch_config={"provider": "claude-code-sdk"},
         )
         assert sm.status == AgentStatus.IDLE
         assert sm.error_message is None

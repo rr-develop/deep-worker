@@ -451,11 +451,17 @@ def index_repository(
     # Ensure directories exist
     repo_index.docstore_path.mkdir(parents=True, exist_ok=True)
 
-    # Resolve embedding model
-    if embedding_model is None:
-        from llama_index.embeddings.huggingface import HuggingFaceEmbedding  # type: ignore[import-untyped]  # noqa: PLC0415
+    # Resolve embedding model via the shared process-wide cache in
+    # ``._embed_cache``. Before this change this code path built a fresh
+    # ``HuggingFaceEmbedding(model_name=...)`` on every call — with no
+    # cache AND no ``local_files_only=True``, so it could also block on a
+    # HF Hub network round-trip. Both defects are fixed by delegating to
+    # the shared resolver, which is now the single construction site for
+    # every semantic-search entry point. See a related internal incident
+    # analysis (not included here), followup 1 (audit the sibling paths).
+    from ._embed_cache import resolve_embed_model  # noqa: PLC0415
 
-        embedding_model = HuggingFaceEmbedding(model_name=config.embedding_model)
+    embedding_model = resolve_embed_model(config, embedding_model)
 
     Settings.embed_model = embedding_model
     Settings.llm = None  # type: ignore[assignment]  # LlamaIndex accepts None at runtime

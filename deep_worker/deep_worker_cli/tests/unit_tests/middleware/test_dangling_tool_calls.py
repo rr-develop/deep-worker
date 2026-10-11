@@ -33,6 +33,7 @@ from langchain_core.messages import (
     SystemMessage,
     ToolMessage,
 )
+from langgraph.types import Overwrite
 
 # NOTE: import fails until the implementation lands — expected TDD red phase.
 from deep_worker_cli.middleware.dangling_tool_calls import (
@@ -66,10 +67,17 @@ def _ai_with_tool_call(call_id: str, name: str = "apply_patch") -> AIMessage:
 
 
 def _closers(result: dict[str, Any] | None) -> list[ToolMessage]:
+    """Synthetic WARNING closers from an Overwrite rewrite (or a raw list)."""
     assert result is not None
     msgs = result["messages"]
-    assert all(isinstance(m, ToolMessage) for m in msgs)
-    return msgs
+    if isinstance(msgs, Overwrite):
+        msgs = msgs.value
+    return [
+        m
+        for m in msgs
+        if isinstance(m, ToolMessage)
+        and (m.additional_kwargs or {}).get(DANGLING_MARKER_KEY)
+    ]
 
 
 # ===========================================================================
@@ -130,7 +138,7 @@ class TestClosesDangling:
         assert tm.status == "error"
         # machine-readable warning markers (Q1 + follow-up suggestion).
         assert tm.additional_kwargs.get(DANGLING_MARKER_KEY) is True
-        assert tm.additional_kwargs.get("warning_kind") == "outcome_unknown"
+        assert tm.additional_kwargs.get("deep_worker_warning") == "outcome_unknown"
         # honest, human-readable warning text mentioning the prior session.
         text = str(tm.content).lower()
         assert "previous session" in text or "prior session" in text
@@ -225,7 +233,8 @@ class TestIdempotency:
         msgs = [HumanMessage(content="old"), ai, HumanMessage(content="new")]
 
         result = _invoke(mw, msgs)
-        closers = _closers(result)
-        # Simulate LangGraph appending the closers to state, then a re-entry.
-        msgs_after = [HumanMessage(content="old"), ai, *closers, HumanMessage(content="new")]
-        assert _invoke(mw, msgs_after) is None
+        rewritten = result["messages"]
+        if isinstance(rewritten, Overwrite):
+            rewritten = rewritten.value
+        # Simulate the Overwrite landing in state, then a re-entry.
+        assert _invoke(mw, list(rewritten)) is None

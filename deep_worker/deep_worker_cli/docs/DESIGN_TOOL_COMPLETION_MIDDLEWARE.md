@@ -207,7 +207,7 @@ class SendMessageCompletionMiddleware(ToolCompletionMiddleware):
 
 Preserved without change: the class name, `TOOL_NAME`, `_parse_tool_result`, the module path, the `middleware/__init__.py` exports, the stack position, and every `isinstance` check. `agent.py:988–997` keeps appending `SendMessageCompletionMiddleware(...)`, now with the launcher's specs passed in.
 
-Known dependents re-verified as unaffected (they key off the tool name string or the class name, both preserved): `client/agent_client.py:113`, `process/agent_process.py:417/3973/4097`, `rpyc_service/agent_service.py:614`, `tools.py:971`, `middleware/inter_agent_reply.py:120`, `providers/claude_code_provider/delivery_resolve_middleware.py:44` (duplicates the string by value — left alone deliberately; deduplicating it is a separate cross-component change), `chat_model.py:358`.
+Known dependents re-verified as unaffected (they key off the tool name string or the class name, both preserved): `client/agent_client.py:113`, `process/agent_process.py:417/3973/4097`, `rpyc_service/agent_service.py:614`, `tools.py:971`, `middleware/inter_agent_reply.py:120`, `providers/claude_code_sdk_provider/delivery_resolve_middleware.py:44` (duplicates the string by value — left alone deliberately; deduplicating it is a separate cross-component change), `chat_model.py:358`.
 
 ### 3.4 Conflicts are configuration errors, not silent no-ops
 

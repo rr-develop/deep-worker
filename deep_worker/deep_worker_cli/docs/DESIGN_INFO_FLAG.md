@@ -18,7 +18,7 @@ the agent.
 
 ```
 agent: <agent_name>
-provider: claude-code
+provider: claude-code-sdk
 model: opus
 working_dir: the development codebase
 tree_root: the development codebase (dev_tree=true)

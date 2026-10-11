@@ -20,39 +20,26 @@ class TestHistoryMemoryMiddleware:
         assert mw.tools == []
         assert mw._cognitive_hint is None
 
-    def test_no_tools_when_no_index(self) -> None:
-        """Middleware should register no tools when no index exists."""
-        with patch(
-            "deep_worker_cli.middleware.history_memory._history_index_exists",
-            return_value=False,
-        ):
-            mw = HistoryMemoryMiddleware(assistant_id="test_agent", enabled=True)
-            assert mw.tools == []
-            assert mw._cognitive_hint is None
+    def test_tool_remains_registered_when_no_index(self) -> None:
+        mw = HistoryMemoryMiddleware(assistant_id="test_agent", enabled=True)
+        assert [tool.name for tool in mw.tools] == ["history_memory"]
+        assert mw._cognitive_hint is None
 
     def test_registers_tool_when_index_exists(self) -> None:
         """Middleware should register history_memory tool when index exists."""
-        with patch(
-            "deep_worker_cli.middleware.history_memory._history_index_exists",
-            return_value=True,
-        ):
-            mw = HistoryMemoryMiddleware(assistant_id="test_agent", enabled=True)
-            assert len(mw.tools) == 1
-            assert mw.tools[0].name == "history_memory"
-            assert mw._cognitive_hint == COGNITIVE_HINT
+        mw = HistoryMemoryMiddleware(assistant_id="test_agent", enabled=True)
+        assert len(mw.tools) == 1
+        assert mw.tools[0].name == "history_memory"
+        assert mw._cognitive_hint is None
 
     def test_before_agent_sets_summaries_dir(self) -> None:
         """before_agent should set summaries_dir in state when enabled."""
-        with patch(
-            "deep_worker_cli.middleware.history_memory._history_index_exists",
-            return_value=True,
-        ):
-            mw = HistoryMemoryMiddleware(assistant_id="test_agent", enabled=True)
-            state = {}
-            result = mw.before_agent(state, None)
-            assert result is not None
-            assert "summaries_dir" in result
-            assert "test_agent" in result["summaries_dir"]
+        mw = HistoryMemoryMiddleware(assistant_id="test_agent", enabled=True)
+        state = {}
+        result = mw.before_agent(state, None)
+        assert result is not None
+        assert "summaries_dir" in result
+        assert "test_agent" in result["summaries_dir"]
 
     def test_before_agent_returns_none_when_disabled(self) -> None:
         """before_agent should return None when middleware is disabled."""

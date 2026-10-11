@@ -1,5 +1,5 @@
 """POLICY (codex provider): every tool gets the job-handle mechanism BY
-DEFAULT — identical contract to claude_code_provider.
+DEFAULT — identical contract to claude_code_sdk_provider.
 
 Hard policy (project owner): the mechanism that, after
 ``long_running_wait_seconds`` (default 120s, env-overridable via

@@ -32,8 +32,10 @@ machine-readable marker in ``additional_kwargs`` and an explicit
 outcome-unknown message, leaving the decision to the agent.
 
 This middleware is provider-agnostic, event-driven, idempotent (once the closers
-become real ``ToolMessage``s they resolve the calls, so a later pass is a
-no-op), and adds no polling and no threads.
+sit immediately after their AIMessage they resolve the calls, so a later pass
+is a no-op), and adds no polling and no threads. Closers are applied via
+``Overwrite`` so they are adjacent to the AIMessage — appending them would
+leave a System/Human restart-notice in between and DeepSeek would 400.
 """
 
 from __future__ import annotations
@@ -43,6 +45,7 @@ from typing import TYPE_CHECKING, Any
 
 from langchain.agents.middleware.types import AgentMiddleware, AgentState
 from langchain_core.messages import AIMessage, ToolMessage
+from langgraph.types import Overwrite
 
 from deepagents.middleware.message_timestamps import ensure_message_created_at_after
 
@@ -54,9 +57,136 @@ logger = logging.getLogger(__name__)
 # Machine-readable marker keys placed on the synthetic closer's
 # ``additional_kwargs`` so downstream code / clients can distinguish a
 # "previous-session, outcome-unknown" closer from a genuine tool error.
-DANGLING_MARKER_KEY = "dangling_tool_call"
-WARNING_KIND_KEY = "warning_kind"
+DANGLING_MARKER_KEY = "deep_worker_dangling_tool_call"
+WARNING_KIND_KEY = "deep_worker_warning"
 WARNING_KIND_VALUE = "outcome_unknown"
+
+
+def _make_warning_closer(call_id: str, tool_name: str, prior: list) -> ToolMessage:
+    closer = ToolMessage(
+        content=_closer_content(tool_name),
+        tool_call_id=call_id,
+        name=tool_name,
+        status="error",
+        additional_kwargs={
+            DANGLING_MARKER_KEY: True,
+            WARNING_KIND_KEY: WARNING_KIND_VALUE,
+        },
+    )
+    ensure_message_created_at_after(prior, closer)
+    return closer
+
+
+def _adjacent_tool_ids(messages: list, ai_index: int) -> set[str]:
+    ids: set[str] = set()
+    j = ai_index + 1
+    while j < len(messages) and isinstance(messages[j], ToolMessage):
+        tid = messages[j].tool_call_id
+        if tid:
+            ids.add(tid)
+        j += 1
+    return ids
+
+
+def _rewrite_adjacent_closers(messages: list) -> tuple[list, list[str]]:
+    """Place a ToolMessage immediately after each dangling AIMessage.tool_calls.
+
+    Returns (rewritten_list, ids_acted_on). ids_acted_on is empty iff the
+    history was already OpenAI-adjacent (caller should return None).
+    Existing later ToolMessages are moved, not copied.
+    """
+    later_by_id: dict[str, ToolMessage] = {}
+    for i, msg in enumerate(messages):
+        if not isinstance(msg, AIMessage) or not msg.tool_calls:
+            continue
+        adjacent = _adjacent_tool_ids(messages, i)
+        for call in msg.tool_calls or []:
+            cid = call.get("id")
+            if not isinstance(cid, str) or cid in adjacent:
+                continue
+            later = next(
+                (
+                    m
+                    for m in messages[i + 1 :]
+                    if isinstance(m, ToolMessage) and m.tool_call_id == cid
+                ),
+                None,
+            )
+            if later is not None:
+                later_by_id[cid] = later
+
+    rewritten: list = []
+    acted: list[str] = []
+    consumed: set[int] = set()
+    for i, msg in enumerate(messages):
+        if id(msg) in consumed:
+            continue
+        rewritten.append(msg)
+        if not isinstance(msg, AIMessage) or not msg.tool_calls:
+            continue
+        adjacent = _adjacent_tool_ids(messages, i)
+        for call in msg.tool_calls or []:
+            cid = call.get("id")
+            if not isinstance(cid, str) or cid in adjacent:
+                continue
+            moved = later_by_id.get(cid)
+            if moved is not None:
+                rewritten.append(moved)
+                consumed.add(id(moved))
+            else:
+                rewritten.append(
+                    _make_warning_closer(cid, str(call.get("name") or "unknown"), rewritten)
+                )
+            acted.append(cid)
+    return rewritten, acted
+
+
+def _drop_orphaned_tool_messages(messages: list) -> tuple[list, list[str]]:
+    """Drop ``ToolMessage`` objects whose ``AIMessage.tool_calls`` is gone.
+
+    The MIRROR of ``_rewrite_adjacent_closers``: that one handles an
+    ``AIMessage`` whose ``ToolMessage`` never arrived, this one handles a
+    ``ToolMessage`` whose ``AIMessage`` no longer exists. Both shapes are
+    rejected by the provider, but only the first had a fix.
+
+    How an orphan is produced (repo_graph ingest, 2026-09-23): a
+    ``--sum-query`` run wipes the whole message channel via
+    ``RemoveMessage(REMOVE_ALL_MESSAGES)`` (agent_process.py:2529). The wipe
+    is atomic over what it can see, so it removes the ``AIMessage`` and its
+    ``ToolMessage`` together — but a tool-call still IN FLIGHT when the wipe
+    lands resolves afterwards, and ``add_messages`` appends its
+    ``ToolMessage`` onto the freshly-installed summary state. Its parent
+    ``AIMessage`` is already gone, so the very next request carries a
+    ``ToolMessage`` with nothing to answer, and the provider returns:
+
+        400 — Messages with role 'tool' must be a response to a preceding
+        message with 'tool_calls'
+
+    Dropping (not closing) is the only honest repair: a closer needs a
+    ``tool_call`` to answer, and here there is none — the request it belonged
+    to was deliberately erased. The tool's OUTPUT is not lost silently: the
+    wipe path offloads the pre-wipe history to ``<agent>.jsonl`` first, and
+    the drop is logged with the ids.
+
+    Returns ``(rewritten, dropped_ids)``; ``dropped_ids`` is empty when the
+    history holds no orphans (caller then returns ``None``).
+    """
+    live_call_ids: set[str] = set()
+    for msg in messages:
+        if isinstance(msg, AIMessage) and msg.tool_calls:
+            for call in msg.tool_calls:
+                cid = call.get("id")
+                if isinstance(cid, str):
+                    live_call_ids.add(cid)
+
+    rewritten: list = []
+    dropped: list[str] = []
+    for msg in messages:
+        if isinstance(msg, ToolMessage) and msg.tool_call_id not in live_call_ids:
+            dropped.append(str(msg.tool_call_id))
+            continue
+        rewritten.append(msg)
+    return rewritten, dropped
 
 
 def _closer_content(tool_name: str) -> str:
@@ -95,50 +225,39 @@ class DanglingToolCallMiddleware(AgentMiddleware):
         if not messages:
             return None
 
-        # 1. Collect tool_call_ids that already have a ToolMessage (resolved).
-        resolved_ids: set[str] = {
-            m.tool_call_id
-            for m in messages
-            if isinstance(m, ToolMessage) and m.tool_call_id is not None
-        }
+        # Orphan sweep FIRST: a ToolMessage with no surviving parent cannot be
+        # paired by the closer pass below (that pass only ever walks
+        # AIMessage.tool_calls, so an orphan is invisible to it) and would
+        # reach the provider as a 400. Running it first also means the closer
+        # pass sees an already-consistent list.
+        messages, dropped = _drop_orphaned_tool_messages(messages)
+        if dropped:
+            logger.warning(
+                "DanglingToolCallMiddleware: dropping %d orphaned ToolMessage(s) "
+                "(ids=%s) whose AIMessage.tool_calls no longer exists — most "
+                "likely an in-flight tool resolved after a --sum-query history "
+                "wipe. Their content was offloaded to the agent's JSONL history "
+                "by the wipe path; dropping here keeps the request valid "
+                "instead of failing with a provider 400.",
+                len(dropped),
+                dropped,
+            )
 
-        # 2. Find dangling tool-calls: an AIMessage tool_call whose id has no
-        #    matching ToolMessage. Preserve first-seen order; de-dup ids.
-        closers: list[ToolMessage] = []
-        seen_dangling: set[str] = set()
-        for m in messages:
-            if not isinstance(m, AIMessage):
-                continue
-            for call in m.tool_calls or []:
-                call_id = call.get("id")
-                if not isinstance(call_id, str):
-                    continue
-                if call_id in resolved_ids or call_id in seen_dangling:
-                    continue
-                seen_dangling.add(call_id)
-                tool_name = call.get("name") or "unknown"
-                closer = ToolMessage(
-                    content=_closer_content(str(tool_name)),
-                    tool_call_id=call_id,
-                    name=str(tool_name),
-                    status="error",
-                    additional_kwargs={
-                        DANGLING_MARKER_KEY: True,
-                        WARNING_KIND_KEY: WARNING_KIND_VALUE,
-                    },
-                )
-                ensure_message_created_at_after(messages + closers, closer)
-                closers.append(closer)
-
-        # 3. Nothing dangling -> normal flow (zero overhead on the common path).
-        if not closers:
+        rewritten, moved_or_new = _rewrite_adjacent_closers(messages)
+        if not moved_or_new:
+            # Orphans alone still require an Overwrite — the caller's state
+            # must lose them, not merely this local list.
+            if dropped:
+                return {"messages": Overwrite(messages)}
             return None
 
         logger.info(
             "DanglingToolCallMiddleware: closing %d unresolved tool-call(s) "
-            "from a previous session (ids=%s) — tools were NOT re-executed.",
-            len(closers),
-            [c.tool_call_id for c in closers],
+            "from a previous session (ids=%s) — tools were NOT re-executed. "
+            "Closers placed immediately after their AIMessage (OpenAI adjacency).",
+            len(moved_or_new),
+            moved_or_new,
         )
-        # Append the closers; do NOT jump — let the model run with valid history.
-        return {"messages": closers}
+        # Overwrite, do not append: add_messages would put closers at the
+        # end, after restart NOTICE / continuation, which DeepSeek rejects.
+        return {"messages": Overwrite(rewritten)}

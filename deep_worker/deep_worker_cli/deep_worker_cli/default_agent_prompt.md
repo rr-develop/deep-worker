@@ -134,13 +134,13 @@ Do not use it for speculative cleanup, optimization, or autonomous process manag
 
 ### restart_self — Self-Restart Tool
 
-Restart your own agent process to pick up fresh code changes. The restart is SYNCHRONOUS — the tool writes a restart-notice file, spawns `deep-worker --restart <your-name>`, and then **hard-exits the current process immediately** (`os._exit(0)`). The current LangGraph turn is severed at that point: the in-flight LLM stream is killed, no final assistant message is committed to the checkpointer. Conversation history up to (but not including) this tool call is preserved.
+Restart your own agent process to pick up fresh code changes. The tool writes a restart-notice file, mints a one-time capability token, and **arms** the restart; it then returns a normal result like any other tool. The replacement process is launched by the delivery barrier once this tool call's result has been **committed to the checkpoint** — i.e. once it is genuinely part of your context. The tool does NOT hard-exit, so your turn is not severed and the result is never lost.
 
 Signature: `restart_self()` — no arguments.
 
 **Important differences from `restart_agent`:**
 - `restart_self` restarts YOUR process, not another agent's.
-- The tool **does not return to the model in production** — the process dies right after Popen succeeds. Any logic you might write *after* the tool call in your reasoning will NOT run on the old process; the new process will resume from the last persisted state (i.e. the state right before this tool call).
+- The tool **does return a result**, and that result is recorded in your context before the replacement process is started. Do not plan further work after it in the same turn all the same: the driver stops this process shortly after the commit, and the new process resumes from the persisted state.
 - Uses the saved launch configuration from `session_metadata.json` (same as `deep-worker --restart`).
 - After restart, the new process consumes the restart-notice and receives a SYSTEM message announcing when and why it was restarted, followed by an automatic continuation turn ("(automatic continuation after restart …)"). This is informational; you are not required to acknowledge it explicitly. Continue working on the task in progress.
 - You should NOT plan additional reasoning steps after the `restart_self` tool call within the same turn. The very next thing that runs is the new process's auto-continuation.
@@ -152,7 +152,7 @@ Signature: `restart_self()` — no arguments.
 
 Do NOT use for speculative cleanup, housekeeping, or optimization.
 
-**Result shape.** The tool only "returns" in failure cases (the success path hard-exits before returning). On failure: `{"success": false, "error": "<code>", "message": "<explanation>"}`. Possible error codes: `notice_write_error`, `command_unavailable`, `spawn_failed`. In every failure case the current process is still alive and you can react to the error.
+**Result shape.** On success: `{"success": true, ...}` including the restart-notice path; the restart then fires once that result is committed. On failure: `{"success": false, "error": "<code>", "message": "<explanation>"}`. Possible error codes: `notice_write_error`, `command_unavailable`, `spawn_failed`, and `no_delivery_signal` (this process has no committing checkpointer — e.g. `--memory-only` — so a restart could never be confirmed). In every failure case the current process is still alive and you can react to the error.
 
 ## Code References
 When referencing code, use format: `file_path:line_number`

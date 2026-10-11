@@ -17,7 +17,68 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # codespell is installed from PyPI rather than run through
+      # codespell-project/actions-codespell@v2 on purpose. That action is a
+      # Docker action whose Dockerfile starts `FROM python:3.13-alpine`, so
+      # every run built an image and pulled that base layer from Docker Hub
+      # anonymously. Run 37989520983 failed on all three attempts without
+      # codespell ever rendering a verdict: attempts 1 and 2 hit
+      # `429 Too Many Requests` from registry-1.docker.io, attempt 3 hit a
+      # `504 Gateway Timeout` from auth.docker.io and then the same 429. The
+      # unauthenticated Docker Hub pull limit is shared per runner egress IP
+      # and is outside this repository's control, so the failure mode is
+      # systematic rather than a one-off outage: it reports red for a reason
+      # that has nothing to do with spelling.
+      #
+      # The version floor matches the action's own requirements.txt
+      # (`codespell[toml]>=2.2.4`), so this installs the same codespell the
+      # action would have. Verified 2026-10-09 that the repository is clean
+      # under both 2.2.6 and 2.4.3, so the floor does not hide drift.
+      - name: Install codespell
+        run: |
+          python -m pip install --upgrade pip
+          pip install 'codespell[toml]>=2.2.4'
+
+      # The Docker action registered a problem matcher so findings showed up as
+      # inline annotations, not just log lines. Dropping the action would drop
+      # that, so the matcher is reproduced here verbatim from the action's
+      # codespell-problem-matcher/codespell-matcher.json (v2). Without it the
+      # check would still pass or fail correctly but report less.
+      - name: Register codespell problem matcher
+        run: |
+          cat > "${RUNNER_TEMP}/codespell-matcher.json" <<'JSON'
+          {
+            "problemMatcher": [
+              {
+                "owner": "codespell-matcher-default",
+                "pattern": [
+                  {
+                    "regexp": "^(.+):(\\d+):\\s+(.+)$",
+                    "file": 1,
+                    "line": 2,
+                    "message": 3
+                  }
+                ]
+              }
+            ]
+          }
+          JSON
+          echo "::add-matcher::${RUNNER_TEMP}/codespell-matcher.json"
+
+      # Word list and skip patterns live in .codespellrc at the repository
+      # root, so `codespell` run locally checks exactly what CI checks.
+      #
+      # No --skip is passed here even though the action defaulted to
+      # `--skip ./.git`. Verified 2026-10-09 that a CLI --skip does not
+      # override the config's skip list: with `skip = *.json` in .codespellrc,
+      # `codespell --skip ./.git y.json` reports nothing while the same bytes
+      # named z.txt are flagged. .git is not tracked content and .codespellrc
+      # already skips it, so the resulting check is equivalent.
       - name: Codespell
-        uses: codespell-project/actions-codespell@v2
-        # Word list and skip patterns live in .codespellrc at the repository
-        # root, so `codespell` run locally checks exactly what CI checks.
+        run: codespell

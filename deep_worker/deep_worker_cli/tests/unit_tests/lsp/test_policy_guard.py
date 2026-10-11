@@ -227,8 +227,8 @@ def _find_repo_root() -> Path:
     the wrong tree when a file moves, and that is exactly what happened
     here — an earlier version used ``parents[4]``
     (``deep_worker/``), under which ``rglob("mcp.json")`` matches
-    nothing, so the repo scan passed while the repo's own
-    ``.deepagents/mcp.json`` was violating the policy.
+    nothing, so the repo scan passed while the repo's own project-scope
+    ``mcp.json`` was violating the policy.
     """
     here = Path(__file__).resolve()
     for candidate in here.parents:
@@ -265,14 +265,14 @@ def test_repo_scan_actually_reaches_the_config_files():
 
     assert (repo_root / "docs" / "POLICY_NO_INPROCESS_HEAVY_MCP.md").exists()
     assert len(py) > 100, f"only {len(py)} python files under {repo_root}"
-    # ``mcp.json`` lives under ``.deepagents/``, which is gitignored: it is a
-    # runtime file an operator's agent writes, not repository content. Asserting
-    # its presence would fail on every clean checkout (CI included) while only
+    # ``mcp.json`` lives under a gitignored config dir: it is a runtime file
+    # an operator's agent writes, not repository content. Asserting its
+    # presence would fail on every clean checkout (CI included) while only
     # passing on a machine that had already run an agent. Guard the Python scan
     # unconditionally and the config scan only where configs actually exist.
     if not configs:
         pytest.skip(
-            "no mcp.json in this checkout (.deepagents/ is gitignored); "
+            "no mcp.json in this checkout (the config dir is gitignored); "
             "the python-source half of the scan is still asserted above"
         )
 
@@ -281,7 +281,7 @@ def test_this_repository_passes_the_guard():
     """The strongest test: run the guard over our own shipped code.
 
     Scans from the real repository root. The first run of this guard
-    found a live violation in the repo's own ``.deepagents/mcp.json``
+    found a live violation in the repo's own project-scope ``mcp.json``
     (a legacy direct-spawn entry).
     """
     repo_root = _find_repo_root()
@@ -297,10 +297,10 @@ def test_legacy_entry_at_the_repo_config_path_would_fail_the_scan(
 ):
     """The precise regression that slipped through once already.
 
-    A ``.deepagents/mcp.json`` holding the legacy direct-spawn entry —
+    A ``.deep_worker/mcp.json`` holding the legacy direct-spawn entry —
     at the same relative location as the real one — must be flagged.
     """
-    cfg = tmp_path / ".deepagents" / "mcp.json"
+    cfg = tmp_path / ".deep_worker" / "mcp.json"
     cfg.parent.mkdir(parents=True)
     cfg.write_text(
         json.dumps(

@@ -4,7 +4,7 @@ This test verifies that when a user makes multiple queries, tool calls from prev
 queries are NOT displayed again in the TUI for subsequent unrelated queries.
 
 This is a CONTROL TEST to verify if the tool call duplication bug is:
-- Specific to claude-code provider, OR
+- Specific to claude-code-sdk provider, OR
 - General bug affecting all providers
 
 The test:
@@ -316,7 +316,7 @@ def test_agent_tool_call_no_duplication_deepseek(clean_agent):
                     f"Actual: Tool call indicators found: {tool_indicators_found_q2}\n\n"
                     f"This indicates that tool calls from previous queries are being\n"
                     f"duplicated or re-displayed for subsequent unrelated queries.\n"
-                    f"This is a GENERAL BUG affecting ALL providers, not just claude-code!\n"
+                    f"This is a GENERAL BUG affecting ALL providers, not just claude-code-sdk!\n"
                 )
 
             logger.info("✓ No tool call indicators found for Query 2")

@@ -3,7 +3,7 @@
 Mirrors ``codex_provider/session_state.py`` but persists
 ``(grok_session_id, sent_count)`` to
 ``~/.deep_worker/<agent>/grok_session_state.json`` — deliberately a
-distinct filename from codex/claude-code so providers never collide in a
+distinct filename from codex/claude-code-sdk so providers never collide in a
 shared agent data dir.
 
 POLICIES.md §4 / DESIGN §6.1, a related issue: the data dir is created 0o700 and

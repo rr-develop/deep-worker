@@ -37,7 +37,16 @@ from deep_worker.providers.grok_provider.builtin_tool_passthrough import (  # no
 )
 from deep_worker.providers.grok_provider.chat_model import GrokChatModel  # noqa: E402
 from deep_worker.providers.grok_provider.client_state import GrokClientState  # noqa: E402
-from deep_worker.providers.grok_provider.tests.test_chat_model import (  # noqa: E402
+# The shared fakes live in the sibling test module. This directory has no
+# __init__.py (pytest rootdir-relative collection), and the old
+# ``deep_worker.providers.grok_provider.tests`` package no longer exists —
+# the grok tests moved to the repo-root ``tests/`` tree. Import the sibling
+# by adding THIS directory to sys.path.
+_here = Path(__file__).resolve().parent
+if str(_here) not in sys.path:
+    sys.path.insert(0, str(_here))
+
+from test_chat_model import (  # noqa: E402
     _FakeAcpClient,
     _FakeProxy,
 )

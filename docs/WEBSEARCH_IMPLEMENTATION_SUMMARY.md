@@ -16,7 +16,7 @@ Successfully implemented a universal web search tool that enables ANY AI provide
 
 ### 1. Core Implementation
 
-#### `claude_code_provider/web_search_hooks.py`
+#### `claude_code_sdk_provider/web_search_hooks.py`
 - **Purpose:** PreToolUse hook factories for parameter enforcement
 - **Functions:**
   - `create_enforcement_hook()` - Enforces original query parameters
@@ -25,7 +25,7 @@ Successfully implemented a universal web search tool that enables ANY AI provide
 - **Lines of Code:** 228
 - **Documentation:** Comprehensive docstrings with examples
 
-#### `claude_code_provider/web_search_delegation.py`
+#### `claude_code_sdk_provider/web_search_delegation.py`
 - **Purpose:** Main LangChain tool implementation
 - **Classes:**
   - `WebSearchInput` - Pydantic input schema
@@ -45,7 +45,7 @@ Successfully implemented a universal web search tool that enables ANY AI provide
 
 ### 2. Testing
 
-#### `claude_code_provider/tests/test_web_search_delegation.py`
+#### `claude_code_sdk_provider/tests/test_web_search_delegation.py`
 - **Purpose:** Comprehensive unit tests
 - **Test Classes:**
   - `TestWebSearchInput` - Input validation tests (4 tests)
@@ -63,7 +63,7 @@ Successfully implemented a universal web search tool that enables ANY AI provide
 
 ### 3. Integration
 
-#### `claude_code_provider/__init__.py`
+#### `claude_code_sdk_provider/__init__.py`
 - **Changes:** Added `WebSearchDelegationTool` to exports
 - **Updated:** Package documentation with usage example
 
@@ -159,35 +159,35 @@ Successfully implemented a universal web search tool that enables ANY AI provide
 ## Test Results
 
 ```bash
-$ python3 -m pytest claude_code_provider/tests/test_web_search_delegation.py -v
+$ python3 -m pytest claude_code_sdk_provider/tests/test_web_search_delegation.py -v
 
 ======================== test session starts =========================
 platform linux -- Python 3.12.3, pytest-8.4.2, pluggy-1.6.0
 
-claude_code_provider/tests/test_web_search_delegation.py::TestWebSearchInput::test_valid_basic_input PASSED
-claude_code_provider/tests/test_web_search_delegation.py::TestWebSearchInput::test_valid_input_with_domains PASSED
-claude_code_provider/tests/test_web_search_delegation.py::TestWebSearchInput::test_empty_query_allowed PASSED
-claude_code_provider/tests/test_web_search_delegation.py::TestWebSearchInput::test_schema_fields PASSED
-claude_code_provider/tests/test_web_search_delegation.py::TestWebSearchDelegationTool::test_tool_metadata PASSED
-claude_code_provider/tests/test_web_search_delegation.py::TestWebSearchDelegationTool::test_tool_configuration PASSED
-claude_code_provider/tests/test_web_search_delegation.py::TestWebSearchDelegationTool::test_sync_run_not_supported PASSED
-claude_code_provider/tests/test_web_search_delegation.py::TestWebSearchDelegationTool::test_build_search_prompt_basic PASSED
-claude_code_provider/tests/test_web_search_delegation.py::TestWebSearchDelegationTool::test_build_search_prompt_with_allowed_domains PASSED
-claude_code_provider/tests/test_web_search_delegation.py::TestWebSearchDelegationTool::test_build_search_prompt_with_blocked_domains PASSED
-claude_code_provider/tests/test_web_search_delegation.py::TestWebSearchDelegationTool::test_parse_websearch_result_empty PASSED
-claude_code_provider/tests/test_web_search_delegation.py::TestWebSearchDelegationTool::test_parse_websearch_result_json_string PASSED
-claude_code_provider/tests/test_web_search_delegation.py::TestWebSearchDelegationTool::test_parse_websearch_result_list_with_text_blocks PASSED
-claude_code_provider/tests/test_web_search_delegation.py::TestWebSearchDelegationTool::test_parse_websearch_result_plain_text PASSED
-claude_code_provider/tests/test_web_search_delegation.py::TestWebSearchDelegationTool::test_parse_websearch_result_list_of_dicts PASSED
-claude_code_provider/tests/test_web_search_delegation.py::TestWebSearchDelegationTool::test_arun_timeout_error PASSED
-claude_code_provider/tests/test_web_search_delegation.py::TestWebSearchDelegationTool::test_arun_exception_handling PASSED
-claude_code_provider/tests/test_web_search_delegation.py::TestWebSearchHooks::test_enforcement_hook_enforces_params PASSED
-claude_code_provider/tests/test_web_search_delegation.py::TestWebSearchHooks::test_enforcement_hook_ignores_other_tools PASSED
-claude_code_provider/tests/test_web_search_delegation.py::TestWebSearchHooks::test_logging_hook PASSED
-claude_code_provider/tests/test_web_search_delegation.py::TestWebSearchHooks::test_validation_hook_denies_long_query PASSED
-claude_code_provider/tests/test_web_search_delegation.py::TestWebSearchHooks::test_validation_hook_allows_valid_query PASSED
-claude_code_provider/tests/test_web_search_delegation.py::TestWebSearchHooks::test_validation_hook_requires_domain_restriction PASSED
-claude_code_provider/tests/test_web_search_delegation.py::test_real_websearch_delegation SKIPPED
+claude_code_sdk_provider/tests/test_web_search_delegation.py::TestWebSearchInput::test_valid_basic_input PASSED
+claude_code_sdk_provider/tests/test_web_search_delegation.py::TestWebSearchInput::test_valid_input_with_domains PASSED
+claude_code_sdk_provider/tests/test_web_search_delegation.py::TestWebSearchInput::test_empty_query_allowed PASSED
+claude_code_sdk_provider/tests/test_web_search_delegation.py::TestWebSearchInput::test_schema_fields PASSED
+claude_code_sdk_provider/tests/test_web_search_delegation.py::TestWebSearchDelegationTool::test_tool_metadata PASSED
+claude_code_sdk_provider/tests/test_web_search_delegation.py::TestWebSearchDelegationTool::test_tool_configuration PASSED
+claude_code_sdk_provider/tests/test_web_search_delegation.py::TestWebSearchDelegationTool::test_sync_run_not_supported PASSED
+claude_code_sdk_provider/tests/test_web_search_delegation.py::TestWebSearchDelegationTool::test_build_search_prompt_basic PASSED
+claude_code_sdk_provider/tests/test_web_search_delegation.py::TestWebSearchDelegationTool::test_build_search_prompt_with_allowed_domains PASSED
+claude_code_sdk_provider/tests/test_web_search_delegation.py::TestWebSearchDelegationTool::test_build_search_prompt_with_blocked_domains PASSED
+claude_code_sdk_provider/tests/test_web_search_delegation.py::TestWebSearchDelegationTool::test_parse_websearch_result_empty PASSED
+claude_code_sdk_provider/tests/test_web_search_delegation.py::TestWebSearchDelegationTool::test_parse_websearch_result_json_string PASSED
+claude_code_sdk_provider/tests/test_web_search_delegation.py::TestWebSearchDelegationTool::test_parse_websearch_result_list_with_text_blocks PASSED
+claude_code_sdk_provider/tests/test_web_search_delegation.py::TestWebSearchDelegationTool::test_parse_websearch_result_plain_text PASSED
+claude_code_sdk_provider/tests/test_web_search_delegation.py::TestWebSearchDelegationTool::test_parse_websearch_result_list_of_dicts PASSED
+claude_code_sdk_provider/tests/test_web_search_delegation.py::TestWebSearchDelegationTool::test_arun_timeout_error PASSED
+claude_code_sdk_provider/tests/test_web_search_delegation.py::TestWebSearchDelegationTool::test_arun_exception_handling PASSED
+claude_code_sdk_provider/tests/test_web_search_delegation.py::TestWebSearchHooks::test_enforcement_hook_enforces_params PASSED
+claude_code_sdk_provider/tests/test_web_search_delegation.py::TestWebSearchHooks::test_enforcement_hook_ignores_other_tools PASSED
+claude_code_sdk_provider/tests/test_web_search_delegation.py::TestWebSearchHooks::test_logging_hook PASSED
+claude_code_sdk_provider/tests/test_web_search_delegation.py::TestWebSearchHooks::test_validation_hook_denies_long_query PASSED
+claude_code_sdk_provider/tests/test_web_search_delegation.py::TestWebSearchHooks::test_validation_hook_allows_valid_query PASSED
+claude_code_sdk_provider/tests/test_web_search_delegation.py::TestWebSearchHooks::test_validation_hook_requires_domain_restriction PASSED
+claude_code_sdk_provider/tests/test_web_search_delegation.py::test_real_websearch_delegation SKIPPED
 
 ================ 23 passed, 1 skipped, 1 warning in 0.16s ================
 ```
@@ -201,7 +201,7 @@ claude_code_provider/tests/test_web_search_delegation.py::test_real_websearch_de
 ### Basic Usage
 
 ```python
-from claude_code_provider import WebSearchDelegationTool
+from claude_code_sdk_provider import WebSearchDelegationTool
 
 # Create tool
 tool = WebSearchDelegationTool(verbose=True)
@@ -224,7 +224,7 @@ for item in results:
 
 ```python
 from langchain_google_genai import ChatGoogleGenerativeAI
-from claude_code_provider import WebSearchDelegationTool
+from claude_code_sdk_provider import WebSearchDelegationTool
 
 model = ChatGoogleGenerativeAI(model="gemini-2.0-flash-exp")
 tool = WebSearchDelegationTool()
@@ -240,7 +240,7 @@ response = await model_with_search.ainvoke([
 
 ```python
 from langchain_openai import ChatOpenAI
-from claude_code_provider import WebSearchDelegationTool
+from claude_code_sdk_provider import WebSearchDelegationTool
 
 model = ChatOpenAI(model="gpt-4o-mini")
 tool = WebSearchDelegationTool()
@@ -409,7 +409,7 @@ await tool.ainvoke({
 ### Step 1: Import
 
 ```python
-from claude_code_provider import WebSearchDelegationTool
+from claude_code_sdk_provider import WebSearchDelegationTool
 ```
 
 ### Step 2: Create Tool
@@ -440,7 +440,7 @@ response = await model_with_search.ainvoke([
 ### Issue: "Claude CLI not found"
 **Solution:** Install Claude CLI and authenticate
 ```bash
-npm install -g @anthropics/claude-code
+npm install -g @anthropics/claude-code-sdk
 claude auth
 ```
 
@@ -464,7 +464,7 @@ tool = WebSearchDelegationTool(timeout=60.0)
 ## Related Documentation
 
 - [Design Document](WEBSEARCH_DELEGATION_DESIGN.md)
-- [Claude Code Provider Design](claude_code_provider_design.md)
+- Claude Code Provider Design (internal document, not included here)
 - [Claude SDK Documentation](https://github.com/anthropics/claude-sdk-python)
 
 ---

@@ -66,28 +66,77 @@ class TestRestartAgentValidation:
 
 
 class TestRestartAgentBehavior:
-    async def test_already_running_returns_success_without_subprocess(
+    async def test_running_agent_is_actually_restarted(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """A live agent must be restarted, not reported back as "already running".
+
+        The tool documents itself as the equivalent of
+        ``deep-worker --restart <name>``, and that CLI path explicitly stops a
+        running agent (``force=True``) before relaunching it — restarting a
+        busy agent is the whole point of the destructive tool, and the only
+        way to interrupt a stuck turn.
+
+        The old code returned on ``registry.lookup() is not None`` and never
+        reached the subprocess, so a running agent was never restarted; the
+        tool silently degraded into "start if dead". It also returned
+        ``success=True`` together with ``error="already_running"``, so the
+        refusal read as success to every caller.
+        """
         from deep_worker_cli import tools as tools_mod
         from deep_worker_cli.tools import make_restart_agent_tool
 
+        old = _process_info("beta", pid=12345)
+        new = _process_info("beta", pid=67890)
         registry = MagicMock()
-        registry.lookup.return_value = _process_info("beta")
-        registry_cls = MagicMock(return_value=registry)
-        run_mock = MagicMock()
+        registry.lookup.return_value = old
+        registry.wait_for_registration = AsyncMock(return_value=new)
+        run_mock = MagicMock(return_value=MagicMock(returncode=0, stdout="", stderr=""))
 
-        monkeypatch.setattr(tools_mod, "ProcessRegistry", registry_cls)
-        monkeypatch.setattr(tools_mod.shutil, "which", lambda _cmd: str(Path("/usr/bin") / "deep-worker"))
+        monkeypatch.setattr(tools_mod, "ProcessRegistry", MagicMock(return_value=registry))
+        monkeypatch.setattr(tools_mod.shutil, "which", lambda _cmd: "/usr/bin/deep-worker")
         monkeypatch.setattr(tools_mod.subprocess, "run", run_mock)
 
         tool = make_restart_agent_tool("alpha")
         result = await _ainvoke(tool, agent_name="beta")
 
+        # The CLI was actually invoked for the running agent.
+        run_mock.assert_called_once()
+        assert run_mock.call_args[0][0] == ["/usr/bin/deep-worker", "--restart", "beta"]
+
         assert result["success"] is True
-        assert result["already_running"] is True
-        assert result["error"] == "already_running"
-        run_mock.assert_not_called()
+        assert result["already_running"] is False
+        assert result.get("error") is None
+        assert result["restarted_pid"] == 67890
+        assert result["previous_pid"] == 12345
+
+    async def test_running_agent_restart_requires_a_new_pid(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Seeing the *old* PID back in the registry is not a restart.
+
+        ``wait_for_registration`` can resolve against the still-present entry
+        of the process we meant to replace. Reporting that as success would
+        claim new code is running while the old process still serves.
+        """
+        from deep_worker_cli import tools as tools_mod
+        from deep_worker_cli.tools import make_restart_agent_tool
+
+        old = _process_info("beta", pid=12345)
+        registry = MagicMock()
+        registry.lookup.return_value = old
+        registry.wait_for_registration = AsyncMock(return_value=_process_info("beta", pid=12345))
+        run_mock = MagicMock(return_value=MagicMock(returncode=0, stdout="", stderr=""))
+
+        monkeypatch.setattr(tools_mod, "ProcessRegistry", MagicMock(return_value=registry))
+        monkeypatch.setattr(tools_mod.shutil, "which", lambda _cmd: "/usr/bin/deep-worker")
+        monkeypatch.setattr(tools_mod.subprocess, "run", run_mock)
+
+        tool = make_restart_agent_tool("alpha")
+        result = await _ainvoke(tool, agent_name="beta")
+
+        assert result["success"] is False
+        assert result["error"] == "restart_timeout"
 
     async def test_missing_command_returns_command_unavailable(
         self, monkeypatch: pytest.MonkeyPatch
@@ -128,7 +177,7 @@ class TestRestartAgentBehavior:
         completed = MagicMock(returncode=1, stdout="", stderr=stderr)
 
         monkeypatch.setattr(tools_mod, "ProcessRegistry", MagicMock(return_value=registry))
-        monkeypatch.setattr(tools_mod.shutil, "which", lambda _cmd: str(Path("/usr/bin") / "deep-worker"))
+        monkeypatch.setattr(tools_mod.shutil, "which", lambda _cmd: "/usr/bin/deep-worker")
         monkeypatch.setattr(tools_mod.subprocess, "run", MagicMock(return_value=completed))
 
         tool = make_restart_agent_tool("alpha")
@@ -153,7 +202,7 @@ class TestRestartAgentBehavior:
         completed = MagicMock(returncode=0, stdout="starting", stderr="")
 
         monkeypatch.setattr(tools_mod, "ProcessRegistry", MagicMock(return_value=registry))
-        monkeypatch.setattr(tools_mod.shutil, "which", lambda _cmd: str(Path("/usr/bin") / "deep-worker"))
+        monkeypatch.setattr(tools_mod.shutil, "which", lambda _cmd: "/usr/bin/deep-worker")
         monkeypatch.setattr(tools_mod.subprocess, "run", MagicMock(return_value=completed))
 
         tool = make_restart_agent_tool("alpha")

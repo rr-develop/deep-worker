@@ -119,7 +119,7 @@ class TestRestartAgent:
             patch(
                 "app.routers.agents.load_launch_config",
                 return_value={
-                    "provider": "claude-code",
+                    "provider": "claude-code-sdk",
                     "model": "opus",
                     "working_dir": "/tmp/test",
                 },

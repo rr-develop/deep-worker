@@ -2,7 +2,7 @@
 
 HARD POLICY (POLICIES.md §7.1, owner 2026-06-17): the 2-minute bound on a
 tool call is enforced in EXACTLY ONE function — ``awrap_tool_call`` — for
-EVERY provider (deepseek/openai/anthropic/google/vertexai/claude-code/codex)
+EVERY provider (deepseek/openai/anthropic/google/vertexai/claude-code-sdk/codex)
 and EVERY tool. No other place may wait on a tool. On the wait elapsing the
 tool's work is parked in the background (NOT cancelled) and the model gets a
 NON-error ``in_progress`` ToolMessage (job_id + wait_for_job/kill_job). A
@@ -104,7 +104,7 @@ async def test_slow_tool_becomes_inprogress_not_error() -> None:
     assert "wait_for_job" in text and "kill_job" in text
     # job_id is a CANONICAL job_N — the same namespace wait_for_job/kill_job
     # resolve. It must NOT be the tool_call_id: advertising a ``toolu_…`` as a
-    # job id gave the model an unresolvable handle (internal defect, 2026-07-31).
+    # job id gave the model an unresolvable handle.
     # See tests/unit_tests/test_parked_job_id_namespace.py.
     import re as _re
 
@@ -123,7 +123,7 @@ async def test_slow_tool_becomes_inprogress_not_error() -> None:
 
 async def test_stage_a_dispatch_wait_is_bounded() -> None:
     """A proxy provider's dispatch wait that NEVER completes (lost control
-    request — the lost-control hole) must hit the SAME timer and degrade to a
+    request — the mj2_vac hole) must hit the SAME timer and degrade to a
     non-error in_progress handle, NOT hang forever."""
     from deepagents.middleware.tool_dispatch_bridge import (
         register_dispatch_waiter,
@@ -180,7 +180,7 @@ async def test_stage_a_dispatch_wait_is_bounded() -> None:
 
 async def test_stage_a_dispatch_patches_authoritative_args() -> None:
     """When dispatch completes, the AUTHORITATIVE args from the provider
-    replace the announced args before the tool runs (internal fix)."""
+    replace the announced args before the tool runs."""
     from deepagents.middleware.tool_dispatch_bridge import (
         register_dispatch_waiter,
         unregister_dispatch_waiter,
@@ -258,18 +258,39 @@ async def test_imagine_tool_wait_override() -> None:
 # ── static invariant: no second timer source, no bare await on a tool ─────
 
 
-def test_providers_delegate_to_single_timer_source() -> None:
-    """Both proxy providers must source their tool-wait bound from
-    resolve_tool_wait_seconds — NO independent 120s constant survives."""
-    import re
+def _provider_sources() -> list[tuple[str, str]]:
+    """Return ``(label, source)`` for every proxy provider under guard.
+
+    The providers used to live at the repository root
+    (``codex_provider/proxy_mcp_server.py``); they now live under
+    ``deep_worker/providers/`` and the old root packages are deprecation
+    shims with no ``proxy_mcp_server`` module. The guards below kept reading
+    the old path, so they raised ``FileNotFoundError`` instead of checking
+    anything — an AST guard that cannot find its target is not a guard.
+    Resolving the path here, once, with an explicit existence assertion keeps
+    a future move loud instead of silently unguarded.
+    """
     from pathlib import Path
 
-    repo = Path(__file__).resolve().parents[4]
-    for rel in (
-        "claude_code_provider/proxy_mcp_server.py",
-        "codex_provider/proxy_mcp_server.py",
-    ):
-        src = (repo / rel).read_text()
+    providers = Path(__file__).resolve().parents[3] / "providers"
+    sources: list[tuple[str, str]] = []
+    for name in ("codex_provider",):
+        path = providers / name / "proxy_mcp_server.py"
+        assert path.is_file(), (
+            f"{path} not found — the tool-wait guard has no target to check. "
+            "If the providers moved again, update this resolver; do not let "
+            "the invariant go unverified."
+        )
+        sources.append((f"{name}/proxy_mcp_server.py", path.read_text()))
+    return sources
+
+
+def test_providers_delegate_to_single_timer_source() -> None:
+    """Every proxy provider under guard must source its tool-wait bound from
+    resolve_tool_wait_seconds — NO independent 120s constant survives."""
+    import re
+
+    for rel, src in _provider_sources():
         # The shared source is referenced.
         assert "resolve_tool_wait_seconds" in src, rel
         # No independent timer constant assignment (a second source of truth).
@@ -284,14 +305,9 @@ def test_no_bare_await_on_tool_future_in_providers() -> None:
     only real statements (``await fut`` at end-of-line or before ``)``/``,``),
     not docstring prose like 'NO bare await future'."""
     import ast
-    from pathlib import Path
 
-    repo = Path(__file__).resolve().parents[4]
-    for rel in (
-        "claude_code_provider/proxy_mcp_server.py",
-        "codex_provider/proxy_mcp_server.py",
-    ):
-        tree = ast.parse((repo / rel).read_text())
+    for rel, src in _provider_sources():
+        tree = ast.parse(src)
         for node in ast.walk(tree):
             # A bare ``await <Name>`` expression (not wrapped in a call like
             # asyncio.wait_for(...)) on an identifier named fut/future.

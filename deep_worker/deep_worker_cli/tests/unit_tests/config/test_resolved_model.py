@@ -39,6 +39,6 @@ class TestResolvedModel:
         deep-worker must pass no ``--model`` and let the CLI decide — the
         same contract codex and grok already have.
         """
-        monkeypatch.delenv("CLAUDE_CODE_MODEL", raising=False)
-        config = AgentConfig(working_dir=Path("/tmp"), model=None, provider="claude-code")
+        monkeypatch.delenv("CLAUDE_CODE_SDK_MODEL", raising=False)
+        config = AgentConfig(working_dir=Path("/tmp"), model=None, provider="claude-code-sdk")
         assert config.resolved_model is None

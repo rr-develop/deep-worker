@@ -12,9 +12,13 @@ This module provides REST API endpoints for:
 All endpoints follow REST conventions and return JSON responses.
 """
 
+import asyncio
 import logging
 import os
+import re
 import subprocess
+import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
 
@@ -31,8 +35,8 @@ from app.schemas.agent_schemas import (
     StopRequest,
     StopTaskManagerRequest,
 )
-from app.services.agent_service import AgentService
-from deep_worker_cli.storage_paths import deep_worker_home
+from app.services.agent_service import AgentRefusedError, AgentService
+from deep_worker_cli.storage_paths import deep_worker_home, read_agent_file
 
 # Provider↔model compatibility. This used to be a hand-copied duplicate of
 # the CLI predicate, kept local because importing ``deep_worker_cli.config``
@@ -451,7 +455,8 @@ async def stop_task_manager(
         )
 
     # Try to stop TaskManager via fire-and-forget
-    from rpyc_async.utils.helpers import fire_and_forget_async
+    from rpyc_async.core.netref import async_call
+    from rpyc_async.utils.helpers import fire_and_forget_call
 
     # Distinguish two failure modes that used to look identical:
     #
@@ -524,8 +529,8 @@ async def stop_task_manager(
         })
 
     # Fire and forget with 5s timeout
-    fire_and_forget_async(
-        root.stop_task_manager(force=request.force),
+    fire_and_forget_call(
+        lambda: async_call(root, "stop_task_manager", force=request.force),
         timeout=5.0,
         success_callback=on_success,
         error_callback=on_error,
@@ -626,13 +631,90 @@ async def get_status(
     return response
 
 
+# ---------------------------------------------------------------------------
+# Full Dialog = static, click-time snapshot (DESIGN_FULL_DIALOG_STATIC_SNAPSHOT.md)
+# ---------------------------------------------------------------------------
+# The Full Dialog tab is ONE static ``text/plain`` document produced at the
+# moment the operator clicks the button. It carries no script, is never
+# streamed, never served from cache, and never updates itself. The two-line
+# banner below makes that contract visible in the tab (agent, verbosity, the
+# click-time stamp, and the words "never updates").
+#
+# Bounded wait: the service waits at most 30 s for the agent's history
+# (agent_service.get_agent_dialog_formatted). If the agent is busy/wedged the
+# tab must show WHY (504 + reason) instead of a generic 500, and a fetch that
+# is slow but succeeds leaves a bounded breadcrumb (elapsed time only, never
+# content) so slow-agent episodes are diagnosable from the web log.
+
+#: Fetch+render longer than this (seconds) logs one WARNING breadcrumb.
+SLOW_DIALOG_WARN_SECONDS: float = 5.0
+
+#: Bound enforced inside ``AgentService.get_agent_dialog_formatted``.
+DIALOG_HISTORY_TIMEOUT_SECONDS: int = 30
+
+
+def _snapshot_now() -> datetime:
+    """Click-time stamp: server local time with UTC offset (monkeypatchable)."""
+    return datetime.now().astimezone()
+
+
+def _snapshot_banner(agent_name: str, verbosity: str, taken_at: datetime | None = None) -> str:
+    """Two banner lines + blank separator that prefix every Full Dialog body."""
+    taken = (taken_at or _snapshot_now()).isoformat(timespec="seconds")
+    return (
+        f"=== Full Dialog snapshot: agent={agent_name}  verbosity={verbosity}  "
+        f"taken={taken} ===\n"
+        "=== Static snapshot \u2014 this page never updates. "
+        "Click \"Full Dialog\" again for a fresh one. ===\n"
+        "\n"
+    )
+
+
+_SNAPSHOT_HEADERS: dict[str, str] = {
+    # Every click is a fresh snapshot; a browser must never reuse an older
+    # cached copy (would show something other than the click-time state).
+    "Cache-Control": "no-store",
+    # Pin text/plain rendering: no MIME sniffing → no HTML/script path, ever.
+    "X-Content-Type-Options": "nosniff",
+}
+
+# Characters allowed in the download filename. Anything else becomes "_" so
+# the value can never break out of the quoted Content-Disposition parameter
+# (no quotes, no CR/LF, no ";"). See DESIGN_FULL_DIALOG_ACTION_MODE.md §3.3.
+_FILENAME_SAFE = re.compile(r"[^A-Za-z0-9_.-]")
+
+
+def _download_filename(agent_name: str, verbosity: str, taken: datetime) -> str:
+    """``dialog_<agent>_<verbosity>_<YYYYMMDD-HHMMSS>.txt`` with a sanitised agent."""
+    safe_agent = _FILENAME_SAFE.sub("_", agent_name) or "agent"
+    stamp = taken.strftime("%Y%m%d-%H%M%S")
+    return f"dialog_{safe_agent}_{verbosity}_{stamp}.txt"
+
+
 @router.get("/{agent_name}/dialog-text", response_class=PlainTextResponse)
 async def get_dialog_text(
     agent_name: str,
     verbosity: Literal["final", "text", "full", "system_prompt", "tools"] = "final",
+    download: bool = False,
+    timestamps: Literal["local", "utc"] = "local",
     service: AgentService = Depends(get_agent_service),
-) -> str:
+) -> PlainTextResponse:
     """Get full dialog text for an agent as plain text.
+
+    ``download=1`` returns the very same bytes with an additional
+    ``Content-Disposition: attachment`` header so the browser saves a
+    ``.txt`` instead of rendering a tab. This exists for screen-reader
+    users: rendering a huge plain-text document forces the browser to
+    build a full accessibility tree and serve the reader synchronously on
+    its UI thread (measured 57 s / 152 812 nodes for 150 KB), freezing the
+    whole browser. See ``docs/DESIGN_FULL_DIALOG_ACTION_MODE.md``.
+
+    The response is a STATIC SNAPSHOT taken at request (button-click) time:
+    a single ``text/plain`` document with ``Cache-Control: no-store``,
+    ``X-Content-Type-Options: nosniff`` and an explicit ``Content-Length``,
+    prefixed by a two-line banner naming the agent, the verbosity and the
+    click-time stamp. It never streams and never updates itself. See
+    ``docs/DESIGN_FULL_DIALOG_STATIC_SNAPSHOT.md``.
 
     Returns ALL messages (no artificial limit). Verbosity controls how
     each turn renders:
@@ -656,13 +738,24 @@ async def get_dialog_text(
     agent pivot?" signal after a compaction. See
     ``docs/DESIGN_SUMMARIZATION_VISIBLE.md``.
 
+    Every block header carries the message's own ``created_at``, e.g.
+    ``--- Assistant 2026-08-29 14:29:22 +02:00 ---``. ``timestamps=local``
+    (default) renders in the host timezone, ``timestamps=utc`` in UTC; the
+    zone is always printed, so a rendering cannot be misread as another
+    clock. Messages written before timestamps existed simply render without
+    one rather than showing a made-up time.
+
     Args:
         agent_name: Name of the agent.
         verbosity: Rendering verbosity (validated by FastAPI; unknown
             values cause HTTP 422).
+        timestamps: ``local`` (default) | ``utc`` — zone of the per-message
+            stamp in block headers.
 
     Raises:
-        HTTPException: 404 if agent unknown, 500 if connection fails.
+        HTTPException: 404 if agent unknown, 503 if not connected yet,
+            504 if the agent did not answer within the 30 s bound,
+            500 on any other failure.
     """
     logger.debug(f"Getting dialog text for agent: {agent_name} (verbosity={verbosity})")
 
@@ -685,19 +778,69 @@ async def get_dialog_text(
             detail=f"Agent '{agent_name}' not connected (connecting…)",
         )
 
-    # Get formatted dialog text from agent
+    # Get formatted dialog text from agent (bounded wait inside the service).
+    started = time.perf_counter()
     try:
         dialog_text = await service.get_agent_dialog_formatted(
-            agent_name, verbosity=verbosity
+            agent_name, verbosity=verbosity, timestamps=timestamps
         )
-        return dialog_text
-
+    except asyncio.TimeoutError:
+        # Agent busy/wedged: the bounded wait expired. Tell the operator WHY
+        # and that the main UI is unaffected — the tab must not look like a
+        # silent hang. Must precede the generic ``except Exception`` below.
+        elapsed = time.perf_counter() - started
+        logger.warning(
+            "Full Dialog for %s: agent did not answer get_history within %ss "
+            "(elapsed %.1fs, verbosity=%s)",
+            agent_name, DIALOG_HISTORY_TIMEOUT_SECONDS, elapsed, verbosity,
+        )
+        raise HTTPException(
+            status_code=504,
+            detail=(
+                f"Agent '{agent_name}' did not answer get_history within "
+                f"{DIALOG_HISTORY_TIMEOUT_SECONDS}s (agent busy or wedged). "
+                "The main UI is unaffected; retry later."
+            ),
+        )
+    except AgentRefusedError as e:
+        # The agent answered, and the answer was a refusal. That is an
+        # upstream failure, not a fault of this server: 500 sent operators
+        # hunting a web bug that was not there. 502 says "the peer refused",
+        # and the detail carries the agent's own words verbatim.
+        #
+        # Deliberately a dedicated type, not bare ValueError: any other
+        # ValueError from this path is a genuine server-side bug and must
+        # keep returning 500 (see test_generic_error_still_500).
+        logger.warning("Dialog text for %s refused by agent: %s", agent_name, e)
+        raise HTTPException(
+            status_code=502,
+            detail=f"Agent '{agent_name}' could not return its dialog: {e}",
+        )
     except Exception as e:
         logger.error(f"Error getting dialog text for {agent_name}: {e}", exc_info=True)
         raise HTTPException(
             status_code=500,
             detail=f"Error getting dialog: {str(e)}",
         )
+
+    elapsed = time.perf_counter() - started
+    if elapsed > SLOW_DIALOG_WARN_SECONDS:
+        # Bounded breadcrumb: sizes/times only, never content.
+        logger.warning(
+            "Full Dialog for %s was slow: %.1fs (verbosity=%s, %d chars)",
+            agent_name, elapsed, verbosity, len(dialog_text),
+        )
+
+    taken = _snapshot_now()
+    headers = dict(_SNAPSHOT_HEADERS)
+    if download:
+        headers["Content-Disposition"] = (
+            f'attachment; filename="{_download_filename(agent_name, verbosity, taken)}"'
+        )
+    return PlainTextResponse(
+        _snapshot_banner(agent_name, verbosity, taken) + dialog_text,
+        headers=headers,
+    )
 
 
 # ===========================================================================
@@ -730,13 +873,11 @@ def load_launch_config(agent_name: str) -> dict[str, Any] | None:
     """Load launch_config from session_metadata.json."""
     import json
 
-    data_dir = deep_worker_home() / agent_name
-    metadata_file = data_dir / "session_metadata.json"
-
-    if not metadata_file.exists():
+    raw = read_agent_file(agent_name, "session_metadata.json")
+    if raw is None:
         return None
     try:
-        data = json.loads(metadata_file.read_text())
+        data = json.loads(raw)
         cfg = data.get("launch_config")
         return cfg if isinstance(cfg, dict) else None
     except (json.JSONDecodeError, OSError):
@@ -817,6 +958,10 @@ def _spawn_subprocess(
     for _server in config.get("mcp_server_inline", []) or []:
         cmd += ["--mcp-server", str(_server)]
 
+    _context_limit = config.get("context_limit")
+    if isinstance(_context_limit, int):
+        cmd += ["--context_limit", str(_context_limit)]
+
     if clean:
         cmd.append("--clean")
 
@@ -824,24 +969,24 @@ def _spawn_subprocess(
     #
     # The agent's ORIGINAL tree is authoritative, NOT the web server's. An
     # agent launched with ``--dev`` (dev codebase) must be RESTARTED on the
-    # dev codebase even when the restart is driven by the PROD web UI,
+    # dev codebase even when the restart is driven by the PROD web UI (:7887),
     # and vice-versa. We persist that choice as ``launch_config['dev_tree']``
     # (build_launch_config), so honor it here. Previously this hard-coded the
     # tree to the web server's OWN checkout (``__file__``), so restarting a
     # ``--dev`` agent from the prod web UI silently dropped ``--dev`` and
-    # respawned it on prod — the bug this fixes. It also meant the
+    # respawned it on prod — the bug this fixes (2026-05-23). It also meant the
     # dev web server stamped DEEP_WORKER_DEV_TREE=1 onto EVERY agent it spawned,
     # even non-dev ones. The CLI ``deep-worker --restart`` launcher already
     # auto-detects dev_tree; this brings the web path in line. See
     # docs/DESIGN_DEV_FLAG.md.
     #
-    # __file__ here = <WEB_TREE>/<web-package>/app/routers/agents.py;
+    # __file__ here = <WEB_TREE>/deep_worker_web/app/routers/agents.py;
     # parent x4 = <WEB_TREE> — the fallback tree for non-dev agents (prod when
     # the web server runs from the production tree).
     _web_tree_root = Path(__file__).resolve().parent.parent.parent.parent
     if config.get("dev_tree"):
         # DEEP_WORKER_DEV_TREE_ROOT_OVERRIDE mirrors the bash launcher's
-        # testing hook so tests don't need a real dev tree on disk.
+        # testing hook so tests don't need a real dev tree.
         _tree_root = Path(
             os.environ.get(
                 "DEEP_WORKER_DEV_TREE_ROOT_OVERRIDE", "/nonexistent/dev-tree"

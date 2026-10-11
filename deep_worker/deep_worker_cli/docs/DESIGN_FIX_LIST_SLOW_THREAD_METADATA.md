@@ -19,12 +19,12 @@ FROM checkpoints
 GROUP BY thread_id;
 ```
 
-Measured on the live box (`~/.deepagents/`):
+Measured on the live box (the legacy ancestor tree, since removed — POLICIES §16):
 
 - 104 `sessions_*.db` files, **17 GB total** (largest 3.3 / 2.4 / 1.7 GB).
 - `checkpoints` holds one row per checkpoint per turn; each row carries a
   `checkpoint` BLOB averaging **~65–126 KB**. Example
-  `sessions_<agent>.db` = 3.3 GB, **13 184 rows, only 2 threads**.
+  the largest per-agent DB = 3.3 GB, **13 184 rows, only 2 threads**.
 - `GROUP BY thread_id` + `MAX(json_extract(metadata…))` forces a full read
   of every row. `EXPLAIN QUERY PLAN` →
   `SCAN checkpoints USING INDEX sqlite_autoindex_checkpoints_1`: it walks
@@ -65,8 +65,8 @@ Across all 104 DBs:
   (`LEFT JOIN … WHERE m.thread_id IS NULL` → 0 everywhere the table exists).
   So where the table exists it is **complete** — no thread is lost.
 - DBs **without** the `thread_metadata` table at all: a set of old/legacy and
-  throwaway test DBs (`sessions_<agent_a/b/c>.db`, `sessions_<web>.db`,
-  `sessions_<test>.db`, `sessions_<unit>.db`, several `sessions_test_*`),
+  throwaway test DBs (`sessions_d1/d2/d3.db`, `sessions_lc1_web.db`,
+  `sessions_lc3_test.db`, a unit-test DB, several `sessions_test_*`),
   most of which are empty. These are the only gap.
 
 ## Decision
@@ -205,8 +205,9 @@ No change to `format_threads_text` / `format_threads_json` — same dict shape.
 
 The code change makes `--list` self-healing (first run backfills, subsequent
 runs are instant). To guarantee the **very first** post-deploy `--list` is
-also fast, run the backfill once over the live `~/.deepagents/sessions_*.db`
-gap set as part of rollout (the integration test exercises the same helper).
+also fast, run the backfill once over the live per-agent checkpoint DBs under
+`~/.deep_worker/` for the gap set as part of rollout (the integration test
+exercises the same helper).
 
 ## Out of scope / non-goals
 
@@ -231,7 +232,7 @@ Unit (`tests/unit_tests/` or `tests/unit/cli/`):
    legacy backfilled rows (single-thread BLOB count fallback).
 5. Multi-`checkpoint_ns` thread aggregates to one row (SUM counts, MAX ts).
 
-Integration (no mocks): build a real multi-DB `~/.deepagents`-like dir with
+Integration (no mocks): build a real multi-DB agent-home-like dir with
 the delta checkpointer, plus one legacy DB with no `thread_metadata`, run the
 real `deep-worker --list` subprocess, assert output correctness and that a
 second run does no backfill writes.

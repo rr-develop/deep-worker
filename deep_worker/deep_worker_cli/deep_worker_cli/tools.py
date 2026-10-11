@@ -1,16 +1,15 @@
 """Custom tools for the CLI agent."""
 
 import logging
-import os
 import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 import requests
-from langchain_core.tools import BaseTool, tool
+from langchain_core.tools import BaseTool, InjectedToolCallId, tool
 from markdownify import markdownify
 from pydantic import BaseModel, Field
 from tavily import (
@@ -66,7 +65,7 @@ class WebSearchAvailability:
     """Result of resolving the universal web-search tool under a policy."""
 
     tool: BaseTool | None
-    reason: str  # "available" | "sdk_missing" | "sdk_incompatible" | "disabled"
+    reason: str  # "available" | "sdk_missing" | "sdk_incompatible" | "provider_missing" | "disabled"
     remedy: str | None
 
 
@@ -103,6 +102,31 @@ def _sdk_fork_status() -> tuple[str, str | None]:
     return "ok", None
 
 
+_WEB_SEARCH_PROVIDER = "deep_worker.providers.claude_code_sdk_provider.web_search"
+
+
+def _web_search_provider_status() -> tuple[str, str | None]:
+    """Return ``(status, remedy)`` for the package that hosts the tool.
+
+    The delegation tool lives in the claude-code-sdk provider, which is not
+    part of every distribution. Its absence is a missing capability
+    (``"provider_missing"``), not a defect; a broken submodule of a present
+    provider is re-raised.
+    """
+    try:
+        import deep_worker.providers.claude_code_sdk_provider.web_search  # noqa: PLC0415, F401
+    except ModuleNotFoundError as exc:
+        name = exc.name or ""
+        if name == _WEB_SEARCH_PROVIDER or _WEB_SEARCH_PROVIDER.startswith(name + "."):
+            return (
+                "provider_missing",
+                "The web_search delegation tool requires the claude-code-sdk "
+                "provider, which is not part of this distribution.",
+            )
+        raise
+    return "ok", None
+
+
 def resolve_web_search_tool(
     policy: WebSearchPolicy | str = WebSearchPolicy.AUTO,
 ) -> WebSearchAvailability:
@@ -127,6 +151,8 @@ def resolve_web_search_tool(
         return WebSearchAvailability(None, "disabled", None)
 
     status, remedy = _sdk_fork_status()
+    if status == "ok":
+        status, remedy = _web_search_provider_status()
     if status != "ok":
         if policy is WebSearchPolicy.ENABLED:
             raise CapabilityError(capability="web_search", remedy=remedy)
@@ -142,7 +168,7 @@ def resolve_web_search_tool(
             _web_search_warned_once = True
         return WebSearchAvailability(None, status, remedy)
 
-    from deep_worker.providers.claude_code_provider.web_search import (  # noqa: PLC0415
+    from deep_worker.providers.claude_code_sdk_provider.web_search import (  # noqa: PLC0415
         WebSearchDelegationTool,
     )
 
@@ -466,14 +492,19 @@ def make_restart_agent_tool(sender_name: str) -> BaseTool:
 
         registry = ProcessRegistry()
         existing = registry.lookup(target)
-        if existing is not None:
-            return {
-                "success": True,
-                "agent_name": target,
-                "already_running": True,
-                "error": "already_running",
-                "message": f"Agent '{target}' is already running (PID {existing.pid}).",
-            }
+        # A running agent is NOT a reason to bail out. This tool documents
+        # itself as the equivalent of ``deep-worker --restart <name>``, and
+        # that path deliberately stops a live agent (``force=True``) before
+        # relaunching it — restarting a busy agent is what the destructive
+        # tool is *for*, and the only way to interrupt a stuck turn.
+        #
+        # Returning early here degraded the tool into "start it if it is
+        # dead": a live agent was never restarted, so a caller asking for
+        # fresh code kept talking to the old process. It also returned
+        # ``success=True`` alongside ``error="already_running"``, so the
+        # refusal read as success (owner report, 2026-09-26: rg1_worker could
+        # not be moved onto the status fix).
+        previous_pid = existing.pid if existing is not None else None
 
         command = shutil.which("deep-worker")
         if command is None:
@@ -516,12 +547,32 @@ def make_restart_agent_tool(sender_name: str) -> BaseTool:
 
         # Linux inotify + asyncio to watch the registry file for changes.
         info = await registry.wait_for_registration(target, timeout=30)
+        # Seeing the *same* PID we set out to replace is not a restart: the
+        # wait can resolve against the still-present entry of the old
+        # process. Reporting that as success would promise fresh code while
+        # the old process is still serving.
+        if info is not None and info.pid == previous_pid:
+            return {
+                "success": False,
+                "agent_name": target,
+                "already_running": False,
+                "error": "restart_timeout",
+                "message": (
+                    f"Agent '{target}' still runs the previous process "
+                    f"(PID {previous_pid}); restart did not replace it."
+                ),
+                "previous_pid": previous_pid,
+                "stdout": completed.stdout,
+                "stderr": completed.stderr,
+            }
         if info is not None:
             return {
                 "success": True,
                 "agent_name": target,
                 "already_running": False,
                 "message": f"Agent '{target}' restarted and registered (PID {info.pid}).",
+                "restarted_pid": info.pid,
+                "previous_pid": previous_pid,
                 "stdout": completed.stdout,
                 "stderr": completed.stderr,
             }
@@ -552,7 +603,7 @@ def make_restart_agent_tool(sender_name: str) -> BaseTool:
 
 
 # ===========================================================================
-# SELF-RESTART TOOL (a related issue)
+# SELF-RESTART TOOL (Issue #89)
 # ===========================================================================
 
 
@@ -583,6 +634,21 @@ def write_restart_notice(data_dir: Path, *, cause: str, message: str) -> Path:
     return notice_path
 
 
+def _is_executable(path: Path) -> bool:
+    """True if ``path`` is a file with an execute bit set.
+
+    Used by ``restart_self`` to pre-flight the driver. Written against
+    ``Path`` rather than ``os.access`` on purpose: ``tools.py`` must not
+    import ``os`` at all, since the only thing it was ever used for in this
+    module was the hard-exit that fabricated the false denial, and a test
+    pins the import's absence.
+    """
+    try:
+        return path.is_file() and bool(path.stat().st_mode & 0o111)
+    except OSError:
+        return False
+
+
 def make_restart_self_tool(sender_name: str) -> BaseTool:
     """Create a tool that allows an agent to restart its own process.
 
@@ -608,7 +674,9 @@ def make_restart_self_tool(sender_name: str) -> BaseTool:
     """
 
     @tool("restart_self")
-    async def restart_self() -> dict[str, Any]:
+    async def restart_self(
+        tool_call_id: Annotated[str, InjectedToolCallId],
+    ) -> dict[str, Any]:
         """Restart your own agent process synchronously.
 
         This is a regular tool — it does NOT defer anything. The agent
@@ -622,12 +690,36 @@ def make_restart_self_tool(sender_name: str) -> BaseTool:
           a restart to take effect.
         - Do NOT use for speculative cleanup, housekeeping, or optimization.
         """
-        from deep_worker_cli.storage_paths import deep_worker_home
-        data_dir = deep_worker_home() / sender_name
+        from deep_worker_cli.storage_paths import agent_root
+        from deep_worker_cli.process.self_restart_barrier import (
+            arm_self_restart,
+            self_restart_delivery_available,
+        )
+        from deep_worker_cli.process.self_restart_token import (
+            mint_self_restart_token,
+        )
+
+        # The barrier fires on the checkpointer's commit, which is the same
+        # path for every provider — so there is no provider gate here. What
+        # IS required is a durable commit to fire on: under --memory-only or
+        # in tests the checkpointer is an InMemorySaver with no commit, and a
+        # restart could never be confirmed. Fail BEFORE notice/token/arm so
+        # that case cannot report success and then silently disarm.
+        if not self_restart_delivery_available():
+            return {
+                "success": False,
+                "error": "no_delivery_signal",
+                "message": (
+                    "restart_self is unavailable: this process has no "
+                    "committing checkpointer, so the tool result could "
+                    "never be confirmed as part of the model's context."
+                ),
+            }
 
         # 1. Write the restart-notice the new process will consume (shared
         #    writer — same format used by provider failover).
         try:
+            data_dir = agent_root(sender_name)
             notice_path = write_restart_notice(
                 data_dir,
                 cause="self",
@@ -656,55 +748,109 @@ def make_restart_self_tool(sender_name: str) -> BaseTool:
                 ),
             }
 
-        # 3. Spawn the restart subprocess SYNCHRONOUSLY. After this
-        #    Popen returns the replacement process is already
-        #    fork/exec'd and will start independently.
+        # 3. Mint the one-time capability that authorizes stopping this
+        #    process mid-turn. Written into THIS agent's private data dir
+        #    (0600), so only code already running as the agent can produce
+        #    it. ``stop_agent`` consumes it exactly once. Without it a bare
+        #    ``--self-requested`` from an external shell is refused, so the
+        #    waiver is not a public bypass of the active-turn guard.
         try:
-            subprocess.Popen(
-                [cmd, "--restart", sender_name],
-                start_new_session=True,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+            token = mint_self_restart_token(data_dir)
+        except OSError as exc:
+            return {
+                "success": False,
+                "error": "notice_write_error",
+                "message": f"Cannot write self-restart token: {exc}",
+            }
+
+        # 4. Arm the restart, but DO NOT spawn the driver yet.
+        #
+        # ⚠️ DELIVERY RACE — why the spawn is deferred.
+        #
+        # The driver is a separate process. Spawning it here starts a race
+        # against our own tool result: the driver can pass ``stop_agent``
+        # and land SIGTERM before this result has been recorded in the
+        # model's context. ``return`` establishes no happens-before with
+        # delivery. If the process dies first, the transcript holds a
+        # ``tool_use`` whose result never came and records the SAME
+        # fabricated denial this fix exists to remove — just through a
+        # narrower window.
+        #
+        # So the spawn is handed to the delivery barrier, which fires it
+        # only after the result has been recorded in the context. See
+        # ``arm_self_restart`` and DESIGN_RESTART_SELF_FALSE_DENIAL.md §4.
+        # Deferring the spawn also defers any spawn ERROR past the point
+        # where this tool can report it — by the time the barrier fires,
+        # the result the model sees is already written. Pre-flight the
+        # driver here so the ordinary failure (missing/non-executable
+        # binary) is still reported synchronously and truthfully, instead
+        # of returning "success" and dying quietly in a log line.
+        # NB: deliberately NOT ``os.access`` — ``tools.py`` must not import
+        # ``os`` at all, because the only thing it was ever used for here
+        # was the hard-exit that caused this bug, and a test pins its
+        # absence. ``Path`` gives the same answer.
+        if not _is_executable(Path(cmd)):
+            return {
+                "success": False,
+                "error": "spawn_failed",
+                "message": (
+                    f"deep-worker at {cmd} is not executable; "
+                    f"cannot perform restart."
+                ),
+            }
+
+        # Armed BOUND: ``tool_call_id`` is injected by LangChain, so this
+        # call knows its own identity without a transport layer supplying
+        # one. The barrier fires only when a checkpoint commit carries this
+        # exact id, so a concurrent tool's commit cannot stop the process
+        # while this result is still unrecorded.
+        try:
+            arm_self_restart(
+                [cmd, "--restart", sender_name,
+                 "--self-requested", "--self-requested-token", token],
+                tool_call_id,
             )
         except OSError as exc:
             return {
                 "success": False,
                 "error": "spawn_failed",
-                "message": f"Could not spawn deep-worker --restart: {exc}",
+                "message": f"Could not arm deep-worker --restart: {exc}",
             }
 
-        # 4. ⚠️ CRITICAL — sever the current LangGraph turn IMMEDIATELY.
+        # 5. Return normally. The driver is fired by the delivery barrier
+        #    once this result has been delivered, and only then stops us.
         #
-        # Without this hard-exit the *old* process would keep running:
-        #   - The LLM stream would finalise the assistant message,
-        #   - The turn would commit to the checkpointer,
-        #   - The *new* process, once started, would observe a fully-
-        #     ended turn and its auto-continuation would be treated as
-        #     a *separate* idle-state turn — exactly the failure mode
-        #     reported on 2026-06-12 ("I don't see that you
-        #     restarted … after that you're in idle, which is NOT RIGHT").
+        # ⚠️ HISTORY — why there is no ``os._exit(0)`` here any more.
         #
-        # Behaviour with hard-exit:
-        #   - The old process dies before LangGraph commits the turn,
-        #   - The checkpointer keeps the last state (pre-tool, with the
-        #     restart_self tool call pending),
-        #   - The new process resumes from that state, consumes the
-        #     restart-notice, and its auto-continuation IS the same
-        #     logical turn — continuing work, not "idle + notice".
+        # This used to hard-exit so the old process could not finalise the
+        # turn. That severed the in-process MCP server (``create_sdk_mcp_
+        # server`` lives in THIS process) before the tool result reached the
+        # CLI. The CLI saw a ``tool_use`` whose result never came, recorded
+        # ``toolDenialKind: "user-rejected"`` and fed the model a fabricated
+        # "The user doesn't want to proceed with this tool use", plus a
+        # "[Request interrupted by user for tool use]" line. Both are
+        # replayed into the next process on resume. 5 of 5 historical
+        # restarts were mis-recorded this way; the user had denied nothing.
+        # See DESIGN_RESTART_SELF_FALSE_DENIAL.md.
         #
-        # We use ``os._exit`` (not ``sys.exit``) so no atexit handlers,
-        # asyncio cleanup, or finally-blocks run — anything that tries
-        # to commit state in this process MUST NOT do so. The
-        # checkpointer's last write (from before this tool call) is the
-        # one the new process will read.
+        # ⚠️ INVARIANT PRESERVED (incident 2026-06-12 — "after this you are
+        # in idle, which is WRONG"): the new process must CONTINUE the pending
+        # task, not wake up idle. That invariant does NOT depend on killing
+        # this process: it is carried by ``.restart_notice.json`` written in
+        # step 1. ``AgentProcess.start`` consumes the notice and schedules
+        # ``_auto_continue_after_restart`` unconditionally on its presence
+        # (agent_process.py §7.1) — it never inspects whether the previous
+        # turn was committed. Pinned by
+        # ``test_restart_self_turn_continues_not_idle``.
         #
-        # The return value below is unreachable in production; it
-        # remains for tests that patch ``os._exit`` and for the
-        # signature contract.
-        os._exit(0)
-
-        return {  # pragma: no cover  -- unreachable in production
+        # The ARMED driver stops this process via SIGTERM (with
+        # ``--self-requested`` + its one-time token waiving the "actively
+        # running" guard, which would otherwise refuse a restart requested
+        # mid-turn). It is spawned only after this result has been written
+        # to the CLI — see ``self_restart_barrier`` — so the result cannot
+        # lose a race against our own SIGTERM and the transcript records
+        # what actually happened.
+        return {
             "success": True,
             "message": (
                 f"Agent '{sender_name}' is being restarted now. "
@@ -976,6 +1122,20 @@ def make_send_message_to_agent_tool(sender_name: str) -> BaseTool:
                     "reply_back": reply_back,
                 })
                 if not resp.get("success"):
+                    # A duplicate refusal is a POLICY outcome, not a transport
+                    # fault. Passing it through as connection_failed would
+                    # invite exactly the wrong reaction — a retry — when the
+                    # message has in fact already been received.
+                    if resp.get("error") == "duplicate_message":
+                        return {
+                            "success": False,
+                            "error": "duplicate_message",
+                            "message": str(
+                                resp.get("message")
+                                or f"'{target}' already has this message in its "
+                                "context; automatic resends are forbidden."
+                            ),
+                        }
                     return {
                         "success": False,
                         "error": "connection_failed",

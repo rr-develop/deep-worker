@@ -19,8 +19,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-pytest.importorskip("claude_agent_sdk")  # optional private fork; skip when absent
-
 from deep_worker_cli.config import WebSearchPolicy
 from deep_worker_cli.exceptions import CapabilityError
 from deep_worker_cli.tools import (
@@ -105,51 +103,39 @@ def test_enabled_sdk_incompatible_raises_capability_error() -> None:
 
 
 # ---------------------------------------------------------------------------
-# available path
+# provider package absent (distribution without claude_code_sdk_provider)
 # ---------------------------------------------------------------------------
 
 
-def test_auto_available_builds_tool() -> None:
-    fake_tool = MagicMock()
+def test_auto_provider_missing_skips_tool() -> None:
     with patch(
         "deep_worker_cli.tools._sdk_fork_status", return_value=("ok", None),
     ), patch(
-        "deep_worker.providers.claude_code_provider.web_search.WebSearchDelegationTool",
-        return_value=fake_tool,
+        "deep_worker_cli.tools._web_search_provider_status",
+        return_value=("provider_missing", "provider not shipped"),
     ):
         avail = resolve_web_search_tool(WebSearchPolicy.AUTO)
-    assert avail.tool is fake_tool
-    assert avail.reason == "available"
-    assert avail.remedy is None
+    assert avail.tool is None
+    assert avail.reason == "provider_missing"
+    assert avail.remedy == "provider not shipped"
 
 
-def test_enabled_available_builds_tool() -> None:
-    fake_tool = MagicMock()
+def test_enabled_provider_missing_raises_capability_error() -> None:
     with patch(
         "deep_worker_cli.tools._sdk_fork_status", return_value=("ok", None),
     ), patch(
-        "deep_worker.providers.claude_code_provider.web_search.WebSearchDelegationTool",
-        return_value=fake_tool,
+        "deep_worker_cli.tools._web_search_provider_status",
+        return_value=("provider_missing", "provider not shipped"),
     ):
-        avail = resolve_web_search_tool(WebSearchPolicy.ENABLED)
-    assert avail.tool is fake_tool
-    assert avail.reason == "available"
+        with pytest.raises(CapabilityError) as exc_info:
+            resolve_web_search_tool(WebSearchPolicy.ENABLED)
+    assert exc_info.value.capability == "web_search"
+    assert exc_info.value.remedy == "provider not shipped"
 
 
 # ---------------------------------------------------------------------------
 # string coercion + unknown values
 # ---------------------------------------------------------------------------
-
-
-def test_string_policy_coercion() -> None:
-    with patch(
-        "deep_worker_cli.tools._sdk_fork_status", return_value=("ok", None),
-    ), patch(
-        "deep_worker.providers.claude_code_provider.web_search.WebSearchDelegationTool",
-        return_value=MagicMock(),
-    ):
-        avail = resolve_web_search_tool("enabled")
-    assert avail.reason == "available"
 
 
 def test_unknown_policy_raises_value_error() -> None:

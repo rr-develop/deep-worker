@@ -5,8 +5,9 @@
 **Date:** 2026-04-23
 **Motivated by:** 2026-04-23 incident — `deep-worker --remove-before 2030-01-01`
 ran against real `$HOME` during an ad-hoc integration probe, deleted 24
-threads / 13580 checkpoints from all `~/.deepagents/sessions_*.db` files
-across every agent. Data was not recoverable through the live SQL table
+threads / 13580 checkpoints from every `sessions_*.db` file in the legacy
+ancestor tree (since removed — POLICIES §16), across every agent. Data was
+not recoverable through the live SQL table
 (though raw pages survive in the file as free pages). Root cause: the CLI
 happily accepts any ISO-8601 or relative date without sanity-checking that
 it is in the past — `2030-01-01`, being in the future, matches every
@@ -17,10 +18,11 @@ existing thread's `updated_at`, effectively meaning "delete everything".
 ## 1. Problem
 
 `deep-worker --remove-before DATE` is a globally-scoped destructive
-command. It sweeps every `sessions_*.db` under `~/.deepagents/` plus the
-legacy global `sessions.db` plus (after commit `41703a1`) every
-`~/.deep_worker/<agent>/summaries/` file, dropping anything whose
-`updated_at < DATE`.
+command. It sweeps every per-agent checkpoint DB under `~/.deep_worker/`
+plus (after commit `41703a1`) every `~/.deep_worker/<agent>/summaries/`
+file, dropping anything whose `updated_at < DATE`. At the time of the
+incident the sweep also covered the legacy ancestor tree's `sessions_*.db`
+and global `sessions.db`, which have since been removed (POLICIES §16).
 
 The CLI today has only one guard: `--dry-run`. It has **no** guard for
 the common mistake of supplying a future cutoff, which is semantically
@@ -187,7 +189,7 @@ File: `deep_worker_cli/tests/unit/cli/test_remove_before_future_guard.py`.
    verify the misparse immediately.
 
 All six tests run in `monkeypatch.setenv("HOME", str(tmp_path))` so they
-do not touch the real `~/.deepagents`. No subprocess, no RPyC, no LLM.
+do not touch the real `~/.deep_worker`. No subprocess, no RPyC, no LLM.
 
 ---
 
@@ -206,7 +208,7 @@ code path is unchanged when `force=True` or `cutoff <= now`.
 - [ ] 6 new unit tests pass.
 - [ ] Full test suite stays green.
 - [ ] README "Thread management commands" block warns about
-      `~/.deepagents/` global scope and forbids ad-hoc invocation
+      `~/.deep_worker/` global scope and forbids ad-hoc invocation
       outside `HOME`-isolated tests.
 
 ---

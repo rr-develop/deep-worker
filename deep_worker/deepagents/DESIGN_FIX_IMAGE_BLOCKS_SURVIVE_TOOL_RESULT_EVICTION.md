@@ -6,7 +6,7 @@ Related, already committed: `b6bdb81` (Claude transcript synthesis) — a *diffe
 
 ## 1. User-visible symptom
 
-`mcp__deepworker__read_image` never shows the model an image. On a claude-code
+`mcp__deepworker__read_image` never shows the model an image. On a claude-code-sdk
 agent the standard MCP path produces a tool result that the model can only see
 as a Python `repr` preview, e.g.
 
@@ -50,7 +50,7 @@ there is no block left to convert, only a string.
 ### 2.1 Why this is provider-agnostic
 
 The eviction middleware runs in `deepagents`, above the provider layer. Every
-provider loses the image identically. claude-code additionally suffered a 400
+provider loses the image identically. claude-code-sdk additionally suffered a 400
 when such a block reached a synthesized transcript verbatim — that separate
 defect is already fixed by `b6bdb81` and is **not** re-litigated here.
 
@@ -302,7 +302,7 @@ Permanent gated proof — must traverse the **real seam**
     semantic recognition — proving sensitivity to this exact source change.
 
 Manual acceptance evidence (user-requested, not a committed test):
-28. A real claude-code agent reads **each** file in a local test directory via the
+28. A real claude-code-sdk agent reads **each** file in a local test directory via the
     standard MCP path and names its actual visible content. Generic answers,
     refusals, or describing a "list"/"data URL" count as failure. Recorded in the
     report.

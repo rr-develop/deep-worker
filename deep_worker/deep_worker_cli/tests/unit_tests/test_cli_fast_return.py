@@ -111,7 +111,7 @@ def _kill_agent(name: str) -> None:
 
 
 def _remove_agent_data(name: str) -> None:
-    data_dir = deep_worker_home() / name
+    data_dir = deep_worker_home() / "agents" / name
     if data_dir.exists():
         shutil.rmtree(data_dir, ignore_errors=True)
     log_dir = deep_worker_home() / "logs"
@@ -179,7 +179,7 @@ def _run_cli_with_budget(args: list[str]) -> tuple[float, subprocess.CompletedPr
     shutil.which("deep-worker") is None,
     reason="deep-worker binary not in PATH; smoke test only runs in an installed env",
 )
-def test_dw_clean_returns_control_within_budget(agent_name: str) -> None:
+def test_deep_worker_clean_returns_control_within_budget(agent_name: str) -> None:
     """The exact user scenario: ``deep-worker <name> -asm --dir /tmp --clean``
     must return control to the shell within ``_FAST_RETURN_BUDGET_SECONDS``.
 
@@ -221,7 +221,7 @@ def test_dw_clean_returns_control_within_budget(agent_name: str) -> None:
     shutil.which("deep-worker") is None,
     reason="deep-worker binary not in PATH",
 )
-def test_dw_without_clean_returns_control_within_budget(
+def test_deep_worker_without_clean_returns_control_within_budget(
     agent_name: str,
 ) -> None:
     """Same fast-return guarantee without ``--clean``. Catches a
@@ -243,7 +243,7 @@ def test_dw_without_clean_returns_control_within_budget(
     shutil.which("deep-worker") is None,
     reason="deep-worker binary not in PATH",
 )
-def test_dw_help_is_instant() -> None:
+def test_deep_worker_help_is_instant() -> None:
     """``deep-worker --help`` must return fast. Catches regressions
     where something heavy creeps into the CLI module's top-level
     imports.

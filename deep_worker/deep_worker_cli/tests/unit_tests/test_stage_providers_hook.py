@@ -38,11 +38,12 @@ _DWC = Path(__file__).resolve().parents[2]
 HOOK_PATH = _DWC / "hooks" / "stage_providers.py"
 
 PROVIDER_PACKAGES = [
-    "claude_code_provider",
     "codex_provider",
     "grok_provider",
     "semantic_search",
     "deepworker_a2a",
+    "acp",
+    "claude_code_provider",
 ]
 
 
@@ -563,7 +564,7 @@ def test_initialize_wheel_force_include(tree: tuple[Path, Path]) -> None:
     build_data = _build_data()
     hook.initialize(version="0.0.0", build_data=build_data)
     fi = build_data["force_include"]
-    assert len(fi) == 7, fi
+    assert len(fi) == 8, fi
     for pkg in PROVIDER_PACKAGES:
         assert f"deep_worker/providers/{pkg}" in fi.values(), pkg
     assert "deep_worker/__init__.py" in fi.values()

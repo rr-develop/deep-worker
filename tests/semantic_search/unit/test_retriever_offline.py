@@ -13,9 +13,15 @@ HEAD/metadata/download request, so a transient HF Hub outage can never hang an
 agent turn.
 
 These tests patch the *boundary* (the ``HuggingFaceEmbedding`` symbol imported
-inside ``search``) and assert on the kwargs it receives — they do NOT mock the
-unit under test (``search``/the retriever logic). The cached-embedder branch is
-exercised by clearing the process-wide ``_embedding_cache`` first.
+inside the shared resolver ``_embed_cache.resolve_embed_model``) and assert on
+the kwargs it receives — they do NOT mock the unit under test (``search``/the
+retriever logic). The cached-embedder branch is exercised by clearing the
+process-wide cache via its public test hook first.
+
+NOTE: prior to the §7.1 hoist (see a related internal incident analysis, not
+included here) the cache lived at ``retriever._embedding_cache``. It now lives at
+``_embed_cache._embedding_cache`` and is cleared via
+``_embed_cache._reset_cache_for_tests()``; this file was updated to follow.
 """
 
 from __future__ import annotations
@@ -26,6 +32,7 @@ from unittest.mock import MagicMock, patch
 from llama_index.core.embeddings.mock_embed_model import MockEmbedding
 
 import deep_worker.providers.semantic_search.retriever as retriever
+from deep_worker.providers.semantic_search import _embed_cache
 from deep_worker.providers.semantic_search.retriever import search
 
 
@@ -46,8 +53,10 @@ def _patched_search(tmp_path: Path, embed_spy: MagicMock) -> MagicMock:
     _make_indexed_repo(tmp_path)
 
     # Force the embedder-construction branch: empty the process-wide cache so
-    # ``search`` does NOT reuse a previously built embedder.
-    retriever._embedding_cache.clear()
+    # ``search`` does NOT reuse a previously built embedder. The cache lives
+    # in the shared resolver (``_embed_cache``); ``retriever._index_cache``
+    # is a separate per-repo LanceDB/StorageContext cache and stays local.
+    _embed_cache._reset_cache_for_tests()
     retriever._index_cache.clear()
 
     node_with_score = MagicMock()

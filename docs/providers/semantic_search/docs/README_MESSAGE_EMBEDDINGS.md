@@ -24,7 +24,7 @@ token-accurate windows; the windows are combined as
 ```python
 from semantic_search import embed_history_messages
 
-embs, lens = embed_history_messages("~/.deep_worker/<agent>/summaries")
+embs, lens = embed_history_messages("/home/<user>/.deep_worker/<agent>/summaries")
 # embs: torch.float32 (N, dim), rows L2-normalised
 # lens: torch.int64  (N,)  — token length per message
 ```
@@ -45,7 +45,7 @@ from semantic_search import (
     message_embeddings_exist,
 )
 
-summaries = "~/.deep_worker/<agent>/summaries"
+summaries = "/home/<user>/.deep_worker/<agent>/summaries"
 
 # First run: full build (slow, one-time). Later runs: only new messages.
 stats = build_message_embeddings(summaries)

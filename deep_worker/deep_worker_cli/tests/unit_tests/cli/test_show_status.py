@@ -35,7 +35,7 @@ def _fake_metadata(**over: Any) -> dict[str, Any]:
         "rpyc_port": 47555,
         "agent_type": "deep-worker",
         "model": "opus",
-        "provider": "claude-code",
+        "provider": "claude-code-sdk",
     }
     base.update(over)
     return base

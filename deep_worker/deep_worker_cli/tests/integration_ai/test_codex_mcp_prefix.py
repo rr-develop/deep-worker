@@ -2,11 +2,11 @@
 
 These tests spawn a REAL ``codex`` agent via :func:`agent_fixture`
 (no mocks, no patches). They exercise the same scenarios used for
-``claude_code_provider`` in
+``claude_code_sdk_provider`` in
 ``test_claude_code_mcp_prefix.py``, so we can compare behaviour
 across providers and catch any provider-specific MCP-bridge
 regressions analogous to the ``mcp__deepworker__`` / sequential
-dispatch bugs fixed for ``claude_code_provider``.
+dispatch bugs fixed for ``claude_code_sdk_provider``.
 
 Architectural difference
 ========================

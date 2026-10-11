@@ -1,12 +1,12 @@
 """Provider-from-wheel artifact positive-path tests (REAL build + clean venv).
 
-Exercises the artifact acceptance gates for BOTH artifacts (monorepo wheel
-AND sdist-derived wheel):
+Exercises the artifact acceptance gates for BOTH artifacts (monorepo wheel AND sdist-derived wheel):
 
 - archive-assert — NO top-level provider dirs
-  (``claude_code_provider/``, ``codex_provider/``, ``grok_provider/``,
-  ``semantic_search/``, ``deepworker_a2a/``) in wheel OR sdist; the wheel
-  rebuilt from the sdist passes the same assert again;
+  (``codex_provider/``, ``grok_provider/``,
+  ``semantic_search/``, ``deepworker_a2a/``, ``acp/``,
+  ``claude_code_provider/``) in wheel OR sdist; the wheel rebuilt from
+  the sdist passes the same assert again;
 - sdist carries the verified ``vendor_staging/`` payload + ``staging.manifest.json``
   so an extracted-sdist wheel rebuild is self-sufficient (no ``../../``);
 - from the isolated venv, ``deep_worker.providers.<pkg>`` imports
@@ -43,11 +43,12 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 REPO_ROOT = PROJECT_ROOT.parent.parent
 
 PROVIDER_PACKAGES = [
-    "claude_code_provider",
     "codex_provider",
     "grok_provider",
     "semantic_search",
     "deepworker_a2a",
+    "acp",
+    "claude_code_provider",
 ]
 TOP_LEVEL_PROVIDER_DIRS = [pkg + "/" for pkg in PROVIDER_PACKAGES]
 
@@ -67,14 +68,6 @@ _SOURCE_SELECTORS = (
 )
 
 
-def _claude_sdk_src() -> str:
-    """Location of the Claude Agent SDK sources used to build the test fork.
-
-    Overridable so the suite can run against any local checkout.
-    """
-    return os.environ.get("CLAUDE_AGENT_SDK_SRC", "claude_sdk/src")
-
-
 def _artifact_env(
     extra: dict[str, str | None] | None = None,
     *,
@@ -83,10 +76,8 @@ def _artifact_env(
     """Host env minus every source selector (DESIGN §3.1 / §5.8).
 
     ``extra`` values of ``None`` REMOVE the variable from the subprocess
-    environment; string values SET it. ``keep_source_selectors=True`` is the
-    ONE deliberate exception — the claude-code SDK-fork test re-adds
-    ``PYTHONPATH``/``CLAUDE_AGENT_SDK_SRC`` pointing at a temp copy (never
-    the /repos tree).
+    environment; string values SET it. ``keep_source_selectors=True`` keeps
+    the source selectors (never pointing at the host source tree).
     """
     env = dict(os.environ)
     if not keep_source_selectors:
@@ -373,7 +364,7 @@ def test_parallel_wheel_builds_no_conflict_and_git_status_clean(
 
 # ---------------------------------------------------------------------------
 # Real-Hatch staging lifecycle: finalize on success, atexit on
-# failure-after-initialize (staging lifetime contract)
+# failure-after-initialize (DESIGN §3.4 lifetime contract)
 # ---------------------------------------------------------------------------
 
 
@@ -585,7 +576,7 @@ def test_coexistence_with_top_level_name_fixtures(tmp_path: Path) -> None:
     """Prefixed packages coexist with legacy top-level name owners.
 
     Deterministic LOCAL fixture wheels own the old top-level names
-    ``claude_code_provider`` / ``semantic_search`` (mirroring the real
+    ``codex_provider`` / ``semantic_search`` (mirroring the real
     PyPI collision). In the same venv:
 
     - the fixture's top-level import works and resolves under site-packages;
@@ -610,7 +601,7 @@ def test_coexistence_with_top_level_name_fixtures(tmp_path: Path) -> None:
     fixtures = tmp_path / "fixtures"
     fixtures.mkdir()
     fx_ccp = _make_fixture_wheel(
-        "claude-code-provider", "claude_code_provider", "fixture-ccp", fixtures
+        "codex-provider", "codex_provider", "fixture-ccp", fixtures
     )
     fx_ss = _make_fixture_wheel(
         "semantic-search", "semantic_search", "fixture-ss", fixtures
@@ -622,11 +613,11 @@ def test_coexistence_with_top_level_name_fixtures(tmp_path: Path) -> None:
     check = _py_script(
         "import importlib, importlib.metadata as md\n"
         "from pathlib import Path\n"
-        "ccp = importlib.import_module('claude_code_provider')\n"
+        "ccp = importlib.import_module('codex_provider')\n"
         "ss = importlib.import_module('semantic_search')\n"
         "assert ccp.FIXTURE_OWNER == 'fixture-ccp', ccp.__file__\n"
         "assert ss.FIXTURE_OWNER == 'fixture-ss', ss.__file__\n"
-        "p_ccp = importlib.import_module('deep_worker.providers.claude_code_provider')\n"
+        "p_ccp = importlib.import_module('deep_worker.providers.codex_provider')\n"
         "p_ss = importlib.import_module('deep_worker.providers.semantic_search')\n"
         "fx_ccp_f = str(Path(ccp.__file__).resolve())\n"
         "fx_ss_f = str(Path(ss.__file__).resolve())\n"
@@ -644,10 +635,10 @@ def test_coexistence_with_top_level_name_fixtures(tmp_path: Path) -> None:
         "    rec = md.distribution(dist_name).read_text('RECORD') or ''\n"
         "    return {ln.split(',', 1)[0] for ln in rec.splitlines() if ln}\n"
         "dw_paths = _paths('deep-worker')\n"
-        "assert not (_paths('claude-code-provider') & dw_paths), 'ccp RECORD overlap'\n"
+        "assert not (_paths('codex-provider') & dw_paths), 'ccp RECORD overlap'\n"
         "assert not (_paths('semantic-search') & dw_paths), 'ss RECORD overlap'\n"
         "# our wheel serves providers from deep_worker/providers only\n"
-        "assert any(p.startswith('deep_worker/providers/claude_code_provider/')\n"
+        "assert any(p.startswith('deep_worker/providers/codex_provider/')\n"
         "           for p in dw_paths), 'missing prefixed ccp in deep-worker RECORD'\n"
         "print('COEX-OK')\n"
     )
@@ -657,17 +648,17 @@ def test_coexistence_with_top_level_name_fixtures(tmp_path: Path) -> None:
 
     # Uninstall the fixtures → prefixed imports must remain intact.
     res = _run(
-        [str(pip), "uninstall", "-y", "claude-code-provider", "semantic-search"],
+        [str(pip), "uninstall", "-y", "codex-provider", "semantic-search"],
         cwd=REPO_ROOT,
         timeout=300,
     )
     assert res.returncode == 0, f"uninstall failed:\n{res.stdout}\n{res.stderr}"
     after = _py_script(
         "import importlib\n"
-        "import deep_worker.providers.claude_code_provider\n"
+        "import deep_worker.providers.codex_provider\n"
         "import deep_worker.providers.semantic_search\n"
         "import importlib.util\n"
-        "assert importlib.util.find_spec('claude_code_provider') is None\n"
+        "assert importlib.util.find_spec('codex_provider') is None\n"
         "assert importlib.util.find_spec('semantic_search') is None\n"
         "print('POST-UNINSTALL-OK')\n"
     )
@@ -762,7 +753,7 @@ def _run_venv(
     ``env_extra`` values of ``None`` REMOVE the variable from the subprocess
     environment (e.g. to unset the host's real ``GOOGLE_API_KEY`` so the
     vertexai ADC path becomes selectable). Source selectors are stripped
-    first; ``env_extra`` may deliberately re-add them (temp SDK fork).
+    first; ``env_extra`` may deliberately re-add them.
     """
     return subprocess.run(
         [str(py), "-c", _py_script(body)],
@@ -1049,23 +1040,18 @@ async def test_rpyc_lifecycle_two_providers_both_wheels(
 
 
 # ---------------------------------------------------------------------------
-# §5.5 positive custom providers (claude-code fork in temp, codex/grok fake
-# CLIs, native-tools assembly, missing-CLI documented error)
+# §5.5 positive custom providers (codex/grok fake CLIs, native-tools assembly,
+# missing-CLI documented error)
 # ---------------------------------------------------------------------------
 
 
 def test_custom_providers_construction_and_missing_cli(
     venv_monorepo: tuple[Path, Path], tmp_path: Path
 ) -> None:
-    """§5.5: claude-code with the SDK fork in temp (outside /repos), codex/grok
-    with deterministic fake executables — REAL construction + native-tools
-    assembly; missing codex CLI → the documented FileNotFoundError."""
+    """§5.5: codex/grok with deterministic fake executables — REAL
+    construction + native-tools assembly; missing codex CLI → the documented
+    FileNotFoundError."""
     _venv_dir, py = venv_monorepo
-
-    # SDK fork copied OUTSIDE /repos so the wheel venv imports the fork from
-    # temp, exactly as a production operator would via CLAUDE_AGENT_SDK_SRC.
-    fork = tmp_path / "claude_sdk_src"
-    shutil.copytree(_claude_sdk_src(), fork)
 
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
@@ -1075,9 +1061,6 @@ def test_custom_providers_construction_and_missing_cli(
         exe.chmod(0o755)
 
     body = (
-        "from deep_worker.providers.claude_code_provider import ClaudeCodeChatModel\n"
-        "m = ClaudeCodeChatModel(model='sonnet')\n"
-        "assert m._base_options is not None, 'SDK fork was not used'\n"
         "from deep_worker_cli.config import create_model\n"
         "c = create_model(provider='codex', model_name=None)\n"
         "assert type(c).__name__ == 'CodexChatModel', type(c)\n"
@@ -1091,7 +1074,7 @@ def test_custom_providers_construction_and_missing_cli(
         py,
         body,
         cwd=tmp_path,
-        env_extra={"PYTHONPATH": str(fork), "PATH": f"{fake_bin}:/usr/bin:/bin"},
+        env_extra={"PATH": f"{fake_bin}:/usr/bin:/bin"},
     )
     assert res.returncode == 0, f"custom provider construction failed:\n{res.stdout}\n{res.stderr}"
     assert "CUSTOM-OK" in res.stdout
@@ -1226,9 +1209,8 @@ def test_web_search_tri_state_and_task_manager_wiring(
     (``assemble_manager_web_tools``, the exact function ``_initialize_manager``
     calls at ``task_manager.py``) and non-interactive mode
     (``assemble_non_interactive_web_tools``, the exact function
-    ``run_non_interactive`` calls at ``non_interactive.py``) — are executed in
-    BOTH availability states: SDK fork absent (tool skipped) and a controlled
-    temp SDK fork present (tool assembled).
+    ``run_non_interactive`` calls at ``non_interactive.py``) — are executed
+    with the tool unavailable (skipped).
     """
     _venv_dir, py = venv_monorepo
     body = (
@@ -1268,36 +1250,3 @@ def test_web_search_tri_state_and_task_manager_wiring(
     res = _run_venv(py, body, cwd=tmp_path)
     assert res.returncode == 0, f"web-search tri-state failed:\n{res.stdout}\n{res.stderr}"
     assert "WEBSRCH-TRI-OK" in res.stdout
-
-    # §5.5 AVAILABLE state: controlled temp SDK fork (the ONE deliberate
-    # source-selector exception) -> both production entry points assemble the
-    # real WebSearchDelegationTool.
-    fork = tmp_path / "claude_sdk_src"
-    shutil.copytree(_claude_sdk_src(), fork)
-    body_avail = (
-        "from deep_worker_cli.agent_config_pkg.agent_config import AgentConfig\n"
-        "from deep_worker_cli.non_interactive import assemble_non_interactive_web_tools\n"
-        "from deep_worker_cli.task_manager.task_manager import assemble_manager_web_tools\n"
-        "from deep_worker_cli.tools import resolve_web_search_tool\n"
-        "r = resolve_web_search_tool('auto')\n"
-        "assert r.tool is not None and r.reason == 'available', r\n"
-        "cfg = AgentConfig(working_dir='.', provider='deepseek',\n"
-        "                  model='deepseek-chat', api_key='test-key')\n"
-        "tm_tools = assemble_manager_web_tools(cfg)\n"
-        "tm_names = [getattr(t, 'name', getattr(t, '__name__', type(t).__name__)) for t in tm_tools]\n"
-        "assert tm_names == ['web_search', 'fetch_url'], tm_names\n"
-        "ni_tools = assemble_non_interactive_web_tools()\n"
-        "ni_names = [getattr(t, 'name', getattr(t, '__name__', type(t).__name__)) for t in ni_tools]\n"
-        "assert ni_names == ['http_request', 'fetch_url', 'web_search'], ni_names\n"
-        "print('WEBSRCH-AVAIL-OK')\n"
-    )
-    res_avail = _run_venv(
-        py,
-        body_avail,
-        cwd=tmp_path,
-        env_extra={"PYTHONPATH": str(fork)},
-    )
-    assert res_avail.returncode == 0, (
-        f"web-search available-path failed:\n{res_avail.stdout}\n{res_avail.stderr}"
-    )
-    assert "WEBSRCH-AVAIL-OK" in res_avail.stdout

@@ -57,17 +57,17 @@ def list_skills(
 
     Precedence order (lowest to highest):
     0. `built_in_skills_dir` (`<package>/built_in_skills/`)
-    1. `user_skills_dir` (`~/.deepagents/{agent}/skills/`)
+    1. `user_skills_dir` (`~/.deep_worker/agents/{agent}/skills/`)
     2. `user_agent_skills_dir` (`~/.agents/skills/`)
-    3. `project_skills_dir` (`.deepagents/skills/`)
+    3. `project_skills_dir` (`.deep_worker/skills/`)
     4. `project_agent_skills_dir` (`.agents/skills/`)
 
     Skills from higher-precedence directories override those with the same name.
 
     Args:
         built_in_skills_dir: Path to built-in skills shipped with the package.
-        user_skills_dir: Path to `~/.deepagents/{agent}/skills/`.
-        project_skills_dir: Path to `.deepagents/skills/`.
+        user_skills_dir: Path to `~/.deep_worker/agents/{agent}/skills/`.
+        project_skills_dir: Path to `.deep_worker/skills/`.
         user_agent_skills_dir: Path to `~/.agents/skills/` (alias).
         project_agent_skills_dir: Path to `.agents/skills/` (alias).
 
@@ -109,7 +109,7 @@ def list_skills(
                 exc_info=True,
             )
 
-    # 1. User deepagents skills (~/.deepagents/{agent}/skills/)
+    # 1. User skills (~/.deep_worker/agents/{agent}/skills/)
     if user_skills_dir and user_skills_dir.exists():
         try:
             user_backend = FilesystemBackend(root_dir=str(user_skills_dir))
@@ -149,7 +149,7 @@ def list_skills(
                 exc_info=True,
             )
 
-    # 3. Project deepagents skills (.deepagents/skills/)
+    # 3. Project skills (.deep_worker/skills/)
     if project_skills_dir and project_skills_dir.exists():
         try:
             project_backend = FilesystemBackend(root_dir=str(project_skills_dir))

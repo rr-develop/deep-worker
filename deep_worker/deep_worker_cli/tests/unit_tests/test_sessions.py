@@ -572,7 +572,7 @@ class TestCleanAgentHistory:
         conn.close()
 
         # Create agent data directory
-        data_dir = deep_worker_home(tmp_path) / "test_agent1"
+        data_dir = deep_worker_home(tmp_path) / "agents" / "test_agent1"
         data_dir.mkdir(parents=True)
         metadata_file = data_dir / "session_metadata.json"
         metadata_file.write_text(json.dumps({

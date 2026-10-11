@@ -191,9 +191,38 @@ async def function_call_output(
     return await _await_and_pop_future(config, tool_call_id)
 
 
+# Name of the catch-all recorder and the args key carrying the codex item
+# type it stood in for. Both are a PUBLIC contract: the string appears in
+# every checkpointed history that recorded an unknown native tool, and a
+# rename would orphan those records.
+GENERIC_NATIVE_TOOL_NAME = "codex_native_tool"
+ORIGINAL_TYPE_ARG_KEY = "_codex_original_type"
+
+
+@tool(GENERIC_NATIVE_TOOL_NAME)
+async def codex_native_tool(
+    tool_call_id: Annotated[str, InjectedToolCallId],
+    config: RunnableConfig,
+    **kwargs: Any,
+) -> str:
+    """Codex native tool not known at design time — recorded verbatim.
+
+    Codex ships tools faster than this package is updated, and the item
+    types above are a snapshot of one CLI version. An unrecognised tool
+    call used to be dropped on the floor: codex ran it, and neither the
+    call nor its result ever entered the agent's history. This recorder
+    keeps it in history under its real type
+    (``_codex_original_type``) so nothing performed by the agent is
+    invisible. It is a RECORDER, not a gate — the tool has already run
+    inside codex either way.
+    """
+    _ = kwargs
+    return await _await_and_pop_future(config, tool_call_id)
+
+
 # The bound tool set. Append to deep-worker's `web_tools` when
 # `config.provider == "codex"`. Order mirrors NATIVE_TOOL_ITEM_TYPES
-# in event_pump.py.
+# in event_pump.py, with the catch-all recorder last.
 NATIVE_TOOLS: tuple[BaseTool, ...] = (
     command_execution,
     apply_patch,
@@ -203,4 +232,5 @@ NATIVE_TOOLS: tuple[BaseTool, ...] = (
     custom_tool_call,
     function_call,
     function_call_output,
+    codex_native_tool,
 )

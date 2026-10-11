@@ -139,5 +139,37 @@ fi
 export PYTHONPATH="$SCRIPT_DIR:$PARENT_DIR/deepagents:$PARENT_DIR:${PYTHONPATH:-}"
 export DEEP_WORKER_TREE_ROOT="${DEEP_WORKER_TREE_ROOT:-$THIS_TREE_ROOT}"
 
+
+# ---------------------------------------------------------------------------
+# Thin path for `lsp bridge`.
+#
+# The bridge is a per-agent stdio MCP proxy to the shared LSP service. It
+# uses none of the agent runtime, but `-m deep_worker_cli.cli.agent_command`
+# IMPORTS that module, and a module's import block runs before any of its
+# code — so no hook inside agent_command.main() can ever be early enough.
+# The agent stack pulls langchain -> transformers -> torch eagerly, which
+# measured 162 heavy lines in /proc/<pid>/maps and ~650 MB RSS per bridge,
+# for modules the bridge never touches.
+#
+# Routing therefore has to happen here, before the exec. Placement is
+# deliberate and both constraints are load-bearing:
+#   * AFTER the --dev branch above, or `--dev` would stop re-exec'ing into
+#     the dev tree's launcher;
+#   * AFTER `export PYTHONPATH`, or the thin module would not resolve
+#     `deep_worker_cli` at all (the package is not installed; see
+#     deep_worker/CLAUDE.md §1 — `pip install -e .` is forbidden).
+# At this point both layouts are already resolved, so one branch covers
+# the master tree and the dev tree alike.
+#
+# The config entry is left untouched (`command: "deep-worker"`), which is
+# what makes every already-written entry become thin with no migration.
+# Matching is on the exact `lsp bridge` pair so sibling subcommands —
+# `lsp serve`, `lsp service-status` — keep their normal route.
+if [[ ${#filtered_args[@]} -ge 2 \
+      && "${filtered_args[0]}" == "lsp" \
+      && "${filtered_args[1]}" == "bridge" ]]; then
+  cd "$SCRIPT_DIR" && DEEP_WORKER_ORIGINAL_CWD="$ORIGINAL_CWD" \
+    exec python3 -m deep_worker_cli.lsp.bridge_main "${filtered_args[@]:2}"
+fi
 cd "$SCRIPT_DIR" && DEEP_WORKER_ORIGINAL_CWD="$ORIGINAL_CWD" \
   exec python3 -m deep_worker_cli.cli.agent_command "${filtered_args[@]}"

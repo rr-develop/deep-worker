@@ -15,7 +15,7 @@ def test_resolve_persisted_codex_display_model_from_saved_session(
     monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / ".codex"))
 
-    state_dir = deep_worker_home(tmp_path) / thread_id
+    state_dir = deep_worker_home(tmp_path) / "agents" / thread_id
     state_dir.mkdir(parents=True)
     (state_dir / "codex_session_state.json").write_text(
         json.dumps({thread_id: {"sent_count": 7, "session_uuid": session_uuid}}),
@@ -44,7 +44,7 @@ def test_resolve_persisted_codex_display_model_rejects_unknown(
     monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / ".codex"))
 
-    state_dir = deep_worker_home(tmp_path) / thread_id
+    state_dir = deep_worker_home(tmp_path) / "agents" / thread_id
     state_dir.mkdir(parents=True)
     (state_dir / "codex_session_state.json").write_text(
         json.dumps({thread_id: {"sent_count": 7, "session_uuid": session_uuid}}),

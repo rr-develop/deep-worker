@@ -37,7 +37,7 @@ def test_agent_info_accepts_error_message() -> None:
         name="a",
         pid=1,
         status=AgentStatus.ERROR,
-        provider="claude-code",
+        provider="claude-code-sdk",
         model="opus",
         rpyc_port=1,
         working_dir="/tmp",
@@ -69,7 +69,7 @@ def _make_service(name: str = "erragent") -> AgentService:
         name=name,
         pid=1,
         status=AgentStatus.IDLE,
-        provider="claude-code",
+        provider="claude-code-sdk",
         model="opus",
         rpyc_port=1,
         working_dir="/tmp",
@@ -151,7 +151,7 @@ async def test_discover_seeds_error_from_persisted_metadata(tmp_path, monkeypatc
             return [_ProcInfo()]
 
     # Persisted metadata says error with a cause.
-    data_dir = deep_worker_home(tmp_path) / "diverged_agent"
+    data_dir = deep_worker_home(tmp_path) / "agents" / "diverged_agent"
     data_dir.mkdir(parents=True)
     (data_dir / "session_metadata.json").write_text(json.dumps({
         "status": "error",

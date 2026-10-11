@@ -20,8 +20,6 @@ NOT in scope (and no assertion pretends otherwise):
   which the user has explicitly ruled out for integration tests. The
   merge-and-launch path is instead covered end-to-end by:
     - the daemon argv assertion above,
-    - unit test ``tests/test_config_create_model_claude_code.py``
-      (``ClaudeCodeChatModel(model="fable")`` build path),
     - and the design's §5 unit matrix.
 
 WAITS AND CLEANUP:
@@ -66,7 +64,7 @@ from pathlib import Path
 
 import pytest
 
-from deep_worker_cli.storage_paths import deep_worker_home
+from deep_worker_cli.storage_paths import agent_root, deep_worker_home
 
 
 # Hard budgets. If the assertions can't be reached inside these windows,
@@ -327,7 +325,7 @@ def _seed_launch_config(
     """Write a minimal but real session_metadata.json so ``--restart`` has
     something to merge against. Direct seeding is acceptable for this
     restart-specific integration."""
-    data_dir = deep_worker_home(agent_home) / agent_name
+    data_dir = agent_root(agent_name, home=agent_home, create=False)
     data_dir.mkdir(parents=True, exist_ok=True)
     launch_config = {
         "provider": "claude-code",
@@ -469,7 +467,7 @@ def test_restart_with_fable_alias(agent_home: Path, tmp_path: Path) -> None:
         # a write/create/rename happens, then we re-check the file's
         # content (json.load — cheap, only invoked on real fs events).
         meta_path = (
-            deep_worker_home(agent_home) / agent_name / "session_metadata.json"
+            agent_root(agent_name, home=agent_home, create=False) / "session_metadata.json"
         )
 
         def _content_shows_fable(p: Path) -> bool:
@@ -575,7 +573,7 @@ def _daemon_pid_for(agent_home: Path, agent_name: str) -> int | None:
             return int(tmp_pid.read_text().strip())
         except (ValueError, OSError):
             pass
-    meta_path = deep_worker_home(agent_home) / agent_name / "session_metadata.json"
+    meta_path = agent_root(agent_name, home=agent_home, create=False) / "session_metadata.json"
     if meta_path.exists():
         try:
             meta = json.loads(meta_path.read_text())

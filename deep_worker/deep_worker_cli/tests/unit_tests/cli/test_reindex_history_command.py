@@ -6,8 +6,6 @@ from types import SimpleNamespace
 
 import pytest
 
-pytest.importorskip("llama_index")  # semantic-search dep; skip when absent
-
 from deep_worker_cli.types import AgentProcessInfo
 
 
@@ -93,29 +91,32 @@ def test_reindex_history_dispatches_command(monkeypatch) -> None:
 @pytest.mark.asyncio
 async def test_reindex_offline_calls_clear_then_index(monkeypatch, tmp_path) -> None:
     from deep_worker_cli.cli import agent_command
-    from deep_worker_cli.storage_paths import deep_worker_home
+    from deep_worker_cli.storage_paths import agent_root
 
-    summaries = deep_worker_home(tmp_path) / "ag" / "summaries"
+    summaries = agent_root("ag", home=tmp_path) / "summaries"
     summaries.mkdir(parents=True)
     (summaries / "one.jsonl").write_text("{}\n", encoding="utf-8")
-    calls: list[str] = []
+    calls: list[tuple[object, bool]] = []
+
+    class Client:
+        async def index_history(self, path, clear_first=False):
+            calls.append((path, clear_first))
+            return SimpleNamespace(
+                files_indexed=1,
+                chunks_added=1,
+                lines_read=1,
+                errors=0,
+            )
 
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setattr(agent_command, "ProcessRegistry", lambda: _Registry(None))
-    monkeypatch.setattr(agent_command, "clear_history_index", lambda path: calls.append("clear"), raising=False)
-    monkeypatch.setattr(
-        agent_command,
-        "index_all_history_files",
-        lambda path, on_progress=None, on_message_progress=None,
-        on_analyze_progress=None: calls.append("index")
-        or SimpleNamespace(files_processed=1, lines_read=1, chunks_indexed=1, errors=0),
-        raising=False,
-    )
+    import deep_worker_cli.semantic_memory.client as client_mod
+    monkeypatch.setattr(client_mod, "SemanticMemoryClient", Client)
 
     rc = await agent_command.reindex_history_command("ag")
 
     assert rc == 0
-    assert calls == ["clear", "index"]
+    assert calls == [(summaries, True)]
 
 
 @pytest.mark.asyncio
@@ -134,9 +135,9 @@ async def test_reindex_offline_no_summaries_dir_exit_1(monkeypatch, tmp_path, ca
 @pytest.mark.asyncio
 async def test_reindex_offline_no_jsonl_files_exit_0(monkeypatch, tmp_path, capsys) -> None:
     from deep_worker_cli.cli import agent_command
-    from deep_worker_cli.storage_paths import deep_worker_home
+    from deep_worker_cli.storage_paths import agent_root
 
-    (deep_worker_home(tmp_path) / "ag" / "summaries").mkdir(parents=True)
+    (agent_root("ag", home=tmp_path) / "summaries").mkdir(parents=True)
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setattr(agent_command, "ProcessRegistry", lambda: _Registry(None))
 
@@ -149,23 +150,24 @@ async def test_reindex_offline_no_jsonl_files_exit_0(monkeypatch, tmp_path, caps
 @pytest.mark.asyncio
 async def test_reindex_offline_stats_errors_exit_1(monkeypatch, tmp_path) -> None:
     from deep_worker_cli.cli import agent_command
-    from deep_worker_cli.storage_paths import deep_worker_home
+    from deep_worker_cli.storage_paths import agent_root
 
-    summaries = deep_worker_home(tmp_path) / "ag" / "summaries"
+    summaries = agent_root("ag", home=tmp_path) / "summaries"
     summaries.mkdir(parents=True)
     (summaries / "one.jsonl").write_text("{}\n", encoding="utf-8")
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setattr(agent_command, "ProcessRegistry", lambda: _Registry(None))
-    monkeypatch.setattr(agent_command, "clear_history_index", lambda path: None, raising=False)
-    monkeypatch.setattr(
-        agent_command,
-        "index_all_history_files",
-        lambda path, on_progress=None, on_message_progress=None,
-        on_analyze_progress=None: SimpleNamespace(
-            files_processed=1, lines_read=1, chunks_indexed=0, errors=1
-        ),
-        raising=False,
-    )
+    class Client:
+        async def index_history(self, path, clear_first=False):
+            return SimpleNamespace(
+                files_indexed=1,
+                chunks_added=0,
+                lines_read=1,
+                errors=1,
+            )
+
+    import deep_worker_cli.semantic_memory.client as client_mod
+    monkeypatch.setattr(client_mod, "SemanticMemoryClient", Client)
 
     assert await agent_command.reindex_history_command("ag") == 1
 
@@ -227,57 +229,3 @@ async def test_reindex_status_guard_refuses_unknown_status(monkeypatch) -> None:
     monkeypatch.setattr(agent_command, "AgentClient", UnknownClient, raising=False)
 
     assert await agent_command.reindex_history_command("ag") == 1
-
-
-def test_run_reindex_with_progress_wires_analyze_and_message(monkeypatch) -> None:
-    """`_run_reindex_with_progress` must forward BOTH an analyze callback
-    (Phase 1) and a message callback (Phase 2) to the indexer, and drive them
-    through a single rich Progress task. Regression guard: the "Analyzing
-    history…" phase must exist and precede the "Indexing" phase.
-    """
-    from pathlib import Path
-
-    from deep_worker_cli.cli import agent_command
-
-    # Stub the indexer func: exercise the callbacks it was handed exactly like
-    # the real one would — analyze ticks first, then message ticks.
-    order: list[str] = []
-
-    def fake_index(summaries_dir, *, on_progress, on_message_progress,
-                   on_analyze_progress):
-        on_progress("thread_x.jsonl")
-        on_analyze_progress(0, 3)
-        on_analyze_progress(3, 3)
-        on_message_progress(0, 5)
-        on_message_progress(5, 5)
-        return SimpleNamespace(files_processed=1, lines_read=5,
-                               chunks_indexed=7, errors=0)
-
-    monkeypatch.setattr(
-        agent_command, "_history_indexer_funcs",
-        lambda: (None, fake_index),
-    )
-
-    # Capture description updates to assert the phase labels appear in order.
-    descriptions: list[str] = []
-    import rich.progress as rp
-
-    real_update = rp.Progress.update
-
-    def spy_update(self, task_id, **kwargs):
-        desc = kwargs.get("description")
-        if desc is not None:
-            descriptions.append(desc)
-        return real_update(self, task_id, **kwargs)
-
-    monkeypatch.setattr(rp.Progress, "update", spy_update)
-
-    stats = agent_command._run_reindex_with_progress(Path("/tmp/summaries"))
-    assert stats.files_processed == 1
-
-    analyzing = [d for d in descriptions if d.startswith("Analyzing")]
-    indexing = [d for d in descriptions if d.startswith("Indexing")]
-    assert analyzing, "Phase 1 'Analyzing …' must drive the bar"
-    assert indexing, "Phase 2 'Indexing …' must drive the bar"
-    # first Analyzing appears before first Indexing
-    assert descriptions.index(analyzing[0]) < descriptions.index(indexing[0])

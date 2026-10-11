@@ -147,7 +147,7 @@ async def test_serena_lsp_navigation_end_to_end(tmp_path: Path) -> None:
 
     workspace = tmp_path / "fixture"
     _make_fixture_project(workspace)
-    cfg = tmp_path / ".deepagents" / "mcp.json"
+    cfg = tmp_path / ".deep_worker" / "mcp.json"
     _write_mcp_config(cfg, workspace)
 
     pids_before = _serena_child_pids()
@@ -243,7 +243,7 @@ async def test_unset_optional_args_reach_server_as_omitted(tmp_path: Path) -> No
 
     workspace = tmp_path / "fixture"
     _make_fixture_project(workspace)
-    cfg = tmp_path / ".deepagents" / "mcp.json"
+    cfg = tmp_path / ".deep_worker" / "mcp.json"
     _write_mcp_config(cfg, workspace)
 
     pids_before = _serena_child_pids()
@@ -285,7 +285,7 @@ async def test_unset_optional_args_reach_server_as_omitted(tmp_path: Path) -> No
 
             # A regression fixed in an earlier commit: the _UNSET sentinel leaked into
             # model_json_schema(), pydantic raised PydanticJsonSchemaWarning, and the
-            # claude-code provider filtered out the Serena tools, so they became
+            # claude-code-sdk provider filtered out the Serena tools, so they became
             # invisible to the agent.
             import warnings as _w
             with _w.catch_warnings():
@@ -329,7 +329,7 @@ async def test_optional_fields_are_fully_omissible_on_wire(tmp_path: Path) -> No
 
     workspace = tmp_path / "fixture"
     _make_fixture_project(workspace)
-    cfg = tmp_path / ".deepagents" / "mcp.json"
+    cfg = tmp_path / ".deep_worker" / "mcp.json"
     _write_mcp_config(cfg, workspace)
 
     pids_before = _serena_child_pids()
@@ -466,7 +466,7 @@ async def test_pyright_config_resolves_system_site_packages(
         "    x: int\n",
         encoding="utf-8",
     )
-    cfg = tmp_path / ".deepagents" / "mcp.json"
+    cfg = tmp_path / ".deep_worker" / "mcp.json"
     _write_mcp_config(cfg, workspace)
 
     pids_before = _serena_child_pids()
@@ -539,7 +539,7 @@ async def test_repo_root_pyrightconfig_kills_false_missing_imports() -> None:
     _require_serena()
 
     repo_root = _PKG_ROOT.parents[1].resolve()
-    cfg = repo_root / ".deepagents" / "mcp.json"
+    cfg = repo_root / ".deep_worker" / "mcp.json"
     if not repo_root.is_dir() or not cfg.is_file():
         pytest.skip(
             f"test is tied to a dev checkout {repo_root} with Serena configured "

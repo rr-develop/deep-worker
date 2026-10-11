@@ -25,6 +25,7 @@ from typing import Any
 
 from langchain_core.tools import BaseTool
 
+from deep_worker_cli.cancellation import is_external_cancellation
 from deep_worker_cli.external_mcp.adapter import MCPToolAdapter
 from deep_worker_cli.external_mcp.config import (
     ServerSpec,
@@ -81,11 +82,15 @@ class ExternalMCPClientPool:
         agent_path: Path | None = None,
         cli_configs: Iterable[Path] = (),
         cli_servers: Iterable[str] = (),
+        working_dir: Path | str | None = None,
     ) -> ExternalMCPClientPool:
         """Collect the merged config and start all enabled servers.
 
         ``UnresolvedEnvError`` from ``load_mcp_config`` is propagated
         outward — this is an intentional fail-loud (see §3.1 of the design).
+
+        ``working_dir`` — the agent's working directory; it is used to
+        resolve ``${agent:working_dir}`` in the bridge's user-scope entry.
         """
         merged = load_mcp_config(
             user_path=user_path,
@@ -93,6 +98,7 @@ class ExternalMCPClientPool:
             agent_path=agent_path,
             cli_configs=list(cli_configs),
             cli_servers=list(cli_servers),
+            working_dir=working_dir,
         )
         pool = cls()
         await pool._start_all(merged)
@@ -129,7 +135,22 @@ class ExternalMCPClientPool:
                     params = StdioServerParameters(
                         command=spec.command or "",
                         args=list(spec.args),
-                        env={**os.environ, **dict(spec.env)} if spec.env else None,
+                        # ALWAYS inherit os.environ, whether or not the spec
+                        # adds anything. Passing ``env=None`` does NOT mean
+                        # "inherit" to the MCP SDK: stdio_client substitutes
+                        # ``get_default_environment()``, which is a scrubbed
+                        # allow-list of just HOME/LOGNAME/PATH/SHELL/USER.
+                        # PYTHONPATH, VIRTUAL_ENV, PYTHONUSERBASE and every
+                        # credential var are dropped, so a server that imports
+                        # anything outside the stdlib dies with
+                        # ModuleNotFoundError and surfaces only as the opaque
+                        # "Connection closed".
+                        #
+                        # The old ternary inherited the environment only when
+                        # the spec happened to define ``env`` — so behaviour
+                        # depended on an unrelated field, and the common case
+                        # (no ``env``) was the broken one.
+                        env={**os.environ, **dict(spec.env or {})},
                         cwd=spec.cwd,
                     )
                     streams_cm = stdio_client(params)
@@ -202,8 +223,23 @@ class ExternalMCPClientPool:
                 logger.info(
                     "external MCP server %r: %d tools loaded", name, len(adapters)
                 )
-            except Exception as e:
+            except BaseException as e:
+                # ``BaseException``, not ``Exception``: an unreachable HTTP
+                # server arrives here as ``CancelledError``, because the anyio
+                # TaskGroup inside ``streamablehttp_client`` cancels its
+                # tasks on ConnectError and surfaces the cancellation rather
+                # than the original network error. Through ``except
+                # Exception`` it passed straight through and took down the
+                # WHOLE pool (and with it the agent process) — a prior
+                # production incident.
+                #
+                # A cancellation initiated from OUTSIDE (we are being shut
+                # down) must not be swallowed: the marker is
+                # ``Task.cancelling() > 0``, an idiom already adopted in
+                # ``agent_process._deliver_inbox_record``.
                 await server_stack.aclose()
+                if is_external_cancellation(e):
+                    raise
                 logger.warning(
                     "external MCP server %r failed to start: %s",
                     name, e, exc_info=True,

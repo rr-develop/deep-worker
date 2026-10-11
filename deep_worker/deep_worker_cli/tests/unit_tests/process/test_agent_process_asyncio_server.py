@@ -28,7 +28,7 @@ async def test_start_rpyc_server_method_is_async():
     # Create minimal config
     config = AgentConfig(
         working_dir=Path("/tmp/test-agent"),
-        provider="claude-code",  # Valid provider
+        provider="claude-code-sdk",  # Valid provider
         model="claude-3-5-sonnet-20241022",
     )
 
@@ -58,7 +58,7 @@ async def test_agent_process_start_is_async():
 
     config = AgentConfig(
         working_dir=Path("/tmp/test-agent-async"),
-        provider="claude-code",
+        provider="claude-code-sdk",
         model="claude-3-5-sonnet-20241022",
     )
 

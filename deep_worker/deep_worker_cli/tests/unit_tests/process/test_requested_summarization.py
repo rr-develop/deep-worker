@@ -242,3 +242,168 @@ async def test_second_startup_run_cannot_replay_summary() -> None:
 
     process.request_summarization.assert_awaited_once_with("Focus")
     assert process._pending_summarize is False
+
+
+# ---------------------------------------------------------------------------
+# Status during a requested summarization (owner report, 2026-08-24).
+#
+# The web UI showed the agent IDLE for the whole duration of a "Summarize
+# context" click. Summarization is a real model turn — it can take tens of
+# seconds on a cold path — so an idle badge is simply wrong: the operator
+# cannot tell the work started, and nothing stops them from firing a message
+# into an agent that is already busy.
+#
+# `request_summarization` never touched `session_manager`, unlike every other
+# turn-running path (`_handle_invoke` sets RUNNING at :3915).
+# ---------------------------------------------------------------------------
+
+
+def _status_probe_process(*, raises: BaseException | None = None):
+    """An AgentProcess wired so status transitions are observable in order.
+
+    ``raises`` (when set) is thrown from inside the summarization call so the
+    test can distinguish RUNNING-set-before-work from RUNNING-set-after.
+    """
+    from deep_worker_cli.types import AgentStatus
+
+    process = AgentProcess.__new__(AgentProcess)
+    process.name = "summary-agent"
+    process._invoke_lock = None
+    process.agent = MagicMock()
+    process.agent.aget_state = AsyncMock(
+        return_value=SimpleNamespace(
+            values={"messages": [HumanMessage(content="old", id="old")]}
+        )
+    )
+    process.agent.aupdate_state = AsyncMock()
+
+    transitions: list[tuple[str, Any]] = []
+    status_when_summarizing: list[AgentStatus] = []
+
+    session_manager = MagicMock()
+
+    async def _set_status(status, **_kwargs):
+        transitions.append(("status", status))
+
+    async def _set_error(message):
+        transitions.append(("error", message))
+
+    session_manager.set_status = AsyncMock(side_effect=_set_status)
+    session_manager.set_error = AsyncMock(side_effect=_set_error)
+    # A starting turn clears the previous turn's recoverable-error marker
+    # (docs/DESIGN_RECOVERABLE_ERROR_VISIBILITY.md §4.4). Deliberately not
+    # recorded in ``transitions``: that list pins the STATUS sequence, and
+    # mixing a non-status call into it would only force the assertions to
+    # be rewritten around an unrelated event.
+    session_manager.clear_error = AsyncMock()
+    process.session_manager = session_manager
+
+    async def _apply(*_args, **_kwargs):
+        # Sampled INSIDE the summarization call: this is what the web UI polls
+        # while the work is in flight. Setting RUNNING after the fact would
+        # leave this list empty and the badge idle for the whole turn.
+        status_when_summarizing.extend(
+            s for kind, s in transitions if kind == "status"
+        )
+        if raises is not None:
+            raise raises
+        return SimpleNamespace(
+            summarized=True,
+            replacement_messages=[HumanMessage(content="summary", id="summary")],
+            history_path=None,
+        )
+
+    middleware = MagicMock()
+    middleware.apply_requested_summary = AsyncMock(side_effect=_apply)
+    process._find_summarization_middleware = MagicMock(return_value=middleware)
+    return process, transitions, status_when_summarizing
+
+
+@pytest.mark.asyncio
+async def test_requested_summarization_marks_agent_running_while_working() -> None:
+    """RED: the agent must read RUNNING (web: "working") during the turn."""
+    from deep_worker_cli.types import AgentStatus
+
+    process, transitions, during = _status_probe_process()
+
+    await process.request_summarization("Focus")
+
+    assert during == [AgentStatus.RUNNING], (
+        "agent was not RUNNING while the summarization was in flight; the web "
+        f"UI shows it idle for the whole turn (observed: {during})"
+    )
+    assert transitions == [
+        ("status", AgentStatus.RUNNING),
+        ("status", AgentStatus.IDLE),
+    ], f"expected RUNNING then IDLE, got {transitions}"
+
+
+@pytest.mark.asyncio
+async def test_requested_summarization_fatal_failure_settles_in_error() -> None:
+    """POLICIES §12: a fatal summarization failure MUST be loud, not IDLE.
+
+    The requested path used to swallow ``SummarizationFailedError`` into a
+    plain ``{success:false}`` and leave the badge at IDLE — exactly the
+    silent-failure surface the automatic path was hardened against on
+    2026-08-23. Route through ``set_error`` (ERROR + visible message) so the
+    operator sees WHAT died, not just "the click did nothing".
+    """
+    from deep_worker_cli.types import AgentStatus
+    from deepagents.middleware.summarization import SummarizationFailedError
+
+    fatal = SummarizationFailedError("summary provider unavailable")
+    process, transitions, _during = _status_probe_process(raises=fatal)
+
+    with pytest.raises(SummarizationFailedError):
+        await process.request_summarization()
+
+    assert transitions[0] == ("status", AgentStatus.RUNNING)
+    assert transitions[-1][0] == "error", (
+        "fatal summarization failure did not land in ERROR; the agent is "
+        f"back to IDLE with no visible failure signal (got {transitions})"
+    )
+    error_msg = transitions[-1][1]
+    assert "summary provider unavailable" in error_msg, (
+        f"error message must preserve the real cause, got: {error_msg!r}"
+    )
+    # RUNNING was cleared exactly once — the ERROR terminal transition IS
+    # that clearing (set_error owns the same status slot as set_status).
+    status_calls = [t for t in transitions if t[0] == "status"]
+    assert status_calls == [("status", AgentStatus.RUNNING)], (
+        f"IDLE must NOT be pinned for the fatal case, got {status_calls}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_requested_summarization_nonfatal_failure_returns_to_idle() -> None:
+    """Non-fatal transient errors go back to IDLE (not sticky ERROR)."""
+    from deep_worker_cli.types import AgentStatus
+
+    # A bare ``RuntimeError`` is NOT in FATAL_EXCEPTION_TYPES, so the requested
+    # path treats it as recoverable — the agent's turn state is intact and
+    # the operator can just click Summarize again.
+    process, transitions, _during = _status_probe_process(
+        raises=RuntimeError("transient hiccup")
+    )
+
+    with pytest.raises(RuntimeError, match="transient hiccup"):
+        await process.request_summarization()
+
+    assert transitions == [
+        ("status", AgentStatus.RUNNING),
+        ("status", AgentStatus.IDLE),
+    ], (
+        "non-fatal failure must clear RUNNING and return to IDLE; ERROR is "
+        f"reserved for fatal classes (got {transitions})"
+    )
+
+
+@pytest.mark.asyncio
+async def test_requested_summarization_without_session_manager_still_works() -> None:
+    """`session_manager` is optional on this path — must not become required."""
+    process, _transitions, _during = _status_probe_process()
+    process.session_manager = None
+
+    result = await process.request_summarization()
+
+    assert result["summarized"] is True

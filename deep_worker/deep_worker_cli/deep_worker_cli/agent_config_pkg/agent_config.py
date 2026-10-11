@@ -8,6 +8,9 @@ from typing import Any
 import yaml
 from dotenv import load_dotenv
 
+from deep_worker_cli.runtime.provider_chain import all_provider_names
+from deep_worker_cli.tool_selection import parse_tool_selection
+
 # Load environment variables from .env file
 load_dotenv()
 
@@ -21,7 +24,10 @@ class AgentConfig:
         working_dir: Working directory for the agent
         provider: AI provider name ("deepseek", "gemini", "openai")
         system_prompt: Optional system prompt for the agent
-        tools: List of tool names or configurations
+        tools: Tool selection (``docs/DESIGN_TOOL_SELECTION.md``). Empty —
+            the default — means every tool, unchanged. ``["-*"]`` denies all;
+            ``["-*", "read_file"]`` denies all but the named; ``["-execute"]``
+            removes only the named.
         backend_type: Type of backend ("state", "filesystem", etc.)
         max_tokens: Maximum tokens for model responses
         temperature: Sampling temperature for model
@@ -50,8 +56,10 @@ class AgentConfig:
         if self.model is not None and not self.model.strip():
             raise ValueError("model must be a non-empty string or None")
 
-        # Validate provider
-        valid_providers = ["deepseek", "gemini", "openai", "claude-code", "codex", "grok"]
+        # Validate provider. Built-ins PLUS config-declared API providers
+        # (~/.deep_worker/providers.json) so adding a standard OpenAI-
+        # compatible vendor needs no code change.
+        valid_providers = list(all_provider_names())
         if self.provider not in valid_providers:
             raise ValueError(
                 f"provider must be one of {valid_providers}, got '{self.provider}'"
@@ -59,8 +67,12 @@ class AgentConfig:
 
         # Auto-load API key from environment if not provided
         if self.api_key is None:
-            if self.provider == "claude-code":
+            if self.provider == "claude-code-sdk":
                 # Claude Code doesn't require API key (uses local installation)
+                self.api_key = None
+            elif self.provider == "claude-code":
+                # claude-code authenticates from Claude Code's own
+                # credential store (~/.claude.json subscription) — no key.
                 self.api_key = None
             elif self.provider == "codex":
                 # Codex CLI uses cached login at ~/.codex/auth.json — no key needed.
@@ -99,6 +111,11 @@ class AgentConfig:
         if self.max_tokens <= 0:
             raise ValueError(f"max_tokens must be positive, got {self.max_tokens}")
 
+        # Validate the tool selection eagerly. A contradictory spec caught
+        # at agent-construction time is a puzzle; caught here it names the
+        # field the user actually wrote.
+        parse_tool_selection(self.tools)
+
         # Validate web_search_policy (tri-state)
         if self.web_search_policy not in ("auto", "enabled", "disabled"):
             raise ValueError(
@@ -117,8 +134,8 @@ class AgentConfig:
         Returns ``None`` when the provider has no default and the user
         did not specify a model — this is the correct value for every
         CLI-wrapper provider: **codex**, **grok** and (since 2026-07-28)
-        **claude-code**. Each wraps a CLI that resolves its own current
-        default when no ``--model`` is passed, and for claude-code that
+        **claude-code-sdk**. Each wraps a CLI that resolves its own current
+        default when no ``--model`` is passed, and for claude-code-sdk that
         default legitimately varies by account type, so pinning one here
         would silently override the operator (see ``config.py``
         ``_PROVIDER_DEFAULT_MODELS``).

@@ -2,7 +2,7 @@
 
 **Status**: Draft → review (v2 — incorporated reviewer feedback)
 **Date**: 2026-06-11
-**Related**: `docs/ARCHITECTURE.md`, the CLI's `process/agent_process.py` and `types.py` (`AgentStatus.ERROR`), `claude_code_provider/chat_model.py`, `codex_provider/exec_runner.py`
+**Related**: `docs/ARCHITECTURE.md`, the CLI's `process/agent_process.py` and `types.py` (`AgentStatus.ERROR`), `claude_code_sdk_provider/chat_model.py`, `codex_provider/exec_runner.py`
 
 ## 1. User requirement (verbatim)
 
@@ -36,7 +36,7 @@ This text is the source of truth. The same wording (without profanity) is placed
 
 ## 3. Current behaviour (root cause)
 
-* `agent_process.AgentProcess._handle_invoke` has a top-level `except Exception` that calls `session_manager.set_error(...)` and returns `success=False`. Any unhandled exception below — including a `print(...)` inside `claude_code_provider/chat_model.py:721` raising `BlockingIOError` — flips the agent to `ERROR`. The catch-all itself uses `print(..., file=sys.stderr)` at lines 2812–2813 and inside the inner `except` at 2827 / 2853, so the *fix* path is itself fragile.
+* `agent_process.AgentProcess._handle_invoke` has a top-level `except Exception` that calls `session_manager.set_error(...)` and returns `success=False`. Any unhandled exception below — including a `print(...)` inside `claude_code_sdk_provider/chat_model.py:721` raising `BlockingIOError` — flips the agent to `ERROR`. The catch-all itself uses `print(..., file=sys.stderr)` at lines 2812–2813 and inside the inner `except` at 2827 / 2853, so the *fix* path is itself fragile.
 * `chat_model.py` contains 37 `print(..., file=sys.stderr)` calls. Any of them can raise `BlockingIOError` under load.
 * `_handle_invoke` also calls `set_error(...)` *without* an exception in three places:
   * line 2463 — `"No messages returned from agent"` (model returned an empty response).
@@ -72,7 +72,7 @@ class AgentNotInitialisedError(RuntimeError):
 
 
 # Match by class name so the table stays provider-agnostic (codex agents
-# never import the claude-code module and vice versa).
+# never import the claude-code-sdk module and vice versa).
 FATAL_EXCEPTION_TYPES: frozenset[str] = frozenset({
     "ClaudeUsageLimitError",
     "CodexUsageLimitError",
@@ -207,8 +207,8 @@ Factory wrap of `awrap_model_call` middleware: at the create-agent factory we wr
 ### 4.6 Forbid `print()` in async hot paths
 
 * Replace `print(..., file=sys.stderr)` in:
-  * `claude_code_provider/chat_model.py` — all 37 sites.
-  * `claude_code_provider/proxy_mcp_server.py` — the `[MCP_CAPTURE handler] ...` debug prints that should have been removed when the related fix landed.
+  * `claude_code_sdk_provider/chat_model.py` — all 37 sites.
+  * `claude_code_sdk_provider/proxy_mcp_server.py` — the `[MCP_CAPTURE handler] ...` debug prints that should have been removed when the related fix landed.
   * the CLI's `process/agent_process.py` — including the prints **inside** the catch-all itself (lines 2812–2813, 2827, 2833, 2849, 2858, 2883).
   * `deepagents/middleware/*.py` — any `[DEBUG ...] ` prints.
 * All replaced sites use `logging.getLogger(__name__)`. Our existing logging stack uses `RotatingFileHandler` + `QueueHandler` so log writes are non-blocking from the caller's point of view (the queue drains on a dedicated worker — that worker existed before this change and is not counted as a "new thread").
@@ -238,7 +238,7 @@ Pre-commit guard: a small grep-based hook in `scripts/check_no_print_in_hot_path
 * **Unit**: `tests/test_no_error_state_policy.py`
   1. Tool raises `RuntimeError` → `SafeToolNode` returns `ToolMessage(status="error")`, agent stays `IDLE`.
   2. Middleware raises → factory wrap injects a `SystemMessage`, agent stays `IDLE`.
-  3. `ClaudeUsageLimitError` raised → agent goes to `ERROR`, `_schedule_failover("claude-code", ...)` called exactly once.
+  3. `ClaudeUsageLimitError` raised → agent goes to `ERROR`, `_schedule_failover("claude-code-sdk", ...)` called exactly once.
   4. `CodexUsageLimitError` raised → agent goes to `ERROR`, `_schedule_failover("codex", ...)` called exactly once.
   5. Fake `BlockingIOError` from a stub print-like call inside chat-model → agent stays `IDLE`.
   6. Empty-message path (line 2463) → agent stays `IDLE`, `SystemMessage` appended.

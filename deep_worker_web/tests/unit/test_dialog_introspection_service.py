@@ -107,7 +107,7 @@ class TestSystemPromptMode:
             system_prompt_payload={
                 "success": True,
                 "system_prompt": "INVARIANT BODY",
-                "provider": "claude-code",
+                "provider": "claude-code-sdk",
                 "model": "opus",
             }
         )
@@ -116,7 +116,7 @@ class TestSystemPromptMode:
         out = await service.get_agent_dialog_formatted("a", verbosity="system_prompt")
 
         assert "INVARIANT BODY" in out
-        assert "provider=claude-code" in out
+        assert "provider=claude-code-sdk" in out
         assert "model=opus" in out
         assert root.history_called is False  # must NOT fetch history
 
@@ -134,7 +134,7 @@ class TestToolsMode:
         root = _FakeRoot(
             tools_payload={
                 "success": True,
-                "provider": "claude-code",
+                "provider": "claude-code-sdk",
                 "tools": [
                     {"name": "execute", "description": "Run a shell command"},
                     {"name": "read_file", "description": "Read a file"},
@@ -186,7 +186,7 @@ class TestStaleAgentGracefulFallback:
             type(service),
             "_compute_invariant_system_prompt_locally",
             lambda self, name: (
-                "--- System Prompt (invariant, provider=claude-code, "
+                "--- System Prompt (invariant, provider=claude-code-sdk, "
                 "model=opus) ---\nLOCAL INVARIANT BODY"
             ),
         )
@@ -221,7 +221,7 @@ class TestLocalSystemPromptComputation:
                 {
                     "launch_config": {
                         "working_dir": str(tmp_path / "ws"),
-                        "provider": "claude-code",
+                        "provider": "claude-code-sdk",
                         "model": "opus",
                     }
                 }
@@ -231,7 +231,7 @@ class TestLocalSystemPromptComputation:
 
         out = service._compute_invariant_system_prompt_locally("demo")
         assert out is not None
-        assert "--- System Prompt (invariant, provider=claude-code, model=opus) ---" in out
+        assert "--- System Prompt (invariant, provider=claude-code-sdk, model=opus) ---" in out
         # The real invariant prompt embeds the agent's identity name.
         assert "demo" in out
 

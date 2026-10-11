@@ -216,7 +216,7 @@ class TestBuildCommandArgs:
         """The bypass flag is what actually lets MCP tool calls go through
         without prompts (approval_policy="never" alone only covers shell
         commands; MCP calls get auto-cancelled). Verified live on this
-        host. Mirrors claude-code's ``permission_mode="bypassPermissions"``.
+        host. Mirrors claude-code-sdk's ``permission_mode="bypassPermissions"``.
         """
         runner = CodexExecRunner(executable_path="/usr/bin/codex")
         argv = runner.build_argv_for_test(ExecArgs(prompt="hi"))

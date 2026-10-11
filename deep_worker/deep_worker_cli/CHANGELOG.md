@@ -22,7 +22,7 @@ Changes made after the fork from `deepagents-cli`, on top of upstream `0.0.19`:
 - **feat**: daemon mode, `--dir` and `-sp` options
 - **feat**: add `deep_worker` — copy of `deepagents-cli` renamed to `deep-worker`
 
-## [0.0.19](https://github.com/langchain-ai/deepagents/compare/deepagents-cli==0.0.18...deepagents-cli==0.0.19) (2026-02-06)
+## [0.0.19](https://github.com/langchain-ai/deepagents/compare/deepagents-cli==0.0.18...deep_worker-cli==0.0.19) (2026-02-06)
 
 
 ### Features
@@ -45,7 +45,7 @@ Changes made after the fork from `deepagents-cli`, on top of upstream `0.0.19`:
 * **cli:** unify spinner API to support dynamic status text ([#1124](https://github.com/langchain-ai/deepagents/issues/1124)) ([bb55608](https://github.com/langchain-ai/deepagents/commit/bb55608b7172f55df38fef88918b2fded894e3ce))
 * **cli:** update help text to include `Esc` key for rejection ([#1122](https://github.com/langchain-ai/deepagents/issues/1122)) ([8f4bcf5](https://github.com/langchain-ai/deepagents/commit/8f4bcf52547dcd3e38d4d75ce395eb973a7ee2c0))
 
-## [0.0.18](https://github.com/langchain-ai/deepagents/compare/deepagents-cli==0.0.17...deepagents-cli==0.0.18) (2026-02-05)
+## [0.0.18](https://github.com/langchain-ai/deepagents/compare/deepagents-cli==0.0.17...deep_worker-cli==0.0.18) (2026-02-05)
 
 
 ### Features
@@ -65,7 +65,7 @@ Changes made after the fork from `deepagents-cli`, on top of upstream `0.0.19`:
 * **cli:** show full shell command in error output ([#1097](https://github.com/langchain-ai/deepagents/issues/1097)) ([23bb1d8](https://github.com/langchain-ai/deepagents/commit/23bb1d8af85eec8739aea17c3bb3616afb22072a)), closes [#1080](https://github.com/langchain-ai/deepagents/issues/1080)
 * **cli:** support `-h`/`--help` flags ([#1106](https://github.com/langchain-ai/deepagents/issues/1106)) ([26bebf5](https://github.com/langchain-ai/deepagents/commit/26bebf592ab56ffdc5eeff55bb7c2e542ef8f706))
 
-## [0.0.17](https://github.com/langchain-ai/deepagents/compare/deepagents-cli==0.0.16...deepagents-cli==0.0.17) (2026-02-03)
+## [0.0.17](https://github.com/langchain-ai/deepagents/compare/deepagents-cli==0.0.16...deep_worker-cli==0.0.17) (2026-02-03)
 
 
 ### Features
@@ -74,7 +74,7 @@ Changes made after the fork from `deepagents-cli`, on top of upstream `0.0.19`:
 * **cli:** model identity ([#770](https://github.com/langchain-ai/deepagents/issues/770)) ([e54a0ee](https://github.com/langchain-ai/deepagents/commit/e54a0ee43c7dfc7fd14c3f43d37cc0ee5e85c5a8))
 * **cli:** sandbox provider interface ([#900](https://github.com/langchain-ai/deepagents/issues/900)) ([d431cfd](https://github.com/langchain-ai/deepagents/commit/d431cfd4a56713434e84f4fa1cdf4a160b43db95))
 
-## [0.0.16](https://github.com/langchain-ai/deepagents/compare/deepagents-cli==0.0.15...deepagents-cli==0.0.16) (2026-02-02)
+## [0.0.16](https://github.com/langchain-ai/deepagents/compare/deepagents-cli==0.0.15...deep_worker-cli==0.0.16) (2026-02-02)
 
 ### Features
 

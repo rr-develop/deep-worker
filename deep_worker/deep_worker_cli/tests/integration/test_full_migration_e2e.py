@@ -1,7 +1,7 @@
 """End-to-end coverage for the AsyncioServer migration.
 
 The original tests in this module spun up a full ``AgentProcess``
-(real claude-code provider, real agent graph, real checkpointer) in
+(real provider, real agent graph, real checkpointer) in
 the **same** Python process and event loop as the client, then drove
 RPC against it via ``async_connect``. That topology is forbidden on
 this host: rpyc_async deadlocks at first-time ``HANDLE_INSPECT`` when
@@ -58,10 +58,12 @@ _REDUNDANT_SKIP_REASON = (
     "duplicate that work."
 )
 
+
 @pytest.mark.skip(reason=_REDUNDANT_SKIP_REASON)
 @pytest.mark.asyncio
 async def test_full_migration_agent_to_client():
     """Replaced — see module docstring."""
+
 
 @pytest.mark.skip(reason=_REDUNDANT_SKIP_REASON)
 @pytest.mark.asyncio

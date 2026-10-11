@@ -19,7 +19,7 @@ Key contracts (see design §§4-6):
   one ``os.write`` with short-write detection, serialized per-process by an
   ``asyncio.Lock`` and executed in a worker thread via ``asyncio.to_thread``
   (no extra threads are created). No fsync — documented crash semantics below.
-- Custom providers (claude-code/codex/grok) drive the recorder through the
+- Custom providers (claude-code-sdk/codex/grok) drive the recorder through the
   async ``UsageEventCallback`` state machine (§5.2): a terminal event is
   written **at most once** per observed invocation; errors are logged and
   never raised (best-effort), except ``asyncio.CancelledError`` which
@@ -56,7 +56,31 @@ STANDARD_PROVIDERS = frozenset({"deepseek", "openai", "anthropic", "google", "ve
 
 # Custom providers: usage flows through the async UsageEventCallback state
 # machine (§5.2) installed via provider.set_usage_event_callback().
-CUSTOM_PROVIDERS = frozenset({"claude-code", "codex", "grok"})
+CUSTOM_PROVIDERS = frozenset({"claude-code-sdk", "claude-code", "codex", "grok"})
+
+
+def is_standard_provider(provider: str) -> bool:
+    """True for providers whose usage flows through the LangChain callback.
+
+    Covers the built-in ``STANDARD_PROVIDERS`` plus any provider declared in
+    ``~/.deep_worker/providers.json``: those are constructed as LangChain
+    chat models (OpenAI-compatible dialect), so their usage arrives through
+    the same handler. Without this, a config-added provider would silently
+    record no token statistics.
+
+    ``CUSTOM_PROVIDERS`` (CLI/ACP) keep their own event-callback path and are
+    never treated as standard.
+    """
+    if provider in STANDARD_PROVIDERS:
+        return True
+    if provider in CUSTOM_PROVIDERS:
+        return False
+    try:
+        from deep_worker_cli.runtime.provider_registry import load_provider_specs
+
+        return any(spec.name == provider for spec in load_provider_specs())
+    except Exception:  # noqa: BLE001 — statistics must never break a turn
+        return False
 
 STATUS_OK = "ok"
 STATUS_NO_USAGE = "no_usage"
@@ -104,7 +128,15 @@ def _to_int(value: Any) -> int | None:
 
 
 def _from_anthropic(usage: dict[str, Any]) -> NormalizedUsage | None:
-    """Raw Anthropic/Claude usage (input/cache_read/cache_creation/output)."""
+    """Raw Anthropic/Claude usage (input/cache_read/cache_creation/output).
+
+    ⚠ DO NOT UNIFY with ``_from_codex``. The miss formula differs because
+    ``input_tokens`` means different things: here it EXCLUDES the cached
+    portions, so prompt = ``input + cache_read + cache_creation`` and miss =
+    ``input + cache_creation``. In Codex ``input_tokens`` INCLUDES the cached
+    part, so miss = ``input - cached``. The two look mergeable and are not —
+    merging silently corrupts one provider's cache accounting.
+    """
     inp = _to_int(usage.get("input_tokens"))
     out = _to_int(usage.get("output_tokens"))
     if inp is None and out is None:
@@ -129,7 +161,20 @@ def _from_anthropic(usage: dict[str, Any]) -> NormalizedUsage | None:
 
 
 def _from_codex(usage: dict[str, Any]) -> NormalizedUsage | None:
-    """Codex turn usage (input/output/cached_input)."""
+    """Codex turn usage (input/output/cached_input).
+
+    ⚠ DO NOT UNIFY with ``_from_anthropic``. ``input_tokens`` here INCLUDES
+    the cached prefix, so prompt = ``input`` and miss = ``input - cached``;
+    Anthropic's excludes it and adds the cache fields on top. See the note
+    there.
+
+    ⚠ This normaliser assumes it is handed THIS TURN's usage. It cannot
+    detect the exec-process TOTAL — feeding it ``turn.completed.usage``
+    directly produced a live ``prompt=3736695`` row against a real spend of
+    ``113457``. The per-turn source is selected upstream by
+    ``last_token_usage_from_rollout`` (``DESIGN_PER_TURN_USAGE_MAPPING.md``
+    §2.1-ter); do not "fix" inflation by adding arithmetic here.
+    """
     inp = _to_int(usage.get("input_tokens"))
     out = _to_int(usage.get("output_tokens"))
     if inp is None and out is None:
@@ -267,11 +312,22 @@ def normalize_usage(provider: str | None, usage: Any) -> NormalizedUsage | None:
     """
     if not isinstance(usage, dict) or not usage:
         return None
-    if provider in ("anthropic", "claude-code"):
+    if provider in ("anthropic", "claude-code-sdk"):
         return _from_anthropic(usage)
-    if provider in ("codex", "grok"):
+    if provider in ("codex", "grok", "claude-code"):
         # grok (live-verified 0.2.73): session/prompt RESULT._meta mapped to
         # the codex shape (input_tokens/output_tokens/cached_input_tokens).
+        #
+        # ``claude-code`` is the ACP provider since ``b164482`` (the rename
+        # moved this NAME off the SDK provider, which kept the raw Anthropic
+        # shape under ``claude-code-sdk`` above). ACP builds the SAME codex
+        # shape from ``session/prompt`` RESULT ``_meta``
+        # (``acp/chat_model.py:1544-1557``: cachedReadTokens →
+        # cached_input_tokens), so it normalises here — NOT via
+        # ``_from_anthropic``, whose ``input_tokens`` excludes the cache.
+        # Routing it to the anthropic branch yields ``miss == prompt`` and
+        # drops the hit; leaving it on the LangChain fallback (the bug this
+        # replaces) silently dropped BOTH cache fields to ``None``.
         return _from_codex(usage)
     if provider in ("google", "vertexai"):
         return _from_google(usage)
@@ -438,9 +494,10 @@ class TokenUsageRecorder:
     - No fsync (see module docstring for crash semantics).
     """
 
-    def __init__(self, data_dir: str | Path) -> None:
+    def __init__(self, data_dir: str | Path, *, on_record: Any = None) -> None:
         self.path: Path = Path(data_dir) / STATS_FILE_NAME
         self._lock = asyncio.Lock()
+        self._on_record = on_record
 
     def _append_line(self, line: str) -> None:
         directory = self.path.parent
@@ -472,6 +529,8 @@ class TokenUsageRecorder:
         line = json.dumps(record.to_dict(), ensure_ascii=False, sort_keys=True) + "\n"
         async with self._lock:
             await asyncio.to_thread(self._append_line, line)
+        if self._on_record is not None:
+            await self._on_record({"type": "model_context_changed", **record.to_dict()})
 
     def make_usage_event_callback(
         self,
@@ -495,7 +554,7 @@ class TokenUsageRecorder:
 class UsageEventCallback:
     """Async state machine for custom-provider usage (§5.2).
 
-    Installed on claude-code/codex/grok chat models via
+    Installed on claude-code-sdk/codex/grok chat models via
     ``set_usage_event_callback(cb)``. Contract:
 
     - ``cb(event="invocation_start")`` — marks a pending invocation (no record).
@@ -533,9 +592,9 @@ class UsageEventCallback:
         uuid: str | None,
         turn_id: str | None,
     ) -> str | None:
-        if self._provider == "claude-code":
+        if self._provider == "claude-code-sdk":
             if uuid:
-                return f"claude-code|{session_id}|{uuid}"
+                return f"claude-code-sdk|{session_id}|{uuid}"
             return None
         if self._provider == "codex":
             if session_id and turn_id:
@@ -587,13 +646,33 @@ class UsageEventCallback:
                     provider_turn_id=turn_id or uuid,
                 )
             elif is_snapshot:
+                # Hybrid record: when the provider hands over BOTH a
+                # snapshot AND per-turn usage in the same terminal event
+                # (e.g. ACP claude-code: usage_update → usage_snapshot;
+                # session/prompt reply _meta → per-turn totalTokens),
+                # persist both on ONE row.  ``build_record`` promotes
+                # ``usage_semantics=context_snapshot`` whenever
+                # ``context_used``/``context_size`` is set, so the UI's
+                # Context field renders the honest observed number (X/Y),
+                # while the per-turn ``total_tokens``/``prompt_tokens``/
+                # ``completion_tokens`` stay on the same record for the
+                # "Last turn" UI row and for the aggregate summary.
+                #
+                # Without this the ACP finalize path emitted the snapshot
+                # only when ``_meta.totalTokens`` was ABSENT (rare), and
+                # the UI showed "Context: 2265.4k tokens" against
+                # "Limit: 400k" — see rg1_worker 2026-08-22 and the
+                # repo_graph extractor.
+                norm = normalize_usage(self._provider, usage) if usage else None
                 record = build_record(
                     provider=self._provider,
                     model=model,
                     kind=self._kind,
                     status=STATUS_OK,
+                    usage=norm,
                     event_key=event_key,
                     provider_session_id=session_id,
+                    provider_turn_id=turn_id or uuid,
                     context_used=context_used,
                     context_size=context_size,
                 )
@@ -691,6 +770,139 @@ class ContextAggregate:
     max_context_size: int | None = None
 
 
+@dataclass(frozen=True)
+class ContextSnapshot:
+    """Per-kind context snapshot for the UI status bar (DESIGN_AGENT_CONTEXT_STATUS_BAR.md).
+
+    Carries the four fields the UI needs:
+
+      * ``context_used`` / ``context_size``: the values (one or both may be
+        None — see ``formatAgentContext`` semantics).
+      * ``usage_semantics``: ``"context_snapshot"`` or ``"tokens"`` — lets the
+        UI choose between ``"X/Y"`` (provider snapshot with both fields)
+        and ``"X tokens"`` (provider-reported token count, exact from the
+        provider's tokenizer — no ``"(est.)"`` qualifier).
+      * ``ts``: original record timestamp (informational; the UI uses
+        in-memory state, not this field).
+    """
+
+    context_used: int | None
+    context_size: int | None
+    usage_semantics: str
+    ts: str
+    # Per-turn total tokens from the SAME record — populated for the
+    # ACP hybrid path (context_snapshot + usage in one row) and for any
+    # pure-tokens record that carries ``total_tokens``.  The UI surfaces
+    # this in a separate ``Last turn: Xk`` row so it is never compared
+    # against ``context_limit``.  ``None`` when the record has no
+    # ``total_tokens``.
+    total_tokens: int | None = None
+
+
+def latest_context_by_kind(records: list[UsageRecord]) -> dict[str, ContextSnapshot]:
+    """Return the latest context snapshot per ``kind ∈ {"agent", "tm"}``.
+
+    Filter (DESIGN_AGENT_CONTEXT_STATUS_BAR §1):
+
+      * Only ``kind="agent"`` and ``kind="tm"`` records are kept — ``kind="other"``
+        (sub-agent calls) is excluded.
+      * ``usage_semantics="context_snapshot"`` records with BOTH
+        ``context_used`` and ``context_size`` set to ``None`` (negative
+        malformed snapshot) are excluded.
+      * Token-semantics records are kept only when they contribute context data
+        (i.e. ``context_used`` or ``context_size`` is non-None) — UNLESS the
+        record carries per-turn token counts, in which case we expose the
+        last turn's INPUT size as ``context_used``, preferring
+        ``prompt_tokens`` (the full blob the provider read: system + tools
+        + history + the new user turn) and falling back to ``total_tokens``
+        only for adapters that never report a prompt count.  Note that
+        ``total_tokens`` is prompt + completion — a transport metric, NOT a
+        context size — so it overstates by ``completion_tokens`` and is a
+        last resort, not the primary source.  Either number is EXACT from
+        the provider's tokenizer — the web UI does NOT label it ``"(est.)"``
+        because it is provider data, not an estimate.  Without this fallback
+        every provider that never reports a snapshot (e.g. the
+        OpenAI-compatible ``minimax`` adapter) would show ``-`` forever.
+
+    Tie-break (DESIGN §1, mutations M2 / M2.5):
+
+      * Records with a later parsed UTC timestamp replace earlier ones.
+      * On equal ts (or both unparsable), the **last** record in the input
+        list wins (file-order tie-break — this matches how the records are
+        read by ``read_stats_file``, with newer entries appended last).
+
+    Empty input → ``{}``.
+    """
+    out: dict[str, ContextSnapshot] = {}
+    for rec in records:
+        if rec.kind not in (KIND_AGENT, KIND_TM):
+            continue
+        snap: ContextSnapshot | None = None
+        if rec.context_used is None and rec.context_size is None:
+            # No explicit context data — fall back to per-turn tokens
+            # ONLY for tokens semantics.  Snapshot semantics with both
+            # fields None is the documented "negative malformed
+            # snapshot" case and stays excluded.
+            #
+            # Priority: ``prompt_tokens`` (the FULL context the provider
+            # read on the last turn — system + tools + full history +
+            # new user turn shipped as one blob) STRICTLY BEATS
+            # ``total_tokens`` (prompt + completion, a transport metric).
+            # ``prompt_tokens`` is the number an operator can meaningfully
+            # compare with ``-l`` in the status bar (the guard itself uses
+            # its own estimator, not this field);
+            # ``total_tokens`` overstates by ``completion_tokens`` and
+            # for tokens-only providers the two used to collide in the
+            # UI Context field (rg1_worker 2026-08-22, "507.3k tokens
+            # vs -l 250k" on codex — completion_tokens was 1498 there,
+            # so the diff was small, but the source was still wrong).
+            # ``total_tokens`` remains the fallback of last resort for
+            # future adapters that only surface totals (minimax-style
+            # OpenAI-compat wrappers) so ``Context: -`` does not
+            # regress (2026-08-17 incident).
+            if rec.usage_semantics == USAGE_SEMANTICS_TOKENS:
+                fallback_used: int | None = None
+                if rec.prompt_tokens is not None and rec.prompt_tokens > 0:
+                    fallback_used = rec.prompt_tokens
+                elif rec.total_tokens is not None:
+                    fallback_used = rec.total_tokens
+                if fallback_used is not None:
+                    snap = ContextSnapshot(
+                        context_used=fallback_used,
+                        context_size=None,
+                        usage_semantics=USAGE_SEMANTICS_TOKENS,
+                        ts=rec.ts,
+                        total_tokens=rec.total_tokens,
+                    )
+            if snap is None:
+                continue
+        else:
+            snap = ContextSnapshot(
+                context_used=rec.context_used,
+                context_size=rec.context_size,
+                usage_semantics=rec.usage_semantics,
+                ts=rec.ts,
+                total_tokens=rec.total_tokens,
+            )
+        existing = out.get(rec.kind)
+        if existing is None:
+            out[rec.kind] = snap
+            continue
+        dt_existing = _parse_ts(existing.ts)
+        dt_new = _parse_ts(rec.ts)
+        # None of the new ts → keep existing (file order, unparsable).
+        if dt_new is None:
+            continue
+        # None of the existing ts → new wins (replaces unparsable).
+        if dt_existing is None:
+            out[rec.kind] = snap
+            continue
+        # Strictly later ts → new wins; equal ts → file order wins (new wins).
+        if dt_new >= dt_existing:
+            out[rec.kind] = snap
+    return out
+
+
 @dataclass
 class BucketTotals:
     """Aggregate over a bucket of records (agent, agent×provider, ×model)."""
@@ -714,6 +926,10 @@ class BucketTotals:
     n_usage: int = 0
     n_cache_observed: int = 0
     context: ContextAggregate = field(default_factory=ContextAggregate)
+    # Per-kind latest context snapshots for the UI status bar.
+    # Populated by ``aggregate_records`` via ``latest_context_by_kind``;
+    # ``kind`` keys are restricted to ``{"agent", "tm"}`` (design §1).
+    latest_by_kind: dict[str, ContextSnapshot] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -741,6 +957,15 @@ class BucketTotals:
                 "latest_context_size": self.context.latest_context_size,
                 "max_context_used": self.context.max_context_used,
                 "max_context_size": self.context.max_context_size,
+            },
+            "latest_by_kind": {
+                kind: {
+                    "context_used": snap.context_used,
+                    "context_size": snap.context_size,
+                    "usage_semantics": snap.usage_semantics,
+                    "ts": snap.ts,
+                }
+                for kind, snap in self.latest_by_kind.items()
             },
         }
 
@@ -843,6 +1068,13 @@ def aggregate_records(records: list[UsageRecord]) -> BucketTotals:
         totals.context.latest_context_size = latest.context_size if latest else None
         totals.context.max_context_used = max_used
         totals.context.max_context_size = max_size
+
+    # Per-kind latest context snapshots (UI status bar).
+    # Computed over ALL records (incl. tokens-semantics) so tokens-only
+    # providers get ``usage_semantics="tokens"`` to drive the
+    # ``"X tokens"`` rendering on the UI side (exact from the provider's
+    # tokenizer — no ``"(est.)"`` qualifier).
+    totals.latest_by_kind = latest_context_by_kind(records)
 
     return totals
 

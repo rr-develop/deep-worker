@@ -31,7 +31,7 @@ def _make_proc(data_dir: Path, tmp_path: Path):
 
     config = AgentConfig(
         working_dir=tmp_path,
-        provider="claude-code",
+        provider="claude-code-sdk",
         model="claude-3-5-sonnet-20241022",
     )
     proc = AgentProcess(

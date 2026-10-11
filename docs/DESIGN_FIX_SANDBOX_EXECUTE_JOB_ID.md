@@ -86,7 +86,7 @@ Searching for all producers of this phrase in the code yields four points:
 ```
 $ grep -rn "is still running after" --include=*.py . | grep -v /tests/
 ./deep_worker/deepagents/deepagents/middleware/bounded_tool_call.py:129   ← fixed (6bd042b)
-./claude_code_provider/proxy_mcp_server.py:543                            ← NOT fixed
+./claude_code_sdk_provider/proxy_mcp_server.py:543                            ← NOT fixed
 ./codex_provider/proxy_mcp_server.py:329                                  ← NOT fixed
 ./grok_provider/proxy_mcp_server.py:380                                   ← NOT fixed
 ```
@@ -94,7 +94,7 @@ $ grep -rn "is still running after" --include=*.py . | grep -v /tests/
 The three provider proxy-MCP servers park work **in their own registry** and
 advertise `call_id` (that is, `toolu_…`) as the `job_id`.
 
-`claude_code_provider/proxy_mcp_server.py:507-554`:
+`claude_code_sdk_provider/proxy_mcp_server.py:507-554`:
 
 ```python
 except asyncio.TimeoutError:
@@ -199,7 +199,7 @@ matter of time.
 * **Three files — three copies.** Editing the three providers at once raises
   the risk of divergence. Mitigation: a shared helper + the T4 invariant test.
 * **Grok/codex not verified live.** The defect in them was found by reading the
-  code (the symptom was observed on claude-code). They will need a separate
+  code (the symptom was observed on claude-code-sdk). They will need a separate
   live check or an explicit "fixed by analogy, not reproduced" note.
 
 ## 7. TDD plan (RED → GREEN + mutation checks)
@@ -223,7 +223,7 @@ tests must not hang").
 
 ## 8. Scope
 
-**In scope:** `claude_code_provider/proxy_mcp_server.py`,
+**In scope:** `claude_code_sdk_provider/proxy_mcp_server.py`,
 `codex_provider/proxy_mcp_server.py`, `grok_provider/proxy_mcp_server.py`;
 a shared text helper; the §7 tests; updating
 `DESIGN_FIX_JOB_ID_NAMESPACE_STALL.md` (marking that there were four sources).
@@ -252,7 +252,7 @@ change, §5.1); a private worktree copy — not touched.
   the code: the notice and the registry operate on `job_N`, while
   `resolve_tool_result` keeps accepting `toolu_…`.
 * **§9.2 — fix all three providers in one scoped change.** One defect class,
-  one contract; T4 must pass on all three. Live reproduction on claude-code
+  one contract; T4 must pass on all three. Live reproduction on claude-code-sdk
   only is acceptable; mark codex/grok in the commit message as "by analogy +
   unit/AST". Phased — only if the user demands a minimal blast radius.
 * **T4 — mandatory** as a unit/AST invariant with mutation checks; this is the

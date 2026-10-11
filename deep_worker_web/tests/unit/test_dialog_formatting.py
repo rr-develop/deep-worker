@@ -16,6 +16,7 @@ from typing import Any
 import pytest
 
 from app.services.dialog_formatter import (
+    NO_RESPONSE_TEXT,
     classify_human,
     extract_text,
     format_tool_call,
@@ -789,3 +790,114 @@ class TestSystemMessagesVisible:
         out = fmt([system("You are a helpful assistant.")], verbosity="full")
         assert "--- System ---" in out
         assert "You are a helpful assistant." in out
+
+
+# ---------------------------------------------------------------------------
+# Recoverable failures are visible at ``final`` too
+#
+# ``final`` hides system messages by design — but hiding the runtime's
+# failure message made a failed turn read as a finished one: the model's
+# last musing was shown as the answer and the error vanished. Reported by
+# the owner 2026-09-04: "it just looked like the model's final answer".
+# See docs/DESIGN_RECOVERABLE_ERROR_VISIBILITY.md §5.
+# ---------------------------------------------------------------------------
+
+
+_RUNTIME_FAILURE = (
+    "[runtime] The previous turn failed with an internal error "
+    "(MaxIterationsExceeded: The agent hit its per-turn iteration cap "
+    "without producing a final response.)."
+)
+
+
+def _turn_with_runtime_failure() -> list[dict[str, Any]]:
+    """The real shape from agent ``test_lsp``: a musing, then the failure."""
+    return [
+        {"type": "HumanMessage", "content": "Determine what the project does"},
+        {"type": "AIMessage", "content": "<think> Let me plan this out. </think>"},
+        {
+            "type": "SystemMessage",
+            "content": _RUNTIME_FAILURE,
+            "recoverable_error": True,
+        },
+    ]
+
+
+def test_recoverable_failure_is_visible_at_final():
+    turns = split_into_turns(_turn_with_runtime_failure())
+
+    out = render_dialog(turns, verbosity="final")
+
+    assert "MaxIterationsExceeded" in out, (
+        "the default rendering dropped the failure — a failed turn reads "
+        "as a finished one"
+    )
+
+
+def test_recoverable_failure_does_not_replace_the_assistant_text():
+    """Both are shown: what the model said, and that the turn failed."""
+    turns = split_into_turns(_turn_with_runtime_failure())
+
+    out = render_dialog(turns, verbosity="final")
+
+    assert "Let me plan this out" in out
+    assert out.index("Let me plan this out") < out.index("MaxIterationsExceeded")
+
+
+def test_an_unflagged_system_message_stays_hidden_at_final():
+    """Otherwise the fix would just be 'show everything at final'.
+
+    The base prompt and routine middleware hints are precisely what
+    ``final`` exists to omit.
+    """
+    history = [
+        {"type": "HumanMessage", "content": "hi"},
+        {"type": "AIMessage", "content": "hello"},
+        {"type": "SystemMessage", "content": "You are a helpful agent."},
+    ]
+    turns = split_into_turns(history)
+
+    assert "helpful agent" not in render_dialog(turns, verbosity="final")
+    assert "helpful agent" in render_dialog(turns, verbosity="text")
+
+
+def test_a_failed_turn_with_no_assistant_text_reports_the_failure():
+    """``NO_RESPONSE_TEXT`` here would be disinformation.
+
+    "The model said nothing" and "the turn crashed" are different facts;
+    the second one is the one the reader needs.
+    """
+    history = [
+        {"type": "HumanMessage", "content": "go"},
+        {
+            "type": "SystemMessage",
+            "content": _RUNTIME_FAILURE,
+            "recoverable_error": True,
+        },
+    ]
+    turns = split_into_turns(history)
+
+    out = render_dialog(turns, verbosity="final")
+
+    assert "MaxIterationsExceeded" in out
+    assert NO_RESPONSE_TEXT not in out
+
+
+def test_text_and_full_still_show_every_system_message():
+    """The flag must not become a filter at the verbose levels."""
+    history = [
+        {"type": "HumanMessage", "content": "hi"},
+        {"type": "AIMessage", "content": "hello"},
+        {"type": "SystemMessage", "content": "You are a helpful agent."},
+        {
+            "type": "SystemMessage",
+            "content": _RUNTIME_FAILURE,
+            "recoverable_error": True,
+        },
+    ]
+    turns = split_into_turns(history)
+
+    for verbosity in ("text", "full"):
+        out = render_dialog(turns, verbosity=verbosity)
+        assert "helpful agent" in out, verbosity
+        assert "MaxIterationsExceeded" in out, verbosity

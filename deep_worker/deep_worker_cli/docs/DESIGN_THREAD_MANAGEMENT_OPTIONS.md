@@ -87,7 +87,7 @@ deep_worker_cli/
          ▼
 ┌─────────────────────────────────────────────────────────────┐
 │               SQLite Database                               │
-│           ~/.deepagents/sessions.db                         │
+│      (legacy global DB — removed, see POLICIES §16)         │
 │                                                             │
 │  checkpoints table:                                         │
 │  - thread_id (indexed)                                      │

@@ -11,11 +11,11 @@ provider**:
 
 | Provider | proxy server name | How the model SHOULD call our tool | Does the short (native) name work? |
 |-----------|-------------------|----------------------------------|-----------------------------------|
-| claude-code | `deepworker` (static) | `mcp__deepworker__<tool>` | unstable (breaks after restart/resume) |
+| claude-code-sdk | `deepworker` (static) | `mcp__deepworker__<tool>` | unstable (breaks after restart/resume) |
 | codex | `deepworker_<pid>` (dynamic) | `mcp__deepworker_<pid>__<tool>` | NO (short names are reserved for Codex's native tools) |
 | grok | `deep_worker_proxy_<pid>` (dynamic) | by the tool name directly — the grok CLI itself resolves it as an MCP tool on our server (the `CallMcpTool` mechanism); **no string prefix** | a bare name = grok's native built-ins; our tool is invoked as an MCP tool, not a native one |
 
-Result: claude-code/codex agents get
+Result: claude-code-sdk/codex agents get
 `No such tool available: send_message_to_agent` and cannot reply to
 inter-agent messages / restart. grok has a separate problem: not recognizing
 the tool, the model goes looking for its schema on disk (`_build_tool_contract`,
@@ -32,7 +32,7 @@ resolution. We change ONLY the text the model sees.
    short names; for the current provider the short name may NOT resolve —
    in that case use the provider-specific MCP form.
 2. Give the correct form for each of the three CLI providers
-   (claude-code/codex/grok), including the dynamic PID for codex.
+   (claude-code-sdk/codex/grok), including the dynamic PID for codex.
 3. Fix the dynamic hint of `InterAgentReplyMiddleware` (it dictates how to
    answer an incoming `send_message_to_agent`) — also provider-dependent.
 
@@ -48,7 +48,7 @@ For the three "command" tools — `send_message_to_agent`, `restart_self`,
 `restart_agent` — we give a DETAILED provider-dependent form. Plus ONE general
 rule for the other base tools (§3.4).
 
-### 3.1 claude-code
+### 3.1 claude-code-sdk
 ```
 Base deep-worker tools are available through the MCP server `deepworker`. If
 you refer to a tool by its short name `<X>` and get "No such tool available",
@@ -116,7 +116,7 @@ grok needs no separate section — the wording of §3.3 is already general.
    and ignore the note. Therefore **the call examples in the Identity block are
    parameterized** via `proxy_tool_form(provider, "send_message_to_agent")`
    (and similarly for `restart_self`/`restart_agent`, if mentioned there):
-   - claude-code → the example shows `mcp__deepworker__send_message_to_agent(...)`;
+   - claude-code-sdk → the example shows `mcp__deepworker__send_message_to_agent(...)`;
    - codex → `mcp__deepworker_<pid>__send_message_to_agent(...)`;
    - grok → the tool name as-is + the §3.3 disambiguation (MCP tool, not a native built-in);
    - providers without proxy → the short name (as now).
@@ -127,7 +127,7 @@ grok needs no separate section — the wording of §3.3 is already general.
 3. **`middleware/inter_agent_reply.py`** (`InterAgentReplyMiddleware`,
    lines 154-171). The hint `send_message_to_agent("{sender}", …)` is formed
    provider-dependently:
-   - claude-code → `mcp__deepworker__send_message_to_agent("{sender}", …)`;
+   - claude-code-sdk → `mcp__deepworker__send_message_to_agent("{sender}", …)`;
    - codex → `mcp__deepworker_<pid>__send_message_to_agent("{sender}", …)`;
    - grok → the §3.3 wording: call the tool `send_message_to_agent` directly as
      a deep-worker MCP tool (NOT a grok native built-in), the CLI will route it
@@ -146,7 +146,7 @@ grok needs no separate section — the wording of §3.3 is already general.
 ## 5. Provider dispatcher (one pure function, no methods on models)
 
 All provider specifics are collected in a single string helper in
-`deep_worker_cli` (e.g. `prompts/proxy_tool_hints.py`):
+the CLI package (e.g. `prompts/proxy_tool_hints.py`):
 
 ```python
 import os
@@ -154,7 +154,7 @@ import os
 def proxy_tool_form(provider: str, bare_name: str, *, pid: int | None = None) -> str:
     """The call form of a base tool for the given provider —
     a string ready to be inserted into a hint."""
-    if provider == "claude-code":
+    if provider == "claude-code-sdk":
         return f"mcp__deepworker__{bare_name}"
     if provider == "codex":
         p = pid if pid is not None else os.getpid()
@@ -172,14 +172,14 @@ functions — trivially testable, never fail.
 
 ## 6. TDD plan
 
-### Unit (deep_worker_cli)
+### Unit (CLI package)
 - `proxy_tool_form`:
-  - `claude-code` → `mcp__deepworker__send_message_to_agent`;
+  - `claude-code-sdk` → `mcp__deepworker__send_message_to_agent`;
   - `codex` (pid=1234) → `mcp__deepworker_1234__send_message_to_agent`;
   - `grok` → `send_message_to_agent` (bare, without `mcp__`);
   - `deepseek`/unknown → `send_message_to_agent` (fallback).
 - The note text for the prompt:
-  - claude-code: contains `mcp__deepworker__` and all three command tools;
+  - claude-code-sdk: contains `mcp__deepworker__` and all three command tools;
   - codex: contains `mcp__deepworker_<pid>__` (the real pid) and the wording
     "reserved for Codex's native tools";
   - grok: contains "call by name directly" and "do not search for their schema
@@ -194,7 +194,7 @@ functions — trivially testable, never fail.
 ### Integration (no mocks)
 - Extend
   `tests/integration_ai/test_claude_code_inter_agent_send_and_reply.py`:
-  bring up a REAL claude-code agent, send an incoming inter-agent message, and
+  bring up a REAL claude-code-sdk agent, send an incoming inter-agent message, and
   verify that the system prompt/hint features
   `mcp__deepworker__send_message_to_agent` (not the bare name), and that the
   agent replies live without `No such tool available`.

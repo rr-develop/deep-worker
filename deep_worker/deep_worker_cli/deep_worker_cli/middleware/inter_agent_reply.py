@@ -106,7 +106,7 @@ class InterAgentReplyMiddleware(AgentMiddleware):
             reply_tool_form: The PROVIDER-CORRECT call form for the
                   ``send_message_to_agent`` tool, used verbatim in the
                   injected hint. Defaults to the bare name (backward
-                  compatible). For claude-code/codex this is the
+                  compatible). For claude-code-sdk/codex this is the
                   ``mcp__deepworker[_<pid>]__send_message_to_agent`` form
                   (see docs/DESIGN_MCP_PROXY_TOOL_NAME_PREFIX_AWARENESS.md).
             grok_mcp_note: When True, append a short "this is an MCP tool,

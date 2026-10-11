@@ -4,17 +4,16 @@ BUG: All agents share a single sessions.db file. With multiple concurrent
 agents writing large checkpoints, SQLite "database is locked" errors occur.
 The shared file also grows to tens of GB without any per-agent cleanup.
 
-Fix: Each agent gets its own DB file: sessions_{agent_name}.db
+Fix: Each agent gets its own DB file under its own root:
+``~/.deep_worker/agents/<agent_name>/threads.db``.
 """
 
-import sqlite3
-import tempfile
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
-from deep_worker_cli.sessions import _migrate_from_global_db, get_db_path
+from deep_worker_cli.storage_paths import DeepagentsPathForbiddenError
+from deep_worker_cli.sessions import get_db_path
 
 
 class TestPerAgentDb:
@@ -41,115 +40,54 @@ class TestPerAgentDb:
         assert "agent_a" in str(path_a)
         assert "agent_b" in str(path_b)
 
-    def test_get_db_path_without_agent_name_returns_global(
+    def test_global_db_path_is_refused(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Backward compat: no agent_name returns the global sessions.db."""
-        monkeypatch.setenv("HOME", str(tmp_path))
-        path = get_db_path()
-        assert path.name == "sessions.db"
+        """The v1 global DB lived in the banned tree, so it must raise.
 
-    def test_get_db_path_same_directory(
+        Per-agent resolution is unaffected and stays in the product tree.
+        """
+        monkeypatch.setenv("HOME", str(tmp_path))
+        with pytest.raises(DeepagentsPathForbiddenError):
+            get_db_path()
+        assert get_db_path(agent_name="test_agent").parent.name == "test_agent"
+
+
+class TestNoMigrationFromTheAncestorsTree:
+    """POLICIES §16: no import path out of ``~/.deepagents`` exists.
+
+    This class replaced ``TestMigrateFromGlobalDb``, which asserted that
+    creating a per-agent DB copied checkpoints and writes out of the legacy
+    global ``sessions.db``. That DB lived in the ancestor's tree, which is
+    banned for reads and writes alike, so the shim was removed rather than
+    repointed: migrating an existing install is a one-time, out-of-band
+    action, never a branch inside the product's own lookup path.
+    """
+
+    def test_migration_helper_no_longer_exists(self) -> None:
+        """The shim must stay gone — re-adding it reintroduces the read."""
+        import deep_worker_cli.sessions as sessions
+
+        assert not hasattr(sessions, "_migrate_from_global_db"), (
+            "_migrate_from_global_db reads ~/.deepagents (POLICIES §16); "
+            "it must not be reintroduced"
+        )
+
+    @pytest.mark.asyncio
+    async def test_checkpointer_creates_a_fresh_per_agent_db(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Global legacy and v3 agent DB files use different roots."""
+        """Opening a checkpointer must not consult any global DB."""
+        from deep_worker_cli.sessions import get_checkpointer
+
         monkeypatch.setenv("HOME", str(tmp_path))
-        global_path = get_db_path()
-        agent_path = get_db_path(agent_name="test_agent")
-        assert global_path.parent.name == ".deepagents"
-        assert agent_path.parent.name == "test_agent"
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
 
+        async with get_checkpointer("freshagent"):
+            pass
 
-class TestMigrateFromGlobalDb:
-    """Verify automatic migration from global sessions.db to per-agent DB."""
-
-    def test_migrates_checkpoints_and_writes(self, tmp_path: Path) -> None:
-        """Data for agent should be copied from global to per-agent DB."""
-        # Create global DB with test data
-        global_db = tmp_path / "sessions.db"
-        conn = sqlite3.connect(str(global_db))
-        conn.execute(
-            "CREATE TABLE checkpoints (thread_id TEXT, checkpoint_ns TEXT, "
-            "checkpoint_id TEXT, parent_checkpoint_id TEXT, type TEXT, "
-            "checkpoint BLOB, metadata BLOB, "
-            "PRIMARY KEY (thread_id, checkpoint_ns, checkpoint_id))"
+        db = tmp_path / ".deep_worker" / "agents" / "freshagent" / "threads.db"
+        assert db.exists(), "per-agent DB was not created"
+        assert not (tmp_path / ".deepagents").exists(), (
+            "opening a checkpointer touched ~/.deepagents (POLICIES §16)"
         )
-        conn.execute(
-            "CREATE TABLE writes (thread_id TEXT, checkpoint_ns TEXT, "
-            "checkpoint_id TEXT, task_id TEXT, idx INTEGER, "
-            "channel TEXT, type TEXT, value BLOB, "
-            "PRIMARY KEY (thread_id, checkpoint_ns, checkpoint_id, task_id, idx))"
-        )
-        conn.execute(
-            "INSERT INTO checkpoints VALUES (?,?,?,?,?,?,?)",
-            ("myagent", "", "cp1", None, "json", b"data1", b"meta1"),
-        )
-        conn.execute(
-            "INSERT INTO checkpoints VALUES (?,?,?,?,?,?,?)",
-            ("myagent:tm", "", "cp2", None, "json", b"data2", b"meta2"),
-        )
-        conn.execute(
-            "INSERT INTO checkpoints VALUES (?,?,?,?,?,?,?)",
-            ("other_agent", "", "cp3", None, "json", b"data3", b"meta3"),
-        )
-        conn.execute(
-            "INSERT INTO writes VALUES (?,?,?,?,?,?,?,?)",
-            ("myagent", "", "cp1", "t1", 0, "ch", "json", b"val1"),
-        )
-        conn.commit()
-        conn.close()
-
-        # Migrate
-        agent_db = tmp_path / "sessions_myagent.db"
-        with patch("deep_worker_cli.sessions.get_db_path", side_effect=lambda a=None: global_db if a is None else agent_db):
-            _migrate_from_global_db("myagent", agent_db)
-
-        # Verify
-        dst = sqlite3.connect(str(agent_db))
-        cps = dst.execute("SELECT thread_id FROM checkpoints ORDER BY thread_id").fetchall()
-        assert len(cps) == 2
-        assert cps[0][0] == "myagent"
-        assert cps[1][0] == "myagent:tm"
-
-        writes = dst.execute("SELECT thread_id FROM writes").fetchall()
-        assert len(writes) == 1
-        assert writes[0][0] == "myagent"
-
-        dst.close()
-
-    def test_skips_if_agent_db_already_has_data(self, tmp_path: Path) -> None:
-        """Migration should not run twice."""
-        global_db = tmp_path / "sessions.db"
-        conn = sqlite3.connect(str(global_db))
-        conn.execute(
-            "CREATE TABLE checkpoints (thread_id TEXT PRIMARY KEY, data TEXT)"
-        )
-        conn.execute("INSERT INTO checkpoints VALUES ('agent', 'data')")
-        conn.commit()
-        conn.close()
-
-        # Create per-agent DB with existing data (> 8192 bytes)
-        agent_db = tmp_path / "sessions_agent.db"
-        dst = sqlite3.connect(str(agent_db))
-        dst.execute("CREATE TABLE checkpoints (thread_id TEXT PRIMARY KEY, data TEXT)")
-        # Insert enough data to exceed 8192 bytes
-        for i in range(100):
-            dst.execute(f"INSERT INTO checkpoints VALUES ('t{i}', '{'x' * 100}')")
-        dst.commit()
-        dst.close()
-
-        original_size = agent_db.stat().st_size
-        assert original_size > 8192
-
-        with patch("deep_worker_cli.sessions.get_db_path", return_value=global_db):
-            _migrate_from_global_db("agent", agent_db)
-
-        # Size should not change (migration skipped)
-        assert agent_db.stat().st_size == original_size
-
-    def test_no_crash_if_global_db_missing(self, tmp_path: Path) -> None:
-        """Migration should not crash if global DB doesn't exist."""
-        agent_db = tmp_path / "sessions_agent.db"
-        with patch("deep_worker_cli.sessions.get_db_path", return_value=tmp_path / "nonexistent.db"):
-            _migrate_from_global_db("agent", agent_db)
-        # Should not crash

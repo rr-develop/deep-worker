@@ -1,6 +1,6 @@
 """Integration (no mocks): `--list` reads thread_metadata fast.
 
-Builds a realistic ``$HOME/.deepagents`` directory with:
+Builds a realistic ``$HOME/.deep_worker/agents/`` tree with:
 
 * two DBs written by the REAL ``DeltaSqliteCheckpointer`` (so they carry a
   live-maintained ``thread_metadata`` table), and
@@ -112,13 +112,18 @@ def _run_list_json(home: Path) -> dict:
     return json.loads(out[start:])
 
 
+def _agent_db(home: Path, agent_name: str) -> Path:
+    """The per-agent DB under the v3 layout: ``agents/<name>/threads.db``."""
+    db = home / ".deep_worker" / "agents" / agent_name / "threads.db"
+    db.parent.mkdir(parents=True, exist_ok=True)
+    return db
+
+
 @pytest.fixture
 def home_with_dbs(tmp_path) -> Path:
-    deepagents = tmp_path / ".deepagents"
-    deepagents.mkdir(parents=True)
-    asyncio.run(_write_real_db(deepagents / "sessions_alpha.db", "alpha", "alpha"))
-    asyncio.run(_write_real_db(deepagents / "sessions_beta.db", "beta", "beta"))
-    _build_legacy_db(deepagents / "sessions_oldagent.db", "oldagent", "oldagent")
+    asyncio.run(_write_real_db(_agent_db(tmp_path, "alpha"), "alpha", "alpha"))
+    asyncio.run(_write_real_db(_agent_db(tmp_path, "beta"), "beta", "beta"))
+    _build_legacy_db(_agent_db(tmp_path, "oldagent"), "oldagent", "oldagent")
     return tmp_path
 
 
@@ -129,7 +134,7 @@ def test_list_includes_all_threads_including_legacy(home_with_dbs):
 
 
 def test_legacy_db_backfilled_once_and_idempotent(home_with_dbs):
-    legacy = home_with_dbs / ".deepagents" / "sessions_oldagent.db"
+    legacy = _agent_db(home_with_dbs, "oldagent")
 
     # First run backfills the table.
     _run_list_json(home_with_dbs)

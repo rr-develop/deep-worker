@@ -21,7 +21,7 @@ import pytest
 def _make_proc(
     *,
     invariant_prompt: str | None,
-    provider: str = "claude-code",
+    provider: str = "claude-code-sdk",
     model: str = "opus",
     agent: Any = None,
 ) -> Any:
@@ -45,7 +45,7 @@ class TestGetSystemPrompt:
         resp = await proc._handle_get_system_prompt()
         assert resp["success"] is True
         assert resp["system_prompt"] == "INVARIANT PROMPT TEXT"
-        assert resp["provider"] == "claude-code"
+        assert resp["provider"] == "claude-code-sdk"
         assert resp["model"] == "opus"
 
     @pytest.mark.asyncio
@@ -77,7 +77,7 @@ class TestGetTools:
         )
         resp = await proc._handle_get_tools()
         assert resp["success"] is True
-        assert resp["provider"] == "claude-code"
+        assert resp["provider"] == "claude-code-sdk"
         assert resp["tools"] == [
             {"name": "execute", "description": "Run a shell command"},
             {"name": "read_file", "description": "Read a file"},

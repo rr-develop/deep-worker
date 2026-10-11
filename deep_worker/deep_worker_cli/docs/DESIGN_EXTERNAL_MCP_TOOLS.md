@@ -18,13 +18,13 @@ tool, only parks the Future" remains unchanged.
 ## 2. Architecture in one picture
 
 ```
-                     project_root/.deepagents/mcp.json   ← shared in repo
-                            ▲
-~/.deepagents/mcp.json  ────┤
-                            │   load_mcp_config(layers)
-~/.deepagents/<a>/mcp.json ─┤   →  dict[name → ServerSpec]
-                            │
-CLI --mcp-config X ─────────┘
+                     project_root/.deep_worker/mcp.json   ← shared in repo
+                                    ▲
+~/.deep_worker/mcp.json  ───────────┤
+                                    │   load_mcp_config(layers)
+~/.deep_worker/agents/<a>/mcp.json ─┤   →  dict[name → ServerSpec]
+                                    │
+CLI --mcp-config X ─────────────────┘
 CLI --mcp-server N=spec
                             │
                             ▼
@@ -115,9 +115,9 @@ Variable substitution:
 ### 3.2 Layers and merge
 
 ```
-1.  ~/.deepagents/mcp.json                          (user-global)
-2.  {project_root}/.deepagents/mcp.json             (project)
-3.  ~/.deepagents/<agent_name>/mcp.json             (per-agent)
+1.  ~/.deep_worker/mcp.json                         (user-global)
+2.  {project_root}/.deep_worker/mcp.json            (project)
+3.  ~/.deep_worker/agents/<agent_name>/mcp.json     (per-agent)
 4.  CLI: --mcp-config <path> (repeatable)
         --mcp-server '<name>={"command":"..."}'     (repeatable)
 ```
@@ -335,8 +335,8 @@ mangles `.`→`_` on top of the MCP spec, plus the OpenAI API rejects HTTP 400)
 need to hardcode values and so that canonical secret sources
 (e.g. `~/.config/my-chrome-mcp/admin.env`, the same file that
 raises the systemd unit of the bridge itself) are not duplicated in
-`~/.deepagents/.env`, the agent additionally loads
-**drop-in env files** from the `~/.deepagents/env.d/` directory at startup.
+`~/.deep_worker/.env`, the agent additionally loads
+**drop-in env files** from the `~/.deep_worker/env.d/` directory at startup.
 
 Contract (see `deep_worker_cli/process/env_loader.py`):
 
@@ -346,16 +346,16 @@ Contract (see `deep_worker_cli/process/env_loader.py`):
 * Each file (or symlink target) must have permissions `0o600` (like
   `mcp.json`). Files with group/world bits — **skipped** with a warning.
   This protects against accidental secret leakage on first run.
-* Already-set variables (from `~/.deepagents/.env` or inherited
+* Already-set variables (from `~/.deep_worker/.env` or inherited
   from the shell) are NEVER overwritten (`override=False`). This means:
-    - the main `~/.deepagents/.env` remains the highest priority — a drop-in
+    - the main `~/.deep_worker/.env` remains the highest priority — a drop-in
       cannot accidentally "beat" it;
     - if two drop-in files set the same variable, the one whose
       name comes earlier in `sorted()` wins.
 * Symlinks **allowed and recommended**: typical setup —
     ```bash
-    mkdir -p ~/.deepagents/env.d
-    ln -s ~/.config/my-chrome-mcp/admin.env ~/.deepagents/env.d/my-chrome-mcp.env
+    mkdir -p ~/.deep_worker/env.d
+    ln -s ~/.config/my-chrome-mcp/admin.env ~/.deep_worker/env.d/my-chrome-mcp.env
     chmod 0600 ~/.config/my-chrome-mcp/admin.env   # once
     ```
   The real file with the token stays at its canonical location (where the
