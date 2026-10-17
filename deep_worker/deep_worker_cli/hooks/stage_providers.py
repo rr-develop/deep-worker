@@ -76,6 +76,37 @@ PROVIDERS_MANIFEST = "providers_manifest.json"
 STAGING_MANIFEST = "staging.manifest.json"
 VENDOR_STAGING = "vendor_staging"
 
+# ---------------------------------------------------------------------------
+# Web payload.
+#
+# ``deep_worker_web`` is the web UI server. It must ship inside the
+# deep-worker wheel, because a user who installed from PyPI has no sources and
+# `deep-worker web` has to work for them.
+#
+# It is staged exactly like the providers — copied from OUTSIDE the hatch root
+# into a unique temp dir, covered by a sha256 marker — and for one specific
+# reason it is NOT moved into the package tree instead: three path expressions
+# in the web code derive the checkout root by counting directory levels
+#
+#   app/config.py                 Path(__file__).resolve().parents[2]
+#   app/routers/agents.py         Path(__file__).resolve().parent x4
+#   app/services/agent_service.py Path(__file__).resolve().parent x4
+#
+# and moving the files changes that count. The result is not an exception but
+# a DIFFERENT yet existing directory (…/deep_worker_cli instead of the tree
+# root), so the failure is silent: ``.exists()`` turns False somewhere far
+# from the cause. Staging keeps the source tree byte-for-byte identical, which
+# is what lets this host keep running deep_worker from source unchanged.
+WEB_SOURCE_DIRNAME = "deep_worker_web"
+WEB_STAGING = "web_staging"
+WEB_DEST = "deep_worker_cli/web"
+
+# Eligible web payload = every production ``*.py`` under ``app/`` plus every
+# asset under ``static/``. ``static/`` ships wholesale (html/css/js and any
+# future asset type), so it is matched by subtree, not by suffix.
+WEB_CODE_SUBDIR = "app"
+WEB_ASSET_SUBDIR = "static"
+
 _TEMP_PREFIX = "dw-provider-stage."
 _CREATED_TEMPS: set[Path] = set()
 
@@ -175,6 +206,90 @@ def collect_eligible(providers_root: Path) -> dict[str, dict[str, str]]:
                 files[rel] = _sha256(full)
         result[pkg] = files
     return result
+
+
+def collect_web_eligible(web_root: Path) -> dict[str, str]:
+    """Return the eligible web payload set: ``{relpath: sha256}``.
+
+    Eligible = every ``*.py`` under ``app/`` plus every file under
+    ``static/``.  ``__pycache__`` is skipped; tree-only files
+    (``requirements.txt``, ``pytest.ini``, docs, tests) are not part of the
+    shipped set by definition.
+
+    Hard-fails on a missing tree and on symlinks — both symlink files AND
+    symlink directories (escape guard) — so the payload can never reach
+    outside ``web_root`` through a link, and a symlink dir is never silently
+    skipped.  Same guarantees as :func:`collect_eligible` for providers.
+    """
+    if not web_root.is_dir():
+        raise ManifestError(f"web tree missing: {web_root}")
+    if web_root.is_symlink():
+        raise ManifestError(f"symlink web tree root (escape guard): {web_root}")
+
+    files: dict[str, str] = {}
+    seen_lower: dict[str, str] = {}
+    for subdir, py_only in ((WEB_CODE_SUBDIR, True), (WEB_ASSET_SUBDIR, False)):
+        sub_root = web_root / subdir
+        if not sub_root.is_dir():
+            raise ManifestError(f"web payload subtree missing: {sub_root}")
+        if sub_root.is_symlink():
+            raise ManifestError(
+                f"symlink directory in web tree (escape guard): {sub_root}"
+            )
+        for dirpath, dirnames, filenames in os.walk(sub_root, followlinks=False):
+            dirpath_p = Path(dirpath)
+            if dirpath_p.is_symlink():
+                raise ManifestError(
+                    f"symlink directory in web tree (escape guard): {dirpath_p}"
+                )
+            for d in list(dirnames):
+                full_d = dirpath_p / d
+                if full_d.is_symlink():
+                    raise ManifestError(
+                        f"symlink directory in web tree (escape guard): {full_d}"
+                    )
+            dirnames[:] = [d for d in dirnames if d != "__pycache__"]
+            for name in sorted(filenames):
+                full = dirpath_p / name
+                if full.is_symlink():
+                    raise ManifestError(
+                        f"symlink in web tree (escape guard): {full}"
+                    )
+                if py_only and not name.endswith(".py"):
+                    continue
+                rel = full.relative_to(web_root).as_posix()
+                lower = rel.lower()
+                if lower in seen_lower and seen_lower[lower] != rel:
+                    raise ManifestError(
+                        f"case collision in web payload: "
+                        f"{seen_lower[lower]} vs {rel}"
+                    )
+                seen_lower[lower] = rel
+                files[rel] = _sha256(full)
+    return files
+
+
+def _web_root_for(project_root: Path) -> Path:
+    """Return the ``deep_worker_web`` tree for a given hatch project root.
+
+    ``project_root`` is ``<tree>/deep_worker/deep_worker_cli``, so the web tree
+    is its grandparent's child — the same relative position the providers tree
+    occupies one level up.
+    """
+    return project_root.parent.parent / WEB_SOURCE_DIRNAME
+
+
+def stage_web_from_source(project_root: Path, payload: Path) -> None:
+    """Copy the eligible web payload from the sources into ``payload``.
+
+    The source tree is only READ: every write goes to ``payload`` (a unique
+    temp dir in monorepo builds).  That is what keeps this host's from-source
+    launch working untouched.
+    """
+    web_root = _web_root_for(project_root)
+    files = collect_web_eligible(web_root)
+    payload.mkdir(parents=True, exist_ok=False)
+    _stage_files(web_root, payload, sorted(files))
 
 
 def build_providers_manifest(providers_root: Path) -> dict[str, Any]:
@@ -369,6 +484,7 @@ class StageProvidersHook(BuildHookInterface):
         # errors, …) must clean it up IMMEDIATELY — Hatch calls finalize()
         # only on success, so a leak here would live until process exit.
         try:
+            web_payload = self._resolve_web_payload(root, temp)
             if self.target_name == "wheel":
                 for pkg in PROVIDER_PACKAGES:
                     build_data["force_include"][str(payload / pkg)] = (
@@ -380,12 +496,25 @@ class StageProvidersHook(BuildHookInterface):
                 build_data["force_include"][str(payload / "__init__" / "providers")] = (
                     "deep_worker/providers/__init__.py"
                 )
+                # Web UI: app/ + static/ land under deep_worker_cli/web/ so a
+                # pip user gets `deep-worker web` with no sources. Mapped as
+                # two subtrees (not file-by-file) to keep force_include small.
+                build_data["force_include"][str(web_payload / WEB_CODE_SUBDIR)] = (
+                    f"{WEB_DEST}/{WEB_CODE_SUBDIR}"
+                )
+                build_data["force_include"][str(web_payload / WEB_ASSET_SUBDIR)] = (
+                    f"{WEB_DEST}/{WEB_ASSET_SUBDIR}"
+                )
             elif self.target_name == "sdist":
                 if temp is not None:
                     # Monorepo: ship the staged payload + its integrity marker so a
                     # later wheel rebuild from this sdist is self-sufficient.
                     build_data["force_include"][str(payload)] = VENDOR_STAGING
                     build_data["force_include"][str(staging_manifest_path)] = STAGING_MANIFEST
+                    # Same for the web payload — without it an sdist rebuild
+                    # would have to reach ../../deep_worker_web, which is
+                    # exactly what extracted mode must never do.
+                    build_data["force_include"][str(web_payload)] = WEB_STAGING
                 # In extracted mode both already live inside the project root and
                 # the default sdist file selection picks them up.
                 build_data["force_include"][str(root / "hooks" / "stage_providers.py")] = (
@@ -407,6 +536,26 @@ class StageProvidersHook(BuildHookInterface):
             shutil.rmtree(temp, ignore_errors=True)
 
     # -- internals ----------------------------------------------------------
+
+    def _resolve_web_payload(self, root: Path, temp: Path | None) -> Path:
+        """Return the staged web payload directory.
+
+        * monorepo (``temp is not None``): staged fresh next to the provider
+          payload by :meth:`_resolve_payload`.
+        * sdist-extracted (``temp is None``): ``web_staging/`` shipped inside
+          the sdist, used as-is — never reaching ``../../`` for sources that
+          an extracted tree does not have.
+        """
+        if temp is not None:
+            return temp / "web"
+        extracted = root / WEB_STAGING
+        if not extracted.is_dir():
+            raise ManifestError(
+                f"{WEB_STAGING} missing from extracted sdist: {extracted}\n"
+                "The web payload must ship inside the sdist; a rebuild cannot "
+                "fall back to the source tree."
+            )
+        return extracted
 
     def _resolve_payload(self, root: Path) -> tuple[Path, Path, Path | None]:
         """Return ``(payload, staging_manifest_path, temp_or_None)``.
@@ -437,6 +586,10 @@ class StageProvidersHook(BuildHookInterface):
         try:
             payload = temp / "payload"
             stage_providers_from_source(root, payload)
+            # The web payload is staged into the SAME temp, under its own
+            # subdir, so one temp lifecycle covers both and finalize() needs
+            # no extra bookkeeping.
+            stage_web_from_source(root, temp / "web")
             staging_manifest = build_staging_manifest(payload)
             (temp / STAGING_MANIFEST).write_text(
                 json.dumps(staging_manifest, indent=2, sort_keys=True) + "\n",

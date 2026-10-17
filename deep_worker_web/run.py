@@ -2,14 +2,18 @@
 
 CRITICAL SECURITY NOTICE:
 ========================
-This application MUST ONLY run on 127.0.0.1 on one of two approved
-ports — and no other:
+This application MUST ONLY run on 127.0.0.1. That is enforced and
+cannot be switched off.
+
+``app.config`` derives the DEFAULT port from the checkout location at
+import time:
 
 - 7887 for the production / hot-fix checkout
 - 7888 for the developer checkout
+- 7887 anywhere else, including an installed wheel
 
-``app.config`` derives the correct port from the checkout location
-at import time and refuses to start anywhere else.
+It no longer refuses to start outside those trees — that refusal is
+precisely what kept the web UI unusable from a pip install.
 """
 
 import logging
@@ -215,12 +219,16 @@ def main() -> None:
     signal.signal(signal.SIGINT, signal_handler)
 
     # Security validation (explicit check before server start).
-    # `settings.validate_security()` enforces the (checkout -> port) pairing —
-    # 7887 for the production checkout, 7888 for the development one — so a
-    # second sanity check here just re-runs it with a friendly error message
-    # in case settings got mutated between import and main().
+    # ``settings.validate_security()`` enforces the one hard invariant —
+    # loopback only. Re-running it here catches a host mutated between
+    # import and main() and reports it with a friendly message.
+    #
+    # It deliberately does NOT police the (checkout -> port) pairing any
+    # more: that whitelist refused to start from a pip install, and its
+    # port branch accepted an occupied port while rejecting a free one.
+    # A busy port is reported by bind() with the OS's own message.
     print(f"🔒 SECURITY: Server will bind to {settings.host}:{settings.port} ONLY")
-    print(f"📂 Active checkout: {settings.checkout_root}")
+    print(f"📂 Active checkout: {settings.checkout_root or 'installed (no checkout)'}")
     print("⚠️  This application MUST NOT be exposed to external networks!")
     print()
 

@@ -78,13 +78,26 @@ def _build_standard_tree(root: Path) -> tuple[Path, Path]:
 
     Layout mirrors production: ``<project_root>.parent/providers/`` with the
     five packages each holding a couple of ``*.py`` files + ``py.typed``.
+
+    A ``deep_worker_web`` sibling is created too, because staging a build now
+    covers the web payload as well and a missing web tree is a hard failure
+    (same strictness as a missing provider package — a payload source is
+    never silently skipped). ``project_root`` is therefore nested one level
+    deeper than the providers tree so the web tree sits at
+    ``project_root.parent.parent/deep_worker_web``, production's real
+    relative position.
     """
-    providers_root = root / "providers"
+    # <root>/deep_worker/{providers,project} + <root>/deep_worker_web, so that
+    # project_root.parent.parent is <root> and the web tree is its child —
+    # everything stays inside the caller's tmp_path (no writes to its parent,
+    # which would leak between tests).
+    deep_worker = root / "deep_worker"
+    providers_root = deep_worker / "providers"
     providers_root.mkdir(parents=True)
     (providers_root / "__init__.py").write_text("", encoding="utf-8")
     # `deep_worker/__init__.py` (parent of the providers tree) — staged by
     # stage_providers_from_source into payload/__init__/deep_worker.
-    (root / "__init__.py").write_text("", encoding="utf-8")
+    (deep_worker / "__init__.py").write_text("", encoding="utf-8")
     for pkg in PROVIDER_PACKAGES:
         _make_package(
             providers_root,
@@ -96,8 +109,9 @@ def _build_standard_tree(root: Path) -> tuple[Path, Path]:
                 "beta.py": f"def beta_{pkg}() -> str:\n    return '{pkg}'\n",
             },
         )
-    project_root = root / "project"
+    project_root = deep_worker / "project"
     project_root.mkdir()
+    _make_web_tree(root)
     return project_root, providers_root
 
 
@@ -564,11 +578,15 @@ def test_initialize_wheel_force_include(tree: tuple[Path, Path]) -> None:
     build_data = _build_data()
     hook.initialize(version="0.0.0", build_data=build_data)
     fi = build_data["force_include"]
-    assert len(fi) == 8, fi
+    # 7 providers + deep_worker/__init__.py + providers/__init__.py
+    # + web app/ + web static/ = 11
+    assert len(fi) == 10, fi
     for pkg in PROVIDER_PACKAGES:
         assert f"deep_worker/providers/{pkg}" in fi.values(), pkg
     assert "deep_worker/__init__.py" in fi.values()
     assert "deep_worker/providers/__init__.py" in fi.values()
+    assert f"{H.WEB_DEST}/{H.WEB_CODE_SUBDIR}" in fi.values()
+    assert f"{H.WEB_DEST}/{H.WEB_ASSET_SUBDIR}" in fi.values()
     hook.finalize(version="0.0.0", build_data={}, artifact="x.whl")  # hygiene
 
 
@@ -733,3 +751,205 @@ def test_cli_update_regenerates_manifest(tmp_path: Path) -> None:
     )
     assert manifest["schema_version"] == H.SCHEMA_VERSION
     assert manifest["packages"].keys() == set(PROVIDER_PACKAGES)
+
+
+# ---------------------------------------------------------------------------
+# Web payload (deep_worker_web → deep_worker_cli/web in the wheel)
+#
+# The web server must ship INSIDE the deep-worker distribution so a user who
+# installed from PyPI can run `deep-worker web` with no sources. It is staged
+# exactly like the providers — from OUTSIDE the hatch root, into a temp dir,
+# with a sha256 integrity marker — because the source tree must stay byte-for-
+# byte untouched: the host runs deep_worker from source, and three path
+# expressions in the web code (``app/config.py`` parents[2],
+# ``app/routers/agents.py`` parent x4, ``app/services/agent_service.py``
+# parent x4) resolve to a DIFFERENT yet existing directory if the files move,
+# which fails silently (``.exists()`` just turns False, nothing raises).
+# ---------------------------------------------------------------------------
+
+
+def _make_web_tree(root: Path) -> Path:
+    """Create a minimal ``deep_worker_web`` sibling tree, return its path.
+
+    Mirrors production layout: ``<tree>/deep_worker_web/{app,static}`` living
+    two levels above the hatch root (``<tree>/deep_worker/deep_worker_cli``),
+    i.e. the same relative position the real repo uses.
+    """
+    web = root / "deep_worker_web"
+    (web / "app" / "routers").mkdir(parents=True)
+    (web / "app" / "services").mkdir(parents=True)
+    (web / "static" / "css").mkdir(parents=True)
+    (web / "static" / "js").mkdir(parents=True)
+    (web / "app" / "__init__.py").write_text("", encoding="utf-8")
+    (web / "app" / "main.py").write_text("APP = 'main'\n", encoding="utf-8")
+    (web / "app" / "config.py").write_text("PORT = 7887\n", encoding="utf-8")
+    (web / "app" / "routers" / "__init__.py").write_text("", encoding="utf-8")
+    (web / "app" / "routers" / "agents.py").write_text("R = 1\n", encoding="utf-8")
+    (web / "app" / "services" / "__init__.py").write_text("", encoding="utf-8")
+    (web / "static" / "index.html").write_text("<html></html>", encoding="utf-8")
+    (web / "static" / "css" / "style.css").write_text("body{}", encoding="utf-8")
+    (web / "static" / "js" / "main.js").write_text("// js", encoding="utf-8")
+    # Non-eligible noise that must NOT be staged.
+    (web / "app" / "__pycache__").mkdir()
+    (web / "app" / "__pycache__" / "main.cpython-312.pyc").write_bytes(b"\x00")
+    (web / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
+    return web
+
+
+@pytest.fixture()
+def web_tree(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """Canonical tree (providers + web sibling) with an up-to-date manifest.
+
+    Returns ``(project_root, providers_root, web_root)``. Reuses
+    ``_build_standard_tree`` so the web payload is exercised against the SAME
+    layout every other test in this module uses.
+    """
+    project_root, providers_root = _build_standard_tree(tmp_path)
+    _write_manifest(project_root, providers_root)
+    return project_root, providers_root, tmp_path / "deep_worker_web"
+
+
+def test_collect_web_eligible_takes_py_and_static_assets(
+    web_tree: tuple[Path, Path, Path]
+) -> None:
+    """Eligible web set = app/**.py + every static/ asset; noise excluded."""
+    _, _, web_root = web_tree
+    files = H.collect_web_eligible(web_root)
+    assert "app/main.py" in files
+    assert "app/config.py" in files
+    assert "app/routers/agents.py" in files
+    assert "static/index.html" in files
+    assert "static/css/style.css" in files
+    assert "static/js/main.js" in files
+    # __pycache__ and tree-only files are not part of the shipped set.
+    assert not any("__pycache__" in rel for rel in files), files
+    assert "requirements.txt" not in files
+    # Every value is a sha256 hex digest.
+    assert all(len(sha) == 64 for sha in files.values()), files
+
+
+def test_collect_web_eligible_symlink_escape_hard_fails(tmp_path: Path) -> None:
+    web = _make_web_tree(tmp_path)
+    outside = tmp_path / "outside.py"
+    outside.write_text("SECRET = 1\n", encoding="utf-8")
+    (web / "app" / "linked.py").symlink_to(outside)
+    with pytest.raises(H.ManifestError, match="symlink"):
+        H.collect_web_eligible(web)
+
+
+def test_collect_web_eligible_symlink_dir_hard_fails(tmp_path: Path) -> None:
+    web = _make_web_tree(tmp_path)
+    target = tmp_path / "elsewhere"
+    target.mkdir()
+    (target / "sneaky.py").write_text("X = 1\n", encoding="utf-8")
+    (web / "app" / "linkdir").symlink_to(target, target_is_directory=True)
+    with pytest.raises(H.ManifestError, match="symlink directory"):
+        H.collect_web_eligible(web)
+
+
+def test_collect_web_eligible_missing_tree_hard_fails(tmp_path: Path) -> None:
+    with pytest.raises(H.ManifestError, match="web tree missing"):
+        H.collect_web_eligible(tmp_path / "nope")
+
+
+def test_stage_web_from_source_layout(web_tree: tuple[Path, Path, Path]) -> None:
+    """Web payload mirrors the source subtree under its own payload dir."""
+    project_root, _, _ = web_tree
+    payload = project_root.parent.parent / "staged"
+    H.stage_web_from_source(project_root, payload)
+    assert (payload / "app" / "main.py").is_file()
+    assert (payload / "app" / "routers" / "agents.py").is_file()
+    assert (payload / "static" / "index.html").is_file()
+    assert (payload / "static" / "css" / "style.css").is_file()
+    assert not (payload / "app" / "__pycache__").exists()
+    assert not (payload / "requirements.txt").exists()
+
+
+def test_initialize_wheel_stages_web_into_cli_web(
+    web_tree: tuple[Path, Path, Path]
+) -> None:
+    """The wheel maps the web payload to ``deep_worker_cli/web/...``.
+
+    This is the assertion that makes `deep-worker web` possible for a user
+    without sources: without it the wheel carries 0 web entries (measured on
+    0.0.20: 301 entries, 0 web, 0 static).
+    """
+    project_root, _, _ = web_tree
+    hook = _make_hook(project_root, "wheel")
+    build_data = _build_data()
+    hook.initialize(version="0.0.0", build_data=build_data)
+    try:
+        dests = set(build_data["force_include"].values())
+        assert "deep_worker_cli/web/app" in dests, dests
+        assert "deep_worker_cli/web/static" in dests, dests
+        # Providers are untouched by the addition.
+        for pkg in PROVIDER_PACKAGES:
+            assert f"deep_worker/providers/{pkg}" in dests, pkg
+    finally:
+        hook.finalize(version="0.0.0", build_data={}, artifact="x.whl")
+
+
+def test_initialize_wheel_never_touches_web_source_tree(
+    web_tree: tuple[Path, Path, Path]
+) -> None:
+    """Variant A's load-bearing invariant: the web SOURCE tree is untouched.
+
+    The host runs deep_worker from source; staging must happen in a temp dir
+    only. If staging ever wrote into ``deep_worker_web/``, the from-source
+    launch would start depending on build artifacts.
+    """
+    project_root, _, web_root = web_tree
+    before = {
+        p.relative_to(web_root).as_posix(): p.stat().st_mtime_ns
+        for p in sorted(web_root.rglob("*"))
+        if p.is_file()
+    }
+    hook = _make_hook(project_root, "wheel")
+    hook.initialize(version="0.0.0", build_data=_build_data())
+    temp = hook._temp
+    try:
+        assert temp is not None and temp.is_dir()
+        # Staged copies live under the temp dir, not in the source tree.
+        assert (temp / "web" / "app" / "main.py").is_file()
+        assert not (web_root / H.VENDOR_STAGING).exists()
+        assert not (web_root / H.STAGING_MANIFEST).exists()
+        after = {
+            p.relative_to(web_root).as_posix(): p.stat().st_mtime_ns
+            for p in sorted(web_root.rglob("*"))
+            if p.is_file()
+        }
+        assert after == before, "web source tree was modified by staging"
+    finally:
+        hook.finalize(version="0.0.0", build_data={}, artifact="x.whl")
+        assert temp is not None and not temp.exists()
+
+
+def test_web_staging_marker_detects_tampering(
+    web_tree: tuple[Path, Path, Path]
+) -> None:
+    """A staged web payload is covered by the sha256 integrity marker."""
+    project_root, _, _ = web_tree
+    payload = project_root.parent.parent / "staged"
+    H.stage_web_from_source(project_root, payload)
+    marker = H.build_staging_manifest(payload)
+    marker_path = project_root.parent.parent / "web.marker.json"
+    marker_path.write_text(json.dumps(marker), encoding="utf-8")
+    H.verify_staging(payload, marker_path)  # positive control: clean payload
+    (payload / "static" / "index.html").write_text("<tampered>", encoding="utf-8")
+    with pytest.raises(H.ManifestError, match="hash mismatch"):
+        H.verify_staging(payload, marker_path)
+
+
+def test_initialize_sdist_ships_web_payload(
+    web_tree: tuple[Path, Path, Path]
+) -> None:
+    """sdist carries the web payload so a rebuild needs no ``../../``."""
+    project_root, _, _ = web_tree
+    hook = _make_hook(project_root, "sdist")
+    build_data = _build_data()
+    hook.initialize(version="0.0.0", build_data=build_data)
+    try:
+        dests = set(build_data["force_include"].values())
+        assert H.WEB_STAGING in dests, dests
+    finally:
+        hook.finalize(version="0.0.0", build_data={}, artifact="x.tar.gz")

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "deep-worker"
-version = "0.0.20"
+version = "0.0.21"
 description = "Terminal interface for Deep Worker - interactive AI agent with file operations, shell access, and sub-agent capabilities."
 readme = "README.md"
 license = "MIT"
@@ -104,15 +104,20 @@ dependencies = [
   "pyperclip>=1.11.0,<2.0.0",
 
   # IPC/RPC — AsyncioServer-based RPyC fork.
-  # This pin is only the FALLBACK. A local rpyc_async source checkout wins over
+  # This pin is only the FALLBACK: a local rpyc_async source checkout wins over
   # any installed distribution (owner decision 2026-10-11, implemented in
-  # deep_worker_cli/rpyc_async_source.py), because the checkout is ahead of
-  # what is published: `rpyc_async.core.netref.async_call` — required by
-  # deep_worker_web.app.services.mcp_service — does not exist in 1.0.0, so a
-  # host resolving the published package cannot send inter-agent messages
-  # from the web UI. Raise this floor to >=1.1.0 once 1.1.0 is on PyPI; until
-  # then it understates what the code needs and only a checkout is complete.
-  "rpyc-async>=1.0.0",
+  # deep_worker_cli/rpyc_async_source.py). Being the fallback is exactly why
+  # it must not understate the requirement — the fallback is what a pip user
+  # actually gets.
+  #
+  # The floor is 1.1.0 because `rpyc_async.core.netref.async_call` — called
+  # by deep_worker_web.app.services.mcp_service — and
+  # `rpyc_async.utils.helpers.fire_and_forget_call` do not exist in 1.0.0.
+  # Verified by downloading both wheels: 1.0.0 exposes neither, 1.1.0
+  # (published 2026-10-11) exposes both. Under >=1.0.0 a resolver was free
+  # to install a web UI that cannot send inter-agent messages, with nothing
+  # in the metadata saying so.
+  "rpyc-async>=1.1.0",
 
   # Utilities
   "python-dotenv>=1.0.0,<2.0.0",
@@ -130,6 +135,30 @@ dependencies = [
   # are core deps because codex/grok are core providers.
   "uvicorn>=0.24.0",
   "starlette>=0.27.0",
+
+  # Web UI (deep_worker_cli/web/, staged into the wheel by
+  # hooks/stage_providers.py and launched by `deep-worker web`).
+  #
+  # CORE, not an extra: a user who runs `pip install deep-worker` must get a
+  # working web UI without knowing an extra exists (owner requirement
+  # 2026-10-13). The earlier [web] extra is gone for that reason.
+  #
+  # The set is derived from the import statements in deep_worker_web/app/**
+  # and run.py (23 files, 35 distinct top-level names), NOT from
+  # deep_worker_web/requirements.txt — that file lists packages no import
+  # asks for. Of the eight third-party names the web code imports, five are
+  # already declared above: uvicorn, starlette, pydantic, mcp, rpyc-async.
+  # These are the remaining three.
+  #
+  # Deliberately absent, each verified by probing the imports:
+  #   jinja2           reached only via fastapi.templating, and the dead
+  #                    app/templates/ branch that used it has been removed
+  #   python-multipart no import site
+  #   websockets       WS is served through Starlette/FastAPI
+  # uvicorn[standard] is not needed either — nothing imports its extras.
+  "fastapi",
+  "pydantic-settings",
+  "anyio",
 
   # LSP shared-service (see docs/DESIGN_LSP_SHARED_SERVICE.md).
   # Pinned to the 1.76.x line: 1.83+ pulls in protobuf 7.x and breaks
@@ -162,6 +191,9 @@ semantic-search = [
 # was built and integration-tested against). Core starts without it; the
 # agent's A2A server/client only activates when the extra is installed.
 a2a = ["a2a-sdk[http-server]>=1.1.0"]
+# NOTE: there is deliberately no `web` extra. The web UI's requirements are
+# CORE dependencies — see the "Web UI" block in [project.dependencies].
+# `pip install deep-worker` must yield a working `deep-worker web`.
 
 [project.urls]
 Homepage = "https://github.com/rr-develop/deep-worker"

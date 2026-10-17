@@ -36,6 +36,9 @@ from app.schemas.agent_schemas import (
     StopTaskManagerRequest,
 )
 from app.services.agent_service import AgentRefusedError, AgentService
+
+from .. import paths
+
 from deep_worker_cli.storage_paths import deep_worker_home, read_agent_file
 
 # Provider↔model compatibility. This used to be a hand-copied duplicate of
@@ -53,6 +56,11 @@ from deep_worker_cli.storage_paths import deep_worker_home, read_agent_file
 from deep_worker_cli.model_predicate import (
     model_can_belong_to_provider as _model_can_belong_to_provider,
 )
+
+# The ONE place that knows where a local rpyc_async checkout lives and
+# whether it is real. Used when building a spawned agent's PYTHONPATH;
+# see the comment at that call site for why a literal was wrong there.
+from deep_worker_cli.rpyc_async_source import ACTIVE_LOCAL_CHECKOUT
 
 logger = logging.getLogger(__name__)
 
@@ -980,10 +988,13 @@ def _spawn_subprocess(
     # auto-detects dev_tree; this brings the web path in line. See
     # docs/DESIGN_DEV_FLAG.md.
     #
-    # __file__ here = <WEB_TREE>/deep_worker_web/app/routers/agents.py;
-    # parent x4 = <WEB_TREE> — the fallback tree for non-dev agents (prod when
-    # the web server runs from the production tree).
-    _web_tree_root = Path(__file__).resolve().parent.parent.parent.parent
+    # The web server's own tree is the fallback for non-dev agents (prod when
+    # the web server runs from the production tree). It comes from the
+    # shared resolver, which returns None when this server was installed
+    # from a wheel — there is no source tree to spawn agents against, and
+    # pointing PYTHONPATH at a guessed directory would start the agent on a
+    # codebase nobody chose.
+    _web_tree_root = paths.source_tree_root()
     if config.get("dev_tree"):
         # DEEP_WORKER_DEV_TREE_ROOT_OVERRIDE mirrors the bash launcher's
         # testing hook so tests don't need a real dev tree.
@@ -995,11 +1006,41 @@ def _spawn_subprocess(
     else:
         _tree_root = _web_tree_root
     env = os.environ.copy()
-    env["PYTHONPATH"] = ":".join([
-        str(_tree_root / "deep_worker" / "deep_worker_cli"),
-        str(_tree_root / "deep_worker" / "deepagents"),
-        "/path/to/rpyc_async",
-    ])
+    if _tree_root is None:
+        # Installed from a wheel: deep_worker_cli and deepagents are already
+        # importable from site-packages, so the spawned agent inherits them
+        # without a hand-built PYTHONPATH. Leave the ambient value alone
+        # rather than overwriting it with paths derived from a tree that
+        # does not exist here.
+        _web_tree_paths: list[str] = []
+    else:
+        _web_tree_paths = [
+            str(_tree_root / "deep_worker" / "deep_worker_cli"),
+            str(_tree_root / "deep_worker" / "deepagents"),
+        ]
+    # The rpyc_async checkout is resolved through the shared resolver rather
+    # than pasted in as a literal. ``LOCAL_RPYC_ASYNC_PATH`` is the same
+    # local checkout path, but ``_is_checkout()`` also verifies that
+    # ``rpyc_async/__init__.py`` is actually there.
+    #
+    # That check is the point. The literal put the directory on the child's
+    # PYTHONPATH unconditionally, so an EMPTY or leftover local checkout
+    # shadowed the installed distribution and the spawned agent died on
+    # ``ImportError`` at startup — the precise failure
+    # ``rpyc_async_source._is_checkout`` was written to prevent, bypassed
+    # here because this call site reimplemented the lookup instead of asking.
+    # Installed hosts have no such checkout at all, which is why this cannot
+    # stay a literal now that the server ships in a wheel.
+    # ``ACTIVE_LOCAL_CHECKOUT`` and not ``prefer_local_rpyc_async()``: the
+    # question here is only "is there a checkout to hand the CHILD", and
+    # calling the resolver would also reorder THIS process's sys.path as a
+    # side effect — an unrelated mutation to perform while answering a
+    # question about a subprocess.
+    _rpyc_paths: list[str] = []
+    if ACTIVE_LOCAL_CHECKOUT is not None:
+        _rpyc_paths.append(str(ACTIVE_LOCAL_CHECKOUT))
+    if _web_tree_paths or _rpyc_paths:
+        env["PYTHONPATH"] = ":".join([*_web_tree_paths, *_rpyc_paths])
     env["DEEP_WORKER_ORIGINAL_CWD"] = config.get("working_dir", ".")
     # Mark the spawned agent as a dev-tree agent iff it actually IS one (its
     # persisted dev_tree), NOT merely because this web server runs from the

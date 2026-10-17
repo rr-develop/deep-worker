@@ -175,6 +175,175 @@ def test_no_repos_rpyc_async_in_extra_paths() -> None:
     assert not any("rpyc_async" in path for path in extra)
 
 
+# ===========================================================================
+# Web UI requirements are CORE
+# ===========================================================================
+# The web UI ships inside the wheel (see hooks/stage_providers.py), and
+# its third-party requirements are ordinary core dependencies: `pip install
+# deep-worker` must yield a working `deep-worker web` without the user
+# knowing an extra exists (owner requirement 2026-10-13).
+#
+# The set is derived from what the code actually IMPORTS — not from
+# the web UI's requirements.txt, which lists packages the imports never
+# ask for.
+
+# Measured by walking every import statement in the web UI's app/** and
+# run.py (23 files, 35 distinct top-level names), then subtracting what core
+# already declared: uvicorn, starlette, pydantic, mcp, rpyc-async.
+_WEB_REQUIREMENTS_IN_CORE = {"fastapi", "pydantic-settings", "anyio"}
+
+# Packages that LOOK like web requirements but are not imported anywhere:
+#   jinja2          — Jinja2Templates came from fastapi.templating, and the
+#                     dead app/templates/ branch that used it is gone
+#   python-multipart, websockets
+#                   — no import site; WS goes through Starlette/FastAPI
+#
+# "Not DECLARED" is not the same as "not installed": resolving the core set
+# pulls python-multipart in transitively via fastapi/mcp. The rule here is
+# that we do not declare what we do not import — a direct declaration is a
+# promise to keep using it, and these are not ours to promise.
+_NOT_WEB_REQUIREMENTS = {"jinja2", "python-multipart", "websockets"}
+
+
+def _requirement_name(spec: str) -> str:
+    """Bare distribution name of a requirement string."""
+    for sep in (">=", "<=", "==", "!=", "~=", ">", "<", "[", ";"):
+        spec = spec.split(sep)[0]
+    return spec.strip().lower()
+
+
+def test_web_requirements_are_core_dependencies() -> None:
+    """Every third-party package the web code imports must be in core.
+
+    A missing entry means ``pip install deep-worker`` then ``deep-worker
+    web`` dies on an ImportError — which is exactly the failure this work
+    exists to remove.
+    """
+    core = {
+        _requirement_name(d)
+        for d in _load_pyproject()["project"]["dependencies"]
+    }
+    missing = _WEB_REQUIREMENTS_IN_CORE - core
+    assert not missing, (
+        f"the web UI imports {sorted(missing)}, which core does not "
+        f"declare. `pip install deep-worker` would install a web UI that "
+        f"cannot start. Core deps present: {len(core)}."
+    )
+
+
+def test_no_web_extra_is_declared() -> None:
+    """The requirements must NOT be hidden behind an extra.
+
+    Owner requirement 2026-10-13: a user does not work "without the web",
+    so ``pip install deep-worker`` has to be enough. An extra would make
+    the working configuration the one nobody types.
+    """
+    extras = _load_pyproject()["project"].get("optional-dependencies", {})
+    assert "web" not in extras, (
+        f"a [web] extra is declared ({extras.get('web')}). The web "
+        f"requirements belong in core so plain `pip install deep-worker` "
+        f"gives a working `deep-worker web`."
+    )
+
+
+def test_web_requirements_are_declared_once_each() -> None:
+    """Positive control for the two tests above.
+
+    Moving the three names into core by ADDING them while an extra still
+    listed them would satisfy "present in core" and "no extra" separately
+    yet leave two pins for one package — and a second, looser pin can widen
+    a constraint core narrowed on purpose (this repo pins ``pydantic<2.14``
+    for exactly that reason).
+    """
+    p = _load_pyproject()
+    core_specs = p["project"]["dependencies"]
+    names = [_requirement_name(d) for d in core_specs]
+    duplicates = {n for n in names if names.count(n) > 1}
+    assert not duplicates, (
+        f"core declares {sorted(duplicates)} more than once; two pins for "
+        f"one package let the looser one win."
+    )
+
+    all_extra_names = {
+        _requirement_name(d)
+        for specs in p["project"].get("optional-dependencies", {}).values()
+        for d in specs
+    }
+    restated = _WEB_REQUIREMENTS_IN_CORE & all_extra_names
+    assert not restated, (
+        f"{sorted(restated)} appear in BOTH core and an extra. Core is the "
+        f"single place the web requirements are declared."
+    )
+
+
+def test_core_omits_packages_the_web_code_never_imports() -> None:
+    """Guard the specific false positives, so a later "looks related, add
+    it" edit has to argue with a named measurement.
+
+    This matters more now than it did behind an extra: these would be
+    downloaded by every single user of the package.
+    """
+    core = {
+        _requirement_name(d)
+        for d in _load_pyproject()["project"]["dependencies"]
+    }
+    offenders = core & _NOT_WEB_REQUIREMENTS
+    assert not offenders, (
+        f"core declares {sorted(offenders)}, which the web UI never "
+        f"imports. jinja2 in particular is reached only through "
+        f"fastapi.templating, and the app/templates/ branch that touched it "
+        f"has been removed."
+    )
+
+
+# ===========================================================================
+# rpyc-async floor
+# ===========================================================================
+
+
+def test_rpyc_async_floor_requires_async_call() -> None:
+    """The declared floor must be a version that HAS ``async_call``.
+
+    Measured against PyPI: 1.0.0 exposes neither
+    ``rpyc_async.core.netref.async_call`` nor
+    ``rpyc_async.utils.helpers.fire_and_forget_call``; 1.1.0 (uploaded
+    2026-10-11) exposes both. the web UI's ``mcp_service``
+    calls ``async_call``, so a host that resolves the published 1.0.0
+    installs a web UI that cannot send inter-agent messages — and nothing
+    in the dependency metadata says so.
+
+    The pin is still only the FALLBACK (a local rpyc_async source checkout wins at
+    runtime), which is exactly why it must not understate the requirement:
+    the fallback is what a pip user gets.
+    """
+    deps = _load_pyproject()["project"]["dependencies"]
+    rpyc = [d for d in deps if d.lower().startswith("rpyc-async")]
+    assert len(rpyc) == 1, f"expected exactly one rpyc-async dep, got {rpyc}"
+
+    spec = rpyc[0]
+    assert ">=1.0.0" not in spec, (
+        f"rpyc-async floor is still {spec!r}. 1.0.0 lacks "
+        f"netref.async_call, which the web UI calls, so this floor permits "
+        f"an installation where inter-agent messaging is silently broken."
+    )
+    assert ">=1.1.0" in spec, (
+        f"rpyc-async floor is {spec!r}; expected >=1.1.0, the first "
+        f"published version with netref.async_call."
+    )
+
+
+def test_rpyc_async_comment_does_not_still_await_the_release() -> None:
+    """The comment above the pin set its own condition — "raise this floor
+    once 1.1.0 is on PyPI". 1.1.0 is on PyPI, so leaving the text in place
+    would make the file instruct a reader to do what has been done."""
+    text = PYPROJECT.read_text()
+    assert "once 1.1.0 is on PyPI" not in text, (
+        "pyproject.toml still says to raise the floor 'once 1.1.0 is on "
+        "PyPI'. It was published 2026-10-11 and the floor is now >=1.1.0; "
+        "the instruction is stale."
+    )
+
+
 def test_license_copy_matches_root() -> None:
     """deep_worker_cli/LICENSE must be byte-for-byte the root LICENSE."""
     cli_license = PROJECT_ROOT / "LICENSE"

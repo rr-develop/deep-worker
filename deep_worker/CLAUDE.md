@@ -23,6 +23,26 @@ pip uninstall --break-system-packages -y deep-worker deep-worker-cli deepagents
 rm -f "$(command -v dwcli)" "$(command -v deep-worker)"
 ```
 
+**SCOPE OF THIS PROHIBITION (owner clarification 2026-10-13).** It governs
+WORKING ON and DEVELOPING deep_worker *on this host*: here deep_worker must
+keep running from source, exactly as it does now, and nothing about that may
+change.
+
+It does NOT forbid **testing other configurations** — a pip install, a
+virtualenv, an isolated environment — when all of the following hold:
+
+* everything lives in a **temporary directory** (e.g. under `/tmp`), including
+  the venv, the build output and a throwaway `HOME`;
+* nothing is installed into the host's system or user Python (no
+  `--break-system-packages`, no `--user`, no install into the repo);
+* the temporary directory is **removed afterwards**;
+* the host's own from-source setup is left untouched.
+
+This is what makes it possible to verify the shipped artifact the way a user
+without sources would get it (build a wheel, install it in a throwaway venv,
+run the console script). Testing the distribution is the point; adopting it as
+this host's way of running deep_worker is still forbidden.
+
 ### 2. NEVER CREATE OR USE VIRTUAL ENVIRONMENTS
 
 **FORBIDDEN COMMANDS:**
@@ -41,6 +61,13 @@ find . -name ".venv" -type d
 # Delete any found:
 rm -rf <path>/.venv
 ```
+
+**SCOPE (owner clarification 2026-10-13).** Same boundary as §1: no virtualenv
+for working on or developing deep_worker on this host, and never inside the
+repository tree. A venv created in a **temporary directory** purely to test
+another configuration (e.g. installing the built wheel the way an end user
+would) is allowed, and must be deleted when the check is done. The `find .`
+sweep above is the invariant that matters: the repo stays free of `.venv`.
 
 ### 3. RPyC: USE THE LOCAL rpyc_async SOURCE CHECKOUT ONLY
 

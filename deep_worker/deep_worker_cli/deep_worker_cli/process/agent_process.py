@@ -331,10 +331,10 @@ def _make_resolved_model_handler(
 
     ``persist`` controls whether the resolved model is written back to
     ``launch_config["model"]`` (durable execution config). For an agent launched
-    with ``config.model is None`` (unpinned), the resolved value is DISPLAY-ONLY
-    and must NOT be persisted — persisting it re-pins execution and defeats the
+    with ``config.model is None`` (unpinned), the observation is stored separately
+    as ``resolved_model`` and must NOT overwrite ``model`` — doing so defeats the
     operator rule "no explicit --model ⇒ provider default". See
-    ``DESIGN_FIX_CROSS_PROVIDER_MODEL_POISON.md`` (ca1_init incident 2026-06-29):
+    ``DESIGN_FIX_CROSS_PROVIDER_MODEL_POISON.md`` (incident 2026-06-29):
     codex's session jsonl had recorded a foreign grok model name (because the
     original broken ``-pp`` bug had fed codex that string), and the previous
     handler persisted that back into ``launch_config["model"]`` on every restart.
@@ -356,6 +356,9 @@ def _make_resolved_model_handler(
             set_display_model(model_name)
         if not persist:
             return
+        update_resolved = getattr(session_manager, "update_resolved_model", None)
+        if callable(update_resolved):
+            await update_resolved(model_name, getattr(config, "provider", None))
         if getattr(config, "model", None) is None:
             # Agent launched unpinned — never re-pin execution config from a
             # resolved value. Display already updated above.

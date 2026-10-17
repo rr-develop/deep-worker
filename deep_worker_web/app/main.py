@@ -2,10 +2,11 @@
 
 CRITICAL SECURITY:
 ==================
-This application MUST ONLY run on 127.0.0.1, on the port that matches
-the active checkout — 7887 for /path/to/production, 7888 for
-/path/to/dev.Security validation happens at config import
-and startup (see app/config.py).
+This application MUST ONLY run on 127.0.0.1. Validation happens at
+config import and at startup (see app/config.py). The port defaults
+per checkout — 7887 for /path/to/production, 7888 for
+/path/to/dev, 7887 anywhere else — but an explicit port is
+honoured; only the loopback binding is enforced.
 
 ARCHITECTURE:
 =============
@@ -18,14 +19,14 @@ ARCHITECTURE:
 import asyncio
 import logging
 from contextlib import asynccontextmanager
-from pathlib import Path
 from typing import AsyncIterator
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
 from starlette.types import Scope
+
+from . import paths
 
 
 class NoStaleStaticFiles(StaticFiles):
@@ -140,8 +141,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     import os as _os
     from app.config import _CHECKOUT_ROOT, get_git_commit_info
 
-    _tree = str(_CHECKOUT_ROOT)
-    _commit, _describe = get_git_commit_info(_tree)
+    # None when installed from a wheel: there is no checkout and no git
+    # tree to describe. ``str(None)`` would log the literal "None" as if it
+    # were a path.
+    _tree = str(_CHECKOUT_ROOT) if _CHECKOUT_ROOT is not None else "installed"
+    _commit, _describe = get_git_commit_info(
+        str(_CHECKOUT_ROOT) if _CHECKOUT_ROOT is not None else None
+    )
     _env_web = {k: v for k, v in sorted(_os.environ.items())
                 if k.startswith("DEEP_WORKER_")}
     _env_str = " ".join(f"{k}={v}" for k, v in _env_web.items())
@@ -285,21 +291,17 @@ app.include_router(websocket_router)
 app.include_router(server_router)
 app.include_router(mcp_router)
 
-# Mount static files
-static_dir = Path(__file__).parent.parent / "static"
-if static_dir.exists():
+# Mount static files. The assets are package data: they ship inside the
+# wheel next to this package, and the shared resolver finds them in both
+# layouts (see app/paths.py). Locating them with a parent chain tuned for
+# the checkout would, under the installed layout, point at a directory that
+# exists but holds no assets — a silent 404 for every page.
+static_dir = paths.web_asset_dir()
+if static_dir.is_dir():
     app.mount("/static", NoStaleStaticFiles(directory=str(static_dir)), name="static")
     logger.info(f"Mounted static files from {static_dir}")
 else:
     logger.warning(f"Static directory not found: {static_dir}")
-
-# Setup templates
-templates_dir = Path(__file__).parent / "templates"
-if templates_dir.exists():
-    templates = Jinja2Templates(directory=str(templates_dir))
-    logger.info(f"Configured templates from {templates_dir}")
-else:
-    logger.warning(f"Templates directory not found: {templates_dir}")
 
 
 @app.get("/")

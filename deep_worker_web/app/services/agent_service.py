@@ -70,11 +70,14 @@ import os
 import sys
 import time
 from collections.abc import Awaitable, Callable
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from app.schemas.agent_schemas import AgentInfo, AgentStatus, AgentStatusInfo
 from app.utils.supervisor import supervise
+
+from .. import paths
 from deep_worker_cli.storage_paths import (
     agent_root,
     deep_worker_home,
@@ -198,7 +201,6 @@ class AgentService:
         # Import ProcessRegistry only if not provided (allows testing with mocks)
         if registry is None:
             import sys
-            from pathlib import Path
 
             # Tree-local resolution: import the deep_worker_cli that lives
             # in the SAME tree as this web server. Hard-coding the prod
@@ -206,15 +208,16 @@ class AgentService:
             # ProcessRegistry, defeating --dev. See
             # docs/DESIGN_DEV_FLAG.md.
             #
-            # __file__ here =
-            #   <TREE>/deep_worker_web/app/services/agent_service.py
-            # parent x3 = <TREE>.
-            _tree_root = Path(__file__).resolve().parent.parent.parent.parent
-            deep_worker_path = (
-                _tree_root / "deep_worker" / "deep_worker_cli"
-            )
-            if str(deep_worker_path) not in sys.path:
-                sys.path.insert(0, str(deep_worker_path))
+            # The tree root comes from the shared resolver, which returns
+            # None when installed from a wheel — there deep_worker_cli is
+            # already importable and nothing needs to go on sys.path.
+            _tree_root = paths.source_tree_root()
+            if _tree_root is not None:
+                deep_worker_path = (
+                    _tree_root / "deep_worker" / "deep_worker_cli"
+                )
+                if str(deep_worker_path) not in sys.path:
+                    sys.path.insert(0, str(deep_worker_path))
 
             from deep_worker_cli.process.registry import ProcessRegistry  # type: ignore[import-not-found]
 
@@ -295,7 +298,7 @@ class AgentService:
         # Latest-model cache used by ``_latest_model_from_token_stats``.
         # Same TTL as ``_context_cache``; kept separate because the
         # value is just a string, not a snapshot dict.
-        self._context_model_cache: dict[str, tuple[float, str | None]] = {}
+        self._context_model_cache: dict[tuple[str, str, datetime | None], tuple[float, str | None]] = {}
 
         # Lazily initialised lifecycle orchestrator (requires a running
         # event loop to spawn tasks — created on first access via
@@ -675,7 +678,9 @@ class AgentService:
         status polls inside the window do not re-read the disk.
         """
         now = time.monotonic()
-        cached = self._context_model_cache.get(agent_name)
+        info = self._agents.get(agent_name)
+        cache_key = (agent_name, info.provider if info else "", info.started_at if info else None)
+        cached = self._context_model_cache.get(cache_key)
         if cached is not None and cached[0] >= now:
             return cached[1]
         result: str | None = None
@@ -705,9 +710,15 @@ class AgentService:
                         rec = _json.loads(line)
                     except Exception:  # noqa: BLE001 — skip malformed
                         continue
-                    model = rec.get("model")
-                    if isinstance(model, str) and model.strip():
-                        result = model.strip()
+                    from deep_worker_cli.model_status import current_record_model
+
+                    info = self._agents.get(agent_name)
+                    model = current_record_model(
+                        rec, info.provider if info else "",
+                        info.started_at if info else None,
+                    )
+                    if model:
+                        result = model
                         break
         except Exception:  # noqa: BLE001 — disk read must never break polling
             logger.debug(
@@ -715,7 +726,7 @@ class AgentService:
                 exc_info=True,
             )
             result = None
-        self._context_model_cache[agent_name] = (
+        self._context_model_cache[cache_key] = (
             now + self._CONTEXT_CACHE_TTL_SEC, result,
         )
         return result
@@ -1320,15 +1331,14 @@ class AgentService:
             if response.get("success"):
                 metadata = response.get("metadata", {})
                 provider = metadata.get("provider")
-                model = metadata.get("model")
+                model = metadata.get("model") or metadata.get("model_display")
                 raw_status_metadata = metadata.get("status_metadata")
 
                 if agent_name in self._agents:
                     info = self._agents[agent_name]
                     if provider:
                         info.provider = provider
-                    if model:
-                        info.model = model
+                    info.model = model or (f"provider default ({provider})" if provider else "unknown")
                     info.status_metadata = (
                         raw_status_metadata
                         if isinstance(raw_status_metadata, dict)

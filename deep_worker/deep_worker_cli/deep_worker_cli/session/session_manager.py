@@ -266,6 +266,38 @@ class SessionManager:
         except Exception as exc:  # noqa: BLE001 — defensive
             logger.warning("status notifier raised: %s", exc)
 
+    async def update_resolved_model(self, model: str, provider: str | None) -> None:
+        from deep_worker_cli.model_predicate import model_can_belong_to_provider
+
+        if self.launch_config is None or provider != self.launch_config.get("provider"):
+            return
+        if not model_can_belong_to_provider(provider, model):
+            return
+        resolved = model.strip()
+        if (
+            self.launch_config.get("resolved_model") == resolved
+            and self.launch_config.get("resolved_model_provider") == provider
+        ):
+            return
+        self.launch_config["resolved_model"] = resolved
+        self.launch_config["resolved_model_provider"] = provider
+        self.launch_config["model_source"] = "provider_reported"
+        await self._persist()
+        if self._notifier is not None:
+            try:
+                payload: dict[str, Any] = {
+                    "type": "status_change",
+                    "status": self.status.value,
+                    "error_message": self.error_message,
+                    "provider": provider,
+                    "model": resolved,
+                }
+                if self.status_metadata is not None:
+                    payload["status_metadata"] = self.status_metadata
+                await self._notifier(payload)
+            except Exception as exc:
+                logger.warning("status notifier raised: %s", exc)
+
     async def set_task_manager_disabled(self, disabled: bool) -> None:
         """Record the operator's TaskManager off switch durably.
 

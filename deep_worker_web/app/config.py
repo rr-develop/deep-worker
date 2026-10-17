@@ -2,13 +2,25 @@
 
 CRITICAL SECURITY REQUIREMENT:
 ==============================
-This application MUST ONLY run on 127.0.0.1, on one of the two
-APPROVED ports — and no other:
+This application MUST ONLY run on 127.0.0.1. That is the one hard
+invariant, enforced by ``Settings.validate_security()``, and there is
+no env var, flag or config key that relaxes it.
+
+The PORT is a default, not a requirement. Each known checkout has one
+so the prod and dev servers can run side by side unattended:
 
 - 7887 when the active checkout is the production / hot-fix tree
   located at /path/to/production  (branch: master)
 - 7888 when the active checkout is the developer tree located at
   /path/to/dev  (branch: dev)
+- 7887 as the fallback anywhere else, including an installed wheel,
+  which has no checkout at all.
+
+An explicitly chosen port is honoured. ``validate_security()`` used to
+veto one that disagreed with the table, which was both unshippable
+(a pip install matches no tree) and backwards (it compared against the
+table rather than reality, accepting an occupied port and rejecting a
+free one). A port already in use is reported by ``bind()``.
 
 Why two ports?
 --------------
@@ -46,6 +58,8 @@ from pathlib import Path
 
 from pydantic_settings import BaseSettings
 
+from . import paths
+
 
 # ---------------------------------------------------------------------------
 # Port selection based on checkout location
@@ -63,8 +77,11 @@ _DEV_PORT = 7888
 _FIXES_PORT = 7889
 _TASKS_PORT = 7890
 
-# Every approved (tree, port) pair. validate_security() refuses anything
-# outside this whitelist.
+# The port each known checkout DEFAULTS to, so the prod and dev servers
+# can run side by side without being told which port to take. A tree that
+# is not listed — including an installed wheel, which has no tree at all —
+# falls back to _PROD_PORT. This table picks a default; it is not a
+# whitelist, and validate_security() does not consult it.
 _APPROVED_BINDINGS: dict[Path, int] = {
     _PROD_TREE: _PROD_PORT,
     _DEV_TREE: _DEV_PORT,
@@ -81,20 +98,31 @@ _CHECKOUT_NAME: dict[Path, str] = {
 }
 
 
-def _detect_checkout_root() -> Path:
+def _detect_checkout_root() -> Path | None:
     """Return the absolute path of the checkout this file lives in.
 
-    This module sits at the web app package root (``deep_worker_web/``); walking
-    two parents up yields ``<repo>``. We resolve symlinks so that
-    matches against ``_APPROVED_BINDINGS`` keys are stable regardless
-    of how the directory was referenced when the process started.
+    ``None`` when running from the installed wheel: there is no checkout,
+    hence no ``(tree, port)`` pair to look up. Walking parents ourselves
+    would land on ``<site-packages>/deep_worker_cli`` — a directory that
+    exists, so the mistake would never surface. See ``app/paths.py``.
+
+    Symlinks are resolved so that matches against ``_APPROVED_BINDINGS``
+    keys are stable regardless of how the directory was referenced when
+    the process started.
     """
-    # config.py -> app/ -> deep_worker_web/ -> <repo root>
-    return Path(__file__).resolve().parents[2]
+    root = paths.source_tree_root()
+    return None if root is None else root.resolve()
 
 
-def _default_port_for(checkout_root: Path) -> int:
-    """Pick the default port based on the checkout the code runs from."""
+def _default_port_for(checkout_root: Path | None) -> int:
+    """Pick the default port based on the checkout the code runs from.
+
+    ``None`` means "installed, no checkout" and takes the same branch as
+    any unrecognised tree: the fallback port. Behaviour for the known
+    checkouts is unchanged (dev 7888, prod 7887).
+    """
+    if checkout_root is None:
+        return _PROD_PORT
     return _APPROVED_BINDINGS.get(checkout_root, _PROD_PORT)
 
 
@@ -164,49 +192,57 @@ class Settings(BaseSettings):
         env_prefix = "DEEP_WORKER_WEB_"
 
     @property
-    def checkout_root(self) -> Path:
-        """The repo this server is running from (resolved absolute path)."""
+    def checkout_root(self) -> Path | None:
+        """The repo this server is running from (resolved absolute path).
+
+        ``None`` when running from the installed wheel — there is no
+        checkout to report.
+        """
         return _CHECKOUT_ROOT
 
     def validate_security(self) -> bool:
-        """Validate host/port against the two approved bindings.
+        """Refuse to serve anything but loopback.
+
+        This is the ONE hard invariant of this configuration, and it is
+        deliberately the only check left here.
+
+        What used to be here and why it is gone
+        ---------------------------------------
+        Two further branches policed WHERE the code lives: the active tree
+        had to be one of four hard-coded checkouts, and the
+        port had to equal the one assigned to that tree. Neither can ship.
+
+        * The checkout whitelist refuses a pip install unconditionally —
+          an installed distribution has no checkout to whitelist. That
+          single branch is what kept the web UI source-only.
+        * The port branch had its intent inverted. It compared the port
+          against a TABLE, not against reality, so it accepted a port that
+          was already in use and rejected a free one (measured: 7888
+          occupied → True, free 39947 → ValueError). Port collisions are
+          detected by ``bind()``, which reports them with the OS's own
+          message; this method is not a port allocator and never was one.
+
+        The port a checkout DEFAULTS to still comes from
+        ``_APPROVED_BINDINGS`` via ``_default_port_for`` — picking a
+        default and vetoing an explicit choice are different jobs.
 
         Returns:
-            True if security check passes.
+            True if the binding is loopback.
 
         Raises:
-            ValueError: If host is not 127.0.0.1, if the active checkout
-                is not one of the two approved trees, or if the port
-                does not match the port assigned to that tree.
+            ValueError: If host is not exactly ``127.0.0.1``.
         """
+        # Runs on the EFFECTIVE value, after env/.env/constructor have all
+        # been applied. Should ``host`` ever gain another configuration
+        # mechanism, this check must stay downstream of it: validating a
+        # class default while the server binds elsewhere would be worse
+        # than no check at all. There is deliberately no env var, flag or
+        # config key that turns this off.
         if self.host != "127.0.0.1":
             raise ValueError(
                 f"SECURITY ERROR: Host must be 127.0.0.1 only! Current: {self.host}\n"
                 "This application must NEVER be exposed to external networks.\n"
                 "Running on 0.0.0.0 or any other address is STRICTLY PROHIBITED."
-            )
-
-        expected = _APPROVED_BINDINGS.get(_CHECKOUT_ROOT)
-        if expected is None:
-            approved = ", ".join(
-                f"{p} -> {port}" for p, port in _APPROVED_BINDINGS.items()
-            )
-            raise ValueError(
-                "SECURITY ERROR: deep_worker_web is running from an "
-                f"unrecognised checkout: {_CHECKOUT_ROOT}\n"
-                f"Approved (checkout -> port) pairs: {approved}\n"
-                "Move the code into one of the approved trees before "
-                "starting the server."
-            )
-
-        if self.port != expected:
-            raise ValueError(
-                f"SECURITY ERROR: checkout {_CHECKOUT_ROOT} must bind to "
-                f"port {expected}, but settings.port is {self.port}.\n"
-                "This pairing is enforced so the production server "
-                "(/path/to/production, 7887) and the developer server "
-                "(/path/to/dev, 7888) can run side by side "
-                "without colliding."
             )
 
         return True

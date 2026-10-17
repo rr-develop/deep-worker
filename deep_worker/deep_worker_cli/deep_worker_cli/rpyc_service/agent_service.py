@@ -1103,6 +1103,11 @@ class AgentService(rpyc.Service):
                 "rpyc_port": self._agent_process.rpyc_port,
                 "agent_type": "deep-worker",
                 "model": model,
+                "model_source": (
+                    "provider_reported" if model and (getattr(config, "dynamic_display_model", None) or not getattr(config, "resolved_model", None))
+                    else "configured" if model else "provider_default"
+                ),
+                "model_display": model or f"provider default ({provider})",
                 "provider": provider,
                 "status_metadata": status_metadata,
             }
@@ -1116,68 +1121,35 @@ class AgentService(rpyc.Service):
             return json.dumps(result)
 
     def _latest_model_from_token_stats(self) -> str | None:
-        """Return the model name from the most recent ``token_stats.jsonl`` line.
-
-        Used as a final fallback by ``exposed_get_metadata`` when the agent
-        was started without an explicit ``--model`` flag and ``config.model``,
-        ``resolved_model`` and ``dynamic_display_model`` are all empty.
-
-        The JSONL is append-only with newest entries at the tail, so we read
-        the last 256 lines and pick the most recent non-empty ``model`` value.
-        Skipping empty / malformed lines keeps the read O(1) in practice.
-
-        Returns ``None`` when the file is missing, unreadable, or every line
-        has an empty model. Never raises — a broken stats file must not
-        break metadata retrieval.
-        """
         try:
-            from pathlib import Path
+            from deep_worker_cli.storage_paths import agent_root
+            from deep_worker_cli.model_status import current_record_model
 
-            deep_worker_dir = Path.home() / ".deep_worker"
-            if not deep_worker_dir.is_dir():
+            name = self._agent_name()
+            if not name:
                 return None
-            # Find the agent's subdirectory by walking parents of the
-            # registry file or by matching our own working directory.
-            # We pick the single agent dir whose ``token_stats.jsonl``
-            # exists (this rpyc service runs INSIDE the agent process,
-            # so ``Path.cwd()`` is the agent's working dir and the
-            # stats file lives one level up at
-            # ``~/.deep_worker/<name>/token_stats.jsonl``).
-            stats_path = deep_worker_dir / self._agent_name() / "token_stats.jsonl"
-            if not stats_path.is_file():
-                # Fallback: search by pid-file proximity.  The agent's
-                # PID file lives at ``~/.deep_worker/<name>/<name>.pid``
-                # and the stats file sits next to it.
-                for candidate in deep_worker_dir.iterdir():
-                    if (candidate / "token_stats.jsonl").is_file():
-                        stats_path = candidate / "token_stats.jsonl"
-                        break
+            stats_path = agent_root(name, create=False) / "token_stats.jsonl"
             if not stats_path.is_file():
                 return None
-            # Read the tail of the file (last 256 lines is more than
-            # enough — token_stats fires once per LLM call, so even a
-            # long-running agent only has a few hundred lines per
-            # session before we re-rotate).
-            with stats_path.open("rb") as fh:
-                fh.seek(0, 2)
-                size = fh.tell()
-                fh.seek(max(0, size - 64 * 1024))
-                data = fh.read().decode("utf-8", errors="replace")
-            # Walk lines in reverse so the newest record wins.
-            for raw in reversed(data.splitlines()):
-                line = raw.strip()
-                if not line:
-                    continue
+            with stats_path.open("rb") as stream:
+                stream.seek(0, 2)
+                stream.seek(max(0, stream.tell() - 64 * 1024))
+                data = stream.read().decode("utf-8", errors="replace")
+            process = self._agent_process
+            if process is None:
+                return None
+            for line in reversed(data.splitlines()):
                 try:
-                    import json as _json
-                    rec = _json.loads(line)
-                except Exception:  # noqa: BLE001 — any parser error → skip
+                    record = json.loads(line)
+                except (ValueError, TypeError):
                     continue
-                model = rec.get("model")
-                if isinstance(model, str) and model.strip():
-                    return model.strip()
+                model = current_record_model(
+                    record, process.config.provider, getattr(process, "started_at", None)
+                )
+                if model:
+                    return model
             return None
-        except Exception:  # noqa: BLE001 — must never break get_metadata
+        except Exception:
             logger.exception("latest_model_from_token_stats fallback failed")
             return None
 
