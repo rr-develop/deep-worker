@@ -180,7 +180,7 @@ def test_config_list_of_names_restricts_to_those_names() -> None:
 # --- honesty about native tools -------------------------------------------
 
 
-@pytest.mark.parametrize("provider", ["claude-code", "grok", "codex"])
+@pytest.mark.parametrize("provider", ["grok", "codex"])
 def test_providers_with_unsuppressable_natives_are_disclosed(provider) -> None:
     """A restricted run on these providers is not hermetic — say so.
 
@@ -195,6 +195,23 @@ def test_providers_with_unsuppressable_natives_are_disclosed(provider) -> None:
 
 def test_fully_suppressed_provider_gets_no_caveat() -> None:
     assert native_tool_caveat("claude-code-sdk", parse_tool_selection(["-*"])) is None
+
+
+def test_claude_code_is_hermetic_via_the_meta_channel() -> None:
+    """``claude-code`` used to be listed here; it no longer belongs.
+
+    Its ACP adapter DOES take tool configuration: ``session/new`` carries
+    ``_meta.claudeCode.options.tools`` (``ToolSelection.acp_meta``), the
+    adapter reads it at ``dist/acp-agent.js:4628``/``:4650``, and the Claude
+    Agent SDK renders ``tools: []`` as ``--tools ""`` — its own typings
+    (``sdk.d.ts:1457``) define that as "disable all built-in tools". MCP
+    tools ride the separate ``--mcp-config`` flag, so an allowlist survives.
+
+    The old caveat told operators to switch provider for a hermetic run.
+    That advice was wrong and it is why rg_linker ran with Bash callable
+    (2026-10-04).
+    """
+    assert native_tool_caveat("claude-code", parse_tool_selection(["-*"])) is None
 
 
 def test_no_caveat_when_nothing_is_restricted() -> None:

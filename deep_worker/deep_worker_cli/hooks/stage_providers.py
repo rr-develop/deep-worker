@@ -81,7 +81,7 @@ VENDOR_STAGING = "vendor_staging"
 #
 # ``deep_worker_web`` is the web UI server. It must ship inside the
 # deep-worker wheel, because a user who installed from PyPI has no sources and
-# `deep-worker web` has to work for them.
+# `deep-worker --web` has to work for them.
 #
 # It is staged exactly like the providers — copied from OUTSIDE the hatch root
 # into a unique temp dir, covered by a sha256 marker — and for one specific
@@ -497,7 +497,7 @@ class StageProvidersHook(BuildHookInterface):
                     "deep_worker/providers/__init__.py"
                 )
                 # Web UI: app/ + static/ land under deep_worker_cli/web/ so a
-                # pip user gets `deep-worker web` with no sources. Mapped as
+                # pip user gets `deep-worker --web` with no sources. Mapped as
                 # two subtrees (not file-by-file) to keep force_include small.
                 build_data["force_include"][str(web_payload / WEB_CODE_SUBDIR)] = (
                     f"{WEB_DEST}/{WEB_CODE_SUBDIR}"

@@ -1499,6 +1499,17 @@ class AgentProcess:
                 if hasattr(model, '_working_dir'):
                     setattr(model, '_working_dir', str(self.config.working_dir))
 
+                # Hand the tool selection to the provider as the ACP
+                # ``_meta`` channel, so a restricted agent's built-ins are
+                # switched off in the CLI itself rather than only filtered
+                # on our side of the wire. ``acp_meta()`` returns None for
+                # the default (unrestricted) selection, which leaves the
+                # ``session/new`` payload byte-identical.
+                if hasattr(model, '_session_meta'):
+                    _selection = getattr(self, "_tool_selection", None)
+                    if _selection is not None:
+                        setattr(model, '_session_meta', _selection.acp_meta())
+
                 # Expose the model on ``self`` so any post-init helper
                 # that needs it (e.g. provider failover, codex display-
                 # model resolution) can reach it. After incident

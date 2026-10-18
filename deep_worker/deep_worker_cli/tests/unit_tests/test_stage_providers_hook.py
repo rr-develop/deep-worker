@@ -757,7 +757,7 @@ def test_cli_update_regenerates_manifest(tmp_path: Path) -> None:
 # Web payload (deep_worker_web → deep_worker_cli/web in the wheel)
 #
 # The web server must ship INSIDE the deep-worker distribution so a user who
-# installed from PyPI can run `deep-worker web` with no sources. It is staged
+# installed from PyPI can run `deep-worker --web` with no sources. It is staged
 # exactly like the providers — from OUTSIDE the hatch root, into a temp dir,
 # with a sha256 integrity marker — because the source tree must stay byte-for-
 # byte untouched: the host runs deep_worker from source, and three path
@@ -870,7 +870,7 @@ def test_initialize_wheel_stages_web_into_cli_web(
 ) -> None:
     """The wheel maps the web payload to ``deep_worker_cli/web/...``.
 
-    This is the assertion that makes `deep-worker web` possible for a user
+    This is the assertion that makes `deep-worker --web` possible for a user
     without sources: without it the wheel carries 0 web entries (measured on
     0.0.20: 301 entries, 0 web, 0 static).
     """

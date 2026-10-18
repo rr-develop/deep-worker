@@ -44,7 +44,9 @@ class _FakeAcpClient:
     async def ensure_started(self) -> None:
         return None
 
-    async def session_new(self, cwd: str, mcp_servers: list) -> str:  # noqa: ARG002
+    async def session_new(
+        self, cwd: str, mcp_servers: list, meta: dict | None = None
+    ) -> str:  # noqa: ARG002
         self.session_new_calls += 1
         return "sess-new-1"
 

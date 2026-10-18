@@ -246,6 +246,32 @@ class ToolSelection:
             return list(tools)
         return [t for t in tools if self.permits(_tool_name(t))]
 
+    def acp_meta(self) -> dict[str, Any] | None:
+        """This selection as ACP ``session/new`` ``_meta``, or ``None``.
+
+        The ACP adapter for ``claude-code`` reads tool configuration from
+        ``_meta.claudeCode.options`` (``dist/acp-agent.js:4628``) and resolves
+        the built-in set from its ``tools`` key (``:4650``). The Claude Agent
+        SDK renders ``tools: []`` as ``--tools ""`` (``sdk.mjs:151``), which
+        its own typings define as "disable all built-in tools"
+        (``sdk.d.ts:1457``).
+
+        Only the built-ins are addressed here. The deep-worker tools an
+        allowlist names are MCP tools: they reach the CLI through
+        ``mcpServers`` → ``--mcp-config``, a SEPARATE flag that ``tools``
+        does not touch, so emptying the built-in set leaves them callable.
+        That asymmetry is the whole point — it is what makes a restricted
+        run hermetic instead of merely advertised as one.
+
+        Returns ``None`` for a selection that restricts nothing, so callers
+        omit ``_meta`` entirely and the default ``session/new`` payload stays
+        byte-for-byte what it was before this channel existed. An agent that
+        never asked for a restriction must not observe a protocol change.
+        """
+        if not self.restricts:
+            return None
+        return {"claudeCode": {"options": {"tools": []}}}
+
     def unknown_names(self, available: Iterable[str]) -> list[str]:
         """Names in the spec that no available tool answers to.
 
@@ -634,12 +660,18 @@ def describe_selection(selection: ToolSelection) -> str:
 # can switch off. Verified per provider; see docs/DESIGN_TOOL_SELECTION.md
 # §4 for the evidence and ``acp/builtin_tool_passthrough.py`` for the
 # protocol-level statement ("they cannot be told not to").
+#
+# ``claude-code`` is deliberately ABSENT: the ACP adapter does expose a
+# tool-configuration channel, and we use it. ``session/new`` carries
+# ``_meta.claudeCode.options.tools`` (see ``ToolSelection.acp_meta``), which
+# the adapter reads at ``dist/acp-agent.js:4628``/``:4650`` and the Claude
+# Agent SDK turns into ``--tools ""`` (``sdk.mjs:151``) — documented in
+# ``sdk.d.ts:1457`` as "disable all built-in tools". MCP servers travel on
+# the separate ``--mcp-config`` flag, so the allowlisted deep-worker tools
+# keep working. The old entry here claimed the opposite and told operators
+# to switch provider for a hermetic run; that advice sent rg_linker out with
+# Bash live (2026-10-04).
 _UNSUPPRESSABLE_NATIVES: dict[str, str] = {
-    "claude-code": (
-        "the ACP adapter exposes no tool-configuration channel — session/new "
-        "carries only {cwd, mcpServers} — so its built-ins (Bash, Read, Write, "
-        "Edit, Glob, Grep, WebFetch, WebSearch, Task, …) stay callable"
-    ),
     "grok": (
         "the Grok CLI runs its built-ins locally in 'agent stdio' mode and "
         "cannot be told not to, so they stay callable"

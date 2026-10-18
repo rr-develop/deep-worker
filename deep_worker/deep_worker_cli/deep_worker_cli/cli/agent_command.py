@@ -1507,12 +1507,26 @@ def create_parser() -> argparse.ArgumentParser:
     """
     parser = argparse.ArgumentParser(
         prog="deep-worker",
-        description="Start a deep-worker agent process",
+        description=(
+            "Start a deep-worker agent process. A positional is always an "
+            "agent NAME; the web UI and the version are flags (--web, "
+            "--version), so an agent called 'web' or 'version' keeps working."
+        ),
         # Subcommands are not registered through add_subparsers (the positional
         # ``name`` with nargs='?' would make that a breaking change — see
         # _dispatch_subcommand), so we list them in the epilog:
         # without this, the user would not find the command in --help.
         epilog=(
+            "web UI and version (flags, so they never collide with an "
+            "agent name):\n"
+            "  --web                 Serve the deep_worker web UI on "
+            "127.0.0.1, detached\n"
+            "                        from the terminal. Combine with "
+            "--port/--status/\n"
+            "                        --stop/--foreground; see --web --help\n"
+            "  --version, -V         Print the installed deep-worker version "
+            "and exit\n"
+            "\n"
             "subcommands (run '<subcommand> --help' for details):\n"
             "  lsp enable|disable|status\n"
             "                        Manage optional LSP code navigation "
@@ -1520,8 +1534,39 @@ def create_parser() -> argparse.ArgumentParser:
             "  mcp list|add|remove   Manage external MCP servers\n"
             "  skills ...            Manage agent skills\n"
             "  threads list|delete   Manage conversation threads\n"
+            "\n"
+            "examples:\n"
+            "  deep-worker myagent             start (or attach to) an agent\n"
+            "  deep-worker web                 start an agent NAMED 'web' — "
+            "a positional\n"
+            "                                  is always an agent name\n"
+            "  deep-worker --web               start the web UI in the "
+            "background\n"
+            "  deep-worker --web --port 8080   serve on port 8080\n"
+            "  deep-worker --web --status      is the web UI running?\n"
+            "  deep-worker --web --stop        stop it\n"
+            "  deep-worker --version           print the version\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+
+    # Routed in router.py BEFORE this parser is built, so these never
+    # reach parse_args(). They are declared anyway: argparse is what
+    # renders --help, and a flag absent from it does not exist for the
+    # user. Spelled as flags on purpose — a positional would compete
+    # with an agent of the same name (see router._dispatch_web).
+    parser.add_argument(
+        "--web",
+        action="store_true",
+        help="Serve the deep_worker web UI on 127.0.0.1, detached from the "
+        "terminal. Combine with --port N, --status, --stop, --foreground; "
+        "run 'deep-worker --web --help' for details.",
+    )
+    parser.add_argument(
+        "--version",
+        "-V",
+        action="store_true",
+        help="Print the installed deep-worker version and exit.",
     )
 
     parser.add_argument(
@@ -2062,9 +2107,10 @@ def create_parser() -> argparse.ArgumentParser:
             "only those. A spec starting with '-' needs the '=' form, e.g. "
             "--tools='-execute', because argparse reads a leading dash as an "
             "option. Applies to "
-            "deep-worker tools; on the ACP providers (claude-code, grok) "
-            "and partly on codex the CLI's own native tools stay reachable "
-            "and a warning says so at startup."
+            "deep-worker tools; on claude-code the CLI's own built-ins are "
+            "switched off too (session/new carries the adapter's tool "
+            "channel), while on grok and partly on codex the native tools "
+            "stay reachable and a warning says so at startup."
         ),
     )
     parser.add_argument(

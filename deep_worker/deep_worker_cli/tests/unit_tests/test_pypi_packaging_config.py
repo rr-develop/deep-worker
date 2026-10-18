@@ -180,7 +180,7 @@ def test_no_repos_rpyc_async_in_extra_paths() -> None:
 # ===========================================================================
 # The web UI ships inside the wheel (see hooks/stage_providers.py), and
 # its third-party requirements are ordinary core dependencies: `pip install
-# deep-worker` must yield a working `deep-worker web` without the user
+# deep-worker` must yield a working `deep-worker --web` without the user
 # knowing an extra exists (owner requirement 2026-10-13).
 #
 # The set is derived from what the code actually IMPORTS — not from
@@ -242,7 +242,7 @@ def test_no_web_extra_is_declared() -> None:
     assert "web" not in extras, (
         f"a [web] extra is declared ({extras.get('web')}). The web "
         f"requirements belong in core so plain `pip install deep-worker` "
-        f"gives a working `deep-worker web`."
+        f"gives a working `deep-worker --web`."
     )
 
 

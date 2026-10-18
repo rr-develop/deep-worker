@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "deep-worker"
-version = "0.0.21"
+version = "0.0.22"
 description = "Terminal interface for Deep Worker - interactive AI agent with file operations, shell access, and sub-agent capabilities."
 readme = "README.md"
 license = "MIT"
@@ -137,7 +137,7 @@ dependencies = [
   "starlette>=0.27.0",
 
   # Web UI (deep_worker_cli/web/, staged into the wheel by
-  # hooks/stage_providers.py and launched by `deep-worker web`).
+  # hooks/stage_providers.py and launched by `deep-worker --web`).
   #
   # CORE, not an extra: a user who runs `pip install deep-worker` must get a
   # working web UI without knowing an extra exists (owner requirement
@@ -193,7 +193,7 @@ semantic-search = [
 a2a = ["a2a-sdk[http-server]>=1.1.0"]
 # NOTE: there is deliberately no `web` extra. The web UI's requirements are
 # CORE dependencies — see the "Web UI" block in [project.dependencies].
-# `pip install deep-worker` must yield a working `deep-worker web`.
+# `pip install deep-worker` must yield a working `deep-worker --web`.
 
 [project.urls]
 Homepage = "https://github.com/rr-develop/deep-worker"

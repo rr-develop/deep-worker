@@ -471,10 +471,23 @@ class AcpClient:
         self._authenticated = True
         return reply
 
-    async def session_new(self, *, cwd: str, mcp_servers: list[dict]) -> str:
-        reply = await self._call(
-            "session/new", {"cwd": cwd, "mcpServers": mcp_servers}
-        )
+    async def session_new(
+        self,
+        *,
+        cwd: str,
+        mcp_servers: list[dict],
+        meta: dict | None = None,
+    ) -> str:
+        """Open a new session, optionally carrying ``_meta``.
+
+        ``meta`` is the adapter's tool-configuration channel (built by
+        ``ToolSelection.acp_meta``). It is omitted from the request entirely
+        when ``None`` so an unrestricted agent's payload is unchanged.
+        """
+        params: dict = {"cwd": cwd, "mcpServers": mcp_servers}
+        if meta is not None:
+            params["_meta"] = meta
+        reply = await self._call("session/new", params)
         # Provider-specific post-session/new gate (e.g. claude-code
         # validates the pinned model against the live picker returned in
         # ``configOptions``). No hardcoded whitelists live in the client:
@@ -522,7 +535,12 @@ class AcpClient:
             await asyncio.wait_for(asyncio.shield(fut), timeout=timeout)
 
     async def session_load(
-        self, session_id: str, *, cwd: str, mcp_servers: list[dict] | None = None
+        self,
+        session_id: str,
+        *,
+        cwd: str,
+        mcp_servers: list[dict] | None = None,
+        meta: dict | None = None,
     ) -> dict:
         """Re-attach a session that was created in a PRIOR subprocess.
 
@@ -551,10 +569,17 @@ class AcpClient:
             file=sys.stderr,
             flush=True,
         )
-        reply = await self._call(
-            "session/load",
-            {"sessionId": session_id, "cwd": cwd, "mcpServers": mcp_servers or []},
-        )
+        load_params: dict = {
+            "sessionId": session_id,
+            "cwd": cwd,
+            "mcpServers": mcp_servers or [],
+        }
+        # A load re-creates the query in a NEW subprocess, so the restriction
+        # has to be re-asserted here or it silently lapses on every resume —
+        # the same reason the model-pin validator runs on both entry points.
+        if meta is not None:
+            load_params["_meta"] = meta
+        reply = await self._call("session/load", load_params)
         validator = self._session_new_validator
         if validator is not None:
             validator(reply, self._env)
@@ -611,6 +636,21 @@ class AcpClient:
         finally:
             self.release_session(session_id)
         return acked
+
+    def has_active_prompt(self, session_id: str | None) -> bool:
+        """Whether this client still holds the prompt guard for ``session_id``.
+
+        The guard is what makes a second concurrent ``session/prompt`` raise
+        ``AcpConcurrentPromptError``. It is released only by the pending
+        future's done-callback, so a caller that lost its reference to that
+        future (a history wipe does exactly this) cannot otherwise tell
+        whether the session is promptable. Exposed so callers can ask instead
+        of reaching into ``_active_prompts``.
+        """
+        if session_id is None:
+            return False
+        active = self._active_prompts.get(session_id)
+        return active is not None and not active.done()
 
     def release_session(self, session_id: str | None) -> None:
         """Drop local ACP bookkeeping for ``session_id`` (best-effort)."""

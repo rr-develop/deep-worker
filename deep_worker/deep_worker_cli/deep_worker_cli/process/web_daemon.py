@@ -46,6 +46,46 @@ def _remove_state(port: int, pid: int) -> None:
         pass
 
 
+def _is_our_server(pid: int, state: dict[str, Any], port: int) -> bool:
+    """Is ``pid`` still the web server this state file describes?
+
+    A PID alone proves nothing: it can be recycled onto an unrelated
+    process. ``start_ticks`` pins the exact process incarnation and the
+    cmdline check pins what it is running, so ``status`` and ``stop``
+    cannot disagree about identity.
+    """
+    command = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+    return not (
+        _identity(pid) != state["start_ticks"]
+        or b"deep_worker_cli.process.web_daemon" not in command
+        or state.get("port") != port
+        or command[command.index(b"--port") + 1] != str(port).encode()
+    )
+
+
+def status(port: int) -> int:
+    """Report whether a managed server owns ``port``. 0 = running."""
+    path = state_path(port)
+    try:
+        state = json.loads(path.read_text())
+        pid = int(state["pid"])
+    except (OSError, ValueError, KeyError, TypeError):
+        print(f"deep-worker --web: no managed server on port {port}")
+        return 1
+    try:
+        alive = _is_our_server(pid, state, port)
+    except (OSError, ValueError, KeyError, TypeError):
+        alive = False
+    if not alive:
+        print(
+            f"deep-worker --web: no managed server on port {port} "
+            f"(stale state file for PID {pid})"
+        )
+        return 1
+    print(f"deep-worker --web: running on http://127.0.0.1:{port} (PID {pid})")
+    return 0
+
+
 def stop(port: int) -> int:
     path = state_path(port)
     try:
@@ -53,27 +93,21 @@ def stop(port: int) -> int:
         pid = int(state["pid"])
         handle = os.pidfd_open(pid)
     except (OSError, ValueError, KeyError, TypeError) as exc:
-        print(f"deep-worker web: no managed server on port {port}: {exc}", file=sys.stderr)
+        print(f"deep-worker --web: no managed server on port {port}: {exc}", file=sys.stderr)
         return 1
     try:
-        command = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
-        if (
-            _identity(pid) != state["start_ticks"]
-            or b"deep_worker_cli.process.web_daemon" not in command
-            or state.get("port") != port
-            or command[command.index(b"--port") + 1] != str(port).encode()
-        ):
-            print("deep-worker web: refusing to stop a different process", file=sys.stderr)
+        if not _is_our_server(pid, state, port):
+            print("deep-worker --web: refusing to stop a different process", file=sys.stderr)
             return 1
         signal.pidfd_send_signal(handle, signal.SIGTERM)
         if not select.select([handle], [], [], 30.0)[0]:
-            print(f"deep-worker web: PID {pid} did not stop within 30 seconds", file=sys.stderr)
+            print(f"deep-worker --web: PID {pid} did not stop within 30 seconds", file=sys.stderr)
             return 1
         _remove_state(port, pid)
         print(f"Stopped web server on port {port} (PID {pid})")
         return 0
     except (OSError, ValueError, KeyError, TypeError) as exc:
-        print(f"deep-worker web: cannot stop server: {exc}", file=sys.stderr)
+        print(f"deep-worker --web: cannot stop server: {exc}", file=sys.stderr)
         return 1
     finally:
         os.close(handle)
@@ -87,7 +121,7 @@ def start(host: str, port: int, reload: bool) -> int:
         listener.listen(2048)
     except OSError as exc:
         listener.close()
-        print(f"deep-worker web: cannot bind {host}:{port}: {exc}", file=sys.stderr)
+        print(f"deep-worker --web: cannot bind {host}:{port}: {exc}", file=sys.stderr)
         return 1
     port = listener.getsockname()[1]
     reader, writer = socket.socketpair()
@@ -103,7 +137,7 @@ def start(host: str, port: int, reload: bool) -> int:
         listener.close()
         reader.close()
         writer.close()
-        print("deep-worker web: --reload requires --foreground", file=sys.stderr)
+        print("deep-worker --web: --reload requires --foreground", file=sys.stderr)
         return 1
     child = subprocess.Popen(
         argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
@@ -146,7 +180,7 @@ def start(host: str, port: int, reload: bool) -> int:
                     return 0
     except (OSError, ValueError, RuntimeError, TimeoutError) as exc:
         print(
-            f"deep-worker web: {exc}; see {log_dir / (name + '.err.log')}",
+            f"deep-worker --web: {exc}; see {log_dir / (name + '.err.log')}",
             file=sys.stderr,
         )
         return 1
@@ -207,8 +241,12 @@ def main() -> int:
         channel.sendall(json.dumps({"pid": os.getpid()}).encode() + b"\n")
         from deep_worker_cli.cli.router import _dispatch_web
 
+        # Must be the flag spelling: ``_dispatch_web`` declines anything
+        # else, and a positional "web" is an agent NAME. Getting this
+        # wrong makes the daemon child fall through to the agent
+        # launcher and the server never becomes ready.
         return _dispatch_web(
-            ["web", "--foreground", "--port", str(args.port)],
+            ["--web", "--foreground", "--port", str(args.port)],
             listener=listener, ready=channel,
         ) or 0
     except BaseException as exc:

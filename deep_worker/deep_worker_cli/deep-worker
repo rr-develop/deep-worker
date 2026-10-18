@@ -139,7 +139,6 @@ fi
 export PYTHONPATH="$SCRIPT_DIR:$PARENT_DIR/deepagents:$PARENT_DIR:${PYTHONPATH:-}"
 export DEEP_WORKER_TREE_ROOT="${DEEP_WORKER_TREE_ROOT:-$THIS_TREE_ROOT}"
 
-
 # ---------------------------------------------------------------------------
 # Thin path for `lsp bridge`.
 #
@@ -171,15 +170,16 @@ if [[ ${#filtered_args[@]} -ge 2 \
   cd "$SCRIPT_DIR" && DEEP_WORKER_ORIGINAL_CWD="$ORIGINAL_CWD" \
     exec python3 -m deep_worker_cli.lsp.bridge_main "${filtered_args[@]:2}"
 fi
+
 # ---------------------------------------------------------------------------
-# Thin path for `web`.
+# Thin path for `--web`.
 #
 # The web UI needs none of the agent runtime either, and routing it through
 # `-m deep_worker_cli.cli.agent_command` would pay the same torch tax
 # documented above for the bridge.
 #
 # Placement mirrors the bridge branch and both constraints are load-bearing
-# for the same reasons: AFTER the --dev dispatch, so `deep-worker --dev web`
+# for the same reasons: AFTER the --dev dispatch, so `deep-worker --dev --web`
 # serves the DEV tree's web code on the dev port; AFTER `export PYTHONPATH`,
 # or `deep_worker_cli` would not resolve at all (the package is not installed
 # when running from source).
@@ -189,11 +189,11 @@ fi
 # target is the router module rather than agent_command. Installed, the
 # console script calls the same function; there is one implementation.
 #
-# Matching is on the exact single token `web` with no further positionals,
-# so an agent literally named `web` started as `deep-worker web --provider …`
-# would be diverted; that name collides with the subcommand by construction
-# and `deep-worker web` IS the server. Sibling forms keep their normal route.
-if [[ ${#filtered_args[@]} -ge 1 && "${filtered_args[0]}" == "web" ]]; then
+# Matching is on the FLAG, never on a positional: the first positional of
+# `deep-worker` is an agent NAME, so a `web` token here would divert an
+# agent literally called "web" into the server. That collision is why the
+# pre-flag spelling was retired; `deep-worker web` now starts that agent.
+if [[ ${#filtered_args[@]} -ge 1 && "${filtered_args[0]}" == "--web" ]]; then
   cd "$SCRIPT_DIR" && DEEP_WORKER_ORIGINAL_CWD="$ORIGINAL_CWD" \
     exec python3 -m deep_worker_cli.cli.router "${filtered_args[@]}"
 fi

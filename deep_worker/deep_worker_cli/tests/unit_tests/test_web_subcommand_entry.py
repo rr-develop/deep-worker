@@ -1,4 +1,4 @@
-"""``deep-worker web`` must start the web UI from an installed distribution.
+"""``deep-worker --web`` must start the web UI from an installed distribution.
 
 Before this entry existed the web server was reachable only as ``python
 run.py`` from a git checkout, so a user who did ``pip install
@@ -84,11 +84,11 @@ def _resolve_wrapper() -> str:
 
 
 def test_wrapper_routes_web_to_the_subcommand_parser():
-    """``deep-worker web --help`` must reach the web parser, not the agent one.
+    """``deep-worker --web --help`` must reach the web parser, not the agent one.
 
     This is the narrowest observable proof that the wrapper's branch
     fires: the help text comes from ``_dispatch_web``'s own
-    ``ArgumentParser(prog="deep-worker web")``. Before the branch
+    ``ArgumentParser(prog="deep-worker --web")``. Before the branch
     existed, ``web`` was an agent NAME and the invocation went to
     ``agent_command``, whose parser prints a different usage line.
 
@@ -96,7 +96,7 @@ def test_wrapper_routes_web_to_the_subcommand_parser():
     port and cannot collide with the long-lived servers on this host.
     """
     proc = subprocess.run(
-        [_resolve_wrapper(), "web", "--help"],
+        [_resolve_wrapper(), "--web", "--help"],
         capture_output=True,
         text=True,
         stdin=subprocess.DEVNULL,
@@ -106,7 +106,7 @@ def test_wrapper_routes_web_to_the_subcommand_parser():
     )
     combined = proc.stdout + proc.stderr
     assert proc.returncode == 0, f"rc={proc.returncode}: {combined[-600:]!r}"
-    assert "usage: deep-worker web" in combined, (
+    assert "usage: deep-worker --web" in combined, (
         "the wrapper did not route `web` to the web subcommand parser; "
         f"got: {combined[-600:]!r}"
     )
@@ -136,7 +136,7 @@ def test_wrapper_web_branch_sits_after_dev_and_pythonpath():
     )
     dev_branch = text.index('if [[ $dev_requested -eq 1 ]]')
     pythonpath = text.index('export PYTHONPATH=')
-    web_branch = text.index('"${filtered_args[0]}" == "web"')
+    web_branch = text.index('"${filtered_args[0]}" == "--web"')
 
     assert dev_branch < web_branch, (
         "the web branch precedes the --dev dispatch, so `--dev web` would "
@@ -288,7 +288,7 @@ def test_real_wrapper_start_makes_app_importable_in_the_server_process():
         pytest.skip(f"web source tree not present at {_WEB_SOURCE}")
     port = _free_port()
     proc = subprocess.Popen(
-        [wrapper, "web", "--foreground", "--port", str(port)],
+        [wrapper, "--web", "--foreground", "--port", str(port)],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         stdin=subprocess.DEVNULL, env=_probe_env(), cwd=str(_REPO_ROOT),
     )
@@ -356,7 +356,10 @@ def test_web_dispatch_declines_every_other_argv():
     """
     from deep_worker_cli.cli.router import _dispatch_web
 
-    for argv in ([], ["lsp", "bridge"], ["myagent"], ["--restart", "web"], ["webhook"]):
+    # ``["web"]`` is in this list deliberately: it is an agent NAME, and
+    # the pre-flag spelling that captured it here is what made an agent
+    # called "web" start a server on port 7887 instead.
+    for argv in ([], ["lsp", "bridge"], ["myagent"], ["--restart", "web"], ["webhook"], ["web"]):
         assert _dispatch_web(argv) is None, (
             f"_dispatch_web captured argv it must decline: {argv!r}"
         )

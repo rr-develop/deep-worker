@@ -48,12 +48,28 @@ def _dispatch_lsp_bridge(argv: list[str]) -> int | None:
 def _dispatch_web(
     argv: list[str], *, listener: socket.socket | None = None, ready: socket.socket | None = None
 ) -> int | None:
-    """Serve ``deep-worker web`` without importing the agent stack.
+    """Serve ``deep-worker --web`` without importing the agent stack.
 
     This is what makes the web UI reachable from a plain ``pip install
     deep-worker``: the server used to be startable only as
     ``python run.py`` from a git checkout, so a user without sources had
     no way in at all.
+
+    Why a FLAG and not a positional subcommand
+    ------------------------------------------
+    The first positional of ``deep-worker`` is an agent NAME, so a
+    positional ``web`` necessarily competes with any agent called
+    ``web`` — one of them has to lose, silently. A flag has no such
+    conflict, which is why ``--web`` is the supported spelling and the
+    only one that appears in any help text.
+
+    The pre-flag positional spelling was retired for exactly that
+    reason: it made ``deep-worker web`` serve the UI on the default
+    port instead of starting an agent named "web". Nothing invoked it
+    (no systemd unit, crontab entry, script or doc; the servers running
+    on this host are ``python3 -m deep_worker_cli.process.web_daemon
+    --port N --listen-fd 3 --ready-fd 5``, PPID 1), so it was removed
+    rather than deprecated, and the name is an agent's again.
 
     Why the interception lives here, like ``lsp bridge``'s: reaching
     ``agent_command``'s own subcommand registry means importing that
@@ -75,15 +91,13 @@ def _dispatch_web(
     The directory is located through ``app.paths``, the single resolver,
     so this works identically from a checkout and from inside the wheel.
 
-    Matching is exact on the first token, so an agent named ``web``
-    is NOT captured by ``deep-worker web`` alone — that form IS the
-    server, and an agent of that name would have to be started by the
-    normal route. Every other invocation falls through unchanged.
-
     Returns:
         Exit code if this argv is the web server; ``None`` to continue routing.
     """
-    if argv[:1] != ["web"]:
+    if argv[:1] == ["--web"]:
+        web_argv = argv[1:]
+        invoked_as = "deep-worker --web"
+    else:
         return None
 
     import argparse
@@ -91,7 +105,7 @@ def _dispatch_web(
     import os
 
     parser = argparse.ArgumentParser(
-        prog="deep-worker web",
+        prog=invoked_as,
         description="Run the deep_worker web UI on 127.0.0.1.",
     )
     parser.add_argument(
@@ -107,7 +121,37 @@ def _dispatch_web(
     )
     parser.add_argument("--foreground", action="store_true", help="Run attached to the terminal for debugging")
     parser.add_argument("--stop", action="store_true", help="Stop the managed web server on this port")
-    args = parser.parse_args(argv[1:])
+    parser.add_argument(
+        "--status",
+        action="store_true",
+        help="Report whether a managed server is running on this port",
+    )
+    parser.epilog = (
+        "examples:\n"
+        "  deep-worker --web                 start in the background on the "
+        "default port\n"
+        "  deep-worker --web --port 8080     start on port 8080\n"
+        "  deep-worker --web --status        is it running?\n"
+        "  deep-worker --web --stop          stop the managed server\n"
+        "  deep-worker --web --foreground    run attached, for debugging\n"
+    )
+    parser.formatter_class = argparse.RawDescriptionHelpFormatter
+
+    # ``--web start`` / ``--web status`` are the shapes people try first;
+    # argparse would answer the bare "unrecognized arguments: start", which
+    # reads like the flag itself is broken.
+    _VERB_FLAGS = {"start": None, "stop": "--stop", "status": "--status", "restart": None}
+    if web_argv[:1] and web_argv[0] in _VERB_FLAGS:
+        flag = _VERB_FLAGS[web_argv[0]]
+        hint = f"use '{flag}'" if flag else "the bare form already starts the server"
+        print(
+            f"{invoked_as}: '{web_argv[0]}' is not a verb here — {hint}.\n"
+            f"Run '{invoked_as} --help' for the available controls.",
+            file=sys.stderr,
+        )
+        return 2
+
+    args = parser.parse_args(web_argv)
 
     # The resolver is imported through whichever name is available. From a
     # checkout ``deep_worker_cli.web`` does not exist (the web tree is a
@@ -118,7 +162,7 @@ def _dispatch_web(
     web_root = _locate_web_root()
     if web_root is None:
         print(
-            "deep-worker web: cannot locate the web application directory.\n"
+            "deep-worker --web: cannot locate the web application directory.\n"
             "An installed distribution ships it as deep_worker_cli/web; a "
             "checkout has it at <repo>/deep_worker_web. Neither was found.",
             file=sys.stderr,
@@ -163,11 +207,13 @@ def _dispatch_web(
     try:
         settings.validate_security()
     except ValueError as exc:
-        print(f"deep-worker web: refusing to start: {exc}", file=sys.stderr)
+        print(f"deep-worker --web: refusing to start: {exc}", file=sys.stderr)
         return 1
 
     from deep_worker_cli.process import web_daemon
 
+    if args.status:
+        return web_daemon.status(port)
     if args.stop:
         return web_daemon.stop(port)
     if listener is not None and ready is not None:
@@ -223,6 +269,107 @@ def _locate_web_root() -> "object | None":
     return None
 
 
+def _dispatch_version(argv: list[str]) -> int | None:
+    """Serve ``deep-worker --version`` without the agent stack.
+
+    The flag did not exist anywhere, so it fell through to the agent parser
+    and died with "unrecognized arguments" — reported from a host running
+    0.0.21 from PyPI.
+
+    The version is read from the INSTALLED distribution metadata, falling
+    back to ``_version.py`` for a source checkout where no distribution is
+    registered. That order matters: metadata is what ``pip show`` reports,
+    so the two can never disagree for a pip user.
+
+    Spelled as a FLAG only: a positional ``version`` would compete with an
+    agent of that name, so ``deep-worker version`` keeps starting the agent
+    called "version" and ``--version`` reports the version.
+
+    Returns:
+        Exit code if this argv asked for the version; ``None`` otherwise.
+    """
+    if argv[:1] not in (["--version"], ["-V"]):
+        return None
+
+    try:
+        from importlib.metadata import PackageNotFoundError, version
+
+        try:
+            resolved = version("deep-worker")
+        except PackageNotFoundError:
+            from deep_worker_cli._version import __version__ as resolved
+    except Exception:  # pragma: no cover - defensive, metadata is stdlib
+        from deep_worker_cli._version import __version__ as resolved
+
+    print(f"deep-worker {resolved}")
+    return 0
+
+
+def _dispatch_help(argv: list[str]) -> int | None:
+    """Answer ``--help`` even when the agent runtime cannot be imported.
+
+    The real help text is the agent parser's: it is the single source of
+    truth for the ~60 agent options, and duplicating a second listing here
+    would guarantee the two drift apart. So this delegates to
+    ``create_parser()`` and only takes over when that import fails.
+
+    That fallback is not hypothetical. ``agent_command`` pulls the whole
+    agent stack at module level (yaml, langchain, …), so in an install
+    whose runtime dependencies are incomplete ``--help`` died with
+    ``ModuleNotFoundError``. Help is precisely what a user reaches for
+    when something else is already broken, so it must still answer —
+    with the flags that need no runtime at all.
+
+    Returns:
+        Exit code if this argv asked for help; ``None`` otherwise.
+    """
+    if argv[:1] not in (["--help"], ["-h"]):
+        return None
+
+    try:
+        from deep_worker_cli.cli.agent_command import create_parser
+    except Exception as exc:  # noqa: BLE001 - any import failure must degrade
+        # Degraded help: still a real help page on stdout with exit 0, so
+        # `deep-worker --help | grep` keeps working in a broken install.
+        # The runtime problem is reported on stderr, where it does not
+        # corrupt the listing.
+        print(
+            f"warning: the agent runtime failed to import "
+            f"({type(exc).__name__}: {exc}),\n"
+            "so the per-agent options are omitted below.",
+            file=sys.stderr,
+        )
+        print(
+            "usage: deep-worker [AGENT_NAME] [options]\n"
+            "\n"
+            "A positional is always an agent NAME. The web UI and the "
+            "version are\n"
+            "flags, so an agent called 'web' or 'version' keeps working.\n"
+            "\n"
+            "options that need no agent runtime:\n"
+            "  --web                 Serve the deep_worker web UI on "
+            "127.0.0.1, detached\n"
+            "                        from the terminal (--port N, --status, "
+            "--stop,\n"
+            "                        --foreground); see --web --help\n"
+            "  --version, -V         Print the installed deep-worker version "
+            "and exit\n"
+            "\n"
+            "examples:\n"
+            "  deep-worker myagent             start (or attach to) an agent\n"
+            "  deep-worker --web               start the web UI in the "
+            "background\n"
+            "  deep-worker --web --port 8080   serve on port 8080\n"
+            "  deep-worker --web --status      is the web UI running?\n"
+            "  deep-worker --web --stop        stop it\n"
+            "  deep-worker --version           print the version\n"
+        )
+        return 0
+
+    create_parser().print_help()
+    return 0
+
+
 def deep_worker_main() -> int:
     """Entry point for 'deep-worker' command (agent process).
 
@@ -230,6 +377,14 @@ def deep_worker_main() -> int:
         Exit code
     """
     code = _dispatch_lsp_bridge(sys.argv[1:])
+    if code is not None:
+        return code
+
+    code = _dispatch_version(sys.argv[1:])
+    if code is not None:
+        return code
+
+    code = _dispatch_help(sys.argv[1:])
     if code is not None:
         return code
 

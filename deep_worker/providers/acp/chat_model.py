@@ -319,6 +319,11 @@ class AcpChatModel(BaseChatModel):
     _proxy_mcp: Any = PrivateAttr(default=None)
     _profile: AcpProfile = PrivateAttr(default=None)
     _tools_metadata: list[ToolMetadata] = PrivateAttr(default_factory=list)
+    # ``_meta`` for session/new and session/load: the adapter's
+    # tool-configuration channel, built once from the launch-time
+    # ``ToolSelection``. ``None`` means "no restriction", and then no
+    # ``_meta`` key is sent at all.
+    _session_meta: dict | None = PrivateAttr(default=None)
     _working_dir: str | None = PrivateAttr(default=None)
     _model_name: str | None = PrivateAttr(default=None)
     _resolved_model_name: str | None = PrivateAttr(default=None)
@@ -822,6 +827,7 @@ class AcpChatModel(BaseChatModel):
             session_id = await self._acp_client.session_new(
                 cwd=self._working_dir or ".",
                 mcp_servers=mcp_servers,
+                meta=self._session_meta_payload(),
             )
             state.session_id = session_id
             state.session_live_in_process = True
@@ -842,6 +848,7 @@ class AcpChatModel(BaseChatModel):
                         state.session_id,
                         cwd=self._working_dir or ".",
                         mcp_servers=mcp_servers,
+                        meta=self._session_meta_payload(),
                     )
                     if hasattr(self._acp_client, "wait_session_ready"):
                         await self._acp_client.wait_session_ready(
@@ -873,6 +880,7 @@ class AcpChatModel(BaseChatModel):
                 session_id = await self._acp_client.session_new(
                     cwd=self._working_dir or ".",
                     mcp_servers=mcp_servers,
+                    meta=self._session_meta_payload(),
                 )
                 state.session_id = session_id
                 if hasattr(self._acp_client, "wait_session_ready"):
@@ -909,6 +917,7 @@ class AcpChatModel(BaseChatModel):
                     state.session_id,
                     cwd=self._working_dir or ".",
                     mcp_servers=[],
+                    meta=self._session_meta_payload(),
                 )
                 if hasattr(self._acp_client, "wait_session_ready"):
                     await self._acp_client.wait_session_ready(
@@ -938,6 +947,7 @@ class AcpChatModel(BaseChatModel):
                         "headers": [],
                     }
                 ],
+                meta=self._session_meta_payload(),
             )
             if hasattr(self._acp_client, "wait_session_ready"):
                 await self._acp_client.wait_session_ready(state.session_id)
@@ -978,6 +988,9 @@ class AcpChatModel(BaseChatModel):
         blocks = [{"type": "text", "text": text}]
 
         # 12. Fire session/prompt + consume until response / tool_calls.
+        # A guard left behind by a wipe between turns would make this raise
+        # synchronously; clear it first (no-op on every ordinary turn).
+        await self._clear_orphaned_prompt_guard(state)
         state.current_notif_queue = asyncio.Queue(maxsize=NOTIF_QUEUE_MAX_ITEMS)
         state.pending_session_prompt_future = self._acp_client.session_prompt(
             session_id=state.session_id,
@@ -1104,6 +1117,7 @@ class AcpChatModel(BaseChatModel):
                 state.session_id,
                 cwd=self._working_dir or ".",
                 mcp_servers=mcp_servers,
+                meta=self._session_meta_payload(),
             )
             if hasattr(self._acp_client, "wait_session_ready"):
                 await self._acp_client.wait_session_ready(state.session_id)
@@ -2398,6 +2412,60 @@ class AcpChatModel(BaseChatModel):
         if name and name in self._bound_tool_names():
             return name, raw_input
         return None
+
+    def _session_meta_payload(self) -> dict | None:
+        """The ``_meta`` to send with session/new and session/load.
+
+        ``getattr`` with a default rather than a bare attribute read: a model
+        built through ``object.__new__`` (the convention across this suite,
+        and the shape ``create_model`` hands back before pydantic private
+        attrs are initialised) has no ``_session_meta`` slot at all, and a
+        missing restriction must degrade to "unrestricted", never to an
+        AttributeError on the turn path.
+        """
+        return getattr(self, "_session_meta", None)
+
+    async def _clear_orphaned_prompt_guard(self, state: Any) -> None:
+        """Release a prompt guard this thread can no longer reach.
+
+        The client's guard is dropped by the pending future's done-callback,
+        so every path that abandons a turn must either cancel or resolve that
+        future. One path cannot: a ``--sum-query`` history wipe runs BETWEEN
+        two turns, and ``DanglingToolCallMiddleware.before_model`` removes the
+        orphaned ``ToolMessage`` that the mid-turn-resume gate keys off. With
+        no ``ToolMessage`` in the tail, ``tool_resolved``/``saw_builtin_resume``
+        are both False, that gate's ``session_cancel`` never runs, and step 12
+        prompts a session the client still considers busy —
+        ``AcpConcurrentPromptError`` on a session created a second earlier
+        (observed in several live sessions).
+
+        The condition is deliberately narrow: the guard is held AND this
+        thread has no future of its own. A turn that is legitimately waiting
+        for a tool result still HOLDS its future, so it is not touched —
+        cancelling there would abort a turn the CLI is correctly serving,
+        which is the one thing this recovery must never do.
+
+        Best-effort, like every other ``session_cancel`` caller: a CLI that
+        refuses must not take down the turn we are about to start.
+        """
+        if state.session_id is None:
+            return
+        if state.pending_session_prompt_future is not None:
+            return
+        # A client that predates the predicate (or a stub that does not
+        # implement it) must read as "no orphan" rather than cancelling
+        # blind: this recovery may only ever act on a guard it positively
+        # observed.
+        probe = getattr(self._acp_client, "has_active_prompt", None)
+        if not callable(probe) or probe(state.session_id) is not True:
+            return
+        logger.warning(
+            "acp: session %s still holds a prompt guard with no local future "
+            "(history wipe between turns); cancelling it before re-prompting",
+            state.session_id,
+        )
+        with contextlib.suppress(Exception):
+            await self._acp_client.session_cancel(state.session_id)
 
     @staticmethod
     def _discard_pending_prompt(state: Any, why: str) -> None:

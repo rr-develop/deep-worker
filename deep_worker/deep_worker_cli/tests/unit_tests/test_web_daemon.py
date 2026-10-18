@@ -54,7 +54,7 @@ def _stop_pid(pid: int) -> None:
 
 def _start(entry: list[str], port: int) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [*entry, "web", "--port", str(port)], capture_output=True,
+        [*entry, "--web", "--port", str(port)], capture_output=True,
         text=True, env=_env(), cwd="/tmp", timeout=120,
     )
 
@@ -69,7 +69,7 @@ def test_background_server_survives_terminal_and_shell_death(entry):
             "/bin/bash",
             ["bash", "--noprofile", "--norc", "-c",
              '"$@"; code=$?; printf "\\n__EXIT__:%s\\n" "$code"; read -r unused',
-             "web-test", *entry, "web", "--port", str(port)],
+             "web-test", *entry, "--web", "--port", str(port)],
             _env(),
         )
     server = None
@@ -123,7 +123,7 @@ def test_background_server_survives_terminal_and_shell_death(entry):
         assert log.is_file()
         errors = Path(re.search(rb"Errors: ([^\r\n]+)", output).group(1).decode())
         result = subprocess.run(
-            [*entry, "web", "--stop", "--port", str(port)],
+            [*entry, "--web", "--stop", "--port", str(port)],
             env=_env(), cwd="/tmp", capture_output=True, text=True, timeout=45,
         )
         assert result.returncode == 0, result.stderr
@@ -162,7 +162,7 @@ def test_stop_refuses_a_pid_file_for_an_unrelated_process():
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({"pid": os.getpid(), "start_ticks": _identity(os.getpid())}))
     result = subprocess.run(
-        [str(WRAPPER), "web", "--stop", "--port", str(port)],
+        [str(WRAPPER), "--web", "--stop", "--port", str(port)],
         env=_env(), capture_output=True, text=True, timeout=30,
     )
     assert result.returncode == 1
@@ -187,7 +187,7 @@ def test_managed_server_can_restart_on_the_same_port():
             assert duplicate.returncode == 1
             assert "cannot bind" in duplicate.stderr
             stopped = subprocess.run(
-                [str(WRAPPER), "web", "--stop", "--port", str(port)],
+                [str(WRAPPER), "--web", "--stop", "--port", str(port)],
                 capture_output=True, text=True, env=_env(), timeout=45,
             )
             assert stopped.returncode == 0, stopped.stderr
@@ -212,7 +212,7 @@ def test_failed_startup_returns_failure_without_leaving_a_daemon(tmp_path):
     env["PYTHONPATH"] = str(tmp_path) + os.pathsep + env["PYTHONPATH"]
     port = _port()
     result = subprocess.run(
-        [str(WRAPPER), "web", "--port", str(port)],
+        [str(WRAPPER), "--web", "--port", str(port)],
         env=env, cwd="/tmp", capture_output=True, text=True, timeout=120,
     )
     assert result.returncode == 1

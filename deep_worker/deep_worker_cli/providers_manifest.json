@@ -5,11 +5,11 @@
     "acp": {
       "files": {
         "__init__.py": "357032d41af405f6f20d927ccb7562a16d233c7f1e07d9f6e318a17689764815",
-        "acp_client.py": "8353b0252bd9feea095b7cccee21d39222699f26c8ac0d9eb2f9d68bab23d913",
+        "acp_client.py": "d18de3d13e93c1134b51b9035080457ce08c32411f618e35e2689eeb16675dc7",
         "acp_types.py": "fb448fd5ead861ed952d4b20aef074bb96bacc0ecc4b4effe72d8b49aca4d36f",
         "arg_compat.py": "d49d7362be35e3ae26e041626d59f4cd43b1162fe57c1788d685c2f0e755eb30",
         "builtin_tool_passthrough.py": "792ae234ee36a850015d2e7939e8ca7adbab201c1ffaa02b3e4e2078978a3415",
-        "chat_model.py": "e226d7d73e93f3b2b9249b375a52b13be602f6f2f542ecaca208aa4ae82097f6",
+        "chat_model.py": "95e865db2de090e54fc40cf98e6fec29d279a072b4f4c600b8f8d097b8947b72",
         "client_state.py": "7d9b9fb69a8a437a14551292ec3629f89dc872ee919c73a076ab5aff0f688287",
         "context_watch.py": "0aebadb03cbdda5f312732a2d17035c6ab88de433c7501932e7bd049b1931124",
         "custom_types.py": "ea409fe838648edc3604f4d5a0ac81f0c4504360ff2997164aeb1b9ca144a09f",
