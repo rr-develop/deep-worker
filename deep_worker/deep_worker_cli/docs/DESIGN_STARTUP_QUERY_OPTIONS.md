@@ -330,7 +330,7 @@ earlier revision of this section (then-"reviewer feedback #1") collapsed
 them into ONE turn whose input was `[summary-shape, query]`. That was
 wrong: in a single turn the agent responds to the *query* with the
 summary as prior context, so the **sum-query is never executed as its own
-request**. Downstream consumers (e.g. my_job) that expect the sum-query to
+request**. Downstream consumers (e.g. a downstream consumer) that expect the sum-query to
 run first and produce its own result silently got nothing. This is the bug
 being fixed.
 

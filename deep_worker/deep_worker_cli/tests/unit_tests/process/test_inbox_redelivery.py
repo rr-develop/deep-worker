@@ -335,7 +335,7 @@ async def test_stale_delivery_is_marked_in_body(
 ) -> None:
     """A delivered-but-old record reaches the turn with a staleness prefix."""
     proc = _make_proc(data_dir, tmp_path)
-    await proc.publish_inbox_message("agent_a -> me :> SIGN OFF", True)
+    await proc.publish_inbox_message("agent_1 -> me :> SIGN OFF", True)
     path = _pending(data_dir)[0]
     body = json.loads(path.read_text())
     body["ts"] = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat()
@@ -350,7 +350,7 @@ async def test_stale_delivery_is_marked_in_body(
     assert "STALE MESSAGE" in delivered[0], (
         "the model must be able to see the message is stale"
     )
-    assert "agent_a -> me :> SIGN OFF" in delivered[0], (
+    assert "agent_1 -> me :> SIGN OFF" in delivered[0], (
         "the original body must be preserved after the prefix"
     )
 
@@ -375,12 +375,12 @@ async def test_stale_prefix_preserves_reply_routing() -> None:
 
     prefixed = (
         "[STALE MESSAGE — queued 13d2h ago, delivered late; may be obsolete]\n"
-        "agent_a -> agent_b :> DESIGN SIGN OFF"
+        "agent_1 -> agent_2 :> DESIGN SIGN OFF"
     )
     msg = HumanMessage(content=prefixed)
 
-    assert _is_inter_agent_message(msg, "agent_b") is True
-    assert _extract_sender(prefixed) == "agent_a"
+    assert _is_inter_agent_message(msg, "agent_2") is True
+    assert _extract_sender(prefixed) == "agent_1"
 
 
 # --- tests 9/10/16/17: ledger durability ----------------------------------

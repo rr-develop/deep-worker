@@ -238,7 +238,7 @@ class TestClassifyMessage:
         assert not (f & MessageFlag.PLAIN_USER)
 
     def test_agent_to_agent_human_transport(self) -> None:
-        f = classify_message(_entry("human", "agent_one -> agent_two :> hi"))
+        f = classify_message(_entry("human", "agent_1 -> agent_2 :> hi"))
         assert f & MessageFlag.USER_ROLE
         assert f & MessageFlag.AGENT_TO_AGENT
         assert not (f & MessageFlag.PLAIN_USER)

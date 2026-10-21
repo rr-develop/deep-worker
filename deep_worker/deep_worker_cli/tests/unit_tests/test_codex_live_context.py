@@ -1,11 +1,11 @@
 """codex: the context gauge must move on every model call, not once a turn.
 
-Owner report 2026-08-25: rg1_worker showed ``Context: 40.9k`` frozen while
+Owner report 2026-08-25: agent_a showed ``Context: 40.9k`` frozen while
 the agent worked, then jumped to ``71.7k``. Both numbers are real records —
 ``prompt_tokens`` 40884 at 12:16:19 and 71716 at 12:25:51, 9.5 minutes
 apart. The provider emits usage in exactly one place, ``TurnCompletedEvent``,
 and a codex *turn* is not a model call: it is one prompt → final answer,
-covering the whole internal loop. Measured on rg1_worker's own rollouts: 48
+covering the whole internal loop. Measured on agent_a's own rollouts: 48
 ``token_count`` events across 4 ``task_complete`` — ~12 model calls per turn
 whose context growth (18k → 21k → 26k → 27k → 28k …) the UI never saw.
 
@@ -18,7 +18,7 @@ have ``thread/tokenUsage/updated``, but that is a different transport.
 So the live number comes from the rollout codex writes as it goes: one
 ``token_count`` per model call, carrying ``info.last_token_usage`` (this
 call's input = the context it read) and ``info.total_token_usage``.
-Verified live that the file is appended DURING a turn (rg1_worker: +1664
+Verified live that the file is appended DURING a turn (agent_a: +1664
 bytes and one new event in 45 s).
 
 Owner constraint: event-driven, no polling. The watcher below is driven by
@@ -220,7 +220,7 @@ class TestWatcher:
     ) -> None:
         """``start`` takes end-of-file as the baseline.
 
-        A session's rollout holds EVERY earlier turn (rg1_worker: 906 KB and
+        A session's rollout holds EVERY earlier turn (agent_a: 906 KB and
         growing). Replaying it would publish a stale reading as if it were
         happening now, and re-reading megabytes per event is the polling cost
         we are avoiding, merely hidden. A change event that adds no new

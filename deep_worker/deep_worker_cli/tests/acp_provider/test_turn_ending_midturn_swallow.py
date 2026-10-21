@@ -1,7 +1,7 @@
 """Regression: a HumanMessage after a turn-ending tool_call must NOT be dropped.
 
-rg1_worker 2026-08-22 reported the defect and produced 2 live captures on
-his own process (10:23:24Z, 11:16:41Z) plus the repo_graph extractor.
+agent_a 2026-08-22 reported the defect and produced 2 live captures on
+his own process (10:23:24Z, 11:16:41Z) plus the the code-graph server extractor.
 
 Mechanism (chat_model.py):
   Turn N ends with a turn-ending tool_call (send_message_to_agent,

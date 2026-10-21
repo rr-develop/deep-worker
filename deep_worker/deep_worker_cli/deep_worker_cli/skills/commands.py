@@ -1,9 +1,9 @@
 """CLI commands for skill management.
 
 These commands are registered with the CLI via main.py:
-- deepagents skills list --agent <agent> [--project]
-- deepagents skills create <name>
-- deepagents skills info <name>
+- deep-worker skills list --agent <agent> [--project]
+- deep-worker skills create <name>
+- deep-worker skills info <name>
 """
 
 import argparse
@@ -193,7 +193,7 @@ def _list(agent: str, *, project: bool = False) -> None:
             )
             console.print(
                 "\n[dim]Create a project skill:\n"
-                "  deepagents skills create my-skill --project[/dim]",
+                "  deep-worker skills create my-skill --project[/dim]",
                 style=COLORS["dim"],
             )
             return
@@ -231,7 +231,7 @@ def _list(agent: str, *, project: bool = False) -> None:
             )
             console.print(
                 "\n[dim]Create your first skill:\n"
-                "  deepagents skills create my-skill[/dim]",
+                "  deep-worker skills create my-skill[/dim]",
                 style=COLORS["dim"],
             )
             return
@@ -441,7 +441,7 @@ def _create(skill_name: str, agent: str, project: bool = False) -> None:
         "\n"
         f"  nano {skill_md}\n"
         "\n"
-        "  See examples/skills/ in the deepagents-cli repo for example skills:\n"
+        "  See examples/skills/ in the deep-worker repo for example skills:\n"
         "   - web-research: Structured research workflow\n"
         "   - langgraph-docs: LangGraph documentation lookup\n"
         "\n"
@@ -569,7 +569,7 @@ def setup_skills_parser(
     """Setup the skills subcommand parser with all its subcommands.
 
     Each subcommand gets a dedicated help screen so that
-    `deepagents skills -h` shows skills-specific help, not the
+    `deep-worker skills -h` shows skills-specific help, not the
     global help.
 
     Args:

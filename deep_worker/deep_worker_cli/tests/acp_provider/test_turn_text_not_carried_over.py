@@ -1,6 +1,6 @@
 """A turn's reply must carry THIS turn's text, not the branch's history.
 
-Defect (rg1_worker, TaskManager branch ``rg1_worker:tm``, measured on the live
+Defect (agent_a, TaskManager branch ``agent_a:tm``, measured on the live
 checkpoint DB 2026-10-11):
 
 ``_consume_turn`` parks its frame-local accumulators on ``state.queued_text``
@@ -14,7 +14,7 @@ the turn, so the next turn in the same branch starts with
 ``_BoundedTextAcc(state.queued_text)`` and inherits the previous turn's text —
 then parks the sum, and so on. The reply grows by one whole turn per turn.
 
-Measured on ``rg1_worker:tm`` (``threads.db``, read-only): one AIMessage per
+Measured on ``agent_a:tm`` (``threads.db``, read-only): one AIMessage per
 evaluation carrying 23, 24, 25, 26, then 27 ``STATUS:``/``REASONING:``/
 ``MESSAGE:`` blocks at lengths 36086 → 40871 chars, each seam glued mid-line
 (``...MESSAGE: NONESTATUS: done``) because the parts are concatenated with no
@@ -46,7 +46,7 @@ from deep_worker.providers.acp.custom_types import (
 from deep_worker.providers.acp.profile import AcpProfile
 
 SESSION = "d6ddeed4-900e-408a-8e37-a54743d5ee3e"
-THREAD = "rg1_worker:tm"
+THREAD = "agent_1:tm"
 
 
 def _model() -> AcpChatModel:
@@ -143,7 +143,7 @@ class TestTurnTextIsNotCarriedOver:
         assert "FIRST-TURN-TEXT" not in second.content, (
             "the second turn's reply carried the first turn's text — the "
             "branch state kept what _preserve_turn_work parked and the next "
-            "turn prepended it (rg1_worker:tm grew one verdict per evaluation)"
+            "turn prepended it (agent_1:tm grew one verdict per evaluation)"
         )
 
     @pytest.mark.asyncio

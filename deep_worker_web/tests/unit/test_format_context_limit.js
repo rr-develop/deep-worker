@@ -4,7 +4,7 @@
 // Pinned: the operator MUST be able to see what limit the guard is
 // holding. Without this, the UI cannot distinguish "guard holds 400k"
 // from "guard silently allowed the provider default" — the very bug
-// rg1_worker hit on 2026-08-18.
+// agent_a hit on 2026-08-18.
 //
 // Run from this directory with:
 //   node tests/unit/test_format_context_limit.js

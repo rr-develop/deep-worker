@@ -90,7 +90,7 @@ async def test_restricted_selection_disables_builtins_via_meta() -> None:
     allowlisted deep-worker tool is an MCP tool and travels via
     ``mcpServers``/``--mcp-config``, so it is deliberately NOT listed here.
     """
-    selection = parse_tool_selection(["repo_graph_link__submit_links"])
+    selection = parse_tool_selection(["code_graph_link__submit_links"])
     assert selection.restricts
     params = await _capture(_client(), meta=selection.acp_meta())
     options = params["_meta"]["claudeCode"]["options"]
@@ -153,13 +153,13 @@ def test_claude_code_no_longer_warns_about_unsuppressable_builtins() -> None:
     run — advice that is now wrong, and the reason rg_linker was launched
     with built-ins live.
     """
-    selection = parse_tool_selection(["repo_graph_link__submit_links"])
+    selection = parse_tool_selection(["code_graph_link__submit_links"])
     assert native_tool_caveat("claude-code", selection) is None
 
 
 def test_other_providers_still_warn() -> None:
     """codex and grok genuinely cannot switch their natives off."""
-    selection = parse_tool_selection(["repo_graph_link__submit_links"])
+    selection = parse_tool_selection(["code_graph_link__submit_links"])
     for provider in ("codex", "grok"):
         warning = native_tool_caveat(provider, selection)
         assert warning is not None

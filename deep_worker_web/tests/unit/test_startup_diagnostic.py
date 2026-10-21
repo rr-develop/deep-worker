@@ -9,6 +9,7 @@ Covers:
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -22,8 +23,13 @@ from app.config import get_git_commit_info
 # =========================================================================
 
 def test_git_commit_info_in_real_tree() -> None:
-    """Must return a non-empty SHA for the real repo."""
-    sha, describe = get_git_commit_info("/path/to/tasks")
+    """Must return a non-empty SHA for the real repo.
+
+    The tree under test is THIS repository, located from the test file rather
+    than hard-coded, so the check works on any checkout.
+    """
+    repo_root = Path(__file__).resolve().parents[3]
+    sha, describe = get_git_commit_info(str(repo_root))
     assert sha != "unknown", "should detect the commit SHA of this repo"
     assert len(sha) == 40, "a full SHA is 40 hex characters"
     assert all(c in "0123456789abcdef" for c in sha), "SHA must be hex only"

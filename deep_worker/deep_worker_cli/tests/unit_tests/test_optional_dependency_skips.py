@@ -39,6 +39,17 @@ import pytest
 
 UNIT_TESTS_ROOT = Path(__file__).parent
 
+#: Every tree whose module-level imports run during a CI collection, not just
+#: this package's. The repo-root ``tests/`` directory was outside the sample
+#: until 2026-10-20, so six unguarded ``llama_index`` importers there were
+#: invisible to this guard while being exactly the failure it exists to catch.
+#: Each root is scanned independently; a root that does not exist is skipped so
+#: the guard still runs from a partial checkout.
+SCANNED_ROOTS = (
+    UNIT_TESTS_ROOT,
+    Path(__file__).resolve().parents[4] / "tests",
+)
+
 #: Modules absent from the CI environment. ``claude_agent_sdk`` is a private
 #: source fork (CLAUDE_AGENT_SDK_SRC); ``llama_index`` and ``lancedb`` come
 #: with the ``semantic-search`` extra; ``a2a`` with the ``a2a`` extra. Keyed by
@@ -57,17 +68,61 @@ OPTIONAL_MODULES = frozenset(
 #: the monorepo, not behind an extra — so only the submodules that reach for
 #: an absent third-party package belong here. Verified by importing each in a
 #: venv built the way the workflow builds it; anything importable there is
-#: deliberately absent from this tuple. No shipped provider needs an entry
-#: today.
-OPTIONAL_PROVIDER_PREFIXES: tuple[str, ...] = ()
+#: deliberately absent from this tuple.
+OPTIONAL_PROVIDER_PREFIXES = (
+    "deep_worker.providers.claude_code_sdk_provider.chat_model",
+    "deep_worker.providers.claude_code_sdk_provider.client_manager",
+    "deep_worker.providers.claude_code_sdk_provider.proxy_mcp_server",
+    "deep_worker.providers.claude_code_sdk_provider.web_search",
+    # semantic_search submodules that import llama_index at their own module
+    # scope. Established the same way as the entries above — importing each
+    # submodule with the extra absent: these five raise ModuleNotFoundError,
+    # while _embed_cache, _tokenizer, config, exceptions,
+    # long_text_embedding, message_embedding_store, message_search and
+    # scanner all import fine and are deliberately omitted, as is the
+    # ``semantic_search`` package itself.
+    "deep_worker.providers.semantic_search.history_indexer",
+    "deep_worker.providers.semantic_search.history_retriever",
+    "deep_worker.providers.semantic_search.indexer",
+    "deep_worker.providers.semantic_search.retriever",
+    "deep_worker.providers.semantic_search.search_cli",
+)
 
 
 def _iter_test_files() -> list[Path]:
-    return sorted(
-        p
-        for p in UNIT_TESTS_ROOT.rglob("test_*.py")
-        if "__pycache__" not in p.parts and p != Path(__file__)
-    )
+    seen: set[Path] = set()
+    for root in SCANNED_ROOTS:
+        if not root.is_dir():
+            continue
+        for p in root.rglob("test_*.py"):
+            if "__pycache__" in p.parts or p.resolve() == Path(__file__).resolve():
+                continue
+            seen.add(p.resolve())
+    return sorted(seen)
+
+
+def _case_id(path: Path) -> str:
+    """Stable id that cannot collide between roots.
+
+    Files in ``UNIT_TESTS_ROOT`` keep the bare relative id they have always
+    had, so widening the sample does not rename 352 existing cases. Files
+    from any other root carry that root's name as a prefix, which both marks
+    where they came from and keeps a same-named file in two trees distinct.
+    ``relative_to(UNIT_TESTS_ROOT)`` alone would raise for the new roots.
+    """
+    resolved = path.resolve()
+    unit_root = UNIT_TESTS_ROOT.resolve()
+    try:
+        return str(resolved.relative_to(unit_root))
+    except ValueError:
+        pass
+    for root in SCANNED_ROOTS:
+        try:
+            rel = resolved.relative_to(root.resolve())
+        except ValueError:
+            continue
+        return f"{root.name}/{rel}"
+    return str(resolved)
 
 
 def _module_roots(node: ast.Import | ast.ImportFrom) -> set[str]:
@@ -133,9 +188,7 @@ def _offending_imports(tree: ast.Module) -> set[str]:
     return found
 
 
-@pytest.mark.parametrize(
-    "test_file", _iter_test_files(), ids=lambda p: str(p.relative_to(UNIT_TESTS_ROOT))
-)
+@pytest.mark.parametrize("test_file", _iter_test_files(), ids=_case_id)
 def test_optional_dependency_is_guarded_by_a_skip(test_file: Path) -> None:
     source = test_file.read_text(encoding="utf-8")
     tree = ast.parse(source, filename=str(test_file))
@@ -145,7 +198,7 @@ def test_optional_dependency_is_guarded_by_a_skip(test_file: Path) -> None:
         return
 
     assert _has_guard(source, tree), (
-        f"{test_file.relative_to(UNIT_TESTS_ROOT)} imports {sorted(offenders)}, "
+        f"{_case_id(test_file)} imports {sorted(offenders)}, "
         "which CI does not install (`pip install -e .` pulls no extras and no "
         "claude_agent_sdk fork), and carries no skip. Without one this file "
         "turns the whole Unit tests job red while passing locally. Add "
@@ -165,6 +218,17 @@ def test_guard_actually_scans_the_tree() -> None:
     files = _iter_test_files()
     assert len(files) > 100, f"expected the unit test tree, found {len(files)} files"
 
+    # Every configured root must contribute, or a path that silently stopped
+    # resolving would shrink the sample back without any case turning red —
+    # which is precisely how the repo-root tree went unscanned until
+    # 2026-10-20.
+    for root in SCANNED_ROOTS:
+        if not root.is_dir():
+            continue
+        assert any(f.is_relative_to(root.resolve()) for f in files), (
+            f"root {root} contributed no files; the sample silently shrank"
+        )
+
 
 def test_known_offenders_would_be_caught() -> None:
     """The guard must fail on the shape it exists to prevent.
@@ -175,6 +239,19 @@ def test_known_offenders_would_be_caught() -> None:
     bad = ast.parse("import llama_index\n\ndef test_x():\n    assert True\n")
     assert _offending_imports(bad) == {"llama_index"}
     assert not _has_guard("import llama_index", bad)
+
+    bad_from = ast.parse(
+        "from deep_worker.providers.claude_code_sdk_provider.chat_model import X\n"
+    )
+    assert _offending_imports(bad_from) == {
+        "deep_worker.providers.claude_code_sdk_provider.chat_model"
+    }
+
+    # The provider package itself resolves in CI, so importing it is fine.
+    ok_pkg = ast.parse(
+        "from deep_worker.providers.claude_code_sdk_provider import session_state\n"
+    )
+    assert _offending_imports(ok_pkg) == set()
 
     # An import inside a test body is out of scope: it does not run at
     # collection time, and such tests pass in CI today.

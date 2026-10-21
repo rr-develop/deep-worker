@@ -68,14 +68,14 @@ class TestValidAliasIsHonouredSilently:
 
     def test_fable_survives_the_merge(self, saved_claude):
         """The core regression from the incident."""
-        merged = _merge(["agent", "--restart", "--model", "fable"], saved_claude)
+        merged = _merge(["agent_1", "--restart", "--model", "fable"], saved_claude)
         assert merged.model == "fable", (
             f"--model fable must reach the launch config, got {merged.model!r}"
         )
 
     def test_fable_emits_no_warning(self, saved_claude, capsys):
         _, err = _merge_capturing(
-            ["agent", "--restart", "--model", "fable"], saved_claude, capsys
+            ["agent_1", "--restart", "--model", "fable"], saved_claude, capsys
         )
         assert "WARNING" not in err, (
             f"honouring a valid alias must be silent; stderr was: {err!r}"
@@ -85,7 +85,7 @@ class TestValidAliasIsHonouredSilently:
         """(d) ``default`` is a documented alias — an explicit replacement,
         not a reset. It must not warn."""
         merged, err = _merge_capturing(
-            ["agent", "--restart", "--model", "default"], saved_claude, capsys
+            ["agent_1", "--restart", "--model", "default"], saved_claude, capsys
         )
         assert merged.model == "default"
         assert "WARNING" not in err
@@ -96,13 +96,13 @@ class TestInvalidModelWarns:
 
     def test_bogus_model_is_reset(self, saved_claude):
         merged = _merge(
-            ["agent", "--restart", "--model", "bogusXYZ"], saved_claude
+            ["agent_1", "--restart", "--model", "bogusXYZ"], saved_claude
         )
         assert merged.model is None
 
     def test_bogus_model_warns_naming_the_token(self, saved_claude, capsys):
         _, err = _merge_capturing(
-            ["agent", "--restart", "--model", "bogusXYZ"], saved_claude, capsys
+            ["agent_1", "--restart", "--model", "bogusXYZ"], saved_claude, capsys
         )
         assert "WARNING" in err
         assert "bogusXYZ" in err, (
@@ -121,7 +121,7 @@ class TestInvalidModelWarns:
         provider does not recognise.
         """
         _, err = _merge_capturing(
-            ["agent", "--restart", "--model", "bogusXYZ"], saved_claude, capsys
+            ["agent_1", "--restart", "--model", "bogusXYZ"], saved_claude, capsys
         )
         assert "unknown-alias" in err, (
             f"predicate rejection must report reason=unknown-alias; got: {err!r}"
@@ -154,7 +154,7 @@ class TestBareProviderDeclarationWarns:
 
     def test_bare_provider_resets_and_warns(self, saved_claude, capsys):
         merged, err = _merge_capturing(
-            ["agent", "--restart", "--provider", "claude-code-sdk"],
+            ["agent_1", "--restart", "--provider", "claude-code-sdk"],
             saved_claude,
             capsys,
         )
@@ -201,7 +201,7 @@ class TestReplacementIsTruthful:
         """claude-code-sdk pins nothing, so the honest text IS "resolved by the
         provider CLI"."""
         _, err = _merge_capturing(
-            ["agent", "--restart", "--model", "bogusXYZ"], saved_claude, capsys
+            ["agent_1", "--restart", "--model", "bogusXYZ"], saved_claude, capsys
         )
         assert "provider default" in err
 
@@ -237,7 +237,7 @@ class TestExactlyOneEmission:
     def test_each_dropped_token_named_once(self, saved_claude, capsys):
         """C1 drops two values; each is reported once, neither is duplicated."""
         _, err = _merge_capturing(
-            ["agent", "--restart", "--model", "bogusXYZ"], saved_claude, capsys
+            ["agent_1", "--restart", "--model", "bogusXYZ"], saved_claude, capsys
         )
         assert err.count("'bogusXYZ' was reset") == 1, (
             f"the rejected explicit model must be reported once; got: {err!r}"
@@ -297,7 +297,7 @@ class TestPreferredCascadeMatrix:
     def test_c2_valid_explicit_updates_both(self, saved_claude, capsys):
         """C2: a valid alias becomes both active and preferred, silently."""
         merged, err = _merge_capturing(
-            ["agent", "--restart", "--model", "fable"], saved_claude, capsys
+            ["agent_1", "--restart", "--model", "fable"], saved_claude, capsys
         )
         assert merged.model == "fable"
         assert merged.preferred_model == "fable"
@@ -368,7 +368,7 @@ class TestPreferredCascadeMatrix:
     def test_c6_bare_provider_collapses_both(self, saved_claude, capsys):
         """C6: RC-1 — preferred must track the reset of active."""
         merged, err = _merge_capturing(
-            ["agent", "--restart", "--provider", "claude-code-sdk"],
+            ["agent_1", "--restart", "--provider", "claude-code-sdk"],
             saved_claude,
             capsys,
         )

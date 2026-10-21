@@ -63,7 +63,7 @@ async def test_apply_pseudo_summary_writes_agent_jsonl_no_graph(tmp_path: Path) 
     # offload happened and is reported via ``file_path``, but the model is not
     # told about it. Framing the task as a recap of the past is what made
     # deepseek spend a whole turn inspecting this JSONL instead of working
-    # (repo_graph stage 2, 2026-10-01).
+    # (the code-graph server stage 2, 2026-10-01).
     assert len(new_msgs) == 1
     assert new_msgs[0].content == "brand new task"
     assert "/conversation_history/myagent.jsonl" not in new_msgs[0].content

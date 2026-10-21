@@ -10,9 +10,9 @@ from deep_worker_cli._version import __version__
 
 
 def _subprocess_env() -> dict[str, str]:
-    """Return an env for subprocess that keeps local `deepagents`
-    importable — mirrors conftest.py's sys.path injection.
-    Without this, `python -m deep_worker_cli.main` in a
+    """Return an env for subprocess that keeps local `deepagents` and
+    `a local rpyc-async checkout` importable — mirrors conftest.py's sys.path
+    injection. Without this, `python -m deep_worker_cli.main` in a
     child process fails with `ModuleNotFoundError: No module named
     'deepagents'` because no site-package install exists (policy:
     tests always run against source, see conftest.py header).
@@ -21,6 +21,7 @@ def _subprocess_env() -> dict[str, str]:
     existing = env.get("PYTHONPATH", "")
     prefix = os.pathsep.join([
         str(Path(__file__).parent.parent.parent.parent / "deepagents"),
+        "a local rpyc-async checkout",
         # deep_worker_cli source dir — so `deep_worker_cli.main` resolves:
         str(Path(__file__).parent.parent.parent),
     ])
@@ -57,15 +58,23 @@ def test_cli_version_flag() -> None:
     )
     # argparse exits with 0 for --version
     assert result.returncode == 0
-    assert f"deepagents-cli {__version__}" in result.stdout
+    assert f"deep-worker {__version__}" in result.stdout
+    # The ancestor's product name must not reach the user.
+    assert "deepagents" not in result.stdout.lower()
 
 
-def test_version_slash_command_message_format() -> None:
-    """Verify the /version slash command message format matches expected output."""
-    # This tests the exact message format used in app.py's _handle_command for /version
-    expected_message = f"deepagents version: {__version__}"
-    assert "deepagents version:" in expected_message
-    assert __version__ in expected_message
+def test_version_slash_command_names_this_product() -> None:
+    """The ``/version`` reply in the TUI names deep-worker, not the ancestor.
+
+    Reads the literal out of ``app.py``'s source rather than rebuilding it
+    here: a test that formats the expected string itself passes no matter
+    what the product prints.
+    """
+    app_src = (
+        Path(__file__).parent.parent.parent / "deep_worker_cli" / "app.py"
+    ).read_text()
+    assert 'AppMessage(f"deep-worker version: {__version__}")' in app_src
+    assert "deepagents version:" not in app_src
 
 
 def test_help_mentions_version_flag() -> None:

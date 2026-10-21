@@ -38,7 +38,7 @@ LAUNCH_CONFIG = {
     "clean": False,
     "started_at": "2026-06-05T20:14:29",
     "pid": 1842836,
-    "cli_args": "--restart sysagent -m",
+    "cli_args": "--restart agent_1 -m",
 }
 
 
@@ -110,7 +110,7 @@ class TestNoMetadata:
 class TestHappyPath:
     def test_all_required_fields_appear(self, temp_data_dir, capsys):
         """Output contains all expected fields from the design spec."""
-        agent_dir = temp_data_dir / "sysagent"
+        agent_dir = temp_data_dir / "agent_1"
         _write_full_metadata(agent_dir, LAUNCH_CONFIG)
 
         from deep_worker_cli.cli.agent_command import show_agent_info
@@ -121,12 +121,12 @@ class TestHappyPath:
             patch("deep_worker_cli.process.registry.ProcessRegistry") as mock_reg,
         ):
             mock_reg().lookup.return_value = None
-            rc = show_agent_info("sysagent")
+            rc = show_agent_info("agent_1")
 
         assert rc == 0
         out = capsys.readouterr().out
 
-        assert "agent: sysagent" in out
+        assert "agent: agent_1" in out
         assert "provider: claude-code-sdk" in out
         assert "model: opus" in out
         assert "working_dir: /tmp/agent_work" in out
@@ -135,7 +135,7 @@ class TestHappyPath:
         assert "started_at: 2026-06-05T20:14:29" in out
         assert "pid: 1842836" in out
         assert "flags:" in out
-        assert "cli_args: --restart sysagent -m" in out
+        assert "cli_args: --restart agent_1 -m" in out
         assert "status: idle" in out
         assert "last_activity: 2026-06-05T20:18:42" in out
 

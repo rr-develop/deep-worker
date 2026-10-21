@@ -11,7 +11,7 @@ Codex "forgets" everything but the raw user prompts.
 This module exercises:
 
 1. ``codex_provider.session_state`` — the on-disk persistence layer
-   (mirror of ``claude_code_provider.session_state``).
+   (mirror of ``claude_code_sdk_provider.session_state``).
 2. ``CodexClientState`` lazy-seed on ``get_or_create`` + ``persist()`` +
    persist-on-summarization-reset.
 3. ``CodexChatModel.ainvoke`` restart path — first turn after a restart uses
@@ -68,12 +68,12 @@ class TestSessionStateFile:
         monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))  # pyright: ignore[reportUnknownLambdaType]
         # main agent, :tm, and a (defensive) epoch-rotated id all map to the
         # SAME per-agent data dir.
-        assert session_state_path("agent_main").parent.name == "agent_main"
-        assert session_state_path("agent_main:tm").parent.name == "agent_main"
-        assert session_state_path("agent_main__epoch_3").parent.name == "agent_main"
-        assert session_state_path("agent_main:tm__epoch_2").parent.name == "agent_main"
+        assert session_state_path("agent_1").parent.name == "agent_1"
+        assert session_state_path("agent_1:tm").parent.name == "agent_1"
+        assert session_state_path("agent_1__epoch_3").parent.name == "agent_1"
+        assert session_state_path("agent_1:tm__epoch_2").parent.name == "agent_1"
         # MUST be the codex-specific filename (no collision with claude's).
-        assert session_state_path("agent_main").name == "codex_session_state.json"
+        assert session_state_path("agent_1").name == "codex_session_state.json"
 
     def test_save_then_load_round_trip(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

@@ -36,7 +36,7 @@ def sample_launch_config():
         "clean": True,
         "started_at": "2026-04-11T16:59:41.692129",
         "pid": 3726921,
-        "cli_args": "lc4_test -sp -tm --dir /path/to/project --provider claude-code-sdk --model opus --clean",
+        "cli_args": "agent_1 -sp -tm --dir /path/to/project --provider claude-code-sdk --model opus --clean",
     }
 
 

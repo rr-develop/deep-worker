@@ -47,7 +47,7 @@ def _fake_status_tm_active(**over: Any) -> Any:
     # Make a minimal SessionInfo; specific fields under test are set to
     # distinguishable sentinels so we can catch leaks of fabricated data.
     si = MagicMock(spec=SessionInfo)
-    si.name = "demo_agent"
+    si.name = "agent_1"
     si.status = SessionStatus.WORKING
     si.session_type = "langchain"
     si.working_dir = over.get("working_dir", "WRONG_SHOULD_NOT_BE_USED")
@@ -70,7 +70,7 @@ class _FakeAgentClient:
         status_obj: Any,
         task_manager_fields: dict[str, bool] | None = None,
     ) -> None:
-        self.agent_name = "demo_agent"
+        self.agent_name = "agent_1"
         self._metadata_payload = metadata_payload
         self._status_obj = status_obj
         self._tm = task_manager_fields or {}
@@ -122,7 +122,7 @@ async def test_show_status_prints_working_dir_from_metadata(capsys) -> None:
         task_manager_fields={"task_manager_active": True, "task_manager_disabled": False},
     )
     with patch("deep_worker_cli.cli.client_command.AgentClient", return_value=client):
-        rc = await show_status("demo_agent")
+        rc = await show_status("agent_1")
     assert rc == 0
     out = capsys.readouterr().out
     assert "/path/to/project" in out, out
@@ -143,7 +143,7 @@ async def test_show_status_never_shows_placeholder_tmp(capsys) -> None:
         status_obj=_fake_status_tm_active(working_dir="/tmp"),
     )
     with patch("deep_worker_cli.cli.client_command.AgentClient", return_value=client):
-        rc = await show_status("demo_agent")
+        rc = await show_status("agent_1")
     assert rc == 0
     out = capsys.readouterr().out
     # Placeholder must be gone.
@@ -171,7 +171,7 @@ async def test_show_status_displays_task_manager_active(capsys) -> None:
         },
     )
     with patch("deep_worker_cli.cli.client_command.AgentClient", return_value=client):
-        rc = await show_status("demo_agent")
+        rc = await show_status("agent_1")
     assert rc == 0
     out = capsys.readouterr().out
     assert "TaskManager" in out, out
@@ -191,7 +191,7 @@ async def test_show_status_displays_task_manager_disabled(capsys) -> None:
         },
     )
     with patch("deep_worker_cli.cli.client_command.AgentClient", return_value=client):
-        rc = await show_status("demo_agent")
+        rc = await show_status("agent_1")
     assert rc == 0
     out = capsys.readouterr().out
     assert "TaskManager" in out
@@ -210,7 +210,7 @@ async def test_show_status_reports_tm_not_configured(capsys) -> None:
         task_manager_fields=None,  # not configured
     )
     with patch("deep_worker_cli.cli.client_command.AgentClient", return_value=client):
-        rc = await show_status("demo_agent")
+        rc = await show_status("agent_1")
     assert rc == 0
     out = capsys.readouterr().out
     assert "TaskManager" in out
@@ -241,7 +241,7 @@ async def test_show_status_uses_started_at_from_metadata_not_now(capsys) -> None
         task_manager_fields={"task_manager_active": True, "task_manager_disabled": False},
     )
     with patch("deep_worker_cli.cli.client_command.AgentClient", return_value=client):
-        rc = await show_status("demo_agent")
+        rc = await show_status("agent_1")
     assert rc == 0
     out = capsys.readouterr().out
     # The real start-time from the agent metadata.
@@ -260,7 +260,7 @@ async def test_show_status_missing_last_activity_prints_na(capsys) -> None:
         task_manager_fields={"task_manager_active": True, "task_manager_disabled": False},
     )
     with patch("deep_worker_cli.cli.client_command.AgentClient", return_value=client):
-        rc = await show_status("demo_agent")
+        rc = await show_status("agent_1")
     assert rc == 0
     out = capsys.readouterr().out
     # ``Last Activity`` row is present but must be N/A — never made up.

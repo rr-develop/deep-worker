@@ -1,6 +1,6 @@
 """Native built-in passthrough must be wired by CAPABILITY, not provider name.
 
-Regression cover for the rg1_worker defect (2026-09-28). The wiring used to be
+Regression cover for the agent_a defect (2026-09-28). The wiring used to be
 keyed on ``provider == "grok"`` / ``provider == "codex"``, so claude-code — whose
 profile declares ``{Bash, Read, Write, Edit, ...}`` and whose chat model
 faithfully surfaces those names as ``AIMessage.tool_calls`` — had NO matching
@@ -94,7 +94,7 @@ def test_claude_code_profile_binds_its_native_builtins() -> None:
     )
     bound = _names(tools)
 
-    # The three that dominated the rg1_worker corruption.
+    # The three that dominated the agent_a corruption.
     for critical in ("Bash", "Edit", "Read"):
         assert critical in bound, f"{critical} must be bound or ToolNode fabricates a refusal"
     assert CLAUDE_CODE_BUILTINS <= bound
@@ -188,7 +188,7 @@ def test_explicit_generic_name_is_honoured() -> None:
 async def test_toolnode_no_longer_fabricates_invalid_tool_error() -> None:
     """End-to-end on the real ToolNode: with the passthrough tools bound, a
     ``Bash`` tool_call must NOT produce the synthetic
-    ``"Bash is not a valid tool"`` ToolMessage that corrupted rg1_worker."""
+    ``"Bash is not a valid tool"`` ToolMessage that corrupted agent_a."""
     from langchain_core.messages import AIMessage
     from langgraph.prebuilt import ToolNode
 
@@ -526,7 +526,7 @@ def test_profile_is_read_past_the_pydantic_property_shadow() -> None:
     """``getattr(model, "profile")`` yields the ``property`` OBJECT, not the
     profile — so the wiring must read ``_profile`` first.
 
-    rg1_worker, 2026-09-29. The capability wiring landed and still bound ZERO
+    agent_a, 2026-09-29. The capability wiring landed and still bound ZERO
     recorders: ``AcpChatModel`` declares ``profile`` as a ``@property`` while
     inheriting it as a pydantic field, pydantic strips the property off the
     class, and the instance ``__dict__`` shadows it. ``getattr`` therefore

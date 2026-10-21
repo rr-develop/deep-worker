@@ -24,7 +24,7 @@ class TestPerAgentDb:
     ) -> None:
         """get_db_path(agent_name) must return agent-specific path."""
         monkeypatch.setenv("HOME", str(tmp_path))
-        path = get_db_path(agent_name="agent_a")
+        path = get_db_path(agent_name="agent_1")
         assert path.name == "threads.db", (
             f"Expected threads.db, got {path.name}"
         )

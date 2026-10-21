@@ -1,7 +1,7 @@
 """Regression: a ToolMessage whose AIMessage.tool_calls is gone must not
 reach the provider.
 
-Incident (repo_graph ingest, 2026-09-23): batches failed with
+Incident (the code-graph server ingest, 2026-09-23): batches failed with
 
     400 — Messages with role 'tool' must be a response to a preceding
     message with 'tool_calls'

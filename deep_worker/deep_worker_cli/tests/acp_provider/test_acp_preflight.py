@@ -144,6 +144,7 @@ class TestBuildProfilePreflight:
 
 
 class TestAsyncSmoke:
+    @pytest.mark.integration  # needs the claude-agent-acp adapter installed
     def test_async_smoke_uses_subprocess_exec(self) -> None:
         """The live adapter --version probe is ASYNC (create_subprocess_exec)
         — it never blocks the event loop with a sync subprocess.run."""

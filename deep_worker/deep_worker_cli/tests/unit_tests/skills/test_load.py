@@ -652,7 +652,7 @@ class TestListSkillsBuiltIn:
         assert creator["source"] == "built-in"
         assert len(creator["description"]) > 0
         assert creator["license"] == "MIT"
-        assert creator["compatibility"] == "designed for deepagents-cli"
+        assert creator["compatibility"] == "designed for deep-worker"
         assert "deepagents-cli-version" in creator["metadata"]
         assert creator["metadata"]["deepagents-cli-version"] == _cli_version
 

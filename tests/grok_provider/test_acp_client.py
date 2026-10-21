@@ -1,4 +1,4 @@
-"""TDD for ``GrokAcpClient`` — the long-lived ``grok agent stdio``
+"""TDD for ``AcpClient`` — the long-lived ``grok agent stdio``
 JSON-RPC channel.
 
 We never launch the real grok binary. Instead we drive the client with a
@@ -28,13 +28,41 @@ _pkg_root = Path(__file__).resolve().parent.parent.parent
 if str(_pkg_root) not in sys.path:
     sys.path.insert(0, str(_pkg_root))
 
-from deep_worker.providers.grok_provider.acp_client import (  # noqa: E402
-    GrokAcpClient,
-    GrokAcpClientError,
-    GrokConcurrentPromptError,
+from deep_worker.providers.acp.acp_client import (  # noqa: E402
+    AcpClient,
+    AcpClientError,
+    AcpConcurrentPromptError,
     raise_for_error_reply,
 )
-from deep_worker.providers.grok_provider.limit_errors import GrokUsageLimitError  # noqa: E402
+from deep_worker.providers.acp.limit_errors import AcpUsageLimitError  # noqa: E402
+from deep_worker.providers.grok_provider.profile import build_profile  # noqa: E402
+
+
+def _grok_client(*, auto_approve: bool = True) -> AcpClient:
+    """Build an ``AcpClient`` carrying the GROK profile's parameters.
+
+    Since 3fe834d1 the ACP client is provider-agnostic: grok's command, its
+    ``_x.ai/`` vendor namespace, its ``allow-*``/``deny-*`` permission kinds
+    and its ``authenticate`` requirement all arrive as constructor arguments
+    from :func:`deep_worker.providers.grok_provider.profile.build_profile`.
+    This file asserts GROK behaviour, so the values are taken from the live
+    grok profile rather than restated here — a profile change that would alter
+    grok's wire behaviour shows up as a failure in these tests instead of
+    silently leaving them asserting claude-code defaults.
+
+    ``auto_approve`` mirrors deep-worker's ``-sp`` flag; the permission tests
+    assert the approval path, which only exists with the flag set.
+    """
+    profile = build_profile(auto_approve=auto_approve)
+    return AcpClient(
+        client_state=None,
+        cmd=profile.cmd,
+        vendor_prefix=profile.vendor_prefix,
+        permission_policy=profile.permission_policy,
+        extra_limit_markers=profile.extra_limit_markers,
+        requires_authenticate=profile.requires_authenticate,
+        session_new_validator=profile.session_new_validator,
+    )
 
 
 class _FakeStdin:
@@ -82,6 +110,16 @@ class _FakeProc:
         self.stderr = _FakeStdout()
         self._waited = False
         self.returncode = None
+        # ``aclose`` tears the CLI down by process GROUP (§5.3):
+        # ``os.killpg(os.getpgid(proc.pid), SIGTERM)``. A fake proc must still
+        # own a ``pid``, and it must be one that can never name a real process
+        # on this host — ``-1`` raises ProcessLookupError, which the client
+        # suppresses before falling back to ``proc.terminate()`` below. So the
+        # real teardown path runs end to end and signals nothing live.
+        self.pid = -1
+        # Filled in by the spawn stub (see ``client_with_proc``).
+        self.spawn_argv: tuple = ()
+        self.spawn_kwargs: dict = {}
 
     async def wait(self) -> int:
         self._waited = True
@@ -100,10 +138,15 @@ async def client_with_proc(monkeypatch):
     proc = _FakeProc()
 
     async def fake_create(*args, **kwargs):
+        # Record the argv the client spawned: the command is a constructor
+        # argument since 3fe834d1, so this is the only place a test can see
+        # that it is GROK's CLI being launched and not another provider's.
+        proc.spawn_argv = tuple(args)
+        proc.spawn_kwargs = kwargs
         return proc
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
-    client = GrokAcpClient(client_state=None)
+    client = _grok_client()
     await client.start()
     try:
         yield client, proc
@@ -118,6 +161,24 @@ async def _reply_to_last(proc: _FakeProc, result: dict) -> None:
 
 
 class TestHandshake:
+    async def test_start_spawns_the_grok_stdio_command(
+        self, client_with_proc
+    ) -> None:
+        """``start()`` must launch GROK's ACP command.
+
+        Before 3fe834d1 the argv was hardcoded in grok's own forked client;
+        it now arrives from ``build_profile().cmd``. Asserting it here is what
+        keeps this file a test of the grok channel rather than of whichever
+        command the shared client happens to be handed.
+        """
+        _client, proc = client_with_proc
+        assert proc.spawn_argv == ("grok", "agent", "stdio")
+        # Large-line limit is mandatory — a 64 KiB default wedges the reader
+        # on grok's big tool-result lines (module docstring).
+        assert proc.spawn_kwargs["limit"] == 8 * 1024 * 1024
+        # Own process group, so teardown can killpg the whole tree (§5.3).
+        assert proc.spawn_kwargs["start_new_session"] is True
+
     async def test_initialize_request_shape(self, client_with_proc) -> None:
         client, proc = client_with_proc
         task = asyncio.create_task(client.initialize())
@@ -176,6 +237,11 @@ class TestNotificationRouting:
 
     async def test_vendor_notification_dropped(self, client_with_proc) -> None:
         client, proc = client_with_proc
+        # The client must be carrying GROK's vendor namespace, not another
+        # provider's: the prefix is a constructor argument since 3fe834d1, so
+        # a profile that stopped supplying ``_x.ai/`` would otherwise leave
+        # this test quietly asserting some other CLI's drop rule.
+        assert client._vendor_prefix == "_x.ai/"
         sink: asyncio.Queue = asyncio.Queue()
         client.register_sink("sess-A", sink)
         proc.stdout.feed_line(
@@ -221,7 +287,14 @@ class TestAgentRequests:
     async def test_permission_selects_offered_allow_option(
         self, client_with_proc
     ) -> None:
-        """Regression: Grok rejects invented option ids and cancels the turn."""
+        """Regression: Grok rejects invented option ids and cancels the turn.
+
+        The client must answer with an optionId grok ACTUALLY offered. The
+        option kinds here are grok's own ``allow-*``/``deny-*`` family (see
+        ``grok_provider.profile.build_profile``), and the selected id is the
+        real grok id ``approved-for-session`` — not the literal ``allow``
+        that an inventing client would send.
+        """
         _client, proc = client_with_proc
         proc.stdout.feed_line(
             {
@@ -232,8 +305,8 @@ class TestAgentRequests:
                     "sessionId": "sess-A",
                     "toolCall": {"toolCallId": "tc-edit", "title": "StrReplace"},
                     "options": [
-                        {"optionId": "reject-once", "name": "Reject", "kind": "reject_once"},
-                        {"optionId": "approved-for-session", "name": "Allow", "kind": "allow_always"},
+                        {"optionId": "reject-once", "name": "Reject", "kind": "deny-once"},
+                        {"optionId": "approved-for-session", "name": "Allow", "kind": "allow-always"},
                     ],
                 },
             }
@@ -247,26 +320,49 @@ class TestAgentRequests:
             }
         }
 
-    async def test_permission_falls_back_to_first_offered_option(
-        self, client_with_proc
+    async def test_permission_denied_without_sp_selects_grok_deny_option(
+        self, monkeypatch
     ) -> None:
-        """Never invent ``allow`` when an agent uses unfamiliar option kinds."""
-        _client, proc = client_with_proc
-        proc.stdout.feed_line(
-            {
-                "jsonrpc": "2.0",
-                "id": 9004,
-                "method": "session/request_permission",
-                "params": {
-                    "options": [
-                        {"optionId": "proceed", "name": "Proceed", "kind": "custom"}
-                    ]
-                },
+        """Without ``-sp`` NOTHING is approved, and the denial picks the id
+        grok offered (DESIGN §4.6, incident 2026-08-24).
+
+        This is the other half of "never invent an option id": the deny
+        branch is bound to grok's ``deny_kind_prefix`` from the profile, so
+        the reply carries grok's ``reject-once`` rather than a literal
+        ``deny``. The forked client approved every request unconditionally,
+        so this path had no coverage at all on the grok side.
+        """
+        proc = _FakeProc()
+
+        async def fake_create(*args, **kwargs):
+            return proc
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+        client = _grok_client(auto_approve=False)
+        await client.start()
+        try:
+            proc.stdout.feed_line(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 9005,
+                    "method": "session/request_permission",
+                    "params": {
+                        "sessionId": "sess-A",
+                        "toolCall": {"toolCallId": "tc-sh", "title": "run_terminal_command"},
+                        "options": [
+                            {"optionId": "reject-once", "name": "Reject", "kind": "deny-once"},
+                            {"optionId": "approved-for-session", "name": "Allow", "kind": "allow-always"},
+                        ],
+                    },
+                }
+            )
+            await asyncio.sleep(0.02)
+            replies = [m for m in proc.stdin.lines() if m.get("id") == 9005]
+            assert replies[-1]["result"] == {
+                "outcome": {"outcome": "selected", "optionId": "reject-once"}
             }
-        )
-        await asyncio.sleep(0.02)
-        replies = [m for m in proc.stdin.lines() if m.get("id") == 9004]
-        assert replies[-1]["result"]["outcome"]["optionId"] == "proceed"
+        finally:
+            await client.aclose()
 
 
 class TestSessionPrompt:
@@ -293,7 +389,7 @@ class TestSessionPrompt:
     async def test_session_prompt_does_not_leak_pending_request(
         self, client_with_proc
     ) -> None:
-        """Regression (review 2026-06-17): session_prompt bypasses
+        """Regression (agent_h review 2026-06-17): session_prompt bypasses
         _call's finally-pop, so the reply dispatch MUST pop the pending
         request — otherwise every turn leaks one stale entry."""
         client, proc = client_with_proc
@@ -323,7 +419,7 @@ class TestSessionPrompt:
         writes_after_first = list(proc.stdin.lines())
 
         second_sink: asyncio.Queue = asyncio.Queue()
-        with pytest.raises(GrokConcurrentPromptError):
+        with pytest.raises(AcpConcurrentPromptError):
             client.session_prompt(
                 session_id="sess-A",
                 prompt=[{"type": "text", "text": "second"}],
@@ -386,13 +482,13 @@ class TestSessionCancelReleasesGuard:
     (crash, wedge, mid-turn CancelledError, session/load discarding the
     request), the guard entry stayed forever and every subsequent
     ``session_prompt`` on the same session id raised
-    ``GrokConcurrentPromptError`` synchronously — permanently poisoning the
+    ``AcpConcurrentPromptError`` synchronously — permanently poisoning the
     agent thread. Cancel means "abandon this prompt", so the local guard MUST
     be released too.
     """
 
     async def test_cancel_releases_active_prompt_guard(
-        self, client_with_proc: tuple[GrokAcpClient, "_FakeProc"]
+        self, client_with_proc: tuple[AcpClient, "_FakeProc"]
     ) -> None:
         client, proc = client_with_proc
         sink: asyncio.Queue[dict[str, object]] = asyncio.Queue()
@@ -408,7 +504,7 @@ class TestSessionCancelReleasesGuard:
         await asyncio.sleep(0)
 
         # Sticky guard MUST be gone after cancel — otherwise the next
-        # session_prompt raises GrokConcurrentPromptError synchronously.
+        # session_prompt raises AcpConcurrentPromptError synchronously.
         assert "sess-A" not in client._active_prompts
         # Sink for the abandoned prompt is also gone (so a new turn's sink
         # can be registered without racing the stale one).
@@ -419,7 +515,7 @@ class TestSessionCancelReleasesGuard:
         assert "session/cancel" in methods
 
     async def test_next_prompt_after_cancel_is_accepted(
-        self, client_with_proc: tuple[GrokAcpClient, "_FakeProc"]
+        self, client_with_proc: tuple[AcpClient, "_FakeProc"]
     ) -> None:
         client, proc = client_with_proc
         first_sink: asyncio.Queue[dict[str, object]] = asyncio.Queue()
@@ -449,7 +545,7 @@ class TestSessionCancelReleasesGuard:
         assert prompts[-1]["params"]["prompt"][0]["text"] == "second"
 
     async def test_cancel_does_not_touch_other_sessions(
-        self, client_with_proc: tuple[GrokAcpClient, "_FakeProc"]
+        self, client_with_proc: tuple[AcpClient, "_FakeProc"]
     ) -> None:
         client, _proc = client_with_proc
         sink_a: asyncio.Queue[dict[str, object]] = asyncio.Queue()
@@ -478,7 +574,7 @@ class TestSessionCancelReleasesGuard:
         assert fut_a.cancelled()
 
     async def test_cancel_none_or_unknown_is_safe_noop(
-        self, client_with_proc: tuple[GrokAcpClient, "_FakeProc"]
+        self, client_with_proc: tuple[AcpClient, "_FakeProc"]
     ) -> None:
         client, proc = client_with_proc
         # Establish B so we can prove it survives noop cancels for None/unknown.
@@ -507,9 +603,9 @@ class TestSessionCancelReleasesGuard:
         assert writes_after_none == proc.stdin.lines()
 
     async def test_cancel_pops_pending_request_entry(
-        self, client_with_proc: tuple[GrokAcpClient, "_FakeProc"]
+        self, client_with_proc: tuple[AcpClient, "_FakeProc"]
     ) -> None:
-        """RC-1 (review). Cancelling an outstanding prompt must
+        """RC-1 (agent_h review). Cancelling an outstanding prompt must
         also drop its entry from ``_pending_requests`` — otherwise every
         wedged-then-cancelled prompt leaks an entry there, one per hot-loop
         retry, exactly in the incident scenario. The active future's
@@ -535,7 +631,7 @@ class TestSessionCancelReleasesGuard:
         assert client._pending_requests == {}
 
     async def test_cancel_pops_only_its_own_pending_entry(
-        self, client_with_proc: tuple[GrokAcpClient, "_FakeProc"]
+        self, client_with_proc: tuple[AcpClient, "_FakeProc"]
     ) -> None:
         """Cancel on sess-A must not evict sess-B's pending JSON-RPC
         request — B's turn is still in flight and its future waiter would
@@ -567,7 +663,7 @@ class TestSessionCancelReleasesGuard:
         assert client._pending_requests.get(rid_b) is fut_b
 
     async def test_late_reply_for_cancelled_rid_is_a_safe_noop(
-        self, client_with_proc: tuple[GrokAcpClient, "_FakeProc"]
+        self, client_with_proc: tuple[AcpClient, "_FakeProc"]
     ) -> None:
         """If grok eventually writes a JSON-RPC reply for the cancelled
         prompt (e.g. its wedge clears seconds later), the reader must not
@@ -618,24 +714,24 @@ class TestRaiseForErrorReply:
 
     def test_billing_error_raises_usage_limit(self) -> None:
         reply = {"id": 1, "error": {"code": 402, "message": "Payment Required"}}
-        with pytest.raises(GrokUsageLimitError):
+        with pytest.raises(AcpUsageLimitError):
             raise_for_error_reply("session/prompt", reply)
 
     def test_insufficient_credits_raises_usage_limit(self) -> None:
         reply = {"id": 1, "error": {"message": "insufficient credits on account"}}
-        with pytest.raises(GrokUsageLimitError):
+        with pytest.raises(AcpUsageLimitError):
             raise_for_error_reply("session/prompt", reply)
 
     def test_generic_error_raises_acp_client_error(self) -> None:
         reply = {"id": 1, "error": {"code": -32602, "message": "bad params"}}
-        with pytest.raises(GrokAcpClientError) as excinfo:
+        with pytest.raises(AcpClientError) as excinfo:
             raise_for_error_reply("session/new", reply)
         # Not misclassified as a usage-limit error.
-        assert not isinstance(excinfo.value, GrokUsageLimitError)
+        assert not isinstance(excinfo.value, AcpUsageLimitError)
 
     def test_error_string_payload(self) -> None:
         # error may be a bare string, not a dict.
-        with pytest.raises(GrokUsageLimitError):
+        with pytest.raises(AcpUsageLimitError):
             raise_for_error_reply("session/prompt", {"id": 1, "error": "402 payment required"})
 
     def test_nested_data_message_402_raises_usage_limit(self) -> None:
@@ -645,7 +741,7 @@ class TestRaiseForErrorReply:
 
         The extractor MUST read ``error.data.message`` (not only the outer
         ``error.message``) or it misclassifies a billing cap as a generic
-        ``GrokAcpClientError`` — no failover, empty AIMessages. This is the
+        ``AcpClientError`` — no failover, empty AIMessages. This is the
         exact reply copied verbatim from test_grok2.err.log."""
         reply = {
             "id": 5,
@@ -662,7 +758,7 @@ class TestRaiseForErrorReply:
                 },
             },
         }
-        with pytest.raises(GrokUsageLimitError):
+        with pytest.raises(AcpUsageLimitError):
             raise_for_error_reply("session/prompt", reply)
 
     def test_nested_data_http_status_402_alone_raises_usage_limit(self) -> None:
@@ -677,13 +773,13 @@ class TestRaiseForErrorReply:
                 "data": {"message": "upstream said no", "http_status": 402},
             },
         }
-        with pytest.raises(GrokUsageLimitError):
+        with pytest.raises(AcpUsageLimitError):
             raise_for_error_reply("session/prompt", reply)
 
     def test_nested_generic_error_still_acp_client_error(self) -> None:
         """A genuinely generic nested error (no billing/limit markers, non-402
         status) must NOT be misclassified as a usage limit — it stays a plain
-        ``GrokAcpClientError`` so we never burn a false failover step."""
+        ``AcpClientError`` so we never burn a false failover step."""
         reply = {
             "id": 9,
             "error": {
@@ -692,9 +788,9 @@ class TestRaiseForErrorReply:
                 "data": {"message": "invalid session id", "http_status": 400},
             },
         }
-        with pytest.raises(GrokAcpClientError) as excinfo:
+        with pytest.raises(AcpClientError) as excinfo:
             raise_for_error_reply("session/prompt", reply)
-        assert not isinstance(excinfo.value, GrokUsageLimitError)
+        assert not isinstance(excinfo.value, AcpUsageLimitError)
 
 
 class TestCallErrorReplies:
@@ -707,7 +803,7 @@ class TestCallErrorReplies:
             {"jsonrpc": "2.0", "id": last["id"],
              "error": {"code": 402, "message": "Payment Required"}}
         )
-        with pytest.raises(GrokUsageLimitError):
+        with pytest.raises(AcpUsageLimitError):
             await asyncio.wait_for(task, timeout=1)
 
     async def test_call_raises_client_error_on_generic(self, client_with_proc) -> None:
@@ -719,7 +815,7 @@ class TestCallErrorReplies:
             {"jsonrpc": "2.0", "id": last["id"],
              "error": {"code": -32602, "message": "missing field mcpServers"}}
         )
-        with pytest.raises(GrokAcpClientError):
+        with pytest.raises(AcpClientError):
             await asyncio.wait_for(task, timeout=1)
 
 
@@ -731,7 +827,7 @@ class TestClose:
             return proc
 
         monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
-        client = GrokAcpClient(client_state=None)
+        client = _grok_client()
         await client.start()
         # A dangling pending request future.
         pend = asyncio.create_task(client.initialize())

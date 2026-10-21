@@ -225,6 +225,19 @@ class TestSinkOverflow:
     sink stays at its capacity (never past it), the reader reports it is NOT idle
     (it is parked holding a frame), and the turn simply does not resolve — no
     exception, nothing lost.
+
+    ORACLE IS STATE-BASED, NOT TIME-BASED. The backpressure claim is "the sink
+    reaches capacity and the reader parks there", which is observable the
+    instant it happens: ``sink.full()`` and ``not reader_is_idle()``. An
+    earlier version proved it by *waiting out* ``wait_for(fut, timeout=2)`` and
+    asserting the TimeoutError — i.e. it inferred "the turn did not resolve"
+    from two seconds of wall clock. That costs 2s of every run and is exactly
+    the construction that flakes on a loaded runner: if the flood needs longer
+    than the budget to fill 16 slots, the assertions fire on a not-yet-full
+    sink. Here the wait is driven by the arrival of frames (each ``sleep(0)``
+    yields to the reader) and bounded by an iteration cap that is a *safety
+    net*, not the oracle; "the turn did not resolve" is read directly off
+    ``fut.done()``.
     """
 
     def test_flood_is_absorbed_and_bounded_instead_of_failing_the_turn(self) -> None:
@@ -241,19 +254,61 @@ class TestSinkOverflow:
                     prompt=[{"type": "text", "text": "hi"}],
                     notification_sink=sink,
                 )
-                # The flood cannot resolve the turn, and must not fail it.
-                with pytest.raises(asyncio.TimeoutError):
-                    await asyncio.wait_for(asyncio.shield(fut), timeout=2)
-                assert sink.qsize() <= 16, f"sink grew past capacity: {sink.qsize()}"
+                # Yield until the flood has filled the sink AND the reader is
+                # parked on it. Both halves are needed: ``_idle_event`` is SET
+                # just before each ``readline()`` and cleared right after, so
+                # between two frames there is a window where the sink is
+                # already full while the reader momentarily reads idle. Waiting
+                # on ``sink.full()`` alone lands in that window and the
+                # ``reader_is_idle()`` assertion below fires spuriously
+                # (measured: 2 of 5 runs). The state we are after is the
+                # conjunction — a parked reader holding a frame it cannot
+                # deliver. Progress is the loop's own condition, so a slow
+                # machine simply takes more iterations; the cap only keeps a
+                # genuinely broken build from spinning forever.
+                for _ in range(100_000):
+                    if sink.full() and not client.reader_is_idle():
+                        break
+                    assert sink.qsize() <= 16, (
+                        f"sink grew past capacity: {sink.qsize()}"
+                    )
+                    await asyncio.sleep(0)
                 assert sink.full(), "expected the flood to fill the bounded sink"
+                assert sink.qsize() <= 16, f"sink grew past capacity: {sink.qsize()}"
+                # The flood must not have resolved OR failed the turn. Read the
+                # future's state directly instead of timing it out.
+                assert not fut.done(), (
+                    "the flood must neither resolve nor fail the turn; "
+                    f"future already done: {fut}"
+                )
                 assert not client.reader_is_idle(), (
                     "the reader should be parked holding a frame while the sink "
                     "is full — that is what prevents the overflow"
                 )
-                # Draining releases the parked reader: liveness, no timeout.
+                # Draining releases the parked reader: liveness, by state.
+                #
+                # NOT ``wait_for(wait_reader_idle(), timeout=5)``: the reader
+                # is idle only while parked on ``readline()`` holding nothing,
+                # and this scenario floods 10 000 updates. Draining 16 slots
+                # lets it enqueue 16 more and park on the sink again, so "idle"
+                # is unreachable until all 10 000 are consumed — it was never
+                # an invariant here, just a race that 3.12 won and 3.11 lost
+                # (run 39511394923: TimeoutError at this line on 3.11 only).
+                #
+                # What draining actually guarantees is that the parked reader
+                # RESUMES, which is observable directly: it refills the slots
+                # we freed. That is the liveness claim, and it needs no clock.
                 for _ in range(16):
                     sink.get_nowait()
-                await asyncio.wait_for(client.wait_reader_idle(), timeout=5)
+                assert sink.qsize() < 16, "sanity: the drain must free slots"
+                for _ in range(100_000):
+                    if sink.full():
+                        break
+                    await asyncio.sleep(0)
+                assert sink.full(), (
+                    "the parked reader must resume once the sink has room — "
+                    f"it refilled only {sink.qsize()} of 16 slots"
+                )
                 fut.cancel()
             finally:
                 await client.aclose()

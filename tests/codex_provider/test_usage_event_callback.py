@@ -101,7 +101,14 @@ class TestCodexUsageEventCallback:
         term = cb.events[1]
         assert term["event"] == "terminal"
         assert term["status"] == "ok"
-        assert term["usage"] == {
+        # ``turn.completed.usage`` is the exec process TOTAL, not this
+        # turn's spend (§2.1-ter), so the provider DISCARDS the handed-over
+        # blob and re-reads this turn's figure from the rollout, failing
+        # CLOSED rather than persisting the inflated number. There is no
+        # rollout in this hermetic harness, so the contract here is the
+        # fail-closed one: the cumulative blob must NOT leak through.
+        assert term["usage"] is None
+        assert term["usage"] != {
             "input_tokens": 10,
             "output_tokens": 5,
             "cached_input_tokens": 4,

@@ -16,7 +16,7 @@ def test_record_summarization_clears_queued_tool_calls(
     monkeypatch.setattr(ss, "deep_worker_home", lambda: tmp_path)
     state = AcpClientState()
     state.set_profile("claude-code", None)
-    st = state.get_or_create("rg1_worker")
+    st = state.get_or_create("agent_1")
     st.session_id = "f44ee866"
     st.sent_count = 722
     st.queued_text.append("partial")
@@ -26,9 +26,9 @@ def test_record_summarization_clears_queued_tool_calls(
     fut: asyncio.Future = loop.create_future()
     st.pending_session_prompt_future = fut
 
-    state.record_summarization("rg1_worker")
+    state.record_summarization("agent_1")
 
-    after = state.get("rg1_worker")
+    after = state.get("agent_1")
     assert after is not None
     assert after.session_id is None
     assert after.sent_count == 0
@@ -53,25 +53,25 @@ def test_record_summarization_clears_context_gauge(tmp_path, monkeypatch) -> Non
     monkeypatch.setattr(ss, "deep_worker_home", lambda: tmp_path)
     state = AcpClientState()
     state.set_profile("claude-code", None)
-    st = state.get_or_create("rg1_worker")
+    st = state.get_or_create("agent_1")
     st.session_id = "f44ee866"
     st.sent_count = 722
     st.last_context_used = 468_000
     st.last_response_at = "2026-08-19T15:14:02+00:00"
-    state.persist("rg1_worker")
+    state.persist("agent_1")
 
     def _load() -> dict:
         loaded = ss.load_session_state(
-            "rg1_worker", provider="claude-code", fingerprint=None
+            "agent_1", provider="claude-code", fingerprint=None
         )
         assert loaded is not None
         return loaded
 
     assert _load()["last_context_used"] == 468_000
 
-    state.record_summarization("rg1_worker")
+    state.record_summarization("agent_1")
 
-    after = state.get("rg1_worker")
+    after = state.get("agent_1")
     assert after is not None
     assert after.last_context_used is None
     assert after.last_response_at is None

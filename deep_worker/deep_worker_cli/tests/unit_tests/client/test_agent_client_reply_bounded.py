@@ -1,7 +1,7 @@
 """Regression: an in-flight RPyC reply must FAIL when the transport dies,
 never park forever.
 
-Incident (repo_graph ingest, 2026-09-23): the agent successfully called its
+Incident (the code-graph server ingest, 2026-09-23): the agent successfully called its
 MCP tool (``submit_links``, 6 links, ``batch_complete=true``) and finished its
 turn in ~1.5s — ``token_stats.jsonl`` recorded it at 02:55:05Z. The caller's
 ``converse()`` did not return for 69 MINUTES. The stack showed a coroutine

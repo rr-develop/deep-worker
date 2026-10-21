@@ -26,7 +26,8 @@ if str(_pkg_root) not in sys.path:
     sys.path.insert(0, str(_pkg_root))
 
 from deep_worker.providers.grok_provider import builtin_tool_passthrough as bp  # noqa: E402
-from deep_worker.providers.grok_provider.client_state import GrokClientState  # noqa: E402
+from deep_worker.providers.acp import builtin_tool_passthrough as acp_bp  # noqa: E402
+from deep_worker.providers.acp.client_state import AcpClientState  # noqa: E402
 
 
 @pytest.fixture()
@@ -37,9 +38,11 @@ def fake_home(tmp_path, monkeypatch):
 
 @pytest.fixture()
 def client_state(fake_home, monkeypatch):
-    cs = GrokClientState()
-    # The passthrough tools resolve the singleton — point it at our instance.
-    monkeypatch.setattr(bp, "get_global_client_state", lambda: cs)
+    cs = AcpClientState()
+    # The passthrough tools resolve the singleton from the SHARED acp module
+    # (the grok module is a thin binding over it since 3fe834d1) — point it
+    # at our instance.
+    monkeypatch.setattr(acp_bp, "get_global_client_state", lambda: cs)
     return cs
 
 
@@ -125,13 +128,17 @@ class TestRoundTrip:
             tcid,
             {
                 "text": "ok",
-                "metadata": {"exit_code": 0},
-                "grok_meta": {"exit_code": 0, "artifact_path": "/tmp/x.png"},
+                # The INPUT key is ``meta`` (``metadata`` is the fallback) —
+                # it is not the same string as the OUTPUT marker. 3fe834d1
+                # renamed the output markers grok_* -> acp_*; the grok module
+                # still exports them under its GROK_* aliases, so assert
+                # through the constants rather than literals.
+                "meta": {"exit_code": 0, "artifact_path": "/tmp/x.png"},
             },
         )
         msg = await asyncio.wait_for(body, timeout=1)
-        assert msg.additional_kwargs.get("grok_builtin") is True
-        assert msg.additional_kwargs["grok_meta"]["artifact_path"] == "/tmp/x.png"
+        assert msg.additional_kwargs.get(bp.GROK_BUILTIN_MARKER) is True
+        assert msg.additional_kwargs[bp.GROK_META_KEY]["artifact_path"] == "/tmp/x.png"
 
     async def test_failed_status_returns_error_text(self, client_state) -> None:
         st = client_state.get_or_create("agentA")
@@ -167,16 +174,30 @@ class TestResolveHelper:
 
 class TestGenericFallback:
     def test_generic_tool_present_for_unknown(self) -> None:
+        # ``get_generic_passthrough_tool()`` was dropped by 3fe834d1 (it was
+        # consumed only by the fork's own chat model). The BEHAVIOUR it
+        # guarded is unchanged: the wildcard tool that surfaces an unknown
+        # grok built-in is still built, so reach it through the live path.
+        #
+        # The name is asserted as a LITERAL, not via
+        # ``bp.GENERIC_BUILTIN_NAME``: selecting the tool by that constant
+        # and then comparing against the same constant is a tautology that
+        # survives renaming it (profile.py:39 is the single source, and
+        # ``bp`` only re-exports it). ``GrokBuiltin`` is the wire name grok
+        # itself emits, so it is a value, not an implementation detail.
         tools = bp.build_passthrough_tools()
-        # The generic wildcard is exposed so an unknown grok built-in can be
-        # surfaced. It must exist and be invocable.
-        generic = bp.get_generic_passthrough_tool()
-        assert generic is not None
-        assert generic.name  # has a name
+        assert bp.GENERIC_BUILTIN_NAME == "GrokBuiltin"
+        names = [t.name for t in tools]
+        assert "GrokBuiltin" in names
+        # Exactly one wildcard, and it does not shadow a known built-in.
+        assert names.count("GrokBuiltin") == 1
+        assert "GrokBuiltin" not in bp.KNOWN_GROK_BUILTINS
 
     async def test_generic_round_trip(self, client_state) -> None:
         st = client_state.get_or_create("agentA")
-        generic = bp.get_generic_passthrough_tool()
+        generic = next(
+            t for t in bp.build_passthrough_tools() if t.name == bp.GENERIC_BUILTIN_NAME
+        )
         tcid = "tc-gen"
         fut: asyncio.Future = asyncio.get_event_loop().create_future()
         st.builtin_passthrough_futures[tcid] = fut

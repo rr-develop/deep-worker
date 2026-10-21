@@ -28,8 +28,8 @@ _pkg_root = Path(__file__).resolve().parent.parent.parent
 if str(_pkg_root) not in sys.path:
     sys.path.insert(0, str(_pkg_root))
 
-from deep_worker.providers.grok_provider.custom_types import ToolMetadata  # noqa: E402
-from deep_worker.providers.grok_provider.proxy_mcp_server import ProxyMCPServer  # noqa: E402
+from deep_worker.providers.acp.custom_types import ToolMetadata  # noqa: E402
+from deep_worker.providers.acp.proxy_mcp_server import ProxyMCPServer  # noqa: E402
 
 pytestmark = pytest.mark.asyncio
 

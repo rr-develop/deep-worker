@@ -123,7 +123,7 @@ async def test_slow_tool_becomes_inprogress_not_error() -> None:
 
 async def test_stage_a_dispatch_wait_is_bounded() -> None:
     """A proxy provider's dispatch wait that NEVER completes (lost control
-    request — the mj2_vac hole) must hit the SAME timer and degrade to a
+    request — the agent_d hole) must hit the SAME timer and degrade to a
     non-error in_progress handle, NOT hang forever."""
     from deepagents.middleware.tool_dispatch_bridge import (
         register_dispatch_waiter,

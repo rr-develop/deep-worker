@@ -285,10 +285,36 @@ def _dispatch_version(argv: list[str]) -> int | None:
     agent of that name, so ``deep-worker version`` keeps starting the agent
     called "version" and ``--version`` reports the version.
 
+    The flag is honoured ANYWHERE in argv, not just first. While it was
+    first-only, ``deep-worker <agent> --version`` fell through to the agent
+    parser, whose own ``--version`` action still carried the ancestor's
+    program name — so the same flag printed two different products
+    depending on its position.
+
+    Scanning is safe against options that take a VALUE: argparse refuses
+    to consume ``--version`` as one (``--fork --version`` fails with
+    "expected one argument", and even ``-r --version`` with ``nargs='?'``
+    leaves the token alone), so in that position it is still the flag.
+
+    The scan stops at ``--`` because argparse's own rule is that
+    everything after it is positional: it reads ``deep-worker --
+    --version`` as the agent NAME ``--version``. Honouring the flag there
+    would report the version instead of starting that agent, contradicting
+    the FLAG-only contract above — the same reason ``version`` as a bare
+    positional keeps starting an agent.
+
     Returns:
         Exit code if this argv asked for the version; ``None`` otherwise.
     """
-    if argv[:1] not in (["--version"], ["-V"]):
+    asked = False
+    for arg in argv:
+        if arg == "--":
+            break
+        if arg in {"--version", "-V"}:
+            asked = True
+            break
+
+    if not asked:
         return None
 
     try:

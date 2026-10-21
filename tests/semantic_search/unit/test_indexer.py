@@ -7,6 +7,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+pytest.importorskip("llama_index")  # semantic-search extra; absent in CI
+
 from deep_worker.providers.semantic_search.indexer import IndexStats, index_repository
 
 

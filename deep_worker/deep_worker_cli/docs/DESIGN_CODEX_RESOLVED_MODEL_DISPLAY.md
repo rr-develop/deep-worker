@@ -62,7 +62,7 @@ Add display-only resolved model support without changing the execution contract:
 
 - `AgentConfig.resolved_model` remains execution-oriented and may return `None` for Codex default.
 - `AgentConfig.display_model` may return the dynamically learned Codex model once set.
-- `launch_config["model"]` is NOT mutated for an agent launched with `config.model is None`. Display continuity is provided in-memory via `set_dynamic_display_model`; the durable execution config stays `None` so the next restart resolves the provider's own default. Only an explicit operator `--model M` pins execution. (Narrowed 2026-06-29 by `DESIGN_FIX_CROSS_PROVIDER_MODEL_POISON.md` — the original wording "passing this known value as `--model` is acceptable" is what allowed a cross-provider stale model to be re-pinned in the ca1_init incident; see that design for the resolver-guard mechanism.)
+- `launch_config["model"]` is NOT mutated for an agent launched with `config.model is None`. Display continuity is provided in-memory via `set_dynamic_display_model`; the durable execution config stays `None` so the next restart resolves the provider's own default. Only an explicit operator `--model M` pins execution. (Narrowed 2026-06-29 by `DESIGN_FIX_CROSS_PROVIDER_MODEL_POISON.md` — the original wording "passing this known value as `--model` is acceptable" is what allowed a cross-provider stale model to be re-pinned in the agent_e incident; see that design for the resolver-guard mechanism.)
 - Never write `"unknown"` as a model.
 
 ## API Changes

@@ -20,8 +20,8 @@ any consumer that only sees the parsed payload. Both the REST path and
 the WS broadcast path therefore publish ``task_manager_attached`` and
 ``task_manager_disabled`` explicitly.
 
-Field names and null semantics are fixed by the WorkControl side
-(``work_control_api`` commit ``6df91c6``): all three fields are
+Field names and null semantics are fixed by the the task manager side
+(``the task-manager API`` commit ``6df91c6``): all three fields are
 ``boolean | null``, ``null`` means UNKNOWN, and ``disabled`` is ``null``
 when nothing is attached because then no switch exists. ``null`` must
 never be read as ``false``, and no field may be inferred from another.
@@ -175,7 +175,7 @@ class TestRestPublishesAllThreeStates:
         A missing key is indistinguishable from "unknown" downstream, so
         attachment must be published as ``False``. With nothing attached
         there is no switch, hence ``disabled is None`` — per the
-        WorkControl contract, ``None`` must not be rendered as ``False``.
+        the task manager contract, ``None`` must not be rendered as ``False``.
         """
         await agent_service.initialize()
 

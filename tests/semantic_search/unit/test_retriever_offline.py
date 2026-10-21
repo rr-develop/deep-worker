@@ -19,7 +19,8 @@ retriever logic). The cached-embedder branch is exercised by clearing the
 process-wide cache via its public test hook first.
 
 NOTE: prior to the §7.1 hoist (see a related internal incident analysis, not
-included here) the cache lived at ``retriever._embedding_cache``. It now lives at
+included here) the cache
+lived at ``retriever._embedding_cache``. It now lives at
 ``_embed_cache._embedding_cache`` and is cleared via
 ``_embed_cache._reset_cache_for_tests()``; this file was updated to follow.
 """
@@ -28,6 +29,10 @@ from __future__ import annotations
 
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+
+import pytest
+
+pytest.importorskip("llama_index")  # semantic-search extra; absent in CI
 
 from llama_index.core.embeddings.mock_embed_model import MockEmbedding
 

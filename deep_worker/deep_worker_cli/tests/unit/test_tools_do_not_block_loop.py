@@ -5,7 +5,7 @@ event loop — they must execute via an async/offloaded path.
 model and query LanceDB in-process (LanceDB bridges to its own background
 event loop with a blocking ``run_coroutine_threadsafe(...).result()``). Run
 inline on the agent's event-loop thread, that blocks the loop while holding
-the GIL and deadlocks LanceDB's loop (the live mj1_init hang, 2026-06-15).
+the GIL and deadlocks LanceDB's loop (the live agent_c hang, 2026-06-15).
 
 Since ``2567038`` the heavy work lives in a separate semantic-memory service
 and the tools reach it over async gRPC (``grpc.aio``), so what they ``await``

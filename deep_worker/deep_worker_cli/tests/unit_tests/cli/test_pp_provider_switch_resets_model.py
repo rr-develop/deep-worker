@@ -56,7 +56,7 @@ def saved_grok() -> dict:
 class TestPpProviderSwitchResetsModel:
     def test_pp_codex_drops_stale_grok_model(self, saved_grok):
         """The core bug: -pp codex must not keep the grok model."""
-        merged = _merge(["agent1", "--restart", "-pp", "codex"], saved_grok)
+        merged = _merge(["agent_1", "--restart", "-pp", "codex"], saved_grok)
 
         assert merged.provider == "codex"
         assert merged.preferred_provider == "codex"
@@ -71,14 +71,14 @@ class TestPpProviderSwitchResetsModel:
         For a -pp provider switch with no --model, preferred_model follows the
         (reset) active model → None.
         """
-        merged = _merge(["agent1", "--restart", "-pp", "codex"], saved_grok)
+        merged = _merge(["agent_1", "--restart", "-pp", "codex"], saved_grok)
         assert merged.preferred_model is None
         assert merged.preferred_model != "grok-composer-2.5-fast"
 
     def test_pp_codex_persists_none_model(self, saved_grok):
         """End-to-end: the rebuilt launch_config persists model=None for codex
         so the Codex CLI picks its own default (not the grok string)."""
-        merged = _merge(["agent1", "--restart", "-pp", "codex"], saved_grok)
+        merged = _merge(["agent_1", "--restart", "-pp", "codex"], saved_grok)
         cfg = build_launch_config(merged)
         assert cfg["provider"] == "codex"
         assert cfg["model"] is None, (
@@ -98,7 +98,7 @@ class TestPpProviderSwitchResetsModel:
         """
         # Simulate the poisoned state at provider=codex level too:
         poisoned_codex = dict(saved_grok, provider="codex", preferred_provider="codex")
-        merged = _merge(["agent1", "--restart", "-pp", "codex"], poisoned_codex)
+        merged = _merge(["agent_1", "--restart", "-pp", "codex"], poisoned_codex)
         assert merged.provider == "codex"
         assert merged.model is None, (
             "explicit -pp without --model must use provider default (None), "
@@ -110,7 +110,7 @@ class TestPpProviderSwitchResetsModel:
         firing — otherwise failover restore-on-idle would re-pin the stale
         foreign model later."""
         poisoned_codex = dict(saved_grok, provider="codex", preferred_provider="codex")
-        merged = _merge(["agent1", "--restart", "-pp", "codex"], poisoned_codex)
+        merged = _merge(["agent_1", "--restart", "-pp", "codex"], poisoned_codex)
         assert merged.preferred_model is None, (
             f"preferred_model must track the model reset; got {merged.preferred_model!r}"
         )
@@ -119,7 +119,7 @@ class TestPpProviderSwitchResetsModel:
         """A flat ``--restart`` with no provider/model flags is NOT an explicit
         provider declaration — Fix1 must not fire, the saved model is preserved.
         """
-        merged = _merge(["agent1", "--restart"], saved_grok)
+        merged = _merge(["agent_1", "--restart"], saved_grok)
         assert merged.provider == "grok"
         assert merged.model == "grok-composer-2.5-fast", (
             "plain --restart must preserve the saved deliberately-pinned model"
@@ -133,7 +133,7 @@ class TestPpProviderSwitchResetsModel:
             preferred_provider="codex",
             preferred_model="opus",
         )
-        merged = _merge(["agent1", "--restart"], poisoned_codex)
+        merged = _merge(["agent_2", "--restart"], poisoned_codex)
 
         assert merged.provider == "codex"
         assert merged.model is None
@@ -142,7 +142,7 @@ class TestPpProviderSwitchResetsModel:
     def test_pp_switch_with_explicit_model_is_honored(self, saved_grok):
         """An explicit --model always wins, even on a -pp provider switch."""
         merged = _merge(
-            ["agent1", "--restart", "-pp", "codex", "--model", "gpt-5.5"],
+            ["agent_1", "--restart", "-pp", "codex", "--model", "gpt-5.5"],
             saved_grok,
         )
         assert merged.provider == "codex"
@@ -151,7 +151,7 @@ class TestPpProviderSwitchResetsModel:
     def test_long_form_preferred_provider_also_resets(self, saved_grok):
         """The long ``--preferred-provider`` form behaves identically to -pp."""
         merged = _merge(
-            ["agent1", "--restart", "--preferred-provider", "codex"],
+            ["agent_1", "--restart", "--preferred-provider", "codex"],
             saved_grok,
         )
         assert merged.provider == "codex"
@@ -160,7 +160,7 @@ class TestPpProviderSwitchResetsModel:
     def test_provider_flag_still_resets_model(self, saved_grok):
         """Pre-existing --provider reset path stays intact (no regression)."""
         merged = _merge(
-            ["agent1", "--restart", "--provider", "codex"], saved_grok
+            ["agent_1", "--restart", "--provider", "codex"], saved_grok
         )
         assert merged.provider == "codex"
         assert merged.model is None

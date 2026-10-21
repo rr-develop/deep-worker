@@ -337,7 +337,7 @@ def fetch_url(url: str, timeout: int = 30) -> dict[str, Any]:
         response = requests.get(
             url,
             timeout=timeout,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; DeepAgents/1.0)"},
+            headers={"User-Agent": "Mozilla/5.0 (compatible; DeepWorker/1.0)"},
         )
         response.raise_for_status()
 
@@ -502,7 +502,7 @@ def make_restart_agent_tool(sender_name: str) -> BaseTool:
         # dead": a live agent was never restarted, so a caller asking for
         # fresh code kept talking to the old process. It also returned
         # ``success=True`` alongside ``error="already_running"``, so the
-        # refusal read as success (owner report, 2026-09-26: rg1_worker could
+        # refusal read as success (owner report, 2026-09-26: an agent could
         # not be moved onto the status fix).
         previous_pid = existing.pid if existing is not None else None
 

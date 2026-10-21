@@ -21,6 +21,8 @@ os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 os.environ.setdefault("TQDM_DISABLE", "1")
 
+pytest.importorskip("llama_index")  # semantic-search extra; absent in CI
+
 from deep_worker.providers.semantic_search.history_indexer import (  # noqa: E402
     index_all_history_files,
     index_history_file,

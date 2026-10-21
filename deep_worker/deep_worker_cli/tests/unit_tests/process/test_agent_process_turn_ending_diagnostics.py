@@ -25,8 +25,8 @@ import pytest
 from deep_worker_cli.agent_config_pkg.agent_config import AgentConfig
 from deep_worker_cli.process.agent_process import AgentProcess
 
-SPEC = "repo_graph__submit_fragments:document_closed"
-FOUND = "repo_graph__submit_fragments"
+SPEC = "code_graph__submit_fragments:document_closed"
+FOUND = "code_graph__submit_fragments"
 
 
 class _Meta:
@@ -101,7 +101,7 @@ def test_empty_inventory_yields_empty_candidates(tmp_path, caplog):
 
 
 def test_candidates_ranked_by_similarity(tmp_path, caplog):
-    agent = _make(tmp_path, ["repo_graph__submit_fragment"])
+    agent = _make(tmp_path, ["code_graph__submit_fragment"])
     inventory = [_Meta("other__unrelated"), _Meta(FOUND)]
     with caplog.at_level(logging.INFO):
         agent._log_turn_ending_tool_diagnostics(inventory)

@@ -10,7 +10,7 @@ fires instantly. This mirrors
 mechanism is COMMON to all providers (HARD POLICY, 2026-06-16).
 
 Pins the policy: EVERY tool gets the job-handle mechanism by default; a
-Future that never resolves (the live ``edit_file`` hang, mj1_init) must
+Future that never resolves (the live ``edit_file`` hang, agent_c) must
 return a non-error ``in_progress`` handle, never park forever, never
 become an agent error.
 
@@ -29,8 +29,8 @@ _pkg_root = Path(__file__).resolve().parent.parent.parent
 if str(_pkg_root) not in sys.path:
     sys.path.insert(0, str(_pkg_root))
 
-from deep_worker.providers.grok_provider.custom_types import ToolMetadata  # noqa: E402
-from deep_worker.providers.grok_provider.proxy_mcp_server import ProxyMCPServer  # noqa: E402
+from deep_worker.providers.acp.custom_types import ToolMetadata  # noqa: E402
+from deep_worker.providers.acp.proxy_mcp_server import ProxyMCPServer  # noqa: E402
 
 pytestmark = pytest.mark.asyncio
 

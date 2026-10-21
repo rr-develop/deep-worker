@@ -1,4 +1,4 @@
-"""Live end-to-end repro of the rg1_worker 2026-08-22 defect.
+"""Live end-to-end repro of the agent_a 2026-08-22 defect.
 
 Unlike ``test_handle_invoke_status_on_empty_response.py`` — which
 stubs ``agent.agent.ainvoke`` with a ``MagicMock`` and hands
@@ -14,10 +14,10 @@ no way to make a real provider deterministic in a unit test), and it is
 the same ``FakeMessagesListChatModel`` the middleware's own graph tests
 use.
 
-Scenario, verbatim from rg1_worker's report (``rg_extractor`` running
-the ``repo_graph`` MCP server):
+Scenario, verbatim from agent_a's report (``rg_extractor`` running
+the ``the code-graph server`` MCP server):
 
-    the model calls ``repo_graph__submit_fragments``; the tool returns
+    the model calls ``code_graph__submit_fragments``; the tool returns
     ``{"success": true, "document_closed": true}``; that tool is
     registered as a ``TurnEndingTool`` with ``echo_field=None``, so
     ``ToolCompletionMiddleware`` jumps to ``end`` WITHOUT injecting a
@@ -71,7 +71,7 @@ class _ToolBindingFakeModel(FakeMessagesListChatModel):
 
 
 @tool
-def repo_graph__submit_fragments(payload: str) -> dict:
+def code_graph__submit_fragments(payload: str) -> dict:
     """Submit extracted fragments and close the document session."""
     return {"success": True, "document_closed": True, "receipt": "r-1"}
 
@@ -94,7 +94,7 @@ def _make_agent_with_real_graph() -> AgentProcess:
     agent.current_thread_id = "default"
 
     # The model emits ONLY the tool call — no text. This is the exact
-    # shape rg1_worker observed: the model delegates the whole turn to
+    # shape agent_a observed: the model delegates the whole turn to
     # the submit_* tool. The second response exists solely to prove it
     # is never consumed.
     model = _ToolBindingFakeModel(
@@ -103,7 +103,7 @@ def _make_agent_with_real_graph() -> AgentProcess:
                 content="",
                 tool_calls=[
                     {
-                        "name": "repo_graph__submit_fragments",
+                        "name": "code_graph__submit_fragments",
                         "args": {"payload": "fragments"},
                         "id": "call-1",
                     }
@@ -114,14 +114,14 @@ def _make_agent_with_real_graph() -> AgentProcess:
     )
 
     spec = TurnEndingTool(
-        tool_name="repo_graph__submit_fragments",
+        tool_name="code_graph__submit_fragments",
         is_success=lambda d: d.get("document_closed") is True,
         echo_field=None,
     )
 
     agent.agent = create_agent(
         model=model,
-        tools=[repo_graph__submit_fragments],
+        tools=[code_graph__submit_fragments],
         middleware=[ToolCompletionMiddleware([spec])],
     )
 
@@ -152,7 +152,7 @@ async def test_turn_ending_tool_tail_returns_success_through_real_graph() -> Non
     assert result["success"] is True, (
         "a real turn-ending tool closing the turn through the real "
         "middleware must reach the caller as success; got "
-        f"{result!r}. This is the rg1_worker 2026-08-22 defect: the "
+        f"{result!r}. This is the agent_a 2026-08-22 defect: the "
         "operator saw 'Agent did not produce a response' for a turn "
         "whose submit_fragments call had actually succeeded"
     )

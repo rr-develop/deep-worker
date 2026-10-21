@@ -38,6 +38,8 @@ from deep_worker.providers.semantic_search._tokenizer import (  # noqa: E402
     effective_max_tokens,
 )
 from deep_worker.providers.semantic_search.config import IndexConfig  # noqa: E402
+pytest.importorskip("llama_index")  # semantic-search extra; absent in CI
+
 from deep_worker.providers.semantic_search.indexer import _split_document, index_repository  # noqa: E402
 from deep_worker.providers.semantic_search.retriever import search  # noqa: E402
 

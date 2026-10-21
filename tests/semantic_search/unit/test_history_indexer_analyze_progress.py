@@ -18,6 +18,10 @@ Contract:
 from __future__ import annotations
 
 from deep_worker.providers.semantic_search.config import IndexConfig
+import pytest
+
+pytest.importorskip("llama_index")  # semantic-search extra; absent in CI
+
 from deep_worker.providers.semantic_search.history_indexer import (
     _chunk_messages,
     _group_by_summarized_event,

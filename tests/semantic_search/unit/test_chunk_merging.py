@@ -6,6 +6,8 @@ Tests are written BEFORE implementation to drive the design.
 from __future__ import annotations
 
 import pytest
+pytest.importorskip("llama_index")  # semantic-search extra; absent in CI
+
 from llama_index.core.schema import TextNode
 
 from deep_worker.providers.semantic_search.indexer import _merge_small_chunks, _create_merged_node

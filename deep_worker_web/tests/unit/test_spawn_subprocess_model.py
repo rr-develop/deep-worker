@@ -64,7 +64,7 @@ BASE_CONFIG = {
 def test_real_model_passed_through(monkeypatch: pytest.MonkeyPatch) -> None:
     captured = _capture_cmd(monkeypatch)
     cfg = {**BASE_CONFIG, "model": "gpt-5.5"}
-    _spawn_subprocess("agent1", cfg, model=None, provider=None, clean=False)
+    _spawn_subprocess("agent_1", cfg, model=None, provider=None, clean=False)
     assert _model_value_after_flag(captured[0]) == "gpt-5.5"
 
 
@@ -72,7 +72,7 @@ def test_unknown_in_config_not_passed(monkeypatch: pytest.MonkeyPatch) -> None:
     """The poisoned saved config must NOT yield --model unknown."""
     captured = _capture_cmd(monkeypatch)
     cfg = {**BASE_CONFIG, "model": "unknown"}
-    _spawn_subprocess("agent1", cfg, model=None, provider=None, clean=False)
+    _spawn_subprocess("agent_1", cfg, model=None, provider=None, clean=False)
     val = _model_value_after_flag(captured[0])
     assert val != "unknown", (
         f"web spawn must not relaunch with --model unknown; cmd was "
@@ -83,7 +83,7 @@ def test_unknown_in_config_not_passed(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_unknown_explicit_arg_not_passed(monkeypatch: pytest.MonkeyPatch) -> None:
     captured = _capture_cmd(monkeypatch)
     cfg = {**BASE_CONFIG, "model": "unknown"}
-    _spawn_subprocess("agent1", cfg, model="unknown", provider=None, clean=False)
+    _spawn_subprocess("agent_1", cfg, model="unknown", provider=None, clean=False)
     assert _model_value_after_flag(captured[0]) != "unknown"
 
 
@@ -91,7 +91,7 @@ def test_absent_model_emits_no_model_flag(monkeypatch: pytest.MonkeyPatch) -> No
     """No model anywhere → no --model flag, never --model None/unknown."""
     captured = _capture_cmd(monkeypatch)
     cfg = {**BASE_CONFIG, "model": None}
-    _spawn_subprocess("agent1", cfg, model=None, provider=None, clean=False)
+    _spawn_subprocess("agent_1", cfg, model=None, provider=None, clean=False)
     cmd = captured[0]
     # A None/unknown model produces NO --model flag — the agent then
     # picks its provider default. (Crucially, never --model None, which
@@ -105,7 +105,7 @@ def test_provider_still_passed(monkeypatch: pytest.MonkeyPatch) -> None:
     """Sanity: provider is unaffected by the model fix."""
     captured = _capture_cmd(monkeypatch)
     cfg = {**BASE_CONFIG, "model": "unknown"}
-    _spawn_subprocess("agent1", cfg, model=None, provider=None, clean=False)
+    _spawn_subprocess("agent_1", cfg, model=None, provider=None, clean=False)
     cmd = captured[0]
     assert "--provider" in cmd
     assert cmd[cmd.index("--provider") + 1] == "codex"
@@ -115,7 +115,7 @@ def test_provider_override_drops_saved_model(monkeypatch: pytest.MonkeyPatch) ->
     captured = _capture_cmd(monkeypatch)
     cfg = {**BASE_CONFIG, "provider": "claude-code-sdk", "model": "opus"}
 
-    _spawn_subprocess("agent1", cfg, model=None, provider="codex", clean=False)
+    _spawn_subprocess("agent_2", cfg, model=None, provider="codex", clean=False)
 
     cmd = captured[0]
     assert cmd[cmd.index("--provider") + 1] == "codex"
@@ -156,18 +156,18 @@ def test_claude_code_aliases_passed_through(
     """Every documented alias must survive the web spawn path."""
     captured = _capture_cmd(monkeypatch)
     cfg = {**CLAUDE_CONFIG, "model": alias}
-    _spawn_subprocess("agent1", cfg, model=None, provider=None, clean=False)
+    _spawn_subprocess("agent_3", cfg, model=None, provider=None, clean=False)
     assert _model_value_after_flag(captured[0]) == alias, (
         f"web spawn dropped the valid claude-code-sdk alias {alias!r}; "
         f"cmd was {captured[0]}"
     )
 
 
-def test_fable_regression_vc15_update(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_fable_regression_context_limit_update(monkeypatch: pytest.MonkeyPatch) -> None:
     """The exact incident: saved fable must not be silently omitted."""
     captured = _capture_cmd(monkeypatch)
     cfg = {**CLAUDE_CONFIG, "model": "fable"}
-    _spawn_subprocess("agent1", cfg, model=None, provider=None, clean=False)
+    _spawn_subprocess("agent_3", cfg, model=None, provider=None, clean=False)
     assert "--model" in captured[0]
     assert _model_value_after_flag(captured[0]) == "fable"
 
@@ -175,7 +175,7 @@ def test_fable_regression_vc15_update(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_explicit_fable_arg_passed_through(monkeypatch: pytest.MonkeyPatch) -> None:
     captured = _capture_cmd(monkeypatch)
     cfg = {**CLAUDE_CONFIG, "model": "sonnet"}
-    _spawn_subprocess("agent1", cfg, model="fable", provider=None, clean=False)
+    _spawn_subprocess("agent_3", cfg, model="fable", provider=None, clean=False)
     assert _model_value_after_flag(captured[0]) == "fable"
 
 
@@ -211,7 +211,7 @@ def test_invalid_model_still_dropped_and_logged(
     captured = _capture_cmd(monkeypatch)
     cfg = {**CLAUDE_CONFIG, "model": "grok-composer-2.5-fast"}
     with caplog.at_level(logging.WARNING):
-        _spawn_subprocess("agent1", cfg, model=None, provider=None, clean=False)
+        _spawn_subprocess("agent_3", cfg, model=None, provider=None, clean=False)
 
     assert "--model" not in captured[0], "foreign model must still be dropped"
     assert any(

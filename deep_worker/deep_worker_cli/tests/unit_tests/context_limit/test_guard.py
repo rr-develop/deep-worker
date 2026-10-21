@@ -2,7 +2,7 @@
 
 See ``docs/DESIGN_CONTEXT_LIMIT_GUARANTEE.md`` §3.2.
 
-The guard is the single safety net for the rg1_worker bug
+The guard is the single safety net for the agent_a bug
 (2026-08-18, limit 400k → actual 600k). It MUST:
 
 * be **provider-independent** — work whether or not

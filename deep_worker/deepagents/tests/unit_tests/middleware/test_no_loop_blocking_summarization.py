@@ -1,7 +1,7 @@
 """Regression guard: the summarization ``on_summarized`` callback must NOT
 block the agent's event loop.
 
-Background — the live mj1_init deadlock (2026-06-15): the production
+Background — the live agent_c deadlock (2026-06-15): the production
 ``on_summarized`` callback is ``index_all_history_files``, a fully
 synchronous LanceDB write. ``_aoffload_to_backend`` is an ``async`` hook
 that runs on the agent's event-loop thread. Calling the callback INLINE
@@ -98,7 +98,7 @@ async def test_on_summarized_dispatch_does_not_block_event_loop() -> None:
     assert max_gap < BLOCK_S * 0.5, (
         f"event loop stalled {max_gap:.2f}s while on_summarized ran — the "
         f"callback was NOT offloaded (regression). A GIL-holding inline "
-        f"callback freezes the loop and deadlocks LanceDB (mj1_init "
+        f"callback freezes the loop and deadlocks LanceDB (agent_c "
         f"2026-06-15). See DESIGN_NO_LOOP_BLOCKING_TOOLS.md"
     )
 
@@ -113,5 +113,5 @@ def test_aoffload_source_offloads_on_summarized() -> None:
         "_aoffload_to_backend must offload _on_summarized via "
         "`await asyncio.to_thread(self._on_summarized, path)`. Running the "
         "LanceDB index write inline on the agent event loop deadlocks the "
-        "GIL (mj1_init 2026-06-15). See DESIGN_NO_LOOP_BLOCKING_TOOLS.md."
+        "GIL (agent_c 2026-06-15). See DESIGN_NO_LOOP_BLOCKING_TOOLS.md."
     )

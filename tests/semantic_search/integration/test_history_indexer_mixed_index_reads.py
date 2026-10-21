@@ -4,7 +4,7 @@ reads cleanly through ``search_history``.
 The pre-fix world stored history chunks measured with tiktoken, so a single
 very long message could land in one over-long row. After the fix, new writes
 use the embedder's own XLM-R tokenizer with the 510-token ceiling. This test
-builds an index whose first file carries a long message and whose
+builds an index whose first file carries a long Cyrillic message and whose
 second file carries small messages indexed by the fixed code path, then proves
 both old and new content remain retrievable from the same index.
 
@@ -24,6 +24,8 @@ import pytest
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 os.environ.setdefault("TQDM_DISABLE", "1")
+
+pytest.importorskip("llama_index")  # semantic-search extra; absent in CI
 
 from deep_worker.providers.semantic_search.history_indexer import index_history_file  # noqa: E402
 from deep_worker.providers.semantic_search.history_retriever import search_history  # noqa: E402
@@ -46,7 +48,7 @@ def _write_jsonl(path: Path, lines: list[dict]) -> None:
     path.write_text(content, encoding="utf-8")
 
 
-_OLD_PHRASE = "quantum entanglement nonlocality Einstein Podolsky Rosen paradox"
+_OLD_PHRASE = "квантовая запутанность нелокальность парадокс Эйнштейна Подольского Розена"
 _NEW_PHRASE = "deterministic incremental indexer regression sentinel marker"
 
 
@@ -54,10 +56,10 @@ def test_mixed_index_reads_old_and_new(tmp_path: Path, embed_model: Any) -> None
     summaries = tmp_path / "summaries"
     summaries.mkdir(parents=True)
 
-    # --- "old" file: one long message (a big chunk) -----------------------
+    # --- "old" file: one long Cyrillic message (a big chunk) -------------
     old = summaries / "thread_old.jsonl"
     long_body = (
-        "This is an old long entry in the agent's history. "
+        "Это старая длинная запись в истории агента. "
         + (_OLD_PHRASE + " ") * 60
     )
     _write_jsonl(
@@ -98,10 +100,10 @@ def test_mixed_index_reads_old_and_new(tmp_path: Path, embed_model: Any) -> None
 
     # --- mixed reads: both queries return their respective rows ----------
     old_hits = search_history(
-        "quantum entanglement paradox", summaries, top_k=5, embed_model=embed_model
+        "квантовая запутанность парадокс", summaries, top_k=5, embed_model=embed_model
     )
     assert old_hits, "old long-chunk content is not retrievable from the mixed index"
-    assert any("thread_old" in (h.thread_id or "") or "Einstein" in h.content for h in old_hits)
+    assert any("thread_old" in (h.thread_id or "") or "Эйнштейна" in h.content for h in old_hits)
 
     new_hits = search_history(
         "incremental indexer regression sentinel", summaries, top_k=5, embed_model=embed_model

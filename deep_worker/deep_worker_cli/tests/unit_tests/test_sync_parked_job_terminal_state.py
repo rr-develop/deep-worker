@@ -1,6 +1,6 @@
 """A thread-backed (sync) parked job must reach a TERMINAL, REPORTABLE state.
 
-Incident 2026-08-28 (rg1_worker): ``report_infrastructure_feedback`` is a sync
+Incident 2026-08-28 (agent_a): ``report_infrastructure_feedback`` is a sync
 tool, so it parks through the thread path. Its report WAS written to disk, but
 the agent could never confirm it: ``wait_for_job`` answered "STILL running on a
 worker thread" three times (120s, 300s, 600s) while ``py-spy`` showed every

@@ -59,8 +59,8 @@ def test_lookup_error_means_agent_gone() -> None:
     """A not-found stop failure → the agent is gone, remove its card."""
     assert _run_decision({
         "type": "agent_stop_failed",
-        "agent_name": "agent_a",
-        "error": "Agent 'agent_a' not found",
+        "agent_name": "agent_1",
+        "error": "Agent 'agent_1' not found",
         "error_type": "LookupError",
     }) is True
 
@@ -69,8 +69,8 @@ def test_not_found_text_means_agent_gone() -> None:
     """Match on the message text too (robust to error_type variations)."""
     assert _run_decision({
         "type": "agent_stop_failed",
-        "agent_name": "agent_a",
-        "error": "Agent 'agent_a' not found",
+        "agent_name": "agent_1",
+        "error": "Agent 'agent_1' not found",
         "error_type": "ValueError",
     }) is True
 
@@ -80,7 +80,7 @@ def test_generic_stop_failure_keeps_card() -> None:
     NOT remove the card — the agent may still be running."""
     assert _run_decision({
         "type": "agent_stop_failed",
-        "agent_name": "agent_b",
+        "agent_name": "agent_2",
         "error": "Connection timeout after 10s",
         "error_type": "IPCConnectionError",
     }) is False

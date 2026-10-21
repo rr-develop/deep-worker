@@ -35,7 +35,7 @@ def test_origin_survives_offload_and_drives_cold_after_ttl() -> None:
     blob = serialize_summarized_messages_jsonl(
         [HumanMessage(content="hi"), ai],
         summarized_at="2026-08-19T15:16:00+00:00",
-        thread_id="rg1_worker",
+        thread_id="agent_1",
         reason="cold",
         provider_session_id="f94ef7a6",
     )

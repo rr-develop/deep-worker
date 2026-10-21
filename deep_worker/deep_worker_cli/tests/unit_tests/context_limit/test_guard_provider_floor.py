@@ -1,6 +1,6 @@
 """The guard must not go blind on providers that keep history in the CLI.
 
-Measured on the live rg1_worker (grok, `-l 250000`), 2026-08-25:
+Measured on the live agent_a (grok, `-l 250000`), 2026-08-25:
 
   * the LangGraph state at guard time holds ONE message — the turn's new
     ``HumanMessage``. The conversation lives inside the grok CLI session,

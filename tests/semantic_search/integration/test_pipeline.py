@@ -23,6 +23,8 @@ os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 os.environ.setdefault("TQDM_DISABLE", "1")
 
 from deep_worker.providers.semantic_search.exceptions import IndexNotFoundError  # noqa: E402
+pytest.importorskip("llama_index")  # semantic-search extra; absent in CI
+
 from deep_worker.providers.semantic_search.indexer import IndexStats, index_repository  # noqa: E402
 from deep_worker.providers.semantic_search.retriever import SearchResult, search  # noqa: E402
 

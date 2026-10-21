@@ -20,7 +20,7 @@ python setup.py develop
 **IF YOU INSTALLED ANYTHING - UNINSTALL IT IMMEDIATELY:**
 ```bash
 pip uninstall --break-system-packages -y deep-worker deep-worker-cli deepagents
-rm -f "$(command -v dwcli)" "$(command -v deep-worker)"
+rm -f /home/<user>/.local/bin/dwcli /home/<user>/.local/bin/deep-worker
 ```
 
 **SCOPE OF THIS PROHIBITION (owner clarification 2026-10-13).** It governs
@@ -56,7 +56,7 @@ virtualenv .venv
 
 ```bash
 # Check for forbidden .venv directories:
-find . -name ".venv" -type d
+find /repos -name ".venv" -type d
 
 # Delete any found:
 rm -rf <path>/.venv
@@ -66,18 +66,18 @@ rm -rf <path>/.venv
 for working on or developing deep_worker on this host, and never inside the
 repository tree. A venv created in a **temporary directory** purely to test
 another configuration (e.g. installing the built wheel the way an end user
-would) is allowed, and must be deleted when the check is done. The `find .`
+would) is allowed, and must be deleted when the check is done. The `find /repos`
 sweep above is the invariant that matters: the repo stays free of `.venv`.
 
-### 3. RPyC: USE THE LOCAL rpyc_async SOURCE CHECKOUT ONLY
+### 3. RPyC: USE a local rpyc-async checkout ONLY
 
-The project uses a local `rpyc_async` source checkout for all RPyC communication.
+The project uses `a local rpyc-async checkout` for all RPyC communication.
 This provides `AsyncioServer` — single event loop, no threads.
 
 **CORRECT (production code already does this):**
 ```python
 # In agent_process.py:
-_rpyc_async_path = Path(RPYC_ASYNC_SOURCE_DIR)
+_rpyc_async_path = Path("a local rpyc-async checkout")
 if _rpyc_async_path.exists() and str(_rpyc_async_path) not in sys.path:
     sys.path.insert(0, str(_rpyc_async_path))
 
@@ -106,7 +106,7 @@ The GitHub Actions `Unit tests` workflow (`.github/workflows/unittest.yml`) runs
 `pytest tests/unit_tests` on Python 3.11 and 3.12 for every push to `master`/`main`.
 A test that depends on a host-specific path is a red-pipeline bug the moment it
 lands, because the CI runner uses `$GITHUB_WORKSPACE` on a fresh `ubuntu-latest`
-image — NOT the developer's local directory layout. Required reading before touching
+image — NOT the developer's `<repo>/...` layout. Required reading before touching
 tests:
 
 * [`docs/CI_CD_TESTS.md`](./docs/CI_CD_TESTS.md) — portability rules, the exact
@@ -117,7 +117,24 @@ If your test fails on CI but passes locally, the bug is in your test's
 portability — never edit `.github/workflows/*.yml` and never add a skip to make
 the pipeline green. Use the procedure in `CI_CD_TESTS.md` §5.
 
-### 6. Why This Matters
+### 6. Work in commits; do not let process outgrow the change
+
+Land work as local commits on the feature branch and review it by meaning —
+`git show <sha>` — not by checksums of uncommitted diffs. Reviewer findings are
+fixed by NEW commits on top; never rewrite history to accommodate a review.
+
+Do NOT introduce sign-off schemes that hash unstaged work. They cost more than
+the change they guard: when one file belongs to two pending steps, every step
+reorder invalidates every digest, and the session then spends its time
+rebuilding shared-file states and digging the old formula out of its own
+history instead of writing code. This happened — hours and a large share of the
+release budget went to that bookkeeping, not to the fix.
+
+The rule generalises: if a procedure starts consuming more time than the work
+it is supposed to verify, STOP and simplify it. Do not keep paying into it
+because it is already set up.
+
+### 7. Why This Matters
 
 Using installed packages instead of source code causes:
 - RPyC proxy errors: `AttributeError: cannot access '__reversed__'`
@@ -131,7 +148,7 @@ Using installed packages instead of source code causes:
 
 1. **Check for .venv:**
    ```bash
-   find . -name ".venv" -type d
+   find <repo> -name ".venv" -type d
    ```
 
 2. **If any .venv found - DELETE IMMEDIATELY:**
@@ -143,7 +160,7 @@ Using installed packages instead of source code causes:
 
 ```bash
 # Run tests WITHOUT activating any venv:
-cd deep_worker/deep_worker_cli
+cd <repo>/deep_worker/deep_worker_cli
 python3 -m pytest tests/
 ```
 
@@ -169,7 +186,7 @@ python3 -m deep_worker_cli.cli.main
 
 ### ✅ CORRECT: Running globally with source imports
 ```
-"This project runs globally with source imports from the local rpyc_async checkout"
+"This project runs globally with source imports from a local rpyc-async checkout"
 ```
 
 ## When User Reports RPyC Errors
@@ -182,7 +199,7 @@ If you see errors like:
 **FIRST ACTION: Check for .venv**
 
 ```bash
-find . -name ".venv" -type d
+find <repo> -name ".venv" -type d
 # If found -> rm -rf immediately
 ```
 
@@ -194,7 +211,7 @@ This is likely the root cause!
 2. **NEVER** suggest creating virtual environments
 3. **NEVER** use `--no-verify` on git commits
 4. **ALWAYS** run everything from source code directly
-5. **ALWAYS** use the local `rpyc_async` source checkout for RPyC (AsyncioServer, single event loop)
+5. **ALWAYS** use `a local rpyc-async checkout` for RPyC (AsyncioServer, single event loop)
 6. **ALWAYS** check for and delete `.venv` directories when encountered
 7. **IF YOU INSTALLED ANYTHING** - uninstall it immediately using the commands in section 1
 

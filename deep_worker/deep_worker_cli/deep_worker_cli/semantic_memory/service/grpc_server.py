@@ -8,7 +8,7 @@ B2). LanceDB bridges to its own background event loop through a blocking
 ``run_coroutine_threadsafe(...).result()``. On a loop thread that call
 holds the GIL while it waits, LanceDB's loop can never acquire the GIL to
 finish the work being waited on, and the process hangs forever — the
-mj1_init deadlock of 2026-06-15. Moving the code into a service does not
+agent_c deadlock of 2026-06-15. Moving the code into a service does not
 change that physics, it only changes which process hangs. So the rule
 covers ``SearchProject`` and ``SearchHistory`` as much as
 ``IndexHistory``: searching loads the same model and opens the same

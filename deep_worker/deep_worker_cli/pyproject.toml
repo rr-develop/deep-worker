@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "deep-worker"
-version = "0.0.22"
+version = "0.0.23"
 description = "Terminal interface for Deep Worker - interactive AI agent with file operations, shell access, and sub-agent capabilities."
 readme = "README.md"
 license = "MIT"
@@ -15,6 +15,8 @@ classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Console",
     "Intended Audience :: Developers",
+    # Linux only, kernel >= 4.19 (WSL2 included) — docs/REQUIREMENTS.md.
+    "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -58,7 +60,7 @@ dependencies = [
   # DeepSeek thinking models (deepseek-v4-flash) require reasoning_content to
   # be round-tripped; we build them with ReasoningChatDeepSeek (subclass of
   # ChatDeepSeek). Pinned exact to match the host install. See
-  # deepseek_model.py and DEEPSEEK_PROVIDER.md (2026-05-22).
+  # deepseek_model.py and DEEPSEEK_PROVIDER.md (agent_f 2026-05-22).
   "langchain-deepseek==1.0.1",
   "langgraph-checkpoint-sqlite==3.0.3",
   # Google Gemini (API provider, core per the capability matrix).
@@ -104,7 +106,7 @@ dependencies = [
   "pyperclip>=1.11.0,<2.0.0",
 
   # IPC/RPC — AsyncioServer-based RPyC fork.
-  # This pin is only the FALLBACK: a local rpyc_async source checkout wins over
+  # This pin is only the FALLBACK: a checkout at a local rpyc-async checkout wins over
   # any installed distribution (owner decision 2026-10-11, implemented in
   # deep_worker_cli/rpyc_async_source.py). Being the fallback is exactly why
   # it must not understate the requirement — the fallback is what a pip user
@@ -194,12 +196,6 @@ a2a = ["a2a-sdk[http-server]>=1.1.0"]
 # NOTE: there is deliberately no `web` extra. The web UI's requirements are
 # CORE dependencies — see the "Web UI" block in [project.dependencies].
 # `pip install deep-worker` must yield a working `deep-worker --web`.
-
-[project.urls]
-Homepage = "https://github.com/rr-develop/deep-worker"
-Source = "https://github.com/rr-develop/deep-worker"
-Repository = "https://github.com/rr-develop/deep-worker"
-Issues = "https://github.com/rr-develop/deep-worker/issues"
 
 [project.scripts]
 deep-worker = "deep_worker_cli.cli.router:deep_worker_main"
@@ -293,8 +289,8 @@ deepagents = { path = "../deepagents", editable = true }
 #           - `Connection.aclose()`                          (async close)
 #           - `Connection.wait_closed()`                     (async close wait)
 #           - `Connection.add_close_callback(cb)`
-#         Note this is a TYPE-CHECKING arrangement only. At RUNTIME a local
-#         rpyc_async checkout takes priority over the installed distribution
+#         Note this is a TYPE-CHECKING arrangement only. At RUNTIME a checkout
+#         at a local rpyc-async checkout takes priority over the installed distribution
 #         (owner decision 2026-10-11, deep_worker_cli/rpyc_async_source.py),
 #         so `ty` may be reading an older API surface than the code runs
 #         against. If a symbol exists in the checkout but not in the installed
@@ -305,9 +301,9 @@ deepagents = { path = "../deepagents", editable = true }
 # or fix the real type error. There are no third options.
 # ═══════════════════════════════════════════════════════════════════════════
 # Paths are tree-relative (../../  = <repo>/, ../  = <repo>/deep_worker/).
-# Using ../.. instead of a hard-coded absolute path means this file works
-# identically in the production tree and in a developer tree.
-# Hard-coding the production path caused
+# Using ../.. instead of hard-coded <repo> means this file
+# works identically in <repo> (prod tree) and
+# <repo> (dev tree). Hard-coding the prod path caused
 # `ty check` to fail in the dev tree: it would add BOTH the prod
 # deep_worker_cli (via extra-paths) and the dev deep_worker_cli (via cwd)
 # to the module-resolution path, then refuse to resolve relative imports
@@ -326,8 +322,8 @@ extra-paths = [
     # the vendored
     # claude_code_sdk_provider imports `claude_agent_sdk._mcp_context` lazily.
     # ty needs the fork on the search path to type-check that code path.
-    # Mirrors the Claude SDK source entry already in pyrightconfig.json.
-    # (A sibling checkout of the repository root, in both trees.)
+    # Mirrors the <repo>/src entry already in pyrightconfig.json.
+    # (Sibling of the repo root: <repo> for both trees.)
     "../../../claude_sdk/src",
 ]
 
@@ -561,4 +557,16 @@ asyncio_default_fixture_loop_scope = "function"
 markers = [
     "reuse_agent: Do not kill existing agent process, reuse it for debugging (default: kill old process)",
     "integration: Integration tests that require real agents or run AsyncioServer+client in-process (select with '-m integration'; deselected by default)",
+    "integration_ai: Real-agent end-to-end suite (tests/integration_ai)",
+    "allow_live_home: Opt out of the autouse HOME-isolation fixture (tests/conftest.py)",
+    # `timeout` comes from pytest-timeout, a DEV EXTRA that CI does not
+    # install. The plugin registers the mark itself when present, but
+    # --strict-markers (above) makes an ABSENT plugin a collection error for
+    # every file carrying @pytest.mark.timeout. Verified before this line
+    # existed: `pytest -p no:timeout tests/integration_tests/
+    # test_daemonize_umask_real.py --collect-only` -> "'timeout' not found in
+    # `markers` configuration option", Interrupted, 1 error. Registering it
+    # here keeps the mark declarative without the plugin; duplicate
+    # registration when the plugin IS installed is harmless.
+    "timeout: Per-test wall-clock budget, enforced only when pytest-timeout is installed",
 ]

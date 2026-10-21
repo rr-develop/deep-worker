@@ -338,11 +338,15 @@ class ServiceSupervisor:
                 # It may still have created the socket before dying, so
                 # readiness is checked first.
                 return "ready" if socket_path.is_socket() else "exited"
-            # Some other OS error (e.g. EPERM/EMFILE): degrade to
-            # inotify + timeout. Still event-driven, just blind to death.
+            # Any other OS error: degrade to inotify + timeout. Still
+            # event-driven, just blind to death. The common case here is
+            # ENOSYS — the kernel has no pidfd_open at all (Linux < 5.3,
+            # e.g. the 4.19 WSL2 images named in docs/REQUIREMENTS.md) —
+            # alongside the incidental ones such as EPERM or EMFILE.
             pid_fd = None
         except AttributeError:
-            # pidfd_open is unavailable on this build.
+            # The other shape the same absence takes: CPython built
+            # without <sys/pidfd.h> has no os.pidfd_open to call.
             pid_fd = None
 
         try:

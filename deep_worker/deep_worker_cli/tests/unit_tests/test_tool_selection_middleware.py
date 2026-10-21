@@ -447,7 +447,7 @@ def test_real_chain_unowned_prompt_text_is_never_touched():
                 request.override(
                     system_message=append_to_system_message(
                         request.system_message,
-                        "You are test_agent. Follow the owner's instructions.",
+                        "You are agent_1. Follow the owner's instructions.",
                     )
                 )
             )
@@ -458,4 +458,4 @@ def test_real_chain_unowned_prompt_text_is_never_touched():
         tools=[],
     )
 
-    assert "You are test_agent." in captured["system"]
+    assert "You are agent_1." in captured["system"]

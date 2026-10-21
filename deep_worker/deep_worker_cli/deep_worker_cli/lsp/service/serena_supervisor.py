@@ -33,6 +33,8 @@ import os
 import time
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Final
 
+from deep_worker_cli.lsp.service import child_death
+
 if TYPE_CHECKING:  # pragma: no cover
     from deep_worker_cli.lsp.service.grpc_server import LSPServiceServer
     from deep_worker_cli.lsp.service.serena_backend import SerenaBackend
@@ -71,6 +73,11 @@ class SerenaSupervisor:
         self._monitor_task: asyncio.Task[None] | None = None
         self._death_event: asyncio.Event | None = None
         self._on_death_task: asyncio.Task[None] | None = None
+        #: Set only on the no-pidfd path, where child death is observed
+        #: by ``blocking_waitpid`` on the default executor. Declared here
+        #: so every attribute of the monitor has one owner and reading it
+        #: before the first armed monitor is not an AttributeError.
+        self._waitpid_future: "asyncio.Future[None] | None" = None
         self._restart_lock = asyncio.Lock()
         self._restarts: list[float] = []
         self._stopped = asyncio.Event()
@@ -79,9 +86,10 @@ class SerenaSupervisor:
 
     @staticmethod
     def _default_pidfd_open(pid: int, flags: int = 0) -> int:
-        # ``os.pidfd_open`` is Linux ≥5.3; the whole tree assumes Linux
-        # 6.x so a hard AttributeError here is acceptable and loud.
-        return os.pidfd_open(pid, flags)
+        # Delegates so that a CPython built without <sys/pidfd.h> raises
+        # AttributeError here rather than at import time; ``_arm_monitor``
+        # turns both that and ENOSYS into the waitpid fallback.
+        return child_death.default_pidfd_open(pid, flags)
 
     def _loop_add_reader(
         self, fd: int, cb: Callable[[], None]
@@ -168,15 +176,28 @@ class SerenaSupervisor:
             )
             return
         try:
-            fd = self._pidfd_open(pid, 0)
-        except OSError as e:
-            _log.error(
-                "supervisor: pidfd_open(%d) failed: %s; auto-restart disabled",
+            fd: int | None = self._pidfd_open(pid, 0)
+        except (OSError, AttributeError) as e:
+            # No pidfd: the syscall is missing (kernel < 5.3) or CPython
+            # was built without <sys/pidfd.h>. Auto-restart must survive
+            # that — see docs/REQUIREMENTS.md — so fall back to a
+            # blocking waitpid on the default executor. It resolves one
+            # Future exactly when the child dies, which is as
+            # event-driven as the pidfd it replaces (no polling).
+            _log.warning(
+                "supervisor: pidfd_open(%d) unavailable (%s); falling back "
+                "to executor waitpid. Auto-restart stays ENABLED. This is "
+                "expected on kernels below 5.3 and on CPython built "
+                "without <sys/pidfd.h>.",
                 pid, e,
             )
-            return
+            fd = None
         self._monitor_fd = fd
         self._death_event = asyncio.Event()
+        if fd is None:
+            self._arm_waitpid_fallback(pid)
+            self._monitor_task = asyncio.create_task(self._monitor_wait())
+            return
         # Reader callback runs in the event-loop thread. Keep it
         # synchronous and idempotent: strip the reader, close the fd,
         # signal the event. The heavy lifting (restart) is scheduled
@@ -198,6 +219,26 @@ class SerenaSupervisor:
         self._loop_add_reader(fd, _on_readable)
         self._monitor_task = asyncio.create_task(self._monitor_wait())
 
+    def _arm_waitpid_fallback(self, pid: int) -> None:
+        """Set ``_death_event`` when ``pid`` exits, without a pidfd.
+
+        ``blocking_waitpid`` runs on the default executor and returns
+        exactly once, when the child is reaped. The done-callback runs on
+        the event-loop thread, so setting the event here is safe.
+        """
+        loop = asyncio.get_running_loop()
+        event = self._death_event
+        future = loop.run_in_executor(
+            None, child_death.blocking_waitpid, pid
+        )
+        self._waitpid_future = future
+
+        def _on_done(_fut: "asyncio.Future[None]") -> None:
+            if event is not None and not event.is_set():
+                event.set()
+
+        future.add_done_callback(_on_done)
+
     def _disarm_monitor(self) -> None:
         fd = self._monitor_fd
         self._monitor_fd = None
@@ -207,6 +248,16 @@ class SerenaSupervisor:
                 self._close_fd(fd)
             except OSError:
                 pass
+        # Drop the no-pidfd watch. Cancelling cannot interrupt a thread
+        # already blocked in ``waitpid`` — it stays parked until the
+        # child dies, which in the normal shutdown order happens moments
+        # later when ``stop()`` calls ``backend.stop()``. What this does
+        # achieve is detaching the done-callback, so a death observed
+        # after disarming can no longer set an event this supervisor has
+        # finished with, and releasing the reference.
+        future, self._waitpid_future = self._waitpid_future, None
+        if future is not None:
+            future.cancel()
         # Wake any waiter so the monitor task exits promptly.
         if self._death_event is not None:
             self._death_event.set()

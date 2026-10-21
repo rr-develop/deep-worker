@@ -2,7 +2,7 @@
 name: skill-creator
 description: "Guide for creating effective skills that extend agent capabilities with specialized knowledge, workflows, or tool integrations. Use this skill when the user asks to: (1) create a new skill, (2) make a skill, (3) build a skill, (4) set up a skill, (5) initialize a skill, (6) scaffold a skill, (7) update or modify an existing skill, (8) validate a skill, (9) learn about skill structure, (10) understand how skills work, or (11) get guidance on skill design patterns. Trigger on phrases like \"create a skill\", \"new skill\", \"make a skill\", \"skill for X\", \"how do I create a skill\", or \"help me build a skill\"."
 license: MIT
-compatibility: designed for deepagents-cli
+compatibility: designed for deep-worker
 ---
 
 # Skill Creator
@@ -16,16 +16,16 @@ specialized knowledge, workflows, and tools. Think of them as "onboarding guides
 domains or tasks—they transform a general-purpose agent into a specialized agent
 equipped with procedural knowledge and domain expertise.
 
-### Skill Location for Deepagents
+### Skill Location for DeepWorker
 
-The deepagents CLI loads skills from five sources, listed here from lowest to highest precedence:
+The DeepWorker CLI loads skills from five sources, listed here from lowest to highest precedence:
 
 | # | Directory | Scope | Notes |
 |---|-----------|-------|-------|
-| 0 | `<package>/built_in_skills/` | Built-in | Ships with deepagents CLI |
-| 1 | `~/.deep_worker/agents/<agent>/skills/` | User | Default for `deepagents skills create` |
+| 0 | `<package>/built_in_skills/` | Built-in | Ships with DeepWorker CLI |
+| 1 | `~/.deep_worker/agents/<agent>/skills/` | User | Default for `deep-worker skills create` |
 | 2 | `~/.agents/skills/` | User | Shared across agent tools |
-| 3 | `.deep_worker/skills/` | Project | Default for `deepagents skills create --project` |
+| 3 | `.deep_worker/skills/` | Project | Default for `deep-worker skills create --project` |
 | 4 | `.agents/skills/` | Project | Shared across agent tools |
 
 `<agent>` is the agent configuration name (default: `agent`). When two directories contain a skill with the same name, the higher-precedence version wins — project skills override user skills, and any user or project skill overrides built-in skills.
@@ -300,7 +300,7 @@ Usage:
 scripts/init_skill.py <skill-name> --path <output-directory>
 ```
 
-For deepagents CLI, use any of the skill directories listed in "Skill Location for Deepagents" above:
+For DeepWorker CLI, use any of the skill directories listed in "Skill Location for DeepWorker" above:
 
 ```bash
 # User skills (default)
@@ -319,19 +319,19 @@ The script:
 
 After initialization, customize or remove the generated SKILL.md and example files as needed.
 
-#### Option B: `deepagents skills create` (quick start)
+#### Option B: `deep-worker skills create` (quick start)
 
 The built-in CLI command creates a minimal skill with just a `SKILL.md` template — no resource directories. Use this for simple skills that only need instructions and no bundled scripts, references, or assets.
 
 ```bash
 # Create in user skills directory
-deepagents skills create <skill-name>
+deep-worker skills create <skill-name>
 
 # Create in project skills directory
-deepagents skills create <skill-name> --project
+deep-worker skills create <skill-name> --project
 ```
 
-Use `init_skill.py` when the skill will include bundled resources (`scripts/`, `references/`, `assets/`). Use `deepagents skills create` for a quick, minimal starting point.
+Use `init_skill.py` when the skill will include bundled resources (`scripts/`, `references/`, `assets/`). Use `deep-worker skills create` for a quick, minimal starting point.
 
 ### Step 4: Edit the Skill
 

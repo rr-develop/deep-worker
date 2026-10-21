@@ -1,6 +1,7 @@
 # Recoverable failures must be visible
 
 Status: design, revision 3 (A committed; B signed off; C revised again)
+Author: DeepWorker team
 Date: 2026-09-04
 
 ## 1. What the owner reported
@@ -18,7 +19,7 @@ they are independent: each can be fixed and verified alone.
 ## 2. Evidence
 
 All facts below were established by execution against the live state of
-`test_lsp` (`threads.db` in the agent data directory, 112 checkpoints,
+`test_lsp` (`~/.deep_worker/agents/test_lsp/threads.db`, 112 checkpoints,
 21 `messages` writes), not by reading code.
 
 The conversation, reconstructed from the `writes` table (LangGraph stores

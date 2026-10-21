@@ -92,6 +92,14 @@ Full design: `DESIGN_FULL_DIALOG_FINAL_RESPONSE_PAIRS.md` (web app docs) §"Syst
   notification), or document that the wait is policy
   (e.g. per-tool execution timeout) with a citation that justifies
   the value. "Arbitrary settle times" are forbidden.
+
+  What is forbidden here is **polling and arbitrary settle times**, not
+  `sleep` as such. Sleeping is a legitimate way to wait when there is
+  nothing to synchronise on — notably when an agent waits out a long
+  subprocess inside its own turn, or a shell command paces a retry
+  against an external system. The defect this rule names is asking
+  again and again instead of waiting for the event, and guessing a
+  delay instead of observing the thing you depend on.
 * No silent `try / except: pass`, no silent `if not isinstance(x, T):
   continue`, no silent retry loops. Either succeed, or fail loudly
   with a message that names what the contract was and why it broke.

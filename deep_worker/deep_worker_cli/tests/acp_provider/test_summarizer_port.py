@@ -101,13 +101,13 @@ async def test_hot_summarize_prompts_existing_session_no_session_new() -> None:
     client = _FakeAcpClient()
     cs = AcpClientState()
     model = _model(client, cs)
-    state = cs.get_or_create("rg1_worker")
+    state = cs.get_or_create("agent_1")
     state.session_id = "sess-live"
     state.session_live_in_process = True
     state.sent_count = 10
 
     result = await model.asummarize(
-        thread_id="rg1_worker",
+        thread_id="agent_1",
         messages=[HumanMessage(content="old"), AIMessage(content="ok")],
         instruction="Summarize. No tools.",
         decision=_hot_decision(),
@@ -218,13 +218,13 @@ async def test_tool_calls_during_summarize_never_dump_into_agent_session() -> No
     cs = AcpClientState()
     model = _model(client, cs)
     model._proxy_mcp = _FakeProxy()
-    state = cs.get_or_create("rg1_worker")
+    state = cs.get_or_create("agent_1")
     state.session_id = "sess-live"
     state.session_live_in_process = True
     state.sent_count = 10
 
     result = await model.asummarize(
-        thread_id="rg1_worker",
+        thread_id="agent_1",
         messages=[HumanMessage(content="old history"), AIMessage(content="ok")],
         instruction="Summarize. No tools.",
         decision=_hot_decision(),
@@ -254,7 +254,7 @@ async def test_hot_mid_turn_cancels_before_prompt() -> None:
     client = _FakeAcpClient()
     cs = AcpClientState()
     model = _model(client, cs)
-    state = cs.get_or_create("rg1_worker")
+    state = cs.get_or_create("agent_1")
     state.session_id = "sess-live"
     state.session_live_in_process = True
     loop = asyncio.get_running_loop()
@@ -262,7 +262,7 @@ async def test_hot_mid_turn_cancels_before_prompt() -> None:
     state.pending_session_prompt_future = fut
 
     await model.asummarize(
-        thread_id="rg1_worker",
+        thread_id="agent_1",
         messages=[HumanMessage(content="q")],
         instruction="Summarize.",
         decision=_hot_decision(),
@@ -278,13 +278,13 @@ async def test_cold_uses_ephemeral_session_without_mcp_and_does_not_load_old() -
     client = _FakeAcpClient()
     cs = AcpClientState()
     model = _model(client, cs)
-    state = cs.get_or_create("rg1_worker")
+    state = cs.get_or_create("agent_1")
     state.session_id = "f44ee866"
     state.session_live_in_process = False
     state.sent_count = 722
 
     result = await model.asummarize(
-        thread_id="rg1_worker",
+        thread_id="agent_1",
         messages=[
             HumanMessage(content="user question 0"),
             AIMessage(content="answer"),
@@ -299,7 +299,7 @@ async def test_cold_uses_ephemeral_session_without_mcp_and_does_not_load_old() -
     assert client.prompts[0][0].startswith("sess-new-")
     dump = client.prompts[0][1][0]["text"]
     assert "user question 0" in dump
-    agent = cs.get("rg1_worker")
+    agent = cs.get("agent_1")
     assert agent is not None
     assert agent.session_id == "f44ee866"
     assert agent.sent_count == 722
@@ -310,15 +310,15 @@ async def test_areset_clears_queued_and_drops_session() -> None:
     client = _FakeAcpClient()
     cs = AcpClientState()
     model = _model(client, cs)
-    state = cs.get_or_create("rg1_worker")
+    state = cs.get_or_create("agent_1")
     state.session_id = "f44ee866"
     state.sent_count = 722
     state.queued_tool_calls.append({"id": "x", "name": "Bash", "args": {}})
     state.queued_text.append("partial")
 
-    await model.areset_after_summary(thread_id="rg1_worker")
+    await model.areset_after_summary(thread_id="agent_1")
 
-    after = cs.get("rg1_worker")
+    after = cs.get("agent_1")
     assert after is not None
     assert after.session_id is None
     assert after.sent_count == 0
@@ -362,7 +362,7 @@ async def test_identical_prefix_fails_loud_when_port_lost_on_acp() -> None:
 
     with pytest.raises(RuntimeError, match="summarization port unavailable"):
         await mw._ainvoke_identical_prefix(
-            [HumanMessage(content="hi")], "summarize", "rg1_worker"
+            [HumanMessage(content="hi")], "summarize", "agent_1"
         )
 
 

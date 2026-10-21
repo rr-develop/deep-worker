@@ -2,7 +2,7 @@
 // per-turn total, and the ``Context`` field must NEVER surface a
 // per-turn total as its value.
 //
-// Root cause pinned by the ACP hybrid-record fix (rg1_worker
+// Root cause pinned by the ACP hybrid-record fix (agent_a
 // 2026-08-22): the ``Context: 2265.4k tokens`` regression happened
 // because ``formatAgentContext`` fell back to a tokens-only rendering
 // when the provider dropped the snapshot.  These tests keep both

@@ -47,3 +47,90 @@ jobs:
         env:
           DEEPSEEK_API_KEY: test-key-not-used-by-unit-tests
         run: pytest tests/unit_tests -q
+
+      # The per-provider suites live in the repo-root ``tests/`` tree, which
+      # no executed selection covered: ``tests/unit_tests`` above is a
+      # different directory and a different package. Nothing excluded them on
+      # purpose — they carry no ``integration`` marker — so they simply went
+      # unrun, and 3fe834d1 (grok, 2026-08-24) plus 2f354dd6 (codex,
+      # 2026-08-25) left them stale for weeks: 12 grok modules failed at
+      # COLLECTION time, which is silent in a selection that never names them.
+      #
+      # ``tests/acp_provider`` is the shared ACP layer both of them now
+      # inherit from, and it was out of every selection too.
+      #
+      # All of these are hermetic (fakes and monkeypatched subprocesses, no
+      # keys, no network, no live CLI) and cost ~28 s against the ~520 s
+      # above. "No live CLI" is a property of the RUNNER, not just of the
+      # test bodies, and it was not free: ``CodexChatModel`` resolves the
+      # binary eagerly at construction, so this step first went red here
+      # (41 failures, ``codex CLI not found on PATH``) while passing on a
+      # developer box that had ``codex`` installed via npm. The suite now
+      # stubs ``CODEX_PATH`` in ``tests/codex_provider/conftest.py``;
+      # reproduce the runner locally with
+      # ``env PATH=/usr/bin:/bin CODEX_PATH= pytest ../../tests/codex_provider``.
+      #
+      # The same first red run exposed six non-codex failures in the
+      # directories this step newly covers, each an environment dependency
+      # rather than a real defect: three in ``tests/unit`` read
+      # ``agent.py`` through a hardcoded ``<repo>/...`` path (now resolved
+      # from the installed package — CLAUDE.md §5), and three needed a
+      # ``GOOGLE_API_KEY``, the ``claude-agent-acp`` adapter, or wall-clock
+      # headroom, so they are marked ``integration`` and deselected here.
+      # Full command under a stripped environment (no codex/claude CLI, no
+      # API keys): 1010 passed, 15 skipped, 3 deselected.
+      # Deliberately NOT here: ``tests/claude_code_sdk_provider`` and
+      # ``tests/semantic_search`` pin host paths (a host-specific path,
+      # <repo>) and need the ``semantic-search`` extra, which this
+      # job does not install — they are run on demand, not per push.
+      #
+      # Running those two ON DEMAND requires cwd=REPO ROOT, not this step's
+      # ``working-directory``. They have no sys.path insert of their own, so
+      # from ``deep_worker/deep_worker_cli`` every module that imports
+      # ``deep_worker`` dies at collection: measured 42 errors
+      # (claude_code_sdk_provider: 85 of its 408 tests still collected, i.e.
+      # 42 of its 53 modules fail to import) and 24 errors
+      # (semantic_search, nothing collected) — ``ModuleNotFoundError: No
+      # module named 'deep_worker'``, i.e. an environment artefact, NOT a
+      # regression in those suites. The two directories named in this step
+      # are immune either way: grok 253 + codex 159 = 412 collected, zero
+      # collection errors, from BOTH cwds.
+      #
+      # ``-m 'not integration'`` is spelled out because pytest picks the
+      # ROOT ``pytest.ini`` as configfile for the repo-root paths, and that
+      # file — unlike this package's pyproject — carries no default
+      # deselection. The root configfile used to mean ``--strict-markers`` was
+      # NOT in force here: measured, a typo'd ``@pytest.mark.integrationn``
+      # silently collected the test back into this step (2 deselected instead
+      # of 3, no error), whereas the package-only selection errored out with
+      # ``'integrationn' not found in markers configuration``. The root
+      # ``pytest.ini`` now carries ``--strict-markers --strict-config`` and
+      # registers every mark used anywhere in the repo, so that typo is a
+      # COLLECTION ERROR here too and the three ``integration`` marks below
+      # are load-bearing AND guarded. Note the root file must cover the UNION
+      # of marks, because this step mixes repo-root paths with package paths
+      # and pytest then picks the root file for the whole run.
+      #
+      # Measured here: 1025 of 1028 collected, 3 deselected — exactly the
+      # three marked tests. (Before they were added the filter deselected
+      # nothing, which is why it first went in as a pure forward guard.) So
+      # it is now both an ACTIVE filter and a forward guard: marking a
+      # future test ``integration`` keeps it out of this step instead of
+      # silently adding it.
+      #
+      # Collection errors are red here by construction: pytest exits non-zero
+      # on them and ``--continue-on-collection-errors`` is deliberately
+      # absent. Verified by reinstating the pre-fix import: exit code 2.
+      - name: Run provider unit tests
+        working-directory: deep_worker/deep_worker_cli
+        env:
+          DEEPSEEK_API_KEY: test-key-not-used-by-unit-tests
+        run: >-
+          pytest
+          ../../tests/grok_provider
+          ../../tests/codex_provider
+          tests/acp_provider
+          tests/unit
+          tests/task_manager
+          tests/integration_tools_schema
+          -q -m 'not integration'

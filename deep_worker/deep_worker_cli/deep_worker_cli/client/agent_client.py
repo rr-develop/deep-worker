@@ -195,7 +195,7 @@ class AgentClient:
         cancel-aware cleanup in ``__await__`` cannot help: it fires when
         the future reaches a done state, and here it never does.
 
-        Observed (repo_graph ingest, 2026-09-23): the agent finished its
+        Observed (the code-graph server ingest, 2026-09-23): the agent finished its
         turn in ~1.5s and wrote ``token_stats.jsonl``, but the caller's
         ``converse()`` never returned — 69 minutes parked on this await
         after a ``ClosedResourceError`` killed the channel. A silence

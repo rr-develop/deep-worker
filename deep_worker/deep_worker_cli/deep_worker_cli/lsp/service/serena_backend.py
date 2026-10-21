@@ -42,29 +42,15 @@ from typing import Any, AsyncContextManager, Awaitable, Callable, Final
 
 from deep_worker_cli.lsp.service.proto import lsp_service_pb2 as pb
 
+from deep_worker_cli.lsp.service import child_death
+
 _log = logging.getLogger(__name__)
 
 
-def _blocking_waitpid(pid: int) -> None:
-    """Block in a worker thread until ``pid`` exits.
-
-    Used as the no-pidfd fallback for child-death detection on CPython
-    builds where ``os.pidfd_open`` is unavailable (it needs
-    ``<sys/pidfd.h>`` at compile time — uv-installed CPython 3.11.14
-    ships without it).  Runs to completion once the kernel reaps the
-    child; ``WNOHANG`` is NOT used, so we never busy-loop.  Idempotent
-    against ECHILD: by the time this is called, the child has either
-    been reaped by its real parent (and the call returns ``(0, 0)``
-    harmlessly) or still belongs to us and we block until it dies.
-    """
-    while True:
-        try:
-            waited_pid, _status = os.waitpid(pid, 0)
-        except ChildProcessError:
-            # Already reaped (e.g. by a previous test teardown).
-            return
-        if waited_pid == pid:
-            return
+#: Shared with the other supervisors — see
+#: ``deep_worker_cli.lsp.service.child_death`` for why the no-pidfd
+#: fallback exists and why it is not a poll.
+_blocking_waitpid = child_death.blocking_waitpid
 
 
 #: gRPC RPC name → MCP tool name Serena advertises. Mirrors the 11

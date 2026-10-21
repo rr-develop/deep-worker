@@ -104,12 +104,12 @@ class TestTopLevelHelp:
     """Test that `deepagents -h` shows the global help screen via _make_help_action."""
 
     def test_top_level_help_exits_cleanly(self) -> None:
-        """Running `deepagents -h` should show help and exit with code 0."""
+        """Running `deep-worker -h` should show help and exit with code 0."""
         buf = io.StringIO()
         test_console = Console(file=buf, highlight=False, width=120)
 
         with (
-            patch.object(sys, "argv", ["deepagents", "-h"]),
+            patch.object(sys, "argv", ["deep-worker", "-h"]),
             patch("deep_worker_cli.ui.console", test_console),
             pytest.raises(SystemExit) as exc_info,
         ):
@@ -119,7 +119,7 @@ class TestTopLevelHelp:
         output = buf.getvalue()
 
         # Should contain global help content
-        assert "deepagents" in output.lower()
+        assert "deep-worker" in output.lower()
         assert "--help" in output
 
     def test_help_subcommand_parses(self) -> None:

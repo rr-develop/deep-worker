@@ -770,7 +770,7 @@ class CodexChatModel(BaseChatModel):
     # session, the exact dump the port exists to avoid.
     #
     # Until this port existed that refusal made EVERY summarization on codex
-    # deterministically fatal: rg1_worker died with
+    # deterministically fatal: agent_a died with
     # ``SummarizationFailedError: summarization port unavailable on a
     # session-stateful provider (CodexChatModel)`` on 2026-08-23, and — being
     # past its context limit — re-died on each following turn.

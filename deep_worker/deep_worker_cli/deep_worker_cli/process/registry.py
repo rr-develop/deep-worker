@@ -11,7 +11,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
-from deep_worker_cli.exceptions import AgentAlreadyExistsError, RegistryLockError
+from deep_worker_cli.exceptions import (
+    AgentAlreadyExistsError,
+    RegistryLockError,
+    RegistryReadError,
+)
 from deep_worker_cli.types import AgentProcessInfo
 
 
@@ -244,9 +248,29 @@ class ProcessRegistry:
             return {}
 
         try:
-            return json.loads(self.registry_file.read_text())
-        except (json.JSONDecodeError, OSError):
-            # Corrupted or unreadable registry, start fresh
+            text = self.registry_file.read_text()
+        except OSError as e:
+            # NOT the same case as corruption. An OSError here is EACCES/EIO —
+            # the registry is there and may be full of live agents, we simply
+            # could not read it. Returning {} made every caller report "no
+            # agents" indistinguishably from "no agents registered": the web
+            # UI logged "Discovered 0 agents from registry" forever while
+            # agents ran fine, with nothing in any log to explain it. The
+            # agent path is spared because it calls validate_writable() first
+            # (cli/agent_command.py); the web path has no such check, so the
+            # failure has to surface from here.
+            raise RegistryReadError(
+                f"Cannot read registry {self.registry_file}: {e}. "
+                f"Check ownership and permissions: ls -l {self.registry_file}"
+            ) from e
+
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            # Genuinely corrupted content — start fresh, as before.
+            self.logger.warning(
+                f"Registry {self.registry_file} contains invalid JSON; starting fresh"
+            )
             return {}
 
     def _save_registry(self, registry: dict[str, Any]) -> None:
@@ -277,7 +301,7 @@ class ProcessRegistry:
             temp_file.write_text(json.dumps(registry, indent=2))
 
             # Set permissions to 0o666 (rw-rw-rw-) so all users can read/write
-            # This is necessary for multi-user environments (e.g., the web client + deep-worker)
+            # This is necessary for multi-user environments (e.g., another local client + deep-worker)
             os.chmod(temp_file, 0o666)
 
             # Atomic replace

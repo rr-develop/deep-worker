@@ -1,7 +1,7 @@
 # DESIGN: Fix `test_get_history_no_limit.py` stub factory after delta-cache
 
 **Status:** 📋 implementation PR
-**Author:** lc6_fix
+**Author:** DeepWorker team
 **Date:** 2026-04-23
 **Related:** `8c2e28d feat(context): delta-based context cache (phases 1+2+3)`,
 `1eee827 fix(summarization): restore _truncate_args_* init after cache

@@ -8,7 +8,7 @@ leaks a whole SDK process, plus the stdio MCP servers that process spawned.
 
 Observed 2026-08-29: one ACP bridge held nine orphaned ``claude`` processes
 (~4.3 GB RSS) whose sessions had ended hours earlier, each still holding its
-own ``repo_graph.mcp`` server.
+own ``the code-graph server.mcp`` server.
 
 These tests pin the three abandonment paths and the capability gate. They
 assert on the WIRE call (``session/close`` for the right id), because that is

@@ -22,7 +22,7 @@ from deep_worker_cli.middleware.tool_completion import (
     TurnEndingToolFlagError,
 )
 
-SPEC = "repo_graph__submit_fragments:document_closed"
+SPEC = "code_graph__submit_fragments:document_closed"
 
 
 def _base_namespace(**overrides) -> argparse.Namespace:

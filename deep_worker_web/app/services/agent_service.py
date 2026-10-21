@@ -78,6 +78,7 @@ from app.schemas.agent_schemas import AgentInfo, AgentStatus, AgentStatusInfo
 from app.utils.supervisor import supervise
 
 from .. import paths
+from deep_worker_cli.exceptions import RegistryReadError
 from deep_worker_cli.storage_paths import (
     agent_root,
     deep_worker_home,
@@ -93,9 +94,9 @@ from deep_worker_cli.stats.token_stats import (
 # ============================================================================
 # CRITICAL: RPYC MUST BE IMPORTED FROM SOURCE CODE, NOT FROM PIP!
 # ============================================================================
-# Import rpyc from a local rpyc_async source checkout to ensure AsyncioServer support
+# Import rpyc from a local rpyc-async checkout source directory to ensure AsyncioServer support
 # ============================================================================
-_rpyc_async_path = Path("/path/to/rpyc_async")
+_rpyc_async_path = Path("a local rpyc-async checkout")
 if _rpyc_async_path.exists() and str(_rpyc_async_path) not in sys.path:
     sys.path.insert(0, str(_rpyc_async_path))
 
@@ -345,9 +346,18 @@ class AgentService:
         # ProcessRegistry is sync (file-based), so we run it in executor
         # to avoid blocking the event loop
         loop = asyncio.get_event_loop()
-        agent_process_infos = await loop.run_in_executor(
-            None, self._registry.list_all
-        )
+        try:
+            agent_process_infos = await loop.run_in_executor(
+                None, self._registry.list_all
+            )
+        except RegistryReadError as e:
+            # An unreadable registry is NOT an empty one. Logging this at
+            # ERROR is the whole point: the previous behaviour reported
+            # "Discovered 0 agents" for a permission problem, which is
+            # indistinguishable from a genuinely empty registry and sent
+            # users hunting through inotify and rpyc instead of `ls -l`.
+            logger.error(f"Cannot read agent registry: {e}")
+            return
 
         logger.info(f"Discovered {len(agent_process_infos)} agents from registry")
 
@@ -368,7 +378,7 @@ class AgentService:
             # session_metadata.json. This is the DURABLE source: it
             # survives even when the agent's live in-memory status has
             # diverged (e.g. error persisted to disk but exposed_get_status
-            # reverted to idle — as seen in a past incident), so the web
+            # reverted to idle — the agent_i 2026-05-20 case), so the web
             # UI shows the error detail on PAGE LOAD instead of an
             # error-with-no-explanation. The live RPyC poll later refreshes
             # this; the disk read just guarantees the snapshot is never
@@ -379,8 +389,8 @@ class AgentService:
             # the 6 context fields synchronously. No broadcast — the page
             # itself reads them straight from the REST response.
             self._fill_context_fields(agent_info)
-            # Same path for the operator-set LIMIT (observed in a past incident
-            # — the UI must show what the operator asked
+            # Same path for the operator-set LIMIT (agent_a
+            # 2026-08-18 — the UI must show what the operator asked
             # for, not the provider default).
             self._fill_context_limit_fields(agent_info)
             logger.debug(f"Registered agent: {proc_info.name} (PID {proc_info.pid}, port {proc_info.rpyc_port})")
@@ -428,7 +438,8 @@ class AgentService:
         visually verify the guard is holding the limit they asked
         for. Without this mirror the UI cannot tell apart "the
         guard is holding 400k" from "the guard is letting the
-        provider's default win" — the very bug seen in a past incident.
+        provider's default win" — the very bug agent_a hit on
+        2026-08-18.
 
         Source of truth: ``<deep_worker_home>/<name>/session_metadata.json``
         → ``launch_config.context_limit``. Same disk file as the
@@ -491,8 +502,8 @@ class AgentService:
         field existed keeps reporting the old shape, and must still be
         described correctly without being restarted.
 
-        Null semantics follow the WorkControl contract
-        (the WorkControl API): ``None`` means
+        Null semantics follow the the task manager contract
+        (``the task-manager API`` commit ``6df91c6``): ``None`` means
         UNKNOWN / not applicable and must NOT be rendered as ``False``.
         With nothing attached there is no switch at all, so ``disabled``
         is ``None`` — ``False`` there would assert "enabled".
@@ -538,7 +549,7 @@ class AgentService:
         Without this fallback the per-agent info bar would render
         ``Model: unknown`` forever for every agent that does not pass
         ``--model`` at start time — see a related internal incident analysis (not included here)
-        (the "Provider: minimax / Model: unknown" regression).
+        (the "Provider: minimax / Model: unknown" regression of 2026-08-17).
         """
         # Build snapshots from disk (cached).
         snapshots = self._load_context_snapshots(info.name)
@@ -552,7 +563,7 @@ class AgentService:
         # Per-turn total from the SAME snapshot record — surfaced as a
         # separate ``Last turn: Xk`` UI row.  Do NOT reuse it as
         # ``agent_context_used`` (that field must be comparable to
-        # ``context_limit``).  Observed in a past incident.
+        # ``context_limit``).  agent_a 2026-08-22.
         info.agent_last_turn_tokens = (
             getattr(agent_snap, "total_tokens", None) if agent_snap else None
         )
@@ -625,7 +636,7 @@ class AgentService:
             # call time (``import_module(...).deep_worker_home``) so the
             # monkeypatch AND the production location both work, AND
             # compose the path manually to avoid the duplication.
-            # See a related internal incident analysis (not included here).
+            # Observed in a past incident (2026-08-17).
             import importlib
             import tempfile
             sp = importlib.import_module("deep_worker_cli.storage_paths")
@@ -1415,14 +1426,14 @@ class AgentService:
                     # path too (not only the subscribe-push path). The
                     # agent's exposed_get_status returns the human-
                     # readable cause under the "error" key when
-                    # status == "error" (observed in a past incident).
+                    # status == "error" (agent_j 2026-05-20).
                     err = response.get("error")
                     if status_str == "error" and err:
                         broadcast_msg["error_message"] = err
                         # Persist into the AgentInfo mirror so
                         # GET /api/agents (page load) and a UI re-select
                         # carry the error detail — not only the live WS
-                        # push. Observed in a past incident.
+                        # push. agent_i 2026-05-20.
                         info.error_message = err
                     else:
                         # Recovered (or no error) → clear so a stale
@@ -2228,7 +2239,7 @@ class AgentService:
                 # all" indistinguishable to every consumer — which is
                 # how a running, enabled TaskManager got reported as
                 # off. Names and null semantics are fixed by the
-                # WorkControl contract (the WorkControl API):
+                # the task manager contract (the task-manager API ``6df91c6``):
                 # ``null`` means UNKNOWN and must not be read as False.
                 **self._task_manager_state_fields(response),
             }
@@ -2717,7 +2728,7 @@ class AgentService:
             # working and its status is unchanged. Forward as a dedicated
             # top-level event so the frontend can show a warning banner
             # WITHOUT touching the agent's displayed status / error panel.
-            # Observed in a past incident.
+            # agent_i 2026-05-22.
             await self._broadcast_message({
                 "type": "channel_quarantined",
                 "agent_name": agent_name,
@@ -2827,9 +2838,17 @@ class AgentService:
         ``_subscribe_to_agent``.
         """
         loop = asyncio.get_event_loop()
-        current_agents = await loop.run_in_executor(
-            None, self._registry.list_all
-        )
+        try:
+            current_agents = await loop.run_in_executor(
+                None, self._registry.list_all
+            )
+        except RegistryReadError as e:
+            # Keep the in-memory map as-is rather than concluding every agent
+            # died: a read failure says nothing about the agents themselves.
+            # Returning (not raising) keeps the inotify monitor armed, so
+            # recovery is automatic once permissions are fixed.
+            logger.error(f"Cannot read agent registry during reconcile: {e}")
+            return
         current_names = {agent.name for agent in current_agents}
         known_names = set(self._agents.keys())
 

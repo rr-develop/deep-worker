@@ -1,4 +1,4 @@
-"""Welcome banner widget for deepagents-cli."""
+"""Welcome banner widget for deep-worker."""
 
 from __future__ import annotations
 

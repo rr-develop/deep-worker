@@ -3,13 +3,13 @@
 WHY THIS EXISTS
 ───────────────────────────────────────────────────────────────────────────
 The web UI's ``Context`` field sat frozen for minutes while a codex agent
-worked and then jumped (owner report 2026-08-25, rg1_worker: 40.9k → 71.7k,
+worked and then jumped (owner report 2026-08-25, agent_a: 40.9k → 71.7k,
 9.5 minutes apart — real records, ``prompt_tokens`` 40884 then 71716).
 
 The cause is not a bug in the gauge but the shape of the transport. The
 provider emits usage in exactly one place, ``TurnCompletedEvent``, and a
 codex *turn* is NOT a model call: it is one prompt → final answer, covering
-the entire internal loop. Measured on rg1_worker's own rollouts: 48
+the entire internal loop. Measured on agent_a's own rollouts: 48
 ``token_count`` events across 4 ``task_complete`` — roughly a dozen model
 calls per turn, whose context growth (18k → 21k → 26k → 27k → 28k …) the UI
 never saw. And the stream cannot help: on codex-cli 0.149.1 both ``--json``
@@ -31,7 +31,7 @@ calls (``turn.completed`` reports the same sum — five calls of ~21.5k came
 back as 108058), and mistaking one for the other is the 2026-08-22
 "507.3k vs -l 250k" defect.
 
-The file is appended DURING the turn — verified live on rg1_worker: +1664
+The file is appended DURING the turn — verified live on agent_a: +1664
 bytes and one new ``token_count`` within 45 s of watching.
 
 WHY A WATCHER AND NOT A TIMER
@@ -41,7 +41,7 @@ knows when the file grows; ``watchfiles`` (a declared dependency, and the
 same mechanism the LSP change-detector uses under
 POLICY_NO_INPROCESS_HEAVY_MCP §3.5) turns inotify events into an async
 iterator. Only the APPENDED bytes are parsed — a long session's rollout is
-megabytes (rg1_worker: 906 KB and growing), so re-reading it per event
+megabytes (agent_a: 906 KB and growing), so re-reading it per event
 would be the polling cost we are avoiding, merely hidden.
 
 Codex's app-server protocol does expose a first-class

@@ -290,7 +290,7 @@ def main() -> int:
                 )
             if SCENARIO == "turn-ending-open":
                 # Regression harness for the mid-turn resume swallow
-                # (rg1_worker, 2026-08-22, 2/2 live). Turn 1 emits a
+                # (agent_a, 2026-08-22, 2/2 live). Turn 1 emits a
                 # turn-ending tool_call and leaves session/prompt
                 # UNRESOLVED — a real CLI keeps the turn open while it
                 # waits for the tool result.

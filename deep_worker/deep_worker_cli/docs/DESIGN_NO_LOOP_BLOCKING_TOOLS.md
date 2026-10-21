@@ -46,7 +46,7 @@ starvation → permanent deadlock.** The agent's loop never ticks again:
 RPyC stops being served, status stays `running` forever, the agent is dead
 to the user.
 
-This was proven live (mj1_init, 2026-06-15): two threads — the agent
+This was proven live (agent_c, 2026-06-15): two threads — the agent
 MainThread and `LanceDBBackgroundEventLoop` — were both parked on the
 **GIL futex** (`_PyRuntime.ceval.gil.mutex`, address inside the
 `_PyRuntime` symbol range), neither able to proceed.
@@ -74,7 +74,7 @@ coming back through new code paths:
   (`project_memory` is a sync `@tool`; the turn coroutine awaits it) … no
   timeout." It fixed the network trigger, not the inline-on-loop root.
 
-**Current regression (mj1_init):** summarization indexing.
+**Current regression (agent_c):** summarization indexing.
 `SummarizationMiddleware.abefore_model` (async, runs on the loop) →
 `_aoffload_to_backend` (async) → `self._on_summarized(path)` →
 `index_all_history_files(...)` — a **fully synchronous LanceDB write run

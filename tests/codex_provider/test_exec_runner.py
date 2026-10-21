@@ -198,17 +198,45 @@ class TestBuildCommandArgs:
         argv = runner.build_argv_for_test(ExecArgs(prompt="hi"))
         assert "--experimental-json" in argv
 
-    def test_sandbox_workspace_write_by_default(self) -> None:
+    def test_sandbox_workspace_write_on_the_bypass_path(self) -> None:
+        """``-s`` rides the bypass path only.
+
+        2f354dd6 (2026-08-25) split the two modes: the CLI rejects
+        ``--approve-for-me`` together with ``-s`` ("cannot be used with
+        --sandbox"), so the sandbox/approval-policy pair is passed only
+        where the CLI accepts it. Without ``-sp`` there is no ``-s`` at all.
+        """
         runner = CodexExecRunner(executable_path="/usr/bin/codex")
-        argv = runner.build_argv_for_test(ExecArgs(prompt="hi"))
-        # -s workspace-write per Q3
+        argv = runner.build_argv_for_test(ExecArgs(prompt="hi", auto_approve=True))
         i = argv.index("-s")
         assert argv[i + 1] == "workspace-write"
 
-    def test_approval_policy_never(self) -> None:
+    def test_no_sandbox_flag_without_auto_approve(self) -> None:
+        """The mirror of the split: passing ``-s`` here would make the CLI
+        reject the whole invocation."""
         runner = CodexExecRunner(executable_path="/usr/bin/codex")
         argv = runner.build_argv_for_test(ExecArgs(prompt="hi"))
-        # --config approval_policy="never" per Q3
+        assert "-s" not in argv
+        assert "--approve-for-me" in argv
+
+    def test_the_two_approval_modes_are_mutually_exclusive(self) -> None:
+        """The CLI REJECTS ``--approve-for-me`` together with ``-s``
+        ("cannot be used with --sandbox"), so emitting it on the bypass
+        path too would make every ``-sp`` invocation fail outright. Each
+        flag must appear on exactly one of the two paths — asserting only
+        its presence on its own path leaves that regression invisible.
+        """
+        runner = CodexExecRunner(executable_path="/usr/bin/codex")
+        plain = runner.build_argv_for_test(ExecArgs(prompt="hi"))
+        bypass = runner.build_argv_for_test(ExecArgs(prompt="hi", auto_approve=True))
+        assert "--approve-for-me" in plain
+        assert "--approve-for-me" not in bypass
+        assert "--dangerously-bypass-approvals-and-sandbox" not in plain
+        assert "--dangerously-bypass-approvals-and-sandbox" in bypass
+
+    def test_approval_policy_never_on_the_bypass_path(self) -> None:
+        runner = CodexExecRunner(executable_path="/usr/bin/codex")
+        argv = runner.build_argv_for_test(ExecArgs(prompt="hi", auto_approve=True))
         joined = " ".join(argv)
         assert 'approval_policy="never"' in joined
 
@@ -217,10 +245,23 @@ class TestBuildCommandArgs:
         without prompts (approval_policy="never" alone only covers shell
         commands; MCP calls get auto-cancelled). Verified live on this
         host. Mirrors claude-code-sdk's ``permission_mode="bypassPermissions"``.
+
+        Since 2f354dd6 it rides ``auto_approve`` (the ``-sp`` flag), exactly
+        like every other provider.
         """
         runner = CodexExecRunner(executable_path="/usr/bin/codex")
-        argv = runner.build_argv_for_test(ExecArgs(prompt="hi"))
+        argv = runner.build_argv_for_test(ExecArgs(prompt="hi", auto_approve=True))
         assert "--dangerously-bypass-approvals-and-sandbox" in argv
+
+    def test_approve_for_me_is_required_without_auto_approve(self) -> None:
+        """Not cosmetic: with neither flag codex announces an MCP tool call
+        and never sends the control request, so every deep-worker tool call
+        hangs for the full 120 s proxy bound (measured live 2026-08-25 —
+        129.5 s for one ``execute``)."""
+        runner = CodexExecRunner(executable_path="/usr/bin/codex")
+        argv = runner.build_argv_for_test(ExecArgs(prompt="hi"))
+        assert "--approve-for-me" in argv
+        assert "--dangerously-bypass-approvals-and-sandbox" not in argv
 
     def test_skip_git_repo_check(self) -> None:
         runner = CodexExecRunner(executable_path="/usr/bin/codex")
@@ -316,7 +357,7 @@ class TestBuildCommandArgs:
 
 
 class TestMcpServerIsolation:
-    """Per-agent MCP server isolation (learned from a related internal incident).
+    """Per-agent MCP server isolation (agent_j incident 2026-05-20).
 
     ROOT CAUSE of that incident: the provider used to register its proxy
     MCP server into the GLOBAL ``~/.codex/config.toml`` via
@@ -354,7 +395,7 @@ class TestMcpServerIsolation:
             "codex exec must pass --ignore-user-config so it does not load "
             "the shared ~/.codex/config.toml and inherit stale "
             "deepworker_<pid> MCP servers from other agents "
-            "(observed live)"
+            "(agent_j incident 2026-05-20)"
         )
 
     def test_own_mcp_server_injected_when_provided(self) -> None:

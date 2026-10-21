@@ -125,7 +125,7 @@ class CLIShellBackend(LocalShellBackend):
         self._jobs: dict[str, _BackgroundJob] = {}
         # Alias map: the originating tool call's ``tool_use_id`` → canonical
         # ``job_N``. Background jobs are keyed in ``_jobs`` by ``job_N`` only;
-        # this lets the model reach a job by EITHER id. See the mj2_vac
+        # this lets the model reach a job by EITHER id. See the agent_d
         # incident (2026-06-17): the model passed the execute call's
         # ``toolu_…`` tool_use_id instead of the advertised ``job_1`` and got
         # "no background job" forever. Both id spaces must resolve.
@@ -430,7 +430,7 @@ class CLIShellBackend(LocalShellBackend):
                 self._jobs[job_id] = bg_job
                 # Also reach this job by the originating tool_use_id, so the
                 # model can't get stuck if it passes ``toolu_…`` instead of
-                # the advertised ``job_N`` (mj2_vac, 2026-06-17).
+                # the advertised ``job_N`` (agent_d, 2026-06-17).
                 if _tool_use_id and _tool_use_id != job_id:
                     self._job_aliases[_tool_use_id] = job_id
                 self._register_shared(job_id, _tool_use_id, job=bg_job)

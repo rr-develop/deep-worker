@@ -1,6 +1,6 @@
 """Tests for the context-limit lookup helpers in ``deep_worker_cli.config``.
 
-These pin the resolution order (rg1_worker 2026-08-18 lesson):
+These pin the resolution order (agent_a 2026-08-18 lesson):
 
   1. ``model_profile["max_input_tokens"]`` (LangChain SDK introspected
      value, authoritative). This is the runtime source — it
@@ -35,7 +35,7 @@ class TestProviderContextLimitsIsFallbackOnly:
     """As of 2026-08-19, PROVIDER_CONTEXT_LIMITS is a thin fallback
     shell with only the ``default`` key. All specific model
     values come from the LangChain SDK profile data, not from
-    a hand-curated dict. The rg1_worker 2026-08-18 regression
+    a hand-curated dict. The agent_a 2026-08-18 regression
     proved that hand-curated values go stale the moment a
     provider ships a new generation.
     """

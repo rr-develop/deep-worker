@@ -33,6 +33,15 @@ class RegistryLockError(RegistryError):
     """Raised when unable to acquire registry lock."""
 
 
+class RegistryReadError(RegistryError):
+    """Raised when the registry file exists but cannot be read.
+
+    Distinct from corrupted content: the registry may hold live agents and
+    only the read failed (EACCES/EIO). Callers must not treat this as an
+    empty registry — doing so reports "no agents" for a permission problem.
+    """
+
+
 class ProcessNotAliveError(DeepWorkerError):
     """Raised when attempting to interact with a dead process."""
 

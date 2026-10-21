@@ -76,7 +76,7 @@ pytestmark = [
 
 def _isolate_state() -> None:
     """Wipe process-global grok state so tests don't interfere."""
-    from deep_worker.providers.grok_provider.client_state import get_global_client_state
+    from deep_worker.providers.acp.client_state import get_global_client_state
 
     cs = get_global_client_state()
     cs._states.clear()  # type: ignore[attr-defined]
@@ -97,7 +97,7 @@ async def _cleanup_grok_globals():  # pyright: ignore[reportUnusedFunction]
     """
     _isolate_state()
     yield
-    import deep_worker.providers.grok_provider.proxy_mcp_server as proxy_mod
+    import deep_worker.providers.acp.proxy_mcp_server as proxy_mod
 
     proxy = proxy_mod._global_proxy  # type: ignore[attr-defined]
     if proxy is not None:
@@ -270,7 +270,7 @@ async def test_hello_world_no_tools() -> None:
     that grok produced SOME non-empty answer — not an exact word, since grok
     paraphrases freely (e.g. 'Say HELLO' → 'UNDERSTOOD')."""
     from deep_worker.providers.grok_provider import GrokChatModel
-    from deep_worker.providers.grok_provider.client_state import get_global_client_state
+    from deep_worker.providers.acp.client_state import get_global_client_state
 
     m = GrokChatModel(working_dir=os.getcwd())
     cfg: RunnableConfig = {"configurable": {"thread_id": "test_hello"}}
@@ -303,7 +303,7 @@ async def test_multi_turn_memory() -> None:
     grok may use built-ins (it sometimes inspects its MCP folder) without
     breaking the assertion."""
     from deep_worker.providers.grok_provider import GrokChatModel
-    from deep_worker.providers.grok_provider.client_state import get_global_client_state
+    from deep_worker.providers.acp.client_state import get_global_client_state
 
     m = GrokChatModel(working_dir=os.getcwd())
     cfg: RunnableConfig = {"configurable": {"thread_id": "test_memory"}}
@@ -352,8 +352,8 @@ async def _simulate_restart(model: Any) -> None:
     provider must session/load it (or fall back) instead of prompting a
     never-created session. This is the eab3e7b bug, exercised live.
     """
-    import deep_worker.providers.grok_provider.client_state as cs_mod
-    import deep_worker.providers.grok_provider.proxy_mcp_server as proxy_mod
+    import deep_worker.providers.acp.client_state as cs_mod
+    import deep_worker.providers.acp.proxy_mcp_server as proxy_mod
 
     with _suppress():
         await model._acp_client.aclose()
@@ -377,7 +377,7 @@ async def test_restart_resume_recalls_memory() -> None:
     grok-side conversation.
     """
     from deep_worker.providers.grok_provider import GrokChatModel
-    from deep_worker.providers.grok_provider.client_state import get_global_client_state
+    from deep_worker.providers.acp.client_state import get_global_client_state
 
     tid = "test_restart_resume"
     secret = "ZEBRA-4242"
@@ -594,7 +594,7 @@ async def test_summarization_starts_fresh_session() -> None:
     lesson L3). This is the live counterpart to test_session_state's unit
     coverage of record_summarization."""
     from deep_worker.providers.grok_provider import GrokChatModel
-    from deep_worker.providers.grok_provider.client_state import get_global_client_state
+    from deep_worker.providers.acp.client_state import get_global_client_state
 
     m = GrokChatModel(working_dir=os.getcwd())
     cfg: RunnableConfig = {"configurable": {"thread_id": "test_summarize"}}
@@ -638,7 +638,7 @@ async def test_summarization_starts_fresh_session() -> None:
 async def test_thread_isolation() -> None:
     """Two agent_thread_ids must not share grok session state (lesson L1)."""
     from deep_worker.providers.grok_provider import GrokChatModel
-    from deep_worker.providers.grok_provider.client_state import get_global_client_state
+    from deep_worker.providers.acp.client_state import get_global_client_state
 
     m = GrokChatModel(working_dir=os.getcwd())
     cfg_a: RunnableConfig = {"configurable": {"thread_id": "agent_main"}}

@@ -149,7 +149,7 @@ def _drop_orphaned_tool_messages(messages: list) -> tuple[list, list[str]]:
     ``ToolMessage`` whose ``AIMessage`` no longer exists. Both shapes are
     rejected by the provider, but only the first had a fix.
 
-    How an orphan is produced (repo_graph ingest, 2026-09-23): a
+    How an orphan is produced (the code-graph server ingest, 2026-09-23): a
     ``--sum-query`` run wipes the whole message channel via
     ``RemoveMessage(REMOVE_ALL_MESSAGES)`` (agent_process.py:2529). The wipe
     is atomic over what it can see, so it removes the ``AIMessage`` and its

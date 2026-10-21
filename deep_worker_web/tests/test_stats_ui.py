@@ -185,4 +185,3 @@ def test_stats_copy_button_disabled_on_error(page: Page, server: str) -> None:
     page.wait_for_timeout(500)
     expect(page.locator(".error-panel")).to_be_visible()
     expect(page.locator("#copy-btn")).to_be_disabled()
-_disabled()

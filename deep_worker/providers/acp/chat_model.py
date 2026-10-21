@@ -783,7 +783,7 @@ class AcpChatModel(BaseChatModel):
         # (session_cancel the still-open response, clear queued state),
         # then fall through to step 10 (case c: session already live) so
         # step 11 builds a proper second session/prompt with the new
-        # user text. (Observed in 2/2 live captures + repo_graph extractor.)
+        # user text. (Observed in 2/2 live captures + the code-graph server extractor.)
         if (tool_resolved or saw_builtin_resume) and (
             state.pending_session_prompt_future is not None
         ):

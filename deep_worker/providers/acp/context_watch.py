@@ -5,7 +5,7 @@ nothing here. grok sends none at all — verified live on 1.0.5: a whole turn
 yields only ``user_message_chunk``, ``agent_thought_chunk``,
 ``agent_message_chunk`` and ``available_commands_update`` — and its
 ``_meta`` arrives once, with the ``session/prompt`` reply. Between those two
-points a grok turn can run a dozen model calls; on rg1_worker eight of them
+points a grok turn can run a dozen model calls; on agent_a eight of them
 carried the context from 260740 to 274277 with nothing recorded, past the
 operator's ``-l 250000``.
 

@@ -21,7 +21,7 @@ from deep_worker_cli.config import (
 class TestProviderContextLimits:
     """Tests for PROVIDER_CONTEXT_LIMITS mapping.
 
-    Architectural shift (rg1_worker 2026-08-18 → 2026-08-19):
+    Architectural shift (agent_a 2026-08-18 → 2026-08-19):
     ---------------------------------------------------------
     As of the 2026-08-19 fix, PROVIDER_CONTEXT_LIMITS contains
     ONLY the ``default`` entry. Hand-curated values for specific
@@ -63,7 +63,7 @@ class TestProviderContextLimits:
                 f"family alias {alias!r} in PROVIDER_CONTEXT_LIMITS. "
                 f"Family aliases must resolve via model_profile (the "
                 f"current generation's value), not via a static dict "
-                f"entry. The rg1_worker 2026-08-18 lesson."
+                f"entry. The agent_a 2026-08-18 lesson."
             )
 
 
@@ -107,7 +107,7 @@ class TestGetModelContextLimit:
     def test_profile_with_non_int_max_input_tokens_falls_through(self) -> None:
         """A profile with ``max_input_tokens`` set to a non-int
         (e.g. ``None``) falls through to the default. This is
-        the rg1_worker 2026-08-18 belt-and-braces guard: the
+        the agent_a 2026-08-18 belt-and-braces guard: the
         downstream code only accepts ints, so an unexpected
         type from a future SDK is silently ignored rather than
         corrupting the trigger calculation."""

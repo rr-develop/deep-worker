@@ -36,6 +36,8 @@ from pathlib import Path
 
 import pytest
 
+pytest.importorskip("llama_index")  # semantic-search extra; absent in CI
+
 from deep_worker.providers.semantic_search.indexer import index_repository
 from deep_worker.providers.semantic_search.retriever import search
 

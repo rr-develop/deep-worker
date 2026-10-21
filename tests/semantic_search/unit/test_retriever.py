@@ -6,6 +6,8 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+pytest.importorskip("llama_index")  # semantic-search extra; absent in CI
+
 from llama_index.core.embeddings.mock_embed_model import MockEmbedding
 from llama_index.core.schema import NodeRelationship, RelatedNodeInfo
 

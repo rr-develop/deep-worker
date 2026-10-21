@@ -55,14 +55,14 @@ class TestIterSummaryFiles:
 
     def test_lists_one_agent_one_thread(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HOME", str(tmp_path))
-        f = deep_worker_home(tmp_path) / "agent_a" / "summaries" / "agent_a.md"
+        f = deep_worker_home(tmp_path) / "agent_1" / "summaries" / "agent_1.md"
         _write_summary(f, ["2026-04-22T15:40:18.122420+00:00"])
         items = list(iter_summary_files())
         assert len(items) == 1
         info = items[0]
         assert isinstance(info, SummaryFileInfo)
-        assert info.agent == "agent_a"
-        assert info.thread == "agent_a"
+        assert info.agent == "agent_1"
+        assert info.thread == "agent_1"
         assert info.path == f
         assert info.events == 1
         assert info.size > 0

@@ -70,6 +70,8 @@ from deep_worker_cli.lsp.service.registry import (
     ServiceRegistry,
 )
 
+from deep_worker_cli.lsp.service import child_death
+
 _DEFAULT_START_TIMEOUT_S: Final = 30.0
 _STOP_TERM_WAIT_S: Final = 2.0
 _LOCK_FILENAME: Final = ".spawn.lock"
@@ -347,27 +349,10 @@ class _slug_lock:
                 self._fd = None
 
 
-def _blocking_waitpid(pid: int) -> None:
-    """Block in a worker thread until ``pid`` exits.
-
-    Used as the no-pidfd fallback for child-death detection on CPython
-    builds where ``os.pidfd_open`` is unavailable (it needs
-    ``<sys/pidfd.h>`` at compile time — uv-installed CPython 3.11.14
-    ships without it).  Runs to completion once the kernel reaps the
-    child; ``WNOHANG`` is NOT used, so we never busy-loop.  Idempotent
-    against ECHILD: by the time this is called, the child has either
-    been reaped by its real parent (and the call raises
-    ``ChildProcessError``, which we swallow) or still belongs to us
-    and we block until it dies.
-    """
-    while True:
-        try:
-            waited_pid, _status = os.waitpid(pid, 0)
-        except ChildProcessError:
-            # Already reaped (e.g. by a previous test teardown).
-            return
-        if waited_pid == pid:
-            return
+#: Shared with the other supervisors — see
+#: ``deep_worker_cli.lsp.service.child_death`` for why the no-pidfd
+#: fallback exists and why it is not a poll.
+_blocking_waitpid = child_death.blocking_waitpid
 
 
 def _wait_pid_exit(pid: int, timeout_s: float) -> bool:

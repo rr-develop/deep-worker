@@ -17,6 +17,7 @@ grok binary, no sockets).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import sys
 from pathlib import Path
 
@@ -31,12 +32,16 @@ _pkg_root = Path(__file__).resolve().parent.parent.parent
 if str(_pkg_root) not in sys.path:
     sys.path.insert(0, str(_pkg_root))
 
-from deep_worker.providers.grok_provider import chat_model as cm  # noqa: E402
-from deep_worker.providers.grok_provider.builtin_tool_passthrough import (  # noqa: E402
-    GROK_BUILTIN_MARKER,
-)
+from deep_worker.providers.acp import chat_model as acp_cm  # noqa: E402
 from deep_worker.providers.grok_provider.chat_model import GrokChatModel  # noqa: E402
-from deep_worker.providers.grok_provider.client_state import GrokClientState  # noqa: E402
+# The ToolMessage marker: ``GROK_BUILTIN_MARKER`` is still exported by the
+# grok module (it is an alias of the shared ``BUILTIN_MARKER`` = "acp_builtin"
+# since 3fe834d1), but the production stamper and the production reader both
+# use the shared constant — import it from there so a divergence between the
+# two spellings fails this test instead of hiding behind the alias.
+from deep_worker.providers.acp.builtin_tool_passthrough import (  # noqa: E402
+    BUILTIN_MARKER,
+)
 # The shared fakes live in the sibling test module. This directory has no
 # __init__.py (pytest rootdir-relative collection), and the old
 # ``deep_worker.providers.grok_provider.tests`` package no longer exists —
@@ -49,6 +54,7 @@ if str(_here) not in sys.path:
 from test_chat_model import (  # noqa: E402
     _FakeAcpClient,
     _FakeProxy,
+    install_client_state,
 )
 
 
@@ -60,8 +66,7 @@ def fake_home(tmp_path, monkeypatch):
 
 @pytest.fixture()
 def model(fake_home, monkeypatch):
-    cs = GrokClientState()
-    monkeypatch.setattr(cm, "get_global_client_state", lambda: cs)
+    cs = install_client_state(monkeypatch)
     m = GrokChatModel(model="grok-4")
     m._client_state = cs
     m._acp_client = _FakeAcpClient()
@@ -120,7 +125,7 @@ class TestPumpResolvesBuiltinFuture:
         # The pump resolves the Future without any further ainvoke.
         result = await asyncio.wait_for(fut, timeout=1)
         assert "total 0" in result["text"]
-        assert result["grok_meta"]["exit_code"] == 0
+        assert result["meta"]["exit_code"] == 0
 
 
 class TestNextAinvokeAdoptsPump:
@@ -159,7 +164,7 @@ class TestNextAinvokeAdoptsPump:
                 {"id": "tc-builtin", "name": "Shell",
                  "args": {"command": "ls -la"}, "type": "tool_call"}]),
             ToolMessage(content="ok", tool_call_id="tc-builtin",
-                        additional_kwargs={GROK_BUILTIN_MARKER: True}),
+                        additional_kwargs={BUILTIN_MARKER: True}),
         ]
         final: AIMessage = await asyncio.wait_for(
             model.ainvoke(messages, config=_cfg("agentA")), timeout=1
@@ -198,7 +203,7 @@ class TestNextAinvokeAdoptsPump:
                 {"id": "tc-builtin", "name": "Shell",
                  "args": {"command": "ls -la"}, "type": "tool_call"}]),
             ToolMessage(content="ok", tool_call_id="tc-builtin",
-                        additional_kwargs={GROK_BUILTIN_MARKER: True}),
+                        additional_kwargs={BUILTIN_MARKER: True}),
         ]
         nxt: AIMessage = await asyncio.wait_for(
             model.ainvoke(messages, config=_cfg("agentA")), timeout=1
@@ -209,29 +214,79 @@ class TestNextAinvokeAdoptsPump:
 
 class TestPumpCancellation:
     async def test_summarization_cancels_pump(self, model):
-        """A mid-turn pump must be cancelled when the next ainvoke detects a
-        summarization (shorter message list) — its session is being dropped."""
+        """A mid-turn pump must be cancelled when its session is dropped by a
+        summarization — otherwise it keeps draining a dead queue and the next
+        turn inherits the pre-summary session's text.
+
+        Driven through the production route, ``areset_after_summary``
+        (SummarizerPort). The fork had no port at all, so the only way to
+        reach this reset was ainvoke's implicit shorter-list detection; that
+        detection is a safety net now, covered by the sibling test below.
+        """
         acp, sid, _msg = await _start_builtin_turn(model)
         st = model._client_state.get("agentA")
         pump = st.pump_task
         assert pump is not None and not pump.done()
-        # Inflate sent_count so the next (shorter) call trips summarization.
-        st.sent_count = 50
 
+        await model.areset_after_summary(thread_id="agentA")
+
+        assert pump.cancelled() or pump.done()
+        st2 = model._client_state.get("agentA")
+        assert st2 is st  # same slot: the thread id is never rotated
+        assert st2.pump_task is None
+        assert st2.session_id is None
+
+        # The next turn runs on a brand-new session and is unaffected.
         task = asyncio.create_task(
             model.ainvoke([HumanMessage(content="fresh start")],
                           config=_cfg("agentA"))
         )
         await asyncio.sleep(0.01)
-        assert pump.cancelled() or pump.done()
-        st2 = model._client_state.get("agentA")
-        assert st2.pump_task is None
-        sid = f"sess-{acp.session_counter}"
-        acp.push_update(sid, {"sessionUpdate": "agent_message_chunk",
-                              "content": {"text": "ok"}})
+        new_sid = f"sess-{acp.session_counter}"
+        assert new_sid != sid
+        acp.push_update(new_sid, {"sessionUpdate": "agent_message_chunk",
+                                  "content": {"text": "ok"}})
         await asyncio.sleep(0.01)
         acp.finish("end_turn")
-        await asyncio.wait_for(task, timeout=1)
+        final = await asyncio.wait_for(task, timeout=1)
+        assert final.content == "ok"
+
+    async def test_safety_net_cancels_pump_and_refuses_to_reprompt(self, model):
+        """The ainvoke-side safety net: a shorter message list without a
+        preceding ``areset_after_summary``.
+
+        It must still cancel the pump and reset the slot, but it may NOT fall
+        through into a fresh session/prompt — that would re-send the whole
+        visible history (incident 2026-08-19). So it raises
+        ``AcpSummarizationResetRequired`` and the next turn starts clean.
+        """
+        acp, _sid, _msg = await _start_builtin_turn(model)
+        st = model._client_state.get("agentA")
+        pump = st.pump_task
+        assert pump is not None and not pump.done()
+        sessions_before = len(acp.session_new_calls)
+        prompts_before = len(acp.prompts)
+        # Inflate sent_count so the next (shorter) call trips the net.
+        st.sent_count = 50
+
+        # Bounded for the same reason as the sibling assertion in
+        # test_chat_model: the regression being pinned is a fall-through into
+        # a fresh session/prompt that nothing here resolves, which hangs
+        # rather than fails if left unbounded.
+        with pytest.raises(acp_cm.AcpSummarizationResetRequired):
+            await asyncio.wait_for(
+                model.ainvoke([HumanMessage(content="fresh start")],
+                              config=_cfg("agentA")),
+                timeout=2,
+            )
+
+        assert pump.cancelled() or pump.done()
+        assert st.pump_task is None
+        assert st.session_id is None
+        assert st.sent_count == 0
+        # No second session and no prompt were fired on the way out.
+        assert len(acp.session_new_calls) == sessions_before
+        assert len(acp.prompts) == prompts_before
 
     async def test_channel_a_does_not_start_pump(self, model):
         """A proxy-MCP (channel A) tool_call must NOT spawn a pump — its
@@ -285,6 +340,48 @@ class TestPumpCancellation:
         assert "ran it" in final.content
         assert st.pump_task is None
 
+    async def test_start_pump_cancels_the_previous_one(self, model):
+        """``_start_pump`` must cancel a live pump before spawning the next
+        one, or the notification queue gets TWO consumers and each update is
+        delivered to whichever task wins the race.
+
+        This covers the second cancellation site (``_start_pump``'s
+        single-consumer guard) — the sibling tests in this class reach the
+        other one (``_adopt_pump``, via ``areset_after_summary`` and the
+        ainvoke safety net), so without this test the guard is unpinned:
+        neutering ``_cancel_pump`` entirely leaves the whole suite green.
+
+        Both arms are asserted, because "the old task is cancelled" alone
+        survives a mutation that cancels unconditionally and never spawns a
+        replacement:
+          * the OLD task ends up cancelled, and
+          * a NEW, distinct, live task owns the slot afterwards.
+        """
+        st = model._client_state.get_or_create("agentA")
+        model._start_pump(st, "agentA")
+        first = st.pump_task
+        assert first is not None and not first.done()
+
+        model._start_pump(st, "agentA")
+        second = st.pump_task
+
+        # Arm 2: the slot holds a different, live task.
+        assert second is not None
+        assert second is not first
+        assert not second.done()
+
+        # Arm 1: the displaced task is actually cancelled, not merely dropped
+        # on the floor (a leaked task would keep draining the same queue).
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(first, timeout=1)
+        assert first.cancelled()
+
+        # Teardown only: ``second`` may already have finished on its own (the
+        # fake queue is empty), so this is not an oracle — just don't leak it.
+        model._cancel_pump(st)
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.wait_for(second, timeout=1)
+
 
 class TestNoHangRegression:
     async def test_full_builtin_roundtrip_does_not_hang(self, model):
@@ -316,7 +413,7 @@ class TestNoHangRegression:
                      "args": {"command": "ls -la /tmp"},
                      "type": "tool_call"}]),
                 ToolMessage(content="12 files", tool_call_id="tc-builtin",
-                            additional_kwargs={GROK_BUILTIN_MARKER: True}),
+                            additional_kwargs={BUILTIN_MARKER: True}),
             ]
             return await model.ainvoke(messages, config=_cfg("agentA"))
 

@@ -680,7 +680,7 @@ async def list_threads_command(
     agent_name: str | None = None,
     limit: int = 20,
 ) -> None:
-    """CLI handler for `deepagents threads list`.
+    """CLI handler for `deep-worker threads list`.
 
     Fetches and displays a table of recent conversation threads, optionally
     filtered by agent name.
@@ -700,7 +700,7 @@ async def list_threads_command(
             )
         else:
             console.print("[yellow]No threads found.[/yellow]")
-        console.print("[dim]Start a conversation with: deepagents[/dim]")
+        console.print("[dim]Start a conversation with: deep-worker[/dim]")
         return
 
     title = (
@@ -731,7 +731,7 @@ async def list_threads_command(
 
 
 async def delete_thread_command(thread_id: str) -> None:
-    """CLI handler for: deepagents threads delete."""
+    """CLI handler for: deep-worker threads delete."""
     deleted = await delete_thread(thread_id)
 
     if deleted:

@@ -43,12 +43,12 @@ Working example (tool name verified from the live `rg_extractor` agent's `mcp.js
 ```
 deep-worker rg_extractor --provider deepseek --model deepseek-chat \
     --dir /path/to/workdir -m -sp \
-    --turn-ending-tool repo_graph__submit_fragments:document_closed
+    --turn-ending-tool code_graph__submit_fragments:document_closed
 ```
 
 ⚠️ Earlier revisions of this document printed `--provider deepworker_a2a --model gpt-5-mini` here. That is NOT an accepted `--provider` value (`argparse` choices are `deepseek`, `gemini`, `openai`, `claude-code-sdk`, `codex`, `grok`), so the command could not be run verbatim. Caught by the consumer during live acceptance, 2026-08-13. Lesson: a documented command is only "verified" if it was actually executed.
 
-The registered name is the **graph-side** name (post-mangling). For an external MCP server named `<server>` exposing tool `<tool>`, the graph name is `mangle(f"{server}.{tool}")` (see `deep_worker_cli/external_mcp/mangler.py:40` — replaces `.` and `/` with `__`). For `repo_graph` + `submit_fragments` that is `repo_graph__submit_fragments`. Users MUST NOT pass the provider-visible form (`mcp__…`); the middleware matches on `ToolMessage.name`, which carries the graph name, not the invocation form.
+The registered name is the **graph-side** name (post-mangling). For an external MCP server named `<server>` exposing tool `<tool>`, the graph name is `mangle(f"{server}.{tool}")` (see `deep_worker_cli/external_mcp/mangler.py:40` — replaces `.` and `/` with `__`). For the code-graph MCP server + `submit_fragments` that is `code_graph__submit_fragments`. Users MUST NOT pass the provider-visible form (`mcp__…`); the middleware matches on `ToolMessage.name`, which carries the graph name, not the invocation form.
 
 ### 3.2 Value parsing
 
@@ -173,7 +173,7 @@ Modeled 1-for-1 on `--mcp-config`. Three touch points in `agent_command.py`:
    ```python
    "turn_ending_tools": list(getattr(args, "turn_ending_tools", None) or []),
    ```
-   Values are stored as the raw CLI strings (`"repo_graph__submit_fragments:document_closed"`), not as parsed `TurnEndingTool` objects. This is on purpose: the format is stable, human-readable in `session_metadata.json`, and re-parsed on each start — mirroring what `--mcp-server` already does with its inline JSON strings.
+   Values are stored as the raw CLI strings (`"code_graph__submit_fragments:document_closed"`), not as parsed `TurnEndingTool` objects. This is on purpose: the format is stable, human-readable in `session_metadata.json`, and re-parsed on each start — mirroring what `--mcp-server` already does with its inline JSON strings.
 
 2. **`merge_restart_config()` (`agent_command.py:329+`, after the existing MCP block):**
    ```python
@@ -323,7 +323,7 @@ New unit tests in `tests/unit_tests/`. Legacy tests must stay green with zero ed
 - `test_merge_restart_empty_cli_does_not_override` — saved `["foo:bar"]` + CLI `[]` → saved wins (matches `--mcp-config` behavior).
 - **`test_restart_round_trip_preserves_specs`** — executable round-trip the reviewer required for the deferred channel:
   ```python
-  original = argparse.Namespace(turn_ending_tools=["repo_graph__submit_fragments:document_closed"], ...)
+  original = argparse.Namespace(turn_ending_tools=["code_graph__submit_fragments:document_closed"], ...)
   saved = build_launch_config(original)
   effective = merge_restart_config(saved, argparse.Namespace(...))  # no CLI override
   rebuilt = build_launch_config(effective)
@@ -354,15 +354,15 @@ New unit tests in `tests/unit_tests/`. Legacy tests must stay green with zero ed
   3. every `turn_ending_tool_not_found` line names a tool NOT in it;
   4. `candidates=[...]` on each miss line is a subset of it.
   Inventory names are read the same way the product does, via the `"name"` key. This proves diagnostics classify against the SAME metadata the rest of startup uses — not a test-local inventory.
-- `test_registered_and_not_found_events_format` — with the seam captured as above and specs `["repo_graph__submit_fragments:document_closed", "typo__submit"]`, `caplog` shows:
-  - one INFO line matching `^turn_ending_tool_registered name=repo_graph__submit_fragments$`,
-  - one WARNING line matching `^turn_ending_tool_not_found name=typo__submit candidates=\[.*\]$` with `repo_graph__submit_fragments` first in the candidates list.
+- `test_registered_and_not_found_events_format` — with the seam captured as above and specs `["code_graph__submit_fragments:document_closed", "typo__submit"]`, `caplog` shows:
+  - one INFO line matching `^turn_ending_tool_registered name=code_graph__submit_fragments$`,
+  - one WARNING line matching `^turn_ending_tool_not_found name=typo__submit candidates=\[.*\]$` with `code_graph__submit_fragments` first in the candidates list.
 - `test_no_events_when_no_specs` — empty specs list, no `turn_ending_tool_*` lines at all.
 - **`test_start_orders_extract_then_diagnostics_then_prewarm`** **[R1 gap 3, R3]** — the PRODUCTION ordering guard. Parses `AgentProcess.start()`'s AST; asserts exactly one `_extract_final_tool_metadata` assignment, one `_log_turn_ending_tool_diagnostics` call and one `_prewarm_client_manager` call, then compares their real `lineno` values (`extract < diagnostics < prewarm`). Fails if a refactor moves the emit before the inventory or after the prewarm. Structural because no test in the suite runs `start()` end-to-end (see `test_provider_capability_guards_in_start.py` for the same, pre-existing constraint).
 - `test_diagnostics_run_between_inventory_and_prewarm` — the behavioural companion: replays the three REAL methods through monkeypatched seams and asserts the observed call order plus that the diagnostic receives the extracted inventory. On its own it could not detect a production reordering (the test chooses the order), which is why the AST guard above is the normative one.
 - `test_start_calls_diagnostics_with_the_extracted_inventory` — argument provenance: the diagnostic's argument must be the `Name` bound to `_extract_final_tool_metadata`'s return value, not an inline expression or a second independent lookup.
 - `test_metadata_may_be_dicts` — the inventory entries are `dict`s on non-claude providers; the diagnostic must resolve names through `_tool_metadata_name()` and report `registered`, not a false `not_found`.
-- `test_candidates_ranked_by_suffix_similarity` — inventory `["repo_graph__submit_fragments", "other__unrelated"]`, spec `["repo_graph__submit_fragment"]` (missing trailing s) → `candidates[0] == "repo_graph__submit_fragments"`.
+- `test_candidates_ranked_by_suffix_similarity` — inventory `["code_graph__submit_fragments", "other__unrelated"]`, spec `["code_graph__submit_fragment"]` (missing trailing s) → `candidates[0] == "code_graph__submit_fragments"`.
 - **`test_candidates_deterministic_tie_break`** **[R1 gap 3]** — inventory `["abc", "acb", "bca"]`, spec `["axx"]` — construct so at least two candidates share the same similarity score. Assert `candidates` uses `(-score, name)` tie-break: same-score candidates appear in ascending alphabetical order. Same run repeated 5 times must produce identical output.
 - `test_empty_inventory_yields_empty_candidates` — inventory `[]`, spec `["foo"]` → `candidates=[]` in the WARNING line.
 
@@ -399,7 +399,7 @@ Owner has resolved:
 6. GREEN: `AgentProcess.__init__` kwarg with SYNCHRONOUS parse (raises on invalid, spies show no resource allocation on failure); attribute stores parsed list; `.start()` no longer parses.
 7. RED: diagnostics tests including the metadata-seam test and ordering guard.
 8. GREEN: diagnostics helper called immediately after `_extract_final_tool_metadata()` returns; consumes that return value; deterministic tie-break (score desc, name asc).
-9. README section with the `rg_extractor` example (`repo_graph__submit_fragments:document_closed`).
+9. README section with the `rg_extractor` example (`code_graph__submit_fragments:document_closed`).
 10. Full suite `tests/unit_tests` — baseline **2911 passed / 0 failed / 5 skipped preserved** (021c5f8 baseline), plus ~37 new tests. Never pass `-p` (argparse prefix collision yields 26 false failures).
 11. CODE REVIEW REQUEST → CODE SIGN OFF (hard gate) → single commit to `dev`. No FF to `master` without explicit user permission.
 
@@ -416,14 +416,14 @@ Both findings are about MY claims overreaching the evidence, not about the evide
 
 ### rev 7 (2026-08-13) — live acceptance by the consumer
 
-Shipped as `aa70703` (`dev`, fast-forwarded to `master`) and exercised end-to-end against a live `repo_graph` MCP endpoint. **Accepted with zero behavioural deviations.** Verbatim evidence from the consumer:
+Shipped as `aa70703` (`dev`, fast-forwarded to `master`) and exercised end-to-end against a live `the code-graph server` MCP endpoint. **Accepted with zero behavioural deviations.** Verbatim evidence from the consumer:
 
 ```
-16:45:27 INFO  external MCP server 'repo_graph': 2 tools loaded
+16:45:27 INFO  external MCP server 'the code-graph server': 2 tools loaded
 16:45:27 INFO  external MCP pool ready for rg_extractor: 2 adapter tool(s)
-16:45:30 INFO  turn_ending_tool_registered name=repo_graph__submit_fragments
+16:45:30 INFO  turn_ending_tool_registered name=code_graph__submit_fragments
 
-16:49:37 WARNING turn_ending_tool_not_found name=repo_graph__submit_fragments candidates=['restart_agent', 'read_image', 'send_message_to_agent', 'edit_file', 'read_file', 'write_file', 'write_todos', 'restart_self']
+16:49:37 WARNING turn_ending_tool_not_found name=code_graph__submit_fragments candidates=['restart_agent', 'read_image', 'send_message_to_agent', 'edit_file', 'read_file', 'write_file', 'write_todos', 'restart_self']
 ```
 
 What this timeline does and does not prove. The `registered` marker at 16:45:30 lands AFTER "external MCP pool ready" at 16:45:27, which establishes ONE thing: the diagnostic did not run before external-MCP readiness, so the healthy case produced no false `not_found` while the pool was still connecting. That is the failure mode §3.4 warns about, and it is the reason both events are emitted at a single late point.

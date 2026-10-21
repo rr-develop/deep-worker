@@ -1,4 +1,4 @@
-"""Context-limit guarantee (rg1_worker 2026-08-18).
+"""Context-limit guarantee (agent_a 2026-08-18).
 
 See ``docs/DESIGN_CONTEXT_LIMIT_GUARANTEE.md``.
 

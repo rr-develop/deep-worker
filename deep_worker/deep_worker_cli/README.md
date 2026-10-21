@@ -7,6 +7,12 @@ This is a fork of [LangChain's `deepagents-cli`](https://github.com/langchain-ai
 renamed to `deep-worker` and extended with additional providers, tools, and
 infrastructure (see the root [README](../../README.md) for the component map).
 
+## Requirements
+
+Python `>=3.11`, Linux kernel `>=4.19` (WSL2 included). See
+[`docs/REQUIREMENTS.md`](docs/REQUIREMENTS.md) — it also lists the syscalls
+that postdate that floor and must stay optional.
+
 ## Quick Install
 
 There are two supported ways to use `deep-worker`:
@@ -255,7 +261,7 @@ their own, so they use the repeatable `--turn-ending-tool` flag instead:
 ```bash
 deep-worker rg_extractor --provider deepseek --model deepseek-chat \
     --dir /path/to/workdir -m -sp \
-    --turn-ending-tool repo_graph__submit_fragments:document_closed
+    --turn-ending-tool code_graph__submit_fragments:document_closed
 ```
 
 | Value | Predicate |
@@ -278,8 +284,8 @@ loudly instead of silently producing a second, near-identical declaration.
 
 ⚠️ **`<name>` is the graph-side tool name, not the form the model calls.**
 For a tool exposed by an external MCP server, that is the mangled
-`<server>__<tool>` name — server `repo_graph` exposing `submit_fragments`
-becomes `repo_graph__submit_fragments`. Do not pass the provider-visible
+`<server>__<tool>` name — server `code_graph` exposing `submit_fragments`
+becomes `code_graph__submit_fragments`. Do not pass the provider-visible
 `mcp__…` form; the middleware matches on `ToolMessage.name`, which carries
 the graph name.
 
@@ -287,8 +293,8 @@ The flag is repeatable, and each start logs one machine-greppable line per
 declaration, so a launcher can prove its flag arrived:
 
 ```
-turn_ending_tool_registered name=repo_graph__submit_fragments
-turn_ending_tool_not_found name=repo_graph__submit_fragment candidates=['repo_graph__submit_fragments', ...]
+turn_ending_tool_registered name=code_graph__submit_fragments
+turn_ending_tool_not_found name=code_graph__submit_fragment candidates=['code_graph__submit_fragments', ...]
 ```
 
 A name that is not in the final tool inventory is a WARNING, never a startup

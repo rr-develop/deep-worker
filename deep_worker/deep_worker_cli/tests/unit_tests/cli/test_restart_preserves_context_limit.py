@@ -1,7 +1,7 @@
 """``deep-worker --restart <name>`` must preserve ``-l`` (context_limit).
 
-Reported by ``rg1_worker`` 2026-08-18: agent launched with
-``deep-worker -r rg1_worker -pp claude-code --model fable -l 400k`` consumed
+Reported by ``agent_a`` 2026-08-18: agent launched with
+``deep-worker -r agent_a -pp claude-code --model fable -l 400k`` consumed
 over 600k tokens despite the explicit 400k ceiling. Root cause: the
 explicit ``-l`` did NOT survive provider-switch restarts (it was reset
 to the parser default on each restart, while the model kept running
@@ -13,7 +13,7 @@ Four scenarios are pinned here:
 
 1. **Preserve on bare restart**: ``-l 400k`` → ``--restart`` (no flags) → 400k.
 2. **Preserve across provider change**: ``-l 400k -pp claude-code`` →
-   ``--restart -pp grok`` → 400k. This is the rg1_worker scenario.
+   ``--restart -pp grok`` → 400k. This is the agent_a scenario.
 3. **Explicit override**: ``-l 400k`` → ``--restart -l 800k`` → 800k.
 4. **Default clears**: ``-l 400k`` → ``--restart -l default`` → ``None``.
 
@@ -203,7 +203,7 @@ async def test_restart_preserves_context_limit(_sandbox, monkeypatch):
     assert captured.get("context_limit") == 400_000, (
         f"context_limit was dropped on bare --restart: "
         f"got {captured.get('context_limit')!r}, expected 400_000. "
-        f"This is the rg1_worker bug (2026-08-18): the limit is "
+        f"This is the agent_a bug (2026-08-18): the limit is "
         f"silently reset to None on every restart, while the model "
         f"keeps running with whatever default the provider picks."
     )
@@ -215,7 +215,7 @@ async def test_restart_with_different_provider_preserves_context_limit(
 ):
     """``-l 400k -pp claude-code`` → ``--restart -pp grok`` → 400k.
 
-    THE rg1_worker scenario: the operator set 400k on claude-code, the
+    THE agent_a scenario: the operator set 400k on claude-code, the
     agent got hot-failed-over to grok, and the limit was reset. The
     fix: the limit is independent of (provider, model) — only an
     explicit ``-l`` change moves it.
@@ -245,7 +245,7 @@ async def test_restart_with_different_provider_preserves_context_limit(
     assert captured.get("context_limit") == 400_000, (
         f"context_limit must survive provider change: "
         f"got {captured.get('context_limit')!r}, expected 400_000. "
-        f"This is the EXACT rg1_worker scenario (2026-08-18)."
+        f"This is the EXACT agent_a scenario (2026-08-18)."
     )
     assert captured.get("preferred_provider") == "grok", (
         "the provider change itself should still take effect"
@@ -293,7 +293,7 @@ async def test_restart_with_different_provider_preserves_context_limit(
 ):
     """``-l 400k -pp claude-code`` → ``--restart -pp grok`` → 400k.
 
-    THE rg1_worker scenario: the operator set 400k on claude-code, the
+    THE agent_a scenario: the operator set 400k on claude-code, the
     agent got hot-failed-over to grok, and the limit was reset. The
     fix: the limit is independent of (provider, model) — only an
     explicit ``-l`` change moves it.
@@ -323,7 +323,7 @@ async def test_restart_with_different_provider_preserves_context_limit(
     assert captured.get("context_limit") == 400_000, (
         f"context_limit must survive provider change: "
         f"got {captured.get('context_limit')!r}, expected 400_000. "
-        f"This is the EXACT rg1_worker scenario (2026-08-18)."
+        f"This is the EXACT agent_a scenario (2026-08-18)."
     )
     assert captured.get("preferred_provider") == "grok", (
         "the provider change itself should still take effect"

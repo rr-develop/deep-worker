@@ -10,7 +10,7 @@ fires instantly. This mirrors
 mechanism is COMMON to all providers (HARD POLICY, 2026-06-16).
 
 Pins the policy: EVERY tool gets the job-handle mechanism by default; a
-Future that never resolves (the live ``edit_file`` hang, mj1_init) must
+Future that never resolves (the live ``edit_file`` hang, agent_c) must
 return a non-error ``in_progress`` handle, never park forever, never
 become an agent error.
 

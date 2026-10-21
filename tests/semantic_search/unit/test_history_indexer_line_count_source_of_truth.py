@@ -26,6 +26,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
+pytest.importorskip("llama_index")  # semantic-search extra; absent in CI
+
 from deep_worker.providers.semantic_search.history_indexer import (
     _read_jsonl_lines,
     count_jsonl_lines,

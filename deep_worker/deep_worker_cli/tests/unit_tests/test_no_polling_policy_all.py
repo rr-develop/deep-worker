@@ -4,7 +4,10 @@ Test that NO polling loops exist in deep_worker_cli source.
 
 Scans ONLY the project's own source tree (deep_worker_cli/) for forbidden
 polling patterns: while loops containing time.sleep() or
-await asyncio.sleep(). These patterns waste CPU and are strictly forbidden.
+await asyncio.sleep(). Such a loop wakes N times a second to re-ask a
+question the kernel could answer by waking us once, and it is the loop
+that is forbidden -- not sleep itself. A bare sleep outside a retry loop
+is not what this scanner is looking for and does not fail it.
 
 The scan excludes __pycache__ but does NOT need to exclude .venv -- virtual
 environments are already forbidden in this repo by the pre-commit hook.

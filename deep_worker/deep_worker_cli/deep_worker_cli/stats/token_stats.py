@@ -661,8 +661,8 @@ class UsageEventCallback:
                 # Without this the ACP finalize path emitted the snapshot
                 # only when ``_meta.totalTokens`` was ABSENT (rare), and
                 # the UI showed "Context: 2265.4k tokens" against
-                # "Limit: 400k" — see rg1_worker 2026-08-22 and the
-                # repo_graph extractor.
+                # "Limit: 400k" — see agent_a 2026-08-22 and the
+                # the code-graph server extractor.
                 norm = normalize_usage(self._provider, usage) if usage else None
                 record = build_record(
                     provider=self._provider,
@@ -853,7 +853,7 @@ def latest_context_by_kind(records: list[UsageRecord]) -> dict[str, ContextSnaps
             # its own estimator, not this field);
             # ``total_tokens`` overstates by ``completion_tokens`` and
             # for tokens-only providers the two used to collide in the
-            # UI Context field (rg1_worker 2026-08-22, "507.3k tokens
+            # UI Context field (agent_a 2026-08-22, "507.3k tokens
             # vs -l 250k" on codex — completion_tokens was 1498 there,
             # so the diff was small, but the source was still wrong).
             # ``total_tokens`` remains the fallback of last resort for

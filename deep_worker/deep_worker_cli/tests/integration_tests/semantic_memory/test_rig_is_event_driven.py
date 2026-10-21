@@ -7,11 +7,17 @@ which scans only ``deep_worker_cli/`` — the test tree is outside its
 reach, so a rig could quietly reintroduce the pattern the product forbids.
 
 This file closes that gap for the semantic-memory integration suite. It
-is deliberately stricter than the production scanner: there, the ban is
-on ``while`` + ``sleep``; here it is on ``sleep`` at all. A bare
-``time.sleep`` in a test is the same defect wearing a different shape —
-"wait a bit and hope" — and it is how a polling loop grows back one line
-at a time.
+is deliberately stricter than the production scanner: there the ban is
+on ``while`` + ``sleep``; here it is on ``sleep`` at all.
+
+That extra strictness is **local to this suite**, and it is not a claim
+that sleeping is forbidden in general — it is not. Waiting by sleeping
+is legitimate when there is nothing to synchronise on. Here there always
+is: every wait in this suite is for a process to die, and ``conftest``
+exposes a pidfd-based primitive for exactly that. So in *this* rig a
+``time.sleep`` is never the right tool, and banning it outright is
+cheaper to enforce than judging each case — it is a scoped house rule,
+not the project's position on ``sleep``.
 """
 
 from __future__ import annotations
@@ -46,8 +52,12 @@ def _sleep_calls(tree: ast.AST) -> list[tuple[int, str]]:
 def test_rig_has_no_polling_loops() -> None:
     """No file in this suite may wait by sleeping.
 
+    Scoped to this suite, where every wait is for a process to exit and
+    ``conftest`` offers a pidfd primitive for it — see the module
+    docstring. Not a general ban on ``sleep``.
+
     The scan covers the suite's own sources, including this file — the
-    ban has no exemption for the thing that enforces it.
+    rule has no exemption for the thing that enforces it.
     """
     offenders: list[str] = []
     for path in sorted(_SUITE.rglob("*.py")):

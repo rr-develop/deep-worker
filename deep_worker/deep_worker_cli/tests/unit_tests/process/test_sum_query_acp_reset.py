@@ -1,7 +1,7 @@
 """sum_query wipe must reset ACP session state before invoking.
 
 Regression harness for the alternating burn/ok pattern reported by
-rg1_worker (2026-08-22) on the repo_graph extractor:
+agent_a (2026-08-22) on the the code-graph server extractor:
 
     ACP client state on disk still carries ``sent_count=k>1`` and the
     pre-wipe ``session_id`` from the previous document. sum_query

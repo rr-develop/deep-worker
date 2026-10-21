@@ -125,8 +125,8 @@ async def test_unreachable_http_server_does_not_kill_the_pool(
     pool = ExternalMCPClientPool()
     await pool._start_all(
         {
-            "repo_graph_cross_file_update": ServerSpec(
-                name="repo_graph_cross_file_update",
+            "code_graph_cross_file_update": ServerSpec(
+                name="code_graph_cross_file_update",
                 type="http",
                 url="http://127.0.0.1:40587/cross-file-update-mcp",
             )

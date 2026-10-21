@@ -1302,7 +1302,7 @@ A condensed summary follows:
             # background loop then can never acquire the GIL to finish
             # → permanent GIL deadlock, the agent's loop stops ticking
             # forever (status stuck "running", RPyC dead). This is the
-            # live mj1_init deadlock (2026-06-15).
+            # live agent_c deadlock (2026-06-15).
             #
             # Offloading to a worker thread makes the blocking
             # ``.result()`` wait there RELEASE the GIL, so LanceDB's

@@ -1256,7 +1256,7 @@ def create_cli_agent(
     # docs/DESIGN_FIX_TOOL_NAME_PRIORITY_AND_DANGLING_TOOLCALLS.md (Fix B).
     agent_middleware.append(DanglingToolCallMiddleware())
 
-    # Context-limit guard — the rg1_worker (2026-08-18) safety net.
+    # Context-limit guard — the agent_a (2026-08-18) safety net.
     # Must run BEFORE every model invocation to enforce ``-l`` regardless
     # of whether the provider emits ``usage_metadata`` (claude-code often
     # does not). Mounted right after DanglingToolCall so the model's
@@ -1269,7 +1269,7 @@ def create_cli_agent(
 
         Read by BOTH the guard and the summarizer — deliberately one
         function, because two readers of the same fact drifting apart is
-        what left rg1_worker unguarded at 110% of its limit while the
+        what left agent_a unguarded at 110% of its limit while the
         summarizer could see the number all along. Never estimates: a
         missing or malformed gauge is UNKNOWN.
         """
@@ -1726,7 +1726,7 @@ def create_cli_agent(
     # The summarization trigger uses the PROVIDER-REPORTED context and
     # nothing else — the same number the status bar shows. The chars/4
     # heuristic that used to stand in for it is gone: it said ~150k while
-    # the CLI held 468k against ``-l 400k`` (rg1_worker 2026-08-19, nothing
+    # the CLI held 468k against ``-l 400k`` (agent_a 2026-08-19, nothing
     # fired), and 214613 against a real 90k on 2026-08-25 (fired on
     # fiction). Owner directive 2026-08-25: provider data only; a fallback
     # needs explicit approval and none is approved.

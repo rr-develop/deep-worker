@@ -27,7 +27,7 @@ from app.schemas.agent_schemas import AgentInfo, AgentStatus
 from app.services.agent_service import AgentService
 
 
-def _make_service(name: str = "agent_a") -> AgentService:
+def _make_service(name: str = "agent_1") -> AgentService:
     svc = AgentService(registry=object())
     svc._agents[name] = AgentInfo(
         name=name,
@@ -74,7 +74,7 @@ async def _run_and_capture(
 
 @pytest.mark.asyncio
 async def test_poll_forwards_error_message_when_status_error() -> None:
-    svc = _make_service("agent_a")
+    svc = _make_service("agent_1")
     err = (
         "Agent invocation failed: Codex stream error: "
         '{"status":400,"error":{"message":"The \'unknown\' model is '
@@ -82,7 +82,7 @@ async def test_poll_forwards_error_message_when_status_error() -> None:
     )
     root = _FakeRoot({"success": True, "status": "error", "error": err})
 
-    events = await _run_and_capture(svc, "agent_a", root)
+    events = await _run_and_capture(svc, "agent_1", root)
     status_events = [e for e in events if e.get("type") == "agent_status"]
     assert status_events, f"expected agent_status broadcast; got {events}"
     e = status_events[0]
@@ -95,10 +95,10 @@ async def test_poll_forwards_error_message_when_status_error() -> None:
 
 @pytest.mark.asyncio
 async def test_poll_omits_error_message_when_healthy() -> None:
-    svc = _make_service("agent_a")
+    svc = _make_service("agent_1")
     root = _FakeRoot({"success": True, "status": "idle", "error": None})
 
-    events = await _run_and_capture(svc, "agent_a", root)
+    events = await _run_and_capture(svc, "agent_1", root)
     status_events = [e for e in events if e.get("type") == "agent_status"]
     assert status_events
     assert "error_message" not in status_events[0], (

@@ -38,8 +38,8 @@ executed by `service/__init__.py` would land in every agent process.
 Keeping it empty means importing `service.supervisor` cannot drag in
 `service.grpc_server` and the engine behind it.
 
-This is the defect `repo_graph` has: its design doc §3.3 states the client
-does not import `repo_graph.service`, while `stdio_server.py` does exactly
+This is the defect `the code-graph server` has: its design doc §3.3 states the client
+does not import `the code-graph server.service`, while `stdio_server.py` does exactly
 that — benign only by accident. A test pins the emptiness here.
 
 ## Pinned toolchain (design §4)

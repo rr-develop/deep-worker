@@ -32,9 +32,15 @@ import pytest
 # conftest from the web app tree.
 import importlib.util as _importlib_util
 
-_POLICY_PATH = Path(
-    "/path/to/dev-tree/deep_worker/deep_worker_cli/"
-    "tests/integration_ai/cleanup_policy.py"
+# Located relative to this file so the suite runs from any checkout: the
+# policy module lives in the sibling CLI package inside the same repository.
+_POLICY_PATH = (
+    Path(__file__).resolve().parents[3]
+    / "deep_worker"
+    / "deep_worker_cli"
+    / "tests"
+    / "integration_ai"
+    / "cleanup_policy.py"
 )
 _spec = _importlib_util.spec_from_file_location(
     "_dw_cleanup_policy",

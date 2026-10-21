@@ -1,6 +1,6 @@
 """The ACP chat model stamps the CLI's live context gauge on its AIMessages.
 
-rg1_worker 2026-08-19: ``usage_update`` said 468k, the LangChain heuristic
+agent_a 2026-08-19: ``usage_update`` said 468k, the LangChain heuristic
 said ~150k, ``-l 400k`` was never honoured. The provider is the only party
 that knows the real number; it must hand it to the summarizer/guard via
 ``response_metadata`` (persisted, restart-safe). These tests pin:

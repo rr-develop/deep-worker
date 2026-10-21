@@ -32,6 +32,8 @@ from deep_worker.providers.semantic_search.config import IndexConfig
 # ---------------------------------------------------------------------------
 
 
+pytest.importorskip("llama_index")  # semantic-search extra; absent in CI
+
 from llama_index.core.embeddings.mock_embed_model import MockEmbedding
 
 
@@ -126,7 +128,8 @@ def _clean_cache_and_counters(monkeypatch: pytest.MonkeyPatch) -> None:
 class TestSharedResolver:
     """The single-load invariant is the whole reason this module exists.
 
-    See the related internal incident analysis (not included here).
+    See the related internal incident analysis (not included here) §0
+    and §7.1.
     """
 
     def test_second_call_reuses_cached_instance(self) -> None:
@@ -136,7 +139,7 @@ class TestSharedResolver:
         assert first is second, (
             "resolve_embed_model must return the SAME instance for the same "
             "model name — otherwise the write path leaks ~163 MB per call "
-            "(see the related internal incident analysis)."
+            "(see incident §6.1)."
         )
         assert len(_INSTANCES) == 1, (
             "HuggingFaceEmbedding must be constructed EXACTLY once, not "
@@ -207,7 +210,8 @@ class TestCallSitesGoThroughSharedCache:
         history_indexer._resolve_embed_and_tokenizer(None, cfg)
         assert len(_INSTANCES) == 1, (
             "history_indexer._resolve_embed_and_tokenizer must reuse the "
-            "shared cache; this is the exact call site the incident named."
+            "shared cache; this is the exact call site the incident named "
+            "at §4."
         )
 
     def test_history_retriever_uses_shared_cache(self) -> None:

@@ -4,7 +4,7 @@ Policy: DESIGN_FIX_TOOL_NAME_PRIORITY_AND_DANGLING_TOOLCALLS.md — after
 restart, dangling pre-restart tool_calls must be closed without re-execution
 and the history must remain valid for the model API.
 
-Production failure (rg1_worker 2026-08-14): DeepSeek 400
+Production failure (agent_a 2026-08-14): DeepSeek 400
   "insufficient tool messages following tool_calls message"
 with history shape:
   AIMessage(tool_calls=[restart_self])
@@ -204,8 +204,8 @@ def test_dangling_moves_nonadjacent_closer_once_preserving_identity():
     _assert_existing_closer_moved_once(rewritten, original, call_id)
 
 
-def test_rg1_2026_08_14_exact_checkpoint_shape_still_poisons_deepseek():
-    """Live rg1_worker threads.db 2026-08-14 (read-only dump): three
+def test_exact_checkpoint_shape_still_poisons_deepseek():
+    """Live threads.db 2026-08-14 (read-only dump): three
     restart_self AIMessages. Two have no ToolMessage at all; one has
     Patch's 'cancelled' closer *after* System+Human. Patch today fixes
     the first two (Overwrite insert) and leaves the third — that leftover
@@ -257,5 +257,5 @@ def test_rg1_2026_08_14_exact_checkpoint_shape_still_poisons_deepseek():
         if isinstance(m, ToolMessage) and m.tool_call_id == id_nonadj
     ]
     assert len(nonadj_tools) == 1, (
-        "rg1 idx-69 closer must be moved once, not copied"
+        "agent_1 idx-69 closer must be moved once, not copied"
     )

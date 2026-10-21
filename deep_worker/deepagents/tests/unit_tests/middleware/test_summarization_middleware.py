@@ -563,14 +563,14 @@ class TestSummarizationHistoryJsonl:
         content = serialize_summarized_messages_jsonl(
             [message],
             summarized_at="2026-08-19T15:16:00+00:00",
-            thread_id="rg1_worker",
+            thread_id="agent_a",
             reason="cold",
         )
         header = json.loads(content.splitlines()[0])
         assert header["kind"] == "deepagents.summarization_history.segment"
         assert header["origin"]["provider"] == "claude-code"
         assert header["origin"]["model"] == "fable"
-        assert header["thread_id"] == "rg1_worker"
+        assert header["thread_id"] == "agent_a"
         assert header["reason"] == "cold"
 
     def test_v5_header_keeps_origin_from_filtered_summary(self) -> None:

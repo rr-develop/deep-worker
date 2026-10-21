@@ -9,7 +9,7 @@ Reported: 2026-08-22.
 
 ## Symptom
 
-`repo_graph` extractor uses `sum_query` for every document: each doc dispatch
+`the code-graph server` extractor uses `sum_query` for every document: each doc dispatch
 is `{"command":"invoke","message":"","sum_query":<prompt-with-document>}`.
 On a live agent, the `exposed_invoke_agent` idle send-through routes into
 the same `_run_startup_or_send_query` used at startup. That path:

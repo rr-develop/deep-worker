@@ -24,8 +24,9 @@ So these tests build the wheel and run the installed console script in a
 throwaway venv under ``/tmp`` with its own ``HOME``. That is the only
 configuration that grades the artifact a user receives. Repository policy
 forbids installing this project on the host and forbids a ``.venv``
-inside the tree; a venv in a temporary directory purely to verify the
-distribution is explicitly allowed, and every fixture below removes its own.
+inside the tree (``deep_worker/CLAUDE.md`` §1, §2); a venv in a temporary
+directory purely to verify the distribution is explicitly allowed there,
+and every fixture below removes its own.
 """
 from __future__ import annotations
 
@@ -53,6 +54,33 @@ def _free_port() -> int:
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         return int(probe.getsockname()[1])
+
+
+def _is_reaper(pid: int) -> bool:
+    """True when ``pid`` adopts orphans rather than merely being an ancestor.
+
+    pid 1 always qualifies. A systemd user session also qualifies: it sets
+    ``PR_SET_CHILD_SUBREAPER``, so a daemon that correctly detaches lands on
+    ``systemd --user`` instead of pid 1. ``/proc/<pid>/status`` exposes that
+    bit via ``ChildSubreaper`` on kernels that report it; where it is absent
+    we fall back to "a direct child of pid 1 whose own session leader it is",
+    which is what a session manager looks like.
+
+    Asserting the parent is a reaper — not "some pid outside our ancestry" —
+    is the portable form: the launching shell is never a reaper, while every
+    host's adopter is one.
+    """
+    if pid == 1:
+        return True
+    try:
+        status = Path(f"/proc/{pid}/status").read_text()
+        stat = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+    except OSError:  # pragma: no cover - race with a dying process
+        return False
+    for line in status.splitlines():
+        if line.startswith("ChildSubreaper:"):
+            return line.split()[1] != "0"
+    return int(stat[1]) == 1 and int(stat[3]) == pid
 
 
 @pytest.fixture(scope="module")
@@ -445,9 +473,19 @@ def test_web_serves_health_detached_from_the_terminal(
     pid = int(record["pid"])
     try:
         stat = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
-        assert stat[1] == "1", (
-            f"web server pid {pid} has PPID {stat[1]}, so it is still a child "
-            "of the launching shell and dies with the terminal"
+        # Reparented away from the launching shell. The reaper is USUALLY pid 1,
+        # but under a systemd user session it is ``systemd --user``, which sets
+        # PR_SET_CHILD_SUBREAPER and adopts the session's orphans itself — so
+        # asserting literally ``PPID == 1`` fails on a correctly detached
+        # server (measured: PPID 1111 = ``systemd --user``, itself PPid 1).
+        # What must hold is that the parent is not this test's process tree:
+        # anything rooted at pid 1 without passing through us survives the
+        # terminal, which is the property the owner asked for.
+        ppid = int(stat[1])
+        assert _is_reaper(ppid), (
+            f"web server pid {pid} has PPID {ppid}, which is not a reaper, "
+            "so it is still a child of the launching shell and dies with "
+            "the terminal"
         )
         assert stat[4] == "0", (
             f"web server pid {pid} kept a controlling TTY ({stat[4]}), so a "

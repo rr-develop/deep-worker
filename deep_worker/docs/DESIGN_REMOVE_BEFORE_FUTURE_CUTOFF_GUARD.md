@@ -1,7 +1,7 @@
 # DESIGN: Safety guard for `deep-worker --remove-before` with future cutoff
 
 **Status:** ✅ IMPLEMENTED
-**Author:** lc6_fix
+**Author:** DeepWorker team
 **Date:** 2026-04-23
 **Motivated by:** 2026-04-23 incident — `deep-worker --remove-before 2030-01-01`
 ran against real `$HOME` during an ad-hoc integration probe, deleted 24

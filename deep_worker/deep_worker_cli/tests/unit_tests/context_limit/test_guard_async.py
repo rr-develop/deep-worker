@@ -1,6 +1,6 @@
 """Async regression guard for ``ContextLimitGuardMiddleware``.
 
-rg1_worker 2026-08-18 incident: Phase 1 commit ``1888357`` shipped
+agent_a 2026-08-18 incident: Phase 1 commit ``1888357`` shipped
 the guard with only ``def wrap_model_call``. Production code paths
 on this project ALWAYS use ``agent.ainvoke`` / ``agent.astream``
 (RPyC handler, TaskManager, full-dialog mode) — never the sync
@@ -243,7 +243,7 @@ async def test_async_await_is_actually_async() -> None:
 
 @pytest.mark.asyncio
 async def test_async_must_not_be_inherited_notimplemented() -> None:
-    """Direct regression test for the rg1_worker failure.
+    """Direct regression test for the agent_a failure.
 
     LangChain's ``AgentMiddleware.awrap_model_call`` raises
     ``NotImplementedError``. If our subclass did NOT override it

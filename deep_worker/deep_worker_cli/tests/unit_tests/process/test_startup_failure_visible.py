@@ -113,8 +113,8 @@ async def test_dead_mcp_server_puts_agent_into_error_state(
     monkeypatch.setattr(
         "deep_worker_cli.external_mcp.config.load_mcp_config",
         lambda **_kw: {
-            "repo_graph_cross_file_update": ServerSpec(
-                name="repo_graph_cross_file_update",
+            "code_graph_cross_file_update": ServerSpec(
+                name="code_graph_cross_file_update",
                 type="http",
                 url="http://127.0.0.1:40587/cross-file-update-mcp",
             )
@@ -129,7 +129,7 @@ async def test_dead_mcp_server_puts_agent_into_error_state(
         await agent._start_external_mcp_pool()
 
     text = str(excinfo.value)
-    assert "repo_graph_cross_file_update" in text, f"server name missing: {text}"
+    assert "code_graph_cross_file_update" in text, f"server name missing: {text}"
     assert "40587" in text, f"address missing: {text}"
 
     # Exactly what the initialization handler does with this error.

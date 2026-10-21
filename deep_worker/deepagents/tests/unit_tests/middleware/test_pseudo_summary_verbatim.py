@@ -1,6 +1,6 @@
 """A pseudo-summary (``sum_query``) reaches the model BYTE FOR BYTE.
 
-Incident 2026-10-01. repo_graph opens its stage-2 agent
+Incident 2026-10-01. the code-graph server opens its stage-2 agent
 (``rg_cross_file_updater``) via ``sum_query`` carrying the full task. The
 middleware wrapped that task in ``<summary>`` tags, prefixed "You are in the
 middle of a conversation that has been summarized", and appended "The full

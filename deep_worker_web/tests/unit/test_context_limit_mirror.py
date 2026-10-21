@@ -68,7 +68,7 @@ async def test_fill_context_limit_from_session_metadata(
 ) -> None:
     """``_fill_context_limit_fields`` reads ``launch_config.context_limit``.
 
-    This is the rg1_worker 2026-08-18 path: operator passed
+    This is the agent_a 2026-08-18 path: operator passed
     ``-l 400k``, session_metadata.json persisted it, and the web UI
     must surface that value — not the provider default.
     """

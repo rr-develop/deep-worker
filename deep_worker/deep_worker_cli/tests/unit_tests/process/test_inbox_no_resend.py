@@ -108,7 +108,7 @@ async def test_resend_of_received_message_is_refused(
     delivered: list[str] = []
     _collect_turns(proc, delivered)
 
-    text = "reviewer -> worker :>SIGN-OFF — POLICIES §14"
+    text = "agent_1 -> agent_2 :> SIGN-OFF — POLICIES §14"
 
     await proc.publish_inbox_message(text, True)
     await _drain_once(proc, 1, delivered, "the first delivery")

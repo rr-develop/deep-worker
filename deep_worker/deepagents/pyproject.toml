@@ -147,13 +147,13 @@ ignore-var-parameters = true
 
 [tool.ty.environment]
 # Tree-relative paths — see deep_worker_cli/pyproject.toml for the
-# rationale (a hard-coded production-tree path breaks --dev in the dev
+# rationale (hard-coded <repo> breaks --dev in the dev
 # tree by introducing a duplicate deepagents package on the module
 # search path). docs/DESIGN_DEV_FLAG.md.
 extra-paths = [
     "../..",
     "../../semantic_search",
-    # The CLI package is an OPTIONAL runtime dependency of the summarization
+    # deep_worker_cli is an OPTIONAL runtime dependency of the summarization
     # middleware (hot/cold origin + decide()), guarded by try/except ImportError
     # so deepagents still runs standalone. ty has no notion of that guard, so
     # without this path it reports the import as unresolved.
@@ -162,3 +162,20 @@ extra-paths = [
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# ``--strict-markers`` turns a typo'd or unregistered mark into a collection
+# error instead of silently ignoring it. ``--strict-config`` is the same
+# contract for this file.
+addopts = "--strict-markers --strict-config"
+
+markers = [
+    # Carried by two upstream integration tests
+    # (test_subagent_middleware.py:46, test_filesystem_middleware.py:32) in the
+    # form @pytest.mark.requires("langchain_anthropic", ...). NOTE: nothing in
+    # this tree acts on it — the only pytest_collection_modifyitems hook here
+    # (tests/integration_tests/conftest.py:180) skips upstream items that drive
+    # the Anthropic SDK and never reads this mark. It is registered so
+    # --strict-markers does not fail collection on the upstream files, NOT
+    # because it filters anything; treat it as documentation until a hook
+    # honours it.
+    "requires: Upstream marker naming optional third-party packages; declarative only here",
+]

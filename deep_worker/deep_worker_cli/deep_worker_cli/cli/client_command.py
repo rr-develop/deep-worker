@@ -5,6 +5,7 @@ import asyncio
 import sys
 
 from deep_worker_cli.client.agent_client import AgentClient
+from deep_worker_cli.exceptions import RegistryReadError
 from deep_worker_cli.process.registry import ProcessRegistry
 
 
@@ -93,7 +94,17 @@ async def list_agents() -> int:
         Exit code
     """
     registry = ProcessRegistry()
-    agents = registry.list_all()
+    try:
+        agents = registry.list_all()
+    except RegistryReadError as e:
+        # The registry exists but could not be read (EACCES/EIO). Loud is
+        # right — a silent "no agents" is what hid this class of failure in
+        # the first place — but loud must not mean a Python traceback: the
+        # exception message carries the path and the `ls -l` remedy, and a
+        # stack trace buries exactly the person who needs it. Print it and
+        # exit non-zero so scripts can tell this from an empty registry.
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
 
     if not agents:
         print("No running agents found")
@@ -260,7 +271,15 @@ async def stop_agent(agent_name: str) -> int:
     """
     try:
         registry = ProcessRegistry()
-        agent_info = registry.lookup(agent_name)
+        # An unreadable registry is caught by the blanket handler at the end
+        # of this function, but that one also prints a traceback. Handle it
+        # here so the user gets the path and the `ls -l` remedy on its own,
+        # the same as in ``list_agents``.
+        try:
+            agent_info = registry.lookup(agent_name)
+        except RegistryReadError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 1
 
         if not agent_info:
             print(f"Error: Agent '{agent_name}' not found", file=sys.stderr)
@@ -598,14 +617,30 @@ async def connect_interactive(agent_name: str) -> int:
     Returns:
         Exit code
     """
-    # Check if agent exists
+    # Check if agent exists. ``lookup`` is the first thing here that reads
+    # the registry, so it — not the "Available agents" listing below — is
+    # where an unreadable registry surfaces first. Same reasoning as in
+    # ``list_agents``: report the path and the remedy, never a traceback.
     registry = ProcessRegistry()
-    agent_info = registry.lookup(agent_name)
+    try:
+        agent_info = registry.lookup(agent_name)
+    except RegistryReadError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
 
     if not agent_info:
         print(f"\nError: Agent '{agent_name}' not found", file=sys.stderr)
         print(f"\nAvailable agents:")
-        agents = registry.list_all()
+        # The listing is secondary information. It cannot normally fail once
+        # ``lookup`` succeeded, but a registry can be made unreadable between
+        # the two reads; say why the list is missing rather than claim the
+        # registry is empty, and keep the primary error intact.
+        try:
+            agents = registry.list_all()
+        except RegistryReadError as e:
+            print(f"  (cannot read registry: {e})")
+            print(f"\nStart an agent with: deep-worker {agent_name}")
+            return 1
         if agents:
             for agent in agents:
                 print(f"  - {agent.name}")

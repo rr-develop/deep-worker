@@ -18,7 +18,7 @@ See ``docs/DESIGN_SEMANTIC_MEMORY_SHARED_SERVICE.md`` §6. Contract:
 * Permissions: 0700 on the directory, 0600 on the files. ``mkdir(mode=)``
   is a no-op on an existing directory and is masked by the ambient umask,
   so the mode is re-asserted with an explicit ``chmod`` — this is exactly
-  how ``repo_graph`` ended up with a world-readable ``svc/``.
+  how ``the code-graph server`` ended up with a world-readable ``svc/``.
 * Liveness checks BOTH the pid and its start time in kernel ticks. The pid
   alone is not enough: pids get recycled, and a recycled pid would make a
   dead service look alive forever.

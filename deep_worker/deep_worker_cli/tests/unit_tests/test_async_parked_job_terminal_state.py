@@ -1,6 +1,6 @@
 """A finished ASYNC parked job must stay reachable until its result is served.
 
-Second half of the rg1_worker incident (2026-08-28). The sync path was fixed in
+Second half of the agent_a incident (2026-08-28). The sync path was fixed in
 5110f23; the async parking site (``BoundedToolCallMiddleware._park_task``) still
 called ``registry.drop`` from its done-callback, so completing the work ERASED
 the entry. A caller that returns AFTER the work finished — the exact shape of

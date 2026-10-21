@@ -22,11 +22,16 @@ from deep_worker_cli.rpyc_service.agent_service import AgentService
 from deep_worker_cli.session.session_manager import AgentStatus
 
 
-def _service(session_manager: object, task_manager: object | None = None) -> AgentService:
+def _service(
+    session_manager: object,
+    task_manager: object | None = None,
+    started_at: datetime | None = None,
+) -> AgentService:
     service = AgentService()
     service._agent_process = SimpleNamespace(
         session_manager=session_manager,
         task_manager=task_manager,
+        started_at=started_at,
     )
     return service
 
@@ -57,6 +62,66 @@ async def test_status_reports_last_activity() -> None:
 
     assert response["success"] is True
     assert response["last_activity"] == stamp.isoformat()
+
+
+@pytest.mark.asyncio
+async def test_status_reports_uptime_and_started_at() -> None:
+    """Uptime must come from the agent — nothing downstream knows it.
+
+    Reported 2026-10-19: the the task manager status tool returned
+    ``uptime_seconds: null`` for every agent and the UI showed "--",
+    because this payload carried neither the start time nor a duration.
+    ``last_activity`` cannot stand in: it is a turn boundary, so on a
+    busy agent it is minutes old and on an idle one it is days old.
+    """
+    started = datetime.now()
+    service = _service(_session_manager(), started_at=started)
+
+    response = json.loads(await service.exposed_get_status())
+
+    assert response["started_at"] == started.isoformat()
+    # Both fields travel: the duration for a one-shot reader, the
+    # timestamp so a UI can tick without re-asking.
+    assert response["uptime_seconds"] is not None
+    assert response["uptime_seconds"] >= 0.0
+    # A freshly-stamped start time cannot have produced a large uptime;
+    # this would catch a wrong epoch or a swapped subtraction.
+    assert response["uptime_seconds"] < 60.0
+
+
+@pytest.mark.asyncio
+async def test_uptime_grows_with_a_known_start_time() -> None:
+    """A fixed start in the past must yield that elapsed time.
+
+    The previous test would also pass if the field were hard-coded to
+    0.0, so pin the arithmetic against a start time whose distance from
+    now is known.
+    """
+    from datetime import timedelta
+
+    started = datetime.now() - timedelta(hours=2)
+    service = _service(_session_manager(), started_at=started)
+
+    response = json.loads(await service.exposed_get_status())
+
+    # 2h = 7200s, with generous slack for test execution time.
+    assert 7190.0 <= response["uptime_seconds"] <= 7260.0
+    assert response["started_at"] == started.isoformat()
+
+
+@pytest.mark.asyncio
+async def test_unknown_start_time_is_null_not_zero() -> None:
+    """Before ``start()`` stamps it, uptime is unknown — not zero.
+
+    Reporting 0 would claim "just started" about an agent whose start
+    time we do not have.
+    """
+    service = _service(_session_manager(), started_at=None)
+
+    response = json.loads(await service.exposed_get_status())
+
+    assert response["started_at"] is None
+    assert response["uptime_seconds"] is None
 
 
 @pytest.mark.asyncio

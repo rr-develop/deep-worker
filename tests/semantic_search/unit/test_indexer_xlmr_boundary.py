@@ -19,6 +19,8 @@ os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 os.environ.setdefault("TQDM_DISABLE", "1")
 
+pytest.importorskip("llama_index")  # semantic-search extra; absent in CI
+
 from llama_index.core import Settings  # noqa: E402
 from llama_index.core.schema import TextNode  # noqa: E402
 

@@ -9,6 +9,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from deep_worker.providers.semantic_search.exceptions import IndexNotFoundError
+pytest.importorskip("llama_index")  # semantic-search extra; absent in CI
+
 from deep_worker.providers.semantic_search.search_cli import (
     find_vector_index,
     load_query_from_file,

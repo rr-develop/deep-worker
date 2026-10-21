@@ -295,7 +295,7 @@ async def test_restart_preserves_turn_ending_tools(_sandbox, monkeypatch):
     _write_saved_config(
         _sandbox,
         "a",
-        {"turn_ending_tools": ["repo_graph__submit_fragments:document_closed"]},
+        {"turn_ending_tools": ["code_graph__submit_fragments:document_closed"]},
     )
     _no_registered_agent(monkeypatch)
     calls = _install_agent_process_spy(monkeypatch)
@@ -304,7 +304,7 @@ async def test_restart_preserves_turn_ending_tools(_sandbox, monkeypatch):
 
     assert rc == 0
     assert calls[0]["turn_ending_tool_specs"] == [
-        "repo_graph__submit_fragments:document_closed"
+        "code_graph__submit_fragments:document_closed"
     ], "turn_ending_tools was wiped on --restart (same class as mcp_config_paths)"
 
 

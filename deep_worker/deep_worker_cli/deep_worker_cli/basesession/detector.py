@@ -51,6 +51,14 @@ class DeepWorkerDetector:
             If an agent fails to respond (e.g., crashed but not cleaned up),
             it will be skipped and a warning will be logged.
         """
+        # ``list_all`` raises RegistryReadError when the registry file exists
+        # but cannot be read. That propagates on purpose: this detector is a
+        # library entry point for the cco daemon, not a user interface, so it
+        # has no business deciding how the failure is presented. Swallowing it
+        # into an empty list would reintroduce the exact silent-"0 sessions"
+        # defect the loud registry was added to kill, and the daemon could not
+        # tell "no agents" from "I cannot see the agents". Callers that do own
+        # a UI (see ``cli/client_command.py``) catch it and print the remedy.
         agents = self.registry.list_all()
         sessions: list[SessionInfo] = []
 

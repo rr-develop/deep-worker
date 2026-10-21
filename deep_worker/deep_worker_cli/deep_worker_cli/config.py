@@ -174,9 +174,15 @@ _editable_cache: bool | None = None
 
 
 def _is_editable_install() -> bool:
-    """Check if deepagents-cli is installed in editable mode.
+    """Check if deep-worker is installed in editable mode.
 
     Uses PEP 610 direct_url.json metadata to detect editable installs.
+
+    The distribution name must match what this project actually publishes.
+    While it read the ancestor's ``deepagents-cli``, the lookup always
+    raised ``PackageNotFoundError``, so this reported False even for a
+    genuine editable install — and the ``(local)`` marker in the help
+    banner could never appear.
 
     Returns:
         True if installed in editable mode, False otherwise.
@@ -186,7 +192,7 @@ def _is_editable_install() -> bool:
         return _editable_cache
 
     try:
-        dist = distribution("deepagents-cli")
+        dist = distribution("deep-worker")
         direct_url = dist.read_text("direct_url.json")
         if direct_url:
             data = json.loads(direct_url)
@@ -684,7 +690,7 @@ def get_summarization_config(
 
 @dataclass
 class Settings:
-    """Global settings and environment detection for deepagents-cli.
+    """Global settings and environment detection for deep-worker.
 
     This class is initialized once at startup and provides access to:
     - Available models and API keys
@@ -1945,7 +1951,7 @@ def create_model(
                     "package is required for this model"
                 )
                 console.print("\nInstall it with:")
-                console.print("  pip install deepagents-cli[vertexai]", markup=False)
+                console.print("  pip install deep-worker[vertexai]", markup=False)
                 sys.exit(1)
 
             model = ChatAnthropicVertex(

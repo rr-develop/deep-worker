@@ -889,7 +889,7 @@ class AgentProcess:
         concerned, since ``init_task`` and ``on_subordinate_response`` both
         return early when disabled, but visibly to the operator, who saw
         ``TaskManager iteration`` lines and decisions continuing after turning
-        it off (rg1_worker, 2026-10-10).
+        it off (agent_a, 2026-10-10).
 
         Kept as one accessor rather than repeating the conjunction at the four
         call sites so the two conditions cannot drift apart again.
@@ -1661,7 +1661,7 @@ class AgentProcess:
                 # who the provider is.
                 #
                 # Without this, claude-code lost every native tool result
-                # (rg1_worker, 2026-09-28). Its profile declares
+                # (agent_a, 2026-09-28). Its profile declares
                 # ``{Bash, Read, Write, Edit, Glob, Grep, ...}`` and its chat
                 # model surfaces those names as real ``AIMessage.tool_calls``,
                 # but no matching BaseTool was ever bound — only grok and codex
@@ -1695,7 +1695,7 @@ class AgentProcess:
                     # ZERO recorders bound for every ACP provider, and ToolNode
                     # went back to fabricating "Error: Bash is not a valid
                     # tool" without running anything — the very defect the
-                    # capability wiring was added to kill (rg1_worker,
+                    # capability wiring was added to kill (agent_a,
                     # 2026-09-29: 122 Bash / 61 Edit / 43 Read refusals from a
                     # POST-fix process). ``summarization.py`` already carries
                     # this same workaround for the same reason.
@@ -2470,7 +2470,7 @@ class AgentProcess:
             return
         # ════════════════════════════════════════════════════════════════
         # ⚠ PREWARM MUST NOT OPEN THE CLAUDE CLI SESSION — INCIDENT
-        # 2026-06-15 (mj1_init forgot its history after restart).
+        # 2026-06-15 (agent_c forgot its history after restart).
         # ════════════════════════════════════════════════════════════════
         # Previously this called ``get_or_create_client(...)``, which
         # actually spawned the Claude CLI subprocess with
@@ -2600,7 +2600,7 @@ class AgentProcess:
         """The compaction report for the turn that just ran, if there was one.
 
         Returns ``None`` on a normal turn. The consumer's contract (agreed with
-        repo_graph, REQ-90) is that an ABSENT key means "no compaction": a report
+        the code-graph server, REQ-90) is that an ABSENT key means "no compaction": a report
         on every turn would mark every document of every run as an incident.
         """
         sm = self._summarization_middleware_or_none()
@@ -2650,7 +2650,7 @@ class AgentProcess:
         reply sites (plain, streaming, TaskManager): a flag delivered on one path
         out of three is an incident that reproduces every other run.
 
-        TWO KEYS, TWO MEANINGS — agreed with rg1_worker (877726c), and they must
+        TWO KEYS, TWO MEANINGS — agreed with agent_a (877726c), and they must
         never be conflated in either direction:
 
         * ``context_compacted`` / ``context_summarized`` — a per-turn FACT: a
@@ -2769,8 +2769,8 @@ class AgentProcess:
                 # from the previous document (or the previous restart)
                 # exceeds the freshly wiped state, and the very next
                 # ainvoke burns on the ``chat_model.py:571`` fail-loud
-                # guard (rg1_worker 2026-08-22 report: alternating
-                # burn/ok per document on the repo_graph extractor).
+                # guard (agent_a 2026-08-22 report: alternating
+                # burn/ok per document on the the code-graph server extractor).
                 #
                 # Capability-based: API-only models do not carry session
                 # state and simply do not implement the port — the call is
@@ -5212,7 +5212,7 @@ class AgentProcess:
                     # loop: init_task and on_subordinate_response each return
                     # early when disabled, so the loop span and broke
                     # immediately, but it still logged "TaskManager iteration"
-                    # and reached the middleware (rg1_worker, 2026-10-10 — 14
+                    # and reached the middleware (agent_a, 2026-10-10 — 14
                     # iterations after the disable, with no enable in between).
                     active_task_manager = self._active_task_manager()
                     if active_task_manager is not None:
@@ -5410,8 +5410,8 @@ class AgentProcess:
                         # a tail it sets this flag, breaks, and returns
                         # success with empty content (so the client does not
                         # see the misleading "Agent did not produce a
-                        # response" error surface reported by rg1_worker
-                        # 2026-08-22 for repo_graph's ``submit_*`` tools).
+                        # response" error surface reported by agent_a
+                        # 2026-08-22 for the code-graph server's ``submit_*`` tools).
                         _terminal_tool_success = False
 
                         # Initial ainvoke with user message

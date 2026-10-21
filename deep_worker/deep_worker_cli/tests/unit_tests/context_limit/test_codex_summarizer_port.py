@@ -6,7 +6,7 @@ empty summary, is worse than no port at all. These tests pin what it does.
 
 Context: codex is session-stateful, so the middleware refuses the generic
 identical-prefix fallback for it. Before this port existed that refusal made
-every summarization on codex deterministically fatal — rg1_worker died with
+every summarization on codex deterministically fatal — agent_a died with
 ``SummarizationFailedError: summarization port unavailable on a
 session-stateful provider (CodexChatModel)`` on 2026-08-23 and, being already
 past its context limit, re-died on every subsequent turn.
@@ -115,7 +115,7 @@ async def test_hot_resumes_the_rollout_and_sends_no_history() -> None:
     object.__setattr__(model, "_client_state", _ClientState("uuid-live"))
 
     result = await model.asummarize(
-        thread_id="rg1_worker",
+        thread_id="agent_1",
         messages=[{"role": "user", "content": "SENTINEL_HISTORY"}],
         instruction="Summarize.",
         decision=_Decision(hot=True),
@@ -139,7 +139,7 @@ async def test_cold_starts_a_fresh_session_and_includes_the_dump() -> None:
     from langchain_core.messages import HumanMessage
 
     result = await model.asummarize(
-        thread_id="rg1_worker",
+        thread_id="agent_1",
         messages=[HumanMessage(content="SENTINEL_HISTORY")],
         instruction="Summarize.",
         decision=_Decision(hot=False),
@@ -167,7 +167,7 @@ async def test_hot_without_a_session_falls_back_to_cold() -> None:
     from langchain_core.messages import HumanMessage
 
     result = await model.asummarize(
-        thread_id="rg1_worker",
+        thread_id="agent_1",
         messages=[HumanMessage(content="SENTINEL_HISTORY")],
         instruction="Summarize.",
         decision=_Decision(hot=True),
@@ -261,7 +261,7 @@ async def test_reset_delegates_to_record_summarization() -> None:
     client_state = _ClientState("uuid-live")
     object.__setattr__(model, "_client_state", client_state)
 
-    await model.areset_after_summary(thread_id="rg1_worker")
-    await model.areset_after_summary(thread_id="rg1_worker")  # idempotent
+    await model.areset_after_summary(thread_id="agent_1")
+    await model.areset_after_summary(thread_id="agent_1")  # idempotent
 
-    assert client_state.reset_calls == ["rg1_worker", "rg1_worker"]
+    assert client_state.reset_calls == ["agent_1", "agent_1"]

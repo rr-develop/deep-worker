@@ -19,7 +19,7 @@ from textual.widgets import Static
 # ============================================================================
 # RPYC_ASYNC — LOCAL SOURCES FIRST, INSTALLED PACKAGE AS FALLBACK
 # ============================================================================
-# A local rpyc_async checkout takes priority over any installed
+# A checkout at a local rpyc-async checkout takes priority over any installed
 # distribution; without one we fall back to `pip install rpyc-async`.
 # Owner decision 2026-10-11. The imports below must stay BELOW this one,
 # which is what puts the checkout on sys.path. See rpyc_async_source for the
@@ -112,7 +112,7 @@ class InteractiveApp(App):
     """Textual TUI app for interacting with a running deep-worker agent.
 
     This app connects to an already-running agent via RPyC and
-    provides an interactive chat interface similar to deepagents-cli.
+    provides an interactive chat interface similar to the deep-worker TUI.
     """
 
     TITLE = "dwcli"
@@ -375,8 +375,8 @@ class InteractiveApp(App):
         # The on_message method MUST be async to match deepagents architecture
         # where all callbacks are async (await adapter._mount_message, etc.)
         #
-        # This ensures the CLI follows the SAME async patterns as
-        # the original deepagents implementation.
+        # This ensures deep-worker/dwcli follows the SAME async patterns as
+        # the original <repo>/ implementation.
         #
         # ARCHITECTURE: Single-thread, single event loop
         # ================================================
@@ -1318,8 +1318,7 @@ class InteractiveApp(App):
                 "  Shift+Tab       Toggle auto-approve mode\n"
                 "  @filename       Auto-complete files and inject content\n"
                 "  /command        Slash commands (/help, /clear, /quit)\n"
-                "  !command        Run bash commands directly\n\n"
-                "Docs: https://docs.langchain.com/oss/python/deepagents/cli"
+                "  !command        Run bash commands directly\n"
             )
             await self._mount_message(AppMessage(help_text))
 

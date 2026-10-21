@@ -26,7 +26,7 @@ from deep_worker_cli.local_context import LocalContextMiddleware
 from deep_worker_cli.tool_selection import parse_tool_selection
 
 #: ``rg_cross_file_updater`` launches with
-#: ``--tools none,repo_graph_cross_file_update__submit_...`` (its
+#: ``--tools none,code_graph_cross_file_update__submit_...`` (its
 #: ``session_metadata.json`` ``cli_args``). That MCP tool needs a live server
 #: to appear in the inventory, and ``validate_against_inventory`` rejects a
 #: name it cannot see — so the kept tool here is a built-in. What matters for

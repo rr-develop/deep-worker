@@ -1,4 +1,4 @@
-"""Textual UI application for deepagents-cli."""
+"""Textual UI application for deep-worker."""
 
 from __future__ import annotations
 
@@ -303,7 +303,7 @@ List what you captured and where you stored it:
 
 
 class DeepAgentsApp(App):
-    """Main Textual application for deepagents-cli."""
+    """Main Textual application for deep-worker."""
 
     TITLE = "Deep Agents"
     CSS_PATH = "app.tcss"
@@ -898,8 +898,7 @@ class DeepAgentsApp(App):
                 "  Shift+Tab       Toggle auto-approve mode\n"
                 "  @filename       Auto-complete files and inject content\n"
                 "  /command        Slash commands (/help, /clear, /quit)\n"
-                "  !command        Run bash commands directly\n\n"
-                "Docs: https://docs.langchain.com/oss/python/deepagents/cli"
+                "  !command        Run bash commands directly\n"
             )
             await self._mount_message(AppMessage(help_text))
 
@@ -910,10 +909,10 @@ class DeepAgentsApp(App):
                 from deep_worker_cli._version import __version__
 
                 await self._mount_message(
-                    AppMessage(f"deepagents version: {__version__}")
+                    AppMessage(f"deep-worker version: {__version__}")
                 )
             except Exception:
-                await self._mount_message(AppMessage("deepagents version: unknown"))
+                await self._mount_message(AppMessage("deep-worker version: unknown"))
         elif cmd == "/clear":
             await self._clear_messages()
             if self._token_tracker:

@@ -23,7 +23,7 @@ knowledge:
     them ``_asummarize_hot``/``_asummarize_cold``, and the latter never grew an
     ``areset_after_summary`` at all.
   * ``CodexChatModel`` and ``GrokChatModel`` implement neither half. For codex
-    that is a loud daily crash (``SummarizationFailedError``, rg1_worker
+    that is a loud daily crash (``SummarizationFailedError``, agent_a
     2026-08-23). For grok it was worse — misclassified as stateless, it sailed
     past the guard into the silent full-history dump.
 

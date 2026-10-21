@@ -263,7 +263,7 @@ async def test_successful_response_lands_idle() -> None:
 # ---------------------------------------------------------------------------
 # Turn-ending tools: successful ToolMessage tail is a legitimate turn end.
 #
-# Regression reported internally (2026-08-22, repo_graph extractor).
+# Regression reported internally (2026-08-22, the code-graph server extractor).
 #
 # ``ToolCompletionMiddleware`` (deep_worker_cli/middleware/tool_completion.py)
 # ends the LangGraph turn immediately after a registered tool succeeds by
@@ -275,8 +275,8 @@ async def test_successful_response_lands_idle() -> None:
 # response, so a successful turn-ending tool_call landed in the "no final
 # content" recovery path with ``success=False`` and the operator saw
 # "Agent did not produce a response" — while the turn had, in fact,
-# succeeded. Symptom: repo_graph's ``repo_graph__submit_fragments`` /
-# ``repo_graph__submit_relations`` closing a DocumentSession left the
+# succeeded. Symptom: the code-graph server's ``code_graph__submit_fragments`` /
+# ``code_graph__submit_relations`` closing a DocumentSession left the
 # client with ``success:false``.
 #
 # The fix reads ``ToolMessage.status`` (LangChain's own signal for
@@ -312,13 +312,13 @@ async def test_terminal_successful_toolmessage_ends_turn_as_success() -> None:
     """
     agent = _make_agent_with_real_session_manager()
 
-    ai = _tool_call_ai("repo_graph__submit_fragments", "call_1")
+    ai = _tool_call_ai("code_graph__submit_fragments", "call_1")
     # A registered turn-ending tool succeeded; ToolCompletionMiddleware
     # emitted no echo (echo_field=None), so this is the tail.
     tool = ToolMessage(
         content='{"success": true, "document_closed": true}',
         tool_call_id="call_1",
-        name="repo_graph__submit_fragments",
+        name="code_graph__submit_fragments",
         status="success",
     )
 
@@ -356,11 +356,11 @@ async def test_terminal_error_toolmessage_still_settles_as_no_response() -> None
     """
     agent = _make_agent_with_real_session_manager()
 
-    ai = _tool_call_ai("repo_graph__submit_fragments", "call_2")
+    ai = _tool_call_ai("code_graph__submit_fragments", "call_2")
     tool = ToolMessage(
         content='{"success": false, "error": "closed session already"}',
         tool_call_id="call_2",
-        name="repo_graph__submit_fragments",
+        name="code_graph__submit_fragments",
         status="error",
     )
 

@@ -2,7 +2,7 @@
 
 See ``docs/DESIGN_CONTEXT_LIMIT_GUARANTEE.md`` §3.2.
 
-This is the safety net for the rg1_worker 2026-08-18 bug: an explicit
+This is the safety net for the agent_a 2026-08-18 bug: an explicit
 ``-l L`` must never be exceeded, regardless of whether the provider
 emits ``usage_metadata`` (claude-code often does not). The guard runs
 BEFORE every model invocation and decides which of four bands the
@@ -196,7 +196,7 @@ class ContextLimitGuardMiddleware(AgentMiddleware):
         The second is not a convenience. A CLI-session provider keeps the
         conversation inside its own process, so our message list holds only
         the current exchange and NO stamp is ever anchored to it: measured
-        on rg1_worker (grok) 2026-08-25, the stamp said ``first_id=b50f955b``
+        on agent_a (grok) 2026-08-25, the stamp said ``first_id=b50f955b``
         while the state the guard saw began at ``4d10180b``. The guard
         logged "passing the turn through UNGUARDED" while the provider
         itself reported 275704 against ``-l 250000``. POLICIES §13: a
@@ -404,7 +404,7 @@ class ContextLimitGuardMiddleware(AgentMiddleware):
     # ── Async entry point ─────────────────────────────────────────────
     # The CANONICAL path. Production always uses
     # ``agent.ainvoke`` / ``agent.astream`` (RPyC handler, TaskManager,
-    # full-dialog mode). rg1_worker 2026-08-18 regression proved that
+    # full-dialog mode). agent_a 2026-08-18 regression proved that
     # omitting this method leaves the agent unable to invoke ANY
     # model — the LangChain factory inherits ``AgentMiddleware.awrap_model_call``
     # which raises ``NotImplementedError`` and breaks the whole chain.

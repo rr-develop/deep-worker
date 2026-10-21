@@ -1061,7 +1061,7 @@ class DeltaSqliteCheckpointer(BaseCheckpointSaver):
         # (delta payload + full snapshot + ``channel_versions`` +
         # ``versions_seen``) but left ``aput_writes`` untouched, so every
         # super-step kept inserting a full ``__pregel_tasks`` payload
-        # (0.5–4 MB / row) into the ``writes`` table. On ``mj2_vac`` that
+        # (0.5–4 MB / row) into the ``writes`` table. On ``agent_d`` that
         # path accumulated 4 596 rows totalling 2.43 GB — 96 % of a
         # 2.84 GB threads.db. Worse, on cold start LangGraph's
         # ``aget_tuple`` merges these pending writes into the

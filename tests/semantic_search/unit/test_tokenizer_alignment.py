@@ -14,6 +14,8 @@ from typing import Any
 
 import pytest
 
+pytest.importorskip("llama_index")  # semantic-search extra; absent in CI
+
 
 # ---- import-time env discipline ------------------------------------------
 # Force strictly-offline before importing anything that may touch HF Hub.

@@ -57,7 +57,7 @@ turn-ending tool_call:
 |---|------|-------|--------|
 | 1 | 2026-08-22 10:23:24Z | worker agent | "Thanks for the invoice…" — reached the agent only after TaskManager retransmit |
 | 2 | 2026-08-22 11:16:41Z | worker agent | "Thanks for both points…" — same, retransmit only |
-| 3 | 2026-08-22 (extractor) | comparison agent | repo_graph extractor, every document after the first |
+| 3 | 2026-08-22 (extractor) | comparison agent | the code-graph server extractor, every document after the first |
 
 Signature identical in all three: `has_tool_calls=False`, instant
 tail-of-previous echo, single `session/prompt`.

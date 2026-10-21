@@ -76,7 +76,7 @@ build_fixture() {
     rm -rf "$root"; mkdir -p "$root"
     make_proc "$root" 2352    serena   4505    567500 'serena-mcp-server --transport stdio'
     make_proc "$root" 1296179 java     2317107 193946 'java -jar /opt/lsp/server.jar'
-    make_proc "$root" 330413  python3  88269   429158 'python3 -m deep_worker_cli.cli.agent_command rg2_reviewer'
+    make_proc "$root" 330413  python3  88269   429158 'python3 -m deep_worker_cli.cli.agent_command agent_b'
     make_proc "$root" 1031    python3  370586  268595 'python3 -m fix_service.main'
     make_proc "$root" 999001  python3  522240  0      'python3 -m some.heavy.helper'
     make_proc "$root" 999002  python3  665600  0      'python3 -m other.heavy.helper'
@@ -175,7 +175,7 @@ fi
 # the №1 holder, so the assertion has to name it.
 check "serena (inverted ratio, comm != python3) is logged" \
     has_pid "$LOG1" 2352
-check "low-RSS known agent rg2_reviewer is logged" \
+check "low-RSS known agent agent_b is logged" \
     has_pid "$LOG1" 330413
 
 # java, as sampled on 2026-10-09, sat just below the swap floor while holding

@@ -13,9 +13,9 @@ in the list (the CLI's own prompt and tool schemas, extended-thinking
 blocks, full-size built-in results) and cannot know a provider's
 tokenizer. It was wrong in both directions, and both directions cost:
 
-* rg1_worker 2026-08-19 — table said ~150k while the CLI held 468k against
+* agent_a 2026-08-19 — table said ~150k while the CLI held 468k against
   ``-l 400k``: nothing fired, and the next turn loaded 466k;
-* rg1_worker 2026-08-25 — table said 214613 against a real 90k (``-l``
+* agent_a 2026-08-25 — table said 214613 against a real 90k (``-l``
   250k): the guard's amber hint fired on fiction, and the extra message it
   injected tripped the codex provider's shrink detector, which dropped a
   warm session and restarted its context from zero.
@@ -141,7 +141,7 @@ def provider_context_tokens(messages: Sequence[Any]) -> int | None:
       tokenizer output, i.e. the same class of fact as the stamp.
 
     ``None`` means UNKNOWN, and UNKNOWN must stay unknown: estimating here
-    is what let a 2.4x fiction (214613 claimed vs 90k real, rg1_worker
+    is what let a 2.4x fiction (214613 claimed vs 90k real, agent_a
     2026-08-25) drive summarization and guard decisions. Owner directive
     2026-08-25: provider numbers only, no fallback without explicit
     approval, and no provider is approved for one today.
@@ -180,7 +180,7 @@ def provider_context_token_counter(
     ``floor`` supplies a PERSISTED provider reading (the provider's own
     session state, or the last ``context_snapshot`` in ``token_stats``) for
     the first call after a restart, when the checkpoint carries no stamp
-    yet — rg1_worker 2026-08-19 went blind precisely there while the CLI
+    yet — agent_a 2026-08-19 went blind precisely there while the CLI
     held 468k. A persisted provider number is still the provider's number,
     not an estimate; a LIVE report always wins over it.
     """

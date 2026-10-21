@@ -1,7 +1,7 @@
 """A long turn must keep a drainer on the notification sink, and a harness
 error must not destroy the work the turn already produced.
 
-Defect (rg1_worker, session ``d6ddeed4-900e-408a-8e37-a54743d5ee3e``,
+Defect (agent_a, session ``d6ddeed4-900e-408a-8e37-a54743d5ee3e``,
 2026-10-02 ~10:56Z and ~11:28Z):
 
 ``AcpSinkOverflowError: ACP notification sink overflowed ... (capacity 1000)``
@@ -112,7 +112,7 @@ class TestMidTurnResumeArmsADrainer:
             }
         ]
 
-        message = await model._consume_turn(state, "rg1_worker")
+        message = await model._consume_turn(state, "agent_1")
 
         assert [tc["name"] for tc in message.tool_calls] == ["wait_for_job"]
         # The response future is deliberately kept in flight, which means the
@@ -120,7 +120,7 @@ class TestMidTurnResumeArmsADrainer:
         # into this very queue — so a drainer is mandatory, not optional.
         assert state.pending_session_prompt_future is fut
         assert not fut.done()
-        assert pump_starts == ["rg1_worker"], (
+        assert pump_starts == ["agent_1"], (
             "the mid-turn replay path handed tool_calls to LangGraph while the "
             "sink stayed registered, but armed no drainer — a long tool then "
             "fills the 1000-slot queue and the turn is failed"
@@ -149,10 +149,10 @@ class TestMidTurnResumeArmsADrainer:
             }
         )
 
-        message = await model._consume_turn(state, "rg1_worker")
+        message = await model._consume_turn(state, "agent_1")
 
         assert message.tool_calls, "expected the tool_call to surface"
-        assert pump_starts == ["rg1_worker"]
+        assert pump_starts == ["agent_1"]
 
     @pytest.mark.asyncio
     async def test_text_only_turn_needs_no_drainer(self) -> None:
@@ -171,7 +171,7 @@ class TestMidTurnResumeArmsADrainer:
             {"id": "c", "name": "execute", "args": {}, "type": "tool_call"}
         ]
 
-        await model._consume_turn(state, "rg1_worker")
+        await model._consume_turn(state, "agent_1")
 
         assert pump_starts == []
         assert state.pending_session_prompt_future is None
@@ -198,7 +198,7 @@ class TestOverflowDoesNotDestroyTheWork:
         )
 
         with pytest.raises(AcpSinkOverflowError):
-            await model._consume_turn(state, "rg1_worker")
+            await model._consume_turn(state, "agent_1")
 
         assert state.queued_text == ["alpha ", "beta ", "gamma"], (
             "the updates drained before the raise were frame locals and were "
@@ -230,7 +230,7 @@ class TestOverflowDoesNotDestroyTheWork:
         fut.set_exception(AcpSinkOverflowError("overflow (capacity 1000)"))
 
         with pytest.raises(AcpSinkOverflowError):
-            await model._consume_turn(state, "rg1_worker")
+            await model._consume_turn(state, "agent_1")
 
         assert state.queued_tool_calls, (
             "a tool_call drained before the raise must survive on the state"
@@ -252,7 +252,7 @@ class TestOverflowDoesNotDestroyTheWork:
         fut.set_exception(AcpSinkOverflowError("overflow (capacity 1000)"))
 
         with pytest.raises(AcpSinkOverflowError, match="overflow"):
-            await model._consume_turn(state, "rg1_worker")
+            await model._consume_turn(state, "agent_1")
 
     @pytest.mark.asyncio
     async def test_preserved_text_is_bounded(self) -> None:
@@ -312,7 +312,7 @@ class TestDrainerLessExitIsNamed:
         ]
 
         with caplog.at_level("ERROR"):
-            await model._consume_turn(state, "rg1_worker")
+            await model._consume_turn(state, "agent_1")
 
         assert state.pump_task is None
         assert not fut.done()
@@ -357,9 +357,9 @@ class TestDrainerLessExitIsNamed:
         ]
 
         with caplog.at_level("ERROR"):
-            await model._consume_turn(state, "rg1_worker")
+            await model._consume_turn(state, "agent_1")
 
-        assert pump_starts == ["rg1_worker"]
+        assert pump_starts == ["agent_1"]
         assert not [r for r in caplog.records if "NO pump" in r.getMessage()], (
             "a correctly drained mid-turn pause must not raise a false alarm"
         )

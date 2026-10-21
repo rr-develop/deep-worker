@@ -94,9 +94,9 @@ def test_is_test_pattern_matches_known_patterns() -> None:
 
 
 def test_is_test_pattern_does_not_match_production_names() -> None:
-    assert not is_test_pattern("ab1_acp")
-    assert not is_test_pattern("rg_cross_file_extractor")
-    assert not is_test_pattern("xy3_dw")
+    assert not is_test_pattern("ab1_one")
+    assert not is_test_pattern("xy_cross_file_extractor")
+    assert not is_test_pattern("cd3_two")
     assert not is_test_pattern("best_test")  # was a false-positive under `.*test.*`
     # Tightened regex `^test[_-]` rejects `best_test` (no prefix match).
 
@@ -125,12 +125,12 @@ def test_is_fresh_rejects_old_metadata(fake_home: Path) -> None:
 
 
 def test_classify_keep_protects_production(fake_home: Path) -> None:
-    agent_dir = fake_home / "ab1_acp"
+    agent_dir = fake_home / "ab1_one"
     agent_dir.mkdir()
     _write_meta(agent_dir, "2026-08-01T00:00:00+00:00")
 
-    keep = {"ab1_acp"}
-    assert classify("ab1_acp", agent_dir, keep, 14) == "keep-move"
+    keep = {"ab1_one"}
+    assert classify("ab1_one", agent_dir, keep, 14) == "keep-move"
 
 
 def test_classify_test_pattern_does_not_depend_on_keep_list(fake_home: Path) -> None:
@@ -205,7 +205,7 @@ def test_handle_dry_run_makes_no_changes(fake_home: Path, tmp_path: Path, monkey
         "deep_worker_cli.cli.migrate_command.REGISTRY_PATH",
         tmp_path / "nope.json",
     )
-    legacy = fake_home / "ab1_acp"
+    legacy = fake_home / "ab1_one"
     legacy.mkdir()
     (legacy / "threads.db").write_bytes(b"data")
 
@@ -217,7 +217,7 @@ def test_handle_dry_run_makes_no_changes(fake_home: Path, tmp_path: Path, monkey
     assert legacy.is_dir()
     assert (legacy / "threads.db").exists()
     # New layout untouched.
-    assert not (fake_home / "agents" / "ab1_acp").exists()
+    assert not (fake_home / "agents" / "ab1_one").exists()
 
 
 def test_handle_execute_moves_legacy_into_agents_subdir(
@@ -227,7 +227,7 @@ def test_handle_execute_moves_legacy_into_agents_subdir(
         "deep_worker_cli.cli.migrate_command.REGISTRY_PATH",
         tmp_path / "nope.json",
     )
-    legacy = fake_home / "ab1_acp"
+    legacy = fake_home / "ab1_one"
     legacy.mkdir()
     (legacy / "threads.db").write_bytes(b"data")
     (legacy / "token_stats.jsonl").write_bytes(b"{}\n")
@@ -237,7 +237,7 @@ def test_handle_execute_moves_legacy_into_agents_subdir(
     assert rc == 0
 
     assert not legacy.exists()
-    new = fake_home / "agents" / "ab1_acp"
+    new = fake_home / "agents" / "ab1_one"
     assert new.is_dir()
     assert (new / "threads.db").read_bytes() == b"data"
     assert (new / "token_stats.jsonl").read_bytes() == b"{}\n"

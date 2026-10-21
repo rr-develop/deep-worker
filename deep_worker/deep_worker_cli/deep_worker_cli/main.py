@@ -139,13 +139,11 @@ def check_cli_dependencies() -> None:
 
     if missing:
         print("\n❌ Missing required CLI dependencies!")
-        print("\nThe following packages are required to use the deepagents CLI:")
+        print("\nThe following packages are required to use the DeepWorker CLI:")
         for pkg in missing:
             print(f"  - {pkg}")
         print("\nPlease install them with:")
-        print("  pip install deepagents[cli]")
-        print("\nOr install all dependencies:")
-        print("  pip install 'deepagents[cli]'")
+        print("  pip install deep-worker")
         sys.exit(1)
 
 
@@ -159,7 +157,7 @@ def parse_args() -> argparse.Namespace:
     # Factory that builds an argparse Action whose __call__ invokes the
     # supplied *help_fn* instead of argparse's default help text.  Each
     # subcommand can pass its own Rich-formatted help screen so that
-    # `deepagents <subcommand> -h` shows context-specific help.
+    # `deep-worker <subcommand> -h` shows context-specific help.
     def _make_help_action(
         help_fn: Callable[[], None],
     ) -> type[argparse.Action]:
@@ -211,7 +209,8 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser = argparse.ArgumentParser(
-        description=("Deep Agents - AI Coding Assistant"),
+        prog="deep-worker",
+        description=("DeepWorker - AI Coding Assistant"),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         add_help=False,
     )
@@ -415,7 +414,7 @@ def parse_args() -> argparse.Namespace:
         "-v",
         "--version",
         action="version",
-        version=f"deepagents-cli {__version__}",
+        version=f"deep-worker {__version__}",
     )
     parser.add_argument(
         "-h",
@@ -672,17 +671,17 @@ def cli_main() -> None:
                         console.print()
                         console.print("[yellow]Did you mean?[/yellow]")
                         for tid in similar:
-                            hint = Text("  deepagents -r ", style="cyan")
+                            hint = Text("  deep-worker -r ", style="cyan")
                             hint.append(str(tid), style="cyan")
                             console.print(hint)
                         console.print()
 
                     console.print(
-                        "[dim]Use 'deepagents threads list' to see "
+                        "[dim]Use 'deep-worker threads list' to see "
                         "available threads.[/dim]"
                     )
                     console.print(
-                        "[dim]Use 'deepagents -r' to resume the most "
+                        "[dim]Use 'deep-worker -r' to resume the most "
                         "recent thread.[/dim]"
                     )
                     sys.exit(1)
@@ -718,7 +717,7 @@ def cli_main() -> None:
             if thread_id and not is_resumed and return_code == 0:
                 console.print()
                 console.print("[dim]Resume this thread with:[/dim]")
-                hint = Text("deepagents -r ", style="cyan")
+                hint = Text("deep-worker -r ", style="cyan")
                 hint.append(str(thread_id), style="cyan")
                 console.print(hint)
     except KeyboardInterrupt:

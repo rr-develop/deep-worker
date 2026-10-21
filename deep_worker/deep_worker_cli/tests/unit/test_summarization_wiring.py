@@ -14,6 +14,20 @@ from pathlib import Path
 import pytest
 
 from deep_worker_cli.storage_paths import deep_worker_home
+
+
+def _agent_py_source() -> str:
+    """Read ``deep_worker_cli/agent.py`` as text, portably.
+
+    These are static source-contract checks, so the file has to be located
+    rather than imported. Resolving it from the installed package keeps the
+    tests working wherever the checkout lives: a hardcoded
+    ``<repo>/...`` passed locally and failed on CI with
+    ``FileNotFoundError``, since the runner uses ``$GITHUB_WORKSPACE``
+    (CLAUDE.md §5).
+    """
+    import deep_worker_cli
+    return (Path(deep_worker_cli.__file__).parent / "agent.py").read_text()
 def test_create_deep_agent_accepts_summarization_history_prefix():
     """create_deep_agent must accept an opt-in summarization_history_prefix kwarg."""
     from deepagents.graph import create_deep_agent
@@ -39,7 +53,7 @@ def test_agent_py_does_not_route_conversation_history_to_tempdir():
     that ACTIVE code (route declaration + tempdir construction) is gone.
     Comments that mention the old path for historical context are allowed.
     """
-    src = Path("deep_worker/deep_worker_cli/deep_worker_cli/agent.py").read_text()
+    src = _agent_py_source()
     # The route declaration is a string KEY in a `routes={...}` dict. It
     # sits on its own line with a comma. A pure-comment mention (starting
     # with '#') is not a route declaration.
@@ -66,12 +80,12 @@ def test_agent_py_does_not_route_conversation_history_to_tempdir():
 
 def test_agent_py_passes_per_agent_summaries_prefix_into_create_deep_agent():
     """The wiring must pass the summaries directory into create_deep_agent."""
-    src = Path("deep_worker/deep_worker_cli/deep_worker_cli/agent.py").read_text()
+    src = _agent_py_source()
     assert "summarization_history_prefix=" in src, (
         "agent.py must forward a per-agent summaries prefix to create_deep_agent."
     )
     # The prefix must be derived from the blessed per-agent data layout
-    # (<agent-data-dir>/<agent>/summaries).
+    # (~/.deep_worker/<agent>/summaries).
     assert "summaries" in src
 
 
@@ -94,6 +108,6 @@ def test_ensure_summaries_dir_enforces_private_permissions(tmp_path, monkeypatch
 
 def test_large_results_route_unchanged():
     """Negative control — we didn't accidentally nuke the other route."""
-    src = Path("deep_worker/deep_worker_cli/deep_worker_cli/agent.py").read_text()
+    src = _agent_py_source()
     assert '"/large_tool_results/"' in src
     assert "deepagents_large_results_" in src

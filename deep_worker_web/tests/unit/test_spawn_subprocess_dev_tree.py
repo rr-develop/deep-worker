@@ -19,12 +19,25 @@ Contract under test:
 """
 from __future__ import annotations
 
+import inspect
+import re
 from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
 
 from app.routers.agents import _spawn_subprocess
+
+
+def _spawner_dev_tree_default() -> str:
+    """The dev-tree root ``_spawn_subprocess`` falls back to without the
+    override, read from the spawner's own source so the two cannot drift."""
+    source = inspect.getsource(_spawn_subprocess)
+    match = re.search(
+        r'"DEEP_WORKER_DEV_TREE_ROOT_OVERRIDE",\s*"([^"]+)"', source
+    )
+    assert match, "spawner no longer has a literal dev-tree default"
+    return match.group(1)
 
 
 def _capture(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
@@ -53,7 +66,7 @@ def test_dev_tree_true_spawns_from_dev_tree(monkeypatch: pytest.MonkeyPatch) -> 
     calls = _capture(monkeypatch)
     cfg = {**BASE, "dev_tree": True}
 
-    _spawn_subprocess("agent_a", cfg, model=None, provider=None, clean=False)
+    _spawn_subprocess("agent_1", cfg, model=None, provider=None, clean=False)
 
     env = calls[0]["env"]
     pythonpath = env.get("PYTHONPATH", "")
@@ -97,16 +110,22 @@ def test_dev_tree_absent_keeps_default(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_dev_tree_true_without_override_uses_canonical_dev_path(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Without the test override, dev_tree=True must target the canonical
-    /path/to/dev-tree."""
+    """Without the test override, dev_tree=True must target the dev-tree root
+    that the spawner itself defaults to.
+
+    The expected prefix is read from the spawner's own default rather than
+    repeated as a literal here: the two must agree by construction, and a
+    literal copy silently stops matching if the default is ever reworded.
+    """
     monkeypatch.delenv("DEEP_WORKER_DEV_TREE_ROOT_OVERRIDE", raising=False)
     calls = _capture(monkeypatch)
     cfg = {**BASE, "dev_tree": True}
 
-    _spawn_subprocess("agent_a", cfg, model=None, provider=None, clean=False)
+    _spawn_subprocess("agent_1", cfg, model=None, provider=None, clean=False)
 
+    default_root = _spawner_dev_tree_default()
     pythonpath = calls[0]["env"].get("PYTHONPATH", "")
-    assert "/path/to/dev-tree/deep_worker/deep_worker_cli" in pythonpath
+    assert f"{default_root}/deep_worker/deep_worker_cli" in pythonpath
 
 
 class TestRpycAsyncPathIsResolvedNotPasted:

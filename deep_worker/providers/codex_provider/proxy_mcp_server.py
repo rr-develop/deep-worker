@@ -293,7 +293,7 @@ class ProxyMCPServer:
 
         ⚠️ A timeout is NEVER ``is_error=true`` — it informs and the agent
         continues / retries. ⚠️ DO NOT reintroduce a bare unbounded
-        ``await future`` (it hung edit_file forever, mj1_init 2026-06-16),
+        ``await future`` (it hung edit_file forever, agent_c 2026-06-16),
         and DO NOT cancel the work on timeout (use ``shield``). See
         docs/POLICIES.md §7.1.
         """

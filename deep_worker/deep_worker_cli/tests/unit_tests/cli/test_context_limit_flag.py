@@ -75,7 +75,7 @@ class TestParseContextLimitGrammar:
             # the bare-restart case where ``args.context_limit is None``
             # simply because no ``-l`` was passed. Merged by
             # ``merge_restart_config``. See design §C2 + the
-            # rg1_worker / 2026-08-18 / sentinel discussion in
+            # agent_a / 2026-08-18 / sentinel discussion in
             # ``test_restart_preserves_context_limit.py``.
             ("default", "_SENTINEL"),
             ("DEFAULT", "_SENTINEL"),

@@ -2,6 +2,7 @@
 
 Status: Draft
 Date: 2026-07-02
+Author: DeepWorker team
 Related policies: `docs/POLICIES.md §1` (No-Agent-Error-State Policy),
 `deep_worker/docs/DESIGN_NO_AGENT_ERROR_STATE_POLICY.md`
 

@@ -25,6 +25,8 @@ here we test the in-process logic by calling handlers directly.
 """
 from __future__ import annotations
 
+import os
+
 import asyncio
 import sys
 from pathlib import Path
@@ -35,8 +37,8 @@ _pkg_root = Path(__file__).resolve().parent.parent.parent
 if str(_pkg_root) not in sys.path:
     sys.path.insert(0, str(_pkg_root))
 
-from deep_worker.providers.grok_provider.custom_types import ToolMetadata  # noqa: E402
-from deep_worker.providers.grok_provider.proxy_mcp_server import ProxyMCPServer  # noqa: E402
+from deep_worker.providers.acp.custom_types import ToolMetadata  # noqa: E402
+from deep_worker.providers.acp.proxy_mcp_server import ProxyMCPServer  # noqa: E402
 
 
 @pytest.fixture
@@ -216,7 +218,7 @@ class TestServerLifecycle:
             assert isinstance(srv.port, int)
             assert srv.port > 0
             # Server name reflects PID so concurrent agents don't clash
-            assert srv.server_name.startswith("deep_worker_proxy_")
+            assert srv.server_name == f"deep_worker_acp_proxy_{os.getpid()}"
         finally:
             await srv.stop()
 

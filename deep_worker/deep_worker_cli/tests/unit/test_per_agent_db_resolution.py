@@ -159,16 +159,16 @@ class TestGetThreadHistoryPerAgentDB:
         foreign.mkdir(parents=True, exist_ok=True)
         (foreign / "sessions.db").write_bytes(b"")
 
-        agent = "lc4_test"
+        agent = "agent_1"
         per_agent_db = _agent_db(fake_home, agent)
-        await _seed_agent_db(per_agent_db, thread_id=agent, content="lc4 ping")
+        await _seed_agent_db(per_agent_db, thread_id=agent, content="agent_2 ping")
 
         result = await get_thread_history(agent)
 
         assert result["success"] is True, result
         assert any(
             (m.get("content") if isinstance(m, dict) else getattr(m, "content", ""))
-            == "lc4 ping"
+            == "agent_2 ping"
             for m in result["messages"]
         )
 

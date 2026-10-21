@@ -1,4 +1,4 @@
-"""Unit tests for grok_provider.arg_compat.
+"""Unit tests for the shared ``providers/acp/arg_compat.py``.
 
 Contract per docs/DESIGN_FIX_TOOL_VALIDATION_ERROR_STATE_AND_GROK_ARG_COMPAT.md
 §3.2 — narrow compat layer for live-observed Grok arg mismatches.
@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import pytest
 
-from deep_worker.providers.grok_provider.arg_compat import normalize_tool_args
+from deep_worker.providers.acp.arg_compat import normalize_tool_args
 
 
 # ---------------------------------------------------------------------------

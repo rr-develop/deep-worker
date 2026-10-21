@@ -21,7 +21,7 @@ from tests.fixtures.mock_registry import MockProcessRegistry
 @pytest.fixture
 def mock_registry() -> MockProcessRegistry:
     registry = MockProcessRegistry()
-    registry.add_mock_agent("agent_a", pid=1000, rpyc_port=18861, working_dir="/tmp/vc")
+    registry.add_mock_agent("agent_1", pid=1000, rpyc_port=18861, working_dir="/tmp/vc")
     return registry
 
 
@@ -50,24 +50,24 @@ class TestIsConnectedIdentity:
 
         # Simulate an established subscription against the ORIGINAL identity.
         conn = _live_conn()
-        agent_service._connections["agent_a"] = conn
-        agent_service._roots["agent_a"] = MagicMock()
-        agent_service._callback_services["agent_a"] = MagicMock()
-        agent_service._record_conn_identity("agent_a", pid=1000, rpyc_port=18861)
+        agent_service._connections["agent_1"] = conn
+        agent_service._roots["agent_1"] = MagicMock()
+        agent_service._callback_services["agent_1"] = MagicMock()
+        agent_service._record_conn_identity("agent_1", pid=1000, rpyc_port=18861)
 
         # The agent restarts: registry now has a new pid + port.
         mock_registry.add_mock_agent(
-            "agent_a", pid=2000, rpyc_port=18862, working_dir="/tmp/vc"
+            "agent_1", pid=2000, rpyc_port=18862, working_dir="/tmp/vc"
         )
         await agent_service._discover_agents()
 
-        connected = await agent_service.is_connected("agent_a")
+        connected = await agent_service.is_connected("agent_1")
 
         assert connected is False, (
             "after a restart (changed pid/port) the old connection must NOT "
             "count as connected even if its _closed flag is still False"
         )
-        assert "agent_a" not in agent_service._connections, (
+        assert "agent_1" not in agent_service._connections, (
             "the stale connection to the dead process must be evicted"
         )
 
@@ -78,11 +78,11 @@ class TestIsConnectedIdentity:
         await agent_service.initialize()
 
         conn = _live_conn()
-        agent_service._connections["agent_a"] = conn
-        agent_service._record_conn_identity("agent_a", pid=1000, rpyc_port=18861)
+        agent_service._connections["agent_1"] = conn
+        agent_service._record_conn_identity("agent_1", pid=1000, rpyc_port=18861)
 
-        assert await agent_service.is_connected("agent_a") is True
-        assert agent_service._connections["agent_a"] is conn
+        assert await agent_service.is_connected("agent_1") is True
+        assert agent_service._connections["agent_1"] is conn
 
     async def test_no_recorded_identity_falls_back_to_closed_flag(
         self, agent_service: AgentService
@@ -92,10 +92,10 @@ class TestIsConnectedIdentity:
         await agent_service.initialize()
 
         conn = _live_conn()
-        agent_service._connections["agent_a"] = conn
+        agent_service._connections["agent_1"] = conn
         # No _record_conn_identity call.
 
-        assert await agent_service.is_connected("agent_a") is True
+        assert await agent_service.is_connected("agent_1") is True
 
 
 class TestReconnectOnRestart:
@@ -108,14 +108,14 @@ class TestReconnectOnRestart:
 
         # Pre-existing (stale) connection from before the restart.
         stale = _live_conn()
-        agent_service._connections["agent_a"] = stale
-        agent_service._roots["agent_a"] = MagicMock()
-        agent_service._callback_services["agent_a"] = MagicMock()
-        agent_service._record_conn_identity("agent_a", pid=1000, rpyc_port=18861)
+        agent_service._connections["agent_1"] = stale
+        agent_service._roots["agent_1"] = MagicMock()
+        agent_service._callback_services["agent_1"] = MagicMock()
+        agent_service._record_conn_identity("agent_1", pid=1000, rpyc_port=18861)
 
         # Restart → new pid/port.
         mock_registry.add_mock_agent(
-            "agent_a", pid=2000, rpyc_port=18862, working_dir="/tmp/vc"
+            "agent_1", pid=2000, rpyc_port=18862, working_dir="/tmp/vc"
         )
         await agent_service._discover_agents()
 
@@ -140,7 +140,7 @@ class TestReconnectOnRestart:
         ), patch.object(
             agent_service, "_update_agent_status", new=AsyncMock()
         ):
-            ok = await agent_service.connect_to_agent("agent_a")
+            ok = await agent_service.connect_to_agent("agent_1")
 
         assert ok is True
         # Reconnected to the NEW port, and resubscribed.
@@ -149,7 +149,7 @@ class TestReconnectOnRestart:
             f"got {connected_ports}"
         )
         sub.assert_awaited_once()
-        assert agent_service._connections["agent_a"] is new_conn
+        assert agent_service._connections["agent_1"] is new_conn
 
 
 if __name__ == "__main__":

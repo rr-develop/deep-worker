@@ -16,7 +16,7 @@ servicer before the first request decides which engine is needed.
 blocking on purpose. LanceDB bridges to its own background event loop
 through a blocking ``run_coroutine_threadsafe(...).result()``; called on
 a loop thread it holds the GIL while waiting, LanceDB's loop starves on
-that GIL, and the process deadlocks — the live mj1_init hang of
+that GIL, and the process deadlocks — the live agent_c hang of
 2026-06-15. ``grpc_server`` therefore hands every call here to a
 dedicated executor (design §4.2, blocker B2). Do not add ``async def``
 to this module: the blocking signature is what forces callers to

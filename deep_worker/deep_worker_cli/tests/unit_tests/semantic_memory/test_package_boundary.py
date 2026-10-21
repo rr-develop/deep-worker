@@ -7,8 +7,8 @@ may spawn a backend) and the agent-side client imports it. So the ONLY
 thing keeping the heavy stack out of every agent process is that
 ``service/__init__.py`` executes nothing.
 
-``repo_graph`` has exactly this defect: its design doc §3.3 claims the
-client never imports ``repo_graph.service``, while ``stdio_server.py``
+``the code-graph server`` has exactly this defect: its design doc §3.3 claims the
+client never imports ``the code-graph server.service``, while ``stdio_server.py``
 does — safe purely by accident. Pin it here so it cannot rot.
 
 The full transitive import lock over the tools lands with the client

@@ -24,7 +24,7 @@ The skill provides a Python script that searches arXiv and returns formatted res
 
 **Note:** Always use the absolute path from your skills directory (shown in the system prompt above).
 
-If running deepagents from a virtual environment:
+If running deep-worker from a virtual environment:
 ```bash
 .venv/bin/python [YOUR_SKILLS_DIR]/arxiv-search/arxiv_search.py "your search query" [--max-papers N]
 ```
@@ -78,7 +78,7 @@ This skill requires the `arxiv` Python package. The script will detect if it's m
 
 **If you see "Error: arxiv package not installed":**
 
-If running deepagents from a virtual environment (recommended), use the venv's Python:
+If running deep-worker from a virtual environment (recommended), use the venv's Python:
 ```bash
 .venv/bin/python -m pip install arxiv
 ```
@@ -88,7 +88,7 @@ Or for system-wide install:
 python3 -m pip install arxiv
 ```
 
-The package is not included in deepagents by default since it's skill-specific. Install it on-demand when first using this skill.
+The package is not included in deep-worker by default since it's skill-specific. Install it on-demand when first using this skill.
 
 ## Notes
 

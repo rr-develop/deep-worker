@@ -123,7 +123,7 @@ class TestPermissions:
         self, tmp_path: Path
     ) -> None:
         # mkdir(mode=...) is a no-op on an existing directory and is
-        # masked by the ambient umask — this is exactly how repo_graph
+        # masked by the ambient umask — this is exactly how the code-graph server
         # ended up with a 0755 svc/ dir. An explicit chmod must fix it.
         base = tmp_path / "semantic_memory"
         base.mkdir(mode=0o755)

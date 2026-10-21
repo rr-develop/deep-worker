@@ -253,7 +253,7 @@ class TestProgressiveRawInput:
             state,
             [
                 _pending("t2", "send_message_to_agent"),
-                _refine("t2", "send_message_to_agent", {"agent_name": "agent_a"}),
+                _refine("t2", "send_message_to_agent", {"agent_name": "agent_1"}),
             ],
         )
         assert calls == [], f"dispatched without 'message': {calls!r}"
@@ -265,16 +265,16 @@ class TestProgressiveRawInput:
             state,
             [
                 _pending("t2", "send_message_to_agent"),
-                _refine("t2", "send_message_to_agent", {"agent_name": "agent_a"}),
+                _refine("t2", "send_message_to_agent", {"agent_name": "agent_1"}),
                 _refine(
                     "t2",
                     "send_message_to_agent",
-                    {"agent_name": "agent_a", "message": "hi"},
+                    {"agent_name": "agent_1", "message": "hi"},
                 ),
             ],
         )
         assert len(calls) == 1
-        assert calls[0]["args"] == {"agent_name": "agent_a", "message": "hi"}
+        assert calls[0]["args"] == {"agent_name": "agent_1", "message": "hi"}
 
     def test_single_refine_with_complete_args_still_works(self) -> None:
         """The original (single-refine) shape must keep working unchanged."""

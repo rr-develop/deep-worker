@@ -3,7 +3,7 @@
 Reported 2026-10-10: ``set_task_manager(name, enabled=False)`` was accepted and
 ``get_agent_status`` reported ``task_manager_active=false``, yet the manager
 started producing decisions again -- after a new task and after a restart. The
-observations in ``rg1_worker.err.log`` pin both halves: ``[TaskManager] Disabled``
+observations in ``agent_a.err.log`` pin both halves: ``[TaskManager] Disabled``
 appears 9 times against a single ``[TaskManager] Enabled``, and 14
 ``TaskManager iteration 1`` lines follow the 09:43Z disable with no enable and no
 restart in between.

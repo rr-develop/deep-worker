@@ -1,6 +1,6 @@
 """Regression: the resolver/display handler must not re-pin a foreign model.
 
-Incident ca1_init (2026-06-29): an agent launched as ``codex`` with
+Incident agent_e (2026-06-29): an agent launched as ``codex`` with
 ``config.model = None`` (unpinned) had its ``launch_config["model"]``
 re-pinned to a stale ``grok-composer-2.5-fast`` on every restart because the
 startup display seed read codex's session jsonl (which had recorded the

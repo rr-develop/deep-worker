@@ -169,7 +169,7 @@ restriction — the same silent miss a typo'd literal causes, which is
 precisely what §2 refuses to allow.
 
 The validated set is the deep-worker tools, so it does NOT include tools
-contributed by external MCP servers (`serena__*`, `repo_graph__*`, …):
+contributed by external MCP servers (`serena__*`, `code_graph__*`, …):
 those are attached by the provider after the selection is checked. Naming
 one is therefore rejected as unknown. This is the same boundary §4 draws
 for the ACP providers — the selection governs deep-worker tools, and the

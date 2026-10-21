@@ -109,7 +109,7 @@ SWAP_FLOOR_KB=204800
 #   2. Every other python3 process above the RSS floor — the catch-all.
 #   3. Every process of ANY kind holding more than SWAP_FLOOR_KB of swap.
 # Without the catch-all, detached grandchildren (post-commit reindex,
-# repo_graph pipeline helpers with cmdline "python3 -", …) never showed
+# the code-graph server pipeline helpers with cmdline "python3 -", …) never showed
 # up in rss.log even at multi-GB RSS.  A related internal incident
 # analysis (not included here) describes the concrete leak this closes.
 #

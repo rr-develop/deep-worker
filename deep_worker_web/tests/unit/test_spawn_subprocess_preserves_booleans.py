@@ -76,7 +76,7 @@ def test_spawn_preserves_history_memory(monkeypatch: pytest.MonkeyPatch) -> None
     """Regression for the actual 2026-06-05 incident: -m dropped on web restart."""
     calls = _capture(monkeypatch)
     cfg = {**BASE, "history_memory": True}
-    _spawn_subprocess("test-agent", cfg, model=None, provider=None, clean=False)
+    _spawn_subprocess("agent_1", cfg, model=None, provider=None, clean=False)
     assert "-m" in calls[0]["agent_args"], (
         f"history_memory=True was persisted but '-m' was NOT emitted to the "
         f"spawn cmd. This is the 2026-06-05 regression. cmd={calls[0]["agent_args"]}"

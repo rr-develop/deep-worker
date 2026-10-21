@@ -4,7 +4,7 @@ These tests exist because of a specific hang, not a style preference.
 LanceDB bridges to its own background event loop with a blocking
 ``run_coroutine_threadsafe(...).result()``; run on a loop thread it holds
 the GIL while waiting, LanceDB's loop starves, and the process is dead
-(mj1_init, 2026-06-15). The service inherits that physics, so the
+(agent_c, 2026-06-15). The service inherits that physics, so the
 executor boundary is a correctness property and is pinned as one.
 """
 
@@ -86,7 +86,7 @@ class TestExecutorBoundary:
 
         assert reply.result.content == "rendered"
         assert seen["thread"] != loop_thread, (
-            "engine ran on the event-loop thread — this is the mj1_init deadlock"
+            "engine ran on the event-loop thread — this is the agent_c deadlock"
         )
 
     @pytest.mark.asyncio

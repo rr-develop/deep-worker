@@ -23,7 +23,7 @@ from tests.fixtures.mock_registry import MockProcessRegistry
 @pytest.fixture
 def mock_registry() -> MockProcessRegistry:
     registry = MockProcessRegistry()
-    registry.add_mock_agent("test-agent", pid=1000, rpyc_port=18861, working_dir="/tmp/vc")
+    registry.add_mock_agent("agent_1", pid=1000, rpyc_port=18861, working_dir="/tmp/vc")
     return registry
 
 
@@ -44,14 +44,14 @@ async def test_reconcile_refreshes_identity_and_reconnects_on_restart(
     await agent_service.initialize()
 
     # Established subscription bound to the ORIGINAL identity.
-    agent_service._connections["test-agent"] = _live_conn()
-    agent_service._roots["test-agent"] = MagicMock()
-    agent_service._callback_services["test-agent"] = MagicMock()
-    agent_service._record_conn_identity("test-agent", pid=1000, rpyc_port=18861)
+    agent_service._connections["agent_1"] = _live_conn()
+    agent_service._roots["agent_1"] = MagicMock()
+    agent_service._callback_services["agent_1"] = MagicMock()
+    agent_service._record_conn_identity("agent_1", pid=1000, rpyc_port=18861)
 
     # Agent restarts: registry now reports a new pid + port.
     mock_registry.add_mock_agent(
-        "test-agent", pid=2000, rpyc_port=18862, working_dir="/tmp/vc"
+        "agent_1", pid=2000, rpyc_port=18862, working_dir="/tmp/vc"
     )
 
     reconnected: list[str] = []
@@ -68,14 +68,14 @@ async def test_reconcile_refreshes_identity_and_reconnects_on_restart(
         await agent_service._reconcile_from_registry()
 
     # In-memory identity refreshed to the NEW port...
-    assert agent_service._registry_identity("test-agent") == (2000, 18862), (
+    assert agent_service._registry_identity("agent_1") == (2000, 18862), (
         "reconcile must refresh _agents[name] with the restarted agent's "
         "current pid/port so the restart is detectable"
     )
     # ...the stale connection evicted (is_connected saw the mismatch)...
-    assert "test-agent" not in agent_service._connections
+    assert "agent_1" not in agent_service._connections
     # ...and a reconnect was scheduled.
-    assert "test-agent" in reconnected, (
+    assert "agent_1" in reconnected, (
         "reconcile must schedule a reconnect after a restart"
     )
 
@@ -88,10 +88,10 @@ async def test_reconcile_no_churn_when_identity_unchanged(
     await agent_service.initialize()
 
     conn = _live_conn()
-    agent_service._connections["test-agent"] = conn
-    agent_service._roots["test-agent"] = MagicMock()
-    agent_service._callback_services["test-agent"] = MagicMock()
-    agent_service._record_conn_identity("test-agent", pid=1000, rpyc_port=18861)
+    agent_service._connections["agent_1"] = conn
+    agent_service._roots["agent_1"] = MagicMock()
+    agent_service._callback_services["agent_1"] = MagicMock()
+    agent_service._record_conn_identity("agent_1", pid=1000, rpyc_port=18861)
 
     reconnected: list[str] = []
 
@@ -103,7 +103,7 @@ async def test_reconcile_no_churn_when_identity_unchanged(
     ):
         await agent_service._reconcile_from_registry()
 
-    assert agent_service._connections.get("test-agent") is conn
+    assert agent_service._connections.get("agent_1") is conn
     assert reconnected == [], "no reconnect/churn when nothing changed"
 
 

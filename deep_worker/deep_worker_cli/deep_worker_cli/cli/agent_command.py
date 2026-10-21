@@ -5,6 +5,7 @@ import asyncio
 import json
 import os
 import re
+import shutil
 import sys
 from collections.abc import Callable
 from datetime import datetime
@@ -2090,7 +2091,7 @@ def create_parser() -> argparse.ArgumentParser:
             "Declare a tool whose successful result ends the agent's turn. "
             "Repeatable. NAME is the GRAPH-side tool name — for an external "
             "MCP server it is the mangled '<server>__<tool>' form, e.g. "
-            "'repo_graph__submit_fragments'. With ':FIELD' the turn ends "
+            "'code_graph__submit_fragments'. With ':FIELD' the turn ends "
             "only when that top-level field of the result is exactly True; "
             "without it, when 'success' is truthy."
         ),

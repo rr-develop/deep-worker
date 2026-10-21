@@ -46,7 +46,7 @@ STATELESS_PROVIDERS: frozenset[str] = frozenset(
 # INVARIANT: every provider listed here MUST implement
 # ``summarizer_port.SummarizerPort`` (both halves). Membership without the port
 # is a deterministic crash — the middleware refuses the generic fallback and
-# raises ``SummarizationFailedError`` (rg1_worker/codex, 2026-08-23). Absence
+# raises ``SummarizationFailedError`` (agent_a/codex, 2026-08-23). Absence
 # while session-stateful is WORSE: the provider sails past the guard and dumps
 # its whole history into a fresh session, silently. ``grok`` sat in
 # STATELESS_PROVIDERS in exactly that state until 2026-08-24 despite sending

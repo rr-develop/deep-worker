@@ -197,13 +197,18 @@ def test_native_tools_module_exposes_every_native_type() -> None:
     from deep_worker.providers.codex_provider.event_pump import NATIVE_TOOL_ITEM_TYPES
 
     exposed_names = {t.name for t in native_tools.NATIVE_TOOLS}
-    # One tool per native item type. The tool name MUST equal the
-    # Codex item.type — that's how history shows the real Codex
-    # tool names instead of any synthetic prefix.
-    assert exposed_names == set(NATIVE_TOOL_ITEM_TYPES), (
+    # One tool per native item type, PLUS the catch-all recorder added by
+    # 2f354dd6: codex ships tools faster than this package, and an
+    # unrecognised call used to be dropped on the floor (codex ran it,
+    # history never saw it). The wildcard keeps it under its real type in
+    # ``_codex_original_type``. Equality stays exact — a new native type
+    # with no tool, or any OTHER stray name, still fails.
+    expected = set(NATIVE_TOOL_ITEM_TYPES) | {native_tools.GENERIC_NATIVE_TOOL_NAME}
+    assert exposed_names == expected, (
         f"native_tools.NATIVE_TOOLS must expose exactly the native "
-        f"item types. Missing: {set(NATIVE_TOOL_ITEM_TYPES) - exposed_names}. "
-        f"Extra: {exposed_names - set(NATIVE_TOOL_ITEM_TYPES)}."
+        f"item types plus the catch-all recorder. "
+        f"Missing: {expected - exposed_names}. "
+        f"Extra: {exposed_names - expected}."
     )
 
 

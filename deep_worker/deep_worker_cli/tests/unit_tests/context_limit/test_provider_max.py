@@ -1,6 +1,6 @@
 """Tests for ``deep_worker_cli.context_limit.provider_max``.
 
-Architecture under test (rg1_worker 2026-08-18 lesson, then refined):
+Architecture under test (agent_a 2026-08-18 lesson, then refined):
 
   - Dated model IDs are sourced from the LangChain SDK's
     ``data._profiles._PROFILES`` dicts — never hand-curated.
@@ -55,7 +55,7 @@ def test_provider_max_table_is_built_from_sdk_profiles() -> None:
     The (provider, model) row must be present in the SDK's
     ``max_input_tokens`` mapping for the same model id. If we
     ever find a row that is NOT in the SDK, that's a manual
-    hardcode — and the rg1_worker 2026-08-18 regression says
+    hardcode — and the agent_a 2026-08-18 regression says
     we don't want to maintain those manually.
     """
     try:
@@ -139,7 +139,7 @@ def test_provider_max_table_has_zero_hand_curated_anthropic_entries() -> None:
     assert not extras, (
         f"Models in _ANTHROPIC_MAX_INPUT but not in "
         f"langchain_anthropic._PROFILES: {extras}. "
-        f"These are hand-curated hardcodes — the rg1_worker regression."
+        f"These are hand-curated hardcodes — the agent_a regression."
     )
 
 
@@ -587,7 +587,7 @@ def test_warn_silent_for_family_alias(capsys: pytest.CaptureFixture[str]) -> Non
     know and can't get it via the API, better not do any cap
     at all besides the operator's -l." Emitting a warn on the
     sync path would be exactly the silent-wrong assumption the
-    rg1_worker regression was about.
+    agent_a regression was about.
     """
     warn_if_above_provider_max(2_000_000, "claude-code", "fable")
     captured = capsys.readouterr()
@@ -595,7 +595,7 @@ def test_warn_silent_for_family_alias(capsys: pytest.CaptureFixture[str]) -> Non
         "family alias must not trigger a clamp warn on the sync "
         "path — we don't know the current generation's cap, so "
         "warning would be exactly the silent-wrong assumption "
-        "the rg1_worker regression was about."
+        "the agent_1 regression was about."
     )
 
 
@@ -633,9 +633,9 @@ def test_codex_cli_override_uses_400k_not_api_cap() -> None:
     assert provider_max_for("codex", "gpt-5.5-codex") == 400_000
 
 
-# ── rg1_worker 2026-08-18 incident regression guard ─────────────────────
+# ── agent_a 2026-08-18 incident regression guard ─────────────────────
 #
-# The original rg1_worker crash: ``-l 400k`` against
+# The original agent_a crash: ``-l 400k`` against
 # ``(claude-code, fable)`` was silently clamped to 200k by
 # a hand-curated table that assumed all Claude families were
 # 200k. The fix path:
@@ -649,7 +649,7 @@ def test_codex_cli_override_uses_400k_not_api_cap() -> None:
 #     passthrough (no fabricated value).
 
 
-def test_rg1_worker_regression_fable_400k_passes_through_sync() -> None:
+def test_family_alias_400k_passes_through_sync() -> None:
     """The sync helper: ``-l 400k`` against ``fable`` is silent
     passthrough (operator's value respected, not silently
     overridden). The async resolver is the path that can
@@ -658,7 +658,7 @@ def test_rg1_worker_regression_fable_400k_passes_through_sync() -> None:
     assert clamp_to_provider_max(400_000, "claude-code", "fable") == 400_000
 
 
-def test_rg1_worker_regression_fable_emits_no_warn_sync(
+def test_family_alias_emits_no_warn_sync(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """``-l 400k`` against ``fable`` emits no stderr warn on the
@@ -670,7 +670,7 @@ def test_rg1_worker_regression_fable_emits_no_warn_sync(
     assert captured.err == ""
 
 
-async def test_rg1_worker_regression_async_resolver_uses_picker() -> None:
+async def test_family_alias_async_resolver_uses_picker() -> None:
     """The async resolver exercises the picker for ``fable`` and
     looks up the resolved id in the SDK. If the SDK has the id,
     we return the real value; if not, silent passthrough.

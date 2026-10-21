@@ -170,7 +170,7 @@ class TestClaudeWrappersShareOneAccount:
             ' "last_failure_agent": "legacy"},'
             ' "grok": {"available_after_utc": "2099-01-01T00:00:00+00:00",'
             ' "last_failure_marker": "real", "last_failure_at_utc": "2026-01-01T00:00:00+00:00",'
-            ' "last_failure_agent": "fg1"}}'
+            ' "last_failure_agent": "agent_1"}}'
         )
 
         tracker = AvailabilityTracker(data_dir=tmp_path)

@@ -58,10 +58,10 @@ class TestArgparseAcceptsAcpProvider:
         parser = create_parser()
         args = parser.parse_args(
             [
-                "acp_test",
+                "agent_g",
                 "-sp",
                 "--dir",
-                "/path/to/repo",
+                "<repo>",
                 "--provider",
                 ACP_PROVIDER,
             ]
@@ -103,6 +103,7 @@ class TestSingleSourceOfTruth:
             assert builtin in choices
         assert len(choices) == len(set(choices)), "duplicate provider choices"
 
+    @pytest.mark.integration  # AgentConfig validates creds: needs GOOGLE_API_KEY
     def test_every_supported_provider_passes_config_validation(self) -> None:
         """argparse and AgentConfig must not disagree in EITHER direction."""
         for provider in SUPPORTED_PROVIDERS:

@@ -365,7 +365,8 @@ async function sendMessage() {
     }
 }
 
-// Copy last response to clipboardasync function copyLastResponse(event) {
+// Copy last response to clipboard
+async function copyLastResponse(event) {
     const content = document.getElementById('last-response-content');
     const text = content.textContent;
 
@@ -1818,7 +1819,7 @@ function formatAgentContext(used, size, semantics) {
 // per-turn total is the sum of prompt + completion tokens the provider
 // billed for the most recent response; it is NOT a cumulative context
 // gauge and MUST NOT be compared with ``context_limit``.
-// rg1_worker 2026-08-22 (Context: 2265.4k vs Limit: 400k regression).
+// agent_a 2026-08-22 (Context: 2265.4k vs Limit: 400k regression).
 function formatLastTurnTokens(total) {
     const s = _fmtK(total);
     if (s == null) return null;
@@ -1830,7 +1831,7 @@ function formatLastTurnTokens(total) {
 // operator can see at a glance:
 //   - the SIZE of the cap (so they know what the guard is holding);
 //   - the SOURCE (the -l flag) — distinguishes it from a provider's
-//     default window that happens to match (rg1_worker 2026-08-18 — the
+//     default window that happens to match (agent_a 2026-08-18 — the
 //     original silent failure).
 function formatContextLimit(limit) {
     // Missing (-l not set) → "-" — the UI must not invent a value
@@ -1921,7 +1922,7 @@ function handleAgentContextChanged(data) {
     agentInfo.agent_context_used = data.agent_context_used;
     agentInfo.agent_context_size = data.agent_context_size;
     agentInfo.agent_context_semantics = data.agent_context_semantics;
-    // ``*_last_turn_tokens`` is a NEW field (rg1_worker 2026-08-22); older
+    // ``*_last_turn_tokens`` is a NEW field (agent_a 2026-08-22); older
     // backends won't send it, so keep the previous value when the key is
     // absent instead of clobbering it to ``undefined``.
     if ('agent_last_turn_tokens' in data) {
