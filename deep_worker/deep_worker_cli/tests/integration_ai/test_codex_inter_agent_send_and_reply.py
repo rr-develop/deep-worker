@@ -6,10 +6,11 @@ Agent B is ``deepseek`` (the same as in the claude-code-sdk test).
 
 Why a SEPARATE test is needed for codex:
 
-  Codex is a provider with its own quirks. Unlike claude-code-sdk, it does
-  NOT use ``InterAgentDeliveryResolveMiddleware`` (that middleware lives
-  in claude_code_sdk_provider because it is specific to the in-process proxy
-  MCP CLI). Codex uses its own JSONL-stream machinery plus native tools
+  Codex is a provider with its own quirks. Unlike claude-code-sdk/ACP, it
+  does NOT use ``InterAgentDeliveryResolveMiddleware`` — registration is by
+  CAPABILITY (``resolve_pending_tool``), and ``CodexChatModel`` does not
+  implement that method, because it does not hold the proxy-MCP Future the
+  same way. Codex uses its own JSONL-stream machinery plus native tools
   passthrough, in which the echo from ``SendMessageCompletionMiddleware``
   and the delivery from ``InterAgentReplyMiddleware`` must also work
   correctly — which is exactly what is verified here end-to-end.

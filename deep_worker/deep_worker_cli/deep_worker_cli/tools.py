@@ -65,7 +65,7 @@ class WebSearchAvailability:
     """Result of resolving the universal web-search tool under a policy."""
 
     tool: BaseTool | None
-    reason: str  # "available" | "sdk_missing" | "sdk_incompatible" | "provider_missing" | "disabled"
+    reason: str  # "available" | "sdk_missing" | "sdk_incompatible" | "disabled"
     remedy: str | None
 
 
@@ -102,45 +102,23 @@ def _sdk_fork_status() -> tuple[str, str | None]:
     return "ok", None
 
 
-_WEB_SEARCH_PROVIDER = "deep_worker.providers.claude_code_sdk_provider.web_search"
-
-
-def _web_search_provider_status() -> tuple[str, str | None]:
-    """Return ``(status, remedy)`` for the package that hosts the tool.
-
-    The delegation tool lives in the claude-code-sdk provider, which is not
-    part of every distribution. Its absence is a missing capability
-    (``"provider_missing"``), not a defect; a broken submodule of a present
-    provider is re-raised.
-    """
-    try:
-        import deep_worker.providers.claude_code_sdk_provider.web_search  # noqa: PLC0415, F401
-    except ModuleNotFoundError as exc:
-        name = exc.name or ""
-        if name == _WEB_SEARCH_PROVIDER or _WEB_SEARCH_PROVIDER.startswith(name + "."):
-            return (
-                "provider_missing",
-                "The web_search delegation tool requires the claude-code-sdk "
-                "provider, which is not part of this distribution.",
-            )
-        raise
-    return "ok", None
-
-
 def resolve_web_search_tool(
     policy: WebSearchPolicy | str = WebSearchPolicy.AUTO,
 ) -> WebSearchAvailability:
     """Resolve the universal web-search tool under a tri-state policy.
 
-    - ``AUTO``: return the tool when the SDK fork is available; otherwise
-      log exactly once and return ``tool=None`` (the agent still starts).
+    - ``AUTO``: return the tool when the SDK fork AND the claude_code_sdk_provider
+      package are both available; otherwise log exactly once and return
+      ``tool=None`` (the agent still starts).
     - ``ENABLED``: return the tool, or raise ``CapabilityError`` with the
-      remedy when the SDK is unavailable.
+      remedy when either is unavailable.
     - ``DISABLED``: NEVER touch the claude provider or the SDK; return
       ``tool=None`` without any import attempt.
 
     The claude provider module is imported lazily, only when the SDK fork
-    is confirmed available and the policy permits resolution.
+    is confirmed available, ``claude_code_sdk_provider`` itself resolves
+    (``claude_code_sdk_provider`` is excluded from the public distribution —
+    see ``ensure_provider_importable``), and the policy permits resolution.
     """
     global _web_search_warned_once
 
@@ -152,7 +130,12 @@ def resolve_web_search_tool(
 
     status, remedy = _sdk_fork_status()
     if status == "ok":
-        status, remedy = _web_search_provider_status()
+        from deep_worker_cli.provider_paths import ensure_provider_importable  # noqa: PLC0415
+
+        resolution = ensure_provider_importable("deep_worker.providers.claude_code_sdk_provider")
+        if resolution.unavailable:
+            status, remedy = "provider_unavailable", resolution.remedy or resolution.unavailable
+
     if status != "ok":
         if policy is WebSearchPolicy.ENABLED:
             raise CapabilityError(capability="web_search", remedy=remedy)

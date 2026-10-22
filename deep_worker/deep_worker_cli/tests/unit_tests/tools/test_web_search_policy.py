@@ -107,26 +107,36 @@ def test_enabled_sdk_incompatible_raises_capability_error() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _provider_absent():
+    """Patch ``ensure_provider_importable`` to report the provider missing.
+
+    ``resolve_web_search_tool`` imports it inside the function body, so the
+    patch has to target the definition site in ``provider_paths``, not an
+    attribute of ``tools``.
+    """
+    resolution = MagicMock()
+    resolution.unavailable = "provider not shipped"
+    resolution.remedy = "provider not shipped"
+    return patch(
+        "deep_worker_cli.provider_paths.ensure_provider_importable",
+        return_value=resolution,
+    )
+
+
 def test_auto_provider_missing_skips_tool() -> None:
     with patch(
         "deep_worker_cli.tools._sdk_fork_status", return_value=("ok", None),
-    ), patch(
-        "deep_worker_cli.tools._web_search_provider_status",
-        return_value=("provider_missing", "provider not shipped"),
-    ):
+    ), _provider_absent():
         avail = resolve_web_search_tool(WebSearchPolicy.AUTO)
     assert avail.tool is None
-    assert avail.reason == "provider_missing"
+    assert avail.reason == "provider_unavailable"
     assert avail.remedy == "provider not shipped"
 
 
 def test_enabled_provider_missing_raises_capability_error() -> None:
     with patch(
         "deep_worker_cli.tools._sdk_fork_status", return_value=("ok", None),
-    ), patch(
-        "deep_worker_cli.tools._web_search_provider_status",
-        return_value=("provider_missing", "provider not shipped"),
-    ):
+    ), _provider_absent():
         with pytest.raises(CapabilityError) as exc_info:
             resolve_web_search_tool(WebSearchPolicy.ENABLED)
     assert exc_info.value.capability == "web_search"

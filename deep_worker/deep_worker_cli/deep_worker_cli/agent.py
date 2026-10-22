@@ -775,19 +775,20 @@ def _maybe_add_delivery_resolve_middleware(
     A live claude-code agent wedged for ~2h47m after a
     ``send_message_to_agent`` for exactly this reason.
 
-    Best-effort: if the provider package can't be imported, leave the stack
-    unchanged rather than breaking agent construction.
+    The middleware itself lives in the shared ``deep_worker.providers.acp``
+    layer (not any single provider package), so its import has no optional
+    dependency to swallow a failure for — a raised exception here means a
+    packaging defect, and must surface rather than silently leave a
+    capable model unwired.
     """
     if isinstance(model, str):
         return
     if not callable(getattr(model, "resolve_pending_tool", None)):
         return
-    try:
-        from deep_worker.providers.claude_code_sdk_provider.delivery_resolve_middleware import (
-            InterAgentDeliveryResolveMiddleware,
-        )
-    except Exception:  # noqa: BLE001 — provider optional / import path issue
-        return
+    from deep_worker.providers.acp.delivery_resolve_middleware import (
+        InterAgentDeliveryResolveMiddleware,
+    )
+
     agent_middleware.append(InterAgentDeliveryResolveMiddleware(model))
 
 
