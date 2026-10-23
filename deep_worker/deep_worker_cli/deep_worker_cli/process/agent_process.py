@@ -550,6 +550,7 @@ class AgentProcess:
         startup_sum_query: str | None = None,
         startup_summarize: bool = False,
         startup_summary_prompt: str | None = None,
+        ready_fd: int | None = None,
     ):
         """Initialize the agent process.
 
@@ -590,6 +591,15 @@ class AgentProcess:
                 current thread history is offloaded to ``<agent>.jsonl`` and
                 the active context wiped before this becomes a summary-shape
                 starting message (one-shot, never persisted).
+            ready_fd: Optional fd of the write end of the readiness
+                socketpair ``daemon.daemonize()`` set up before forking
+                (``None`` when not launched via ``deep-worker <name>``,
+                e.g. tests/direct construction). ``start()`` sends exactly
+                one ``{"ready": true}`` or ``{"error": "<cause>"}`` line
+                over it — see ``_report_ready``/``_report_startup_error``
+                — so the launching terminal's blocking wait in
+                ``daemon._wait_for_readiness`` resolves. See
+                docs/DESIGN_FAIL_FAST_AGENT_STARTUP.md.
 
         Raises:
             ValueError: If both memory_only and use_sqlite are True
@@ -651,6 +661,17 @@ class AgentProcess:
         self._pending_startup_sum_query: str | None = startup_sum_query
         self._pending_summarize = startup_summarize
         self._pending_summary_prompt = startup_summary_prompt
+
+        # Readiness channel to the launching terminal (``deep-worker
+        # <name>``'s original, still-blocked process). ``None`` outside
+        # that launch path. Reported exactly once, from ``start()`` — see
+        # ``_report_ready``/``_report_startup_error``.
+        self._ready_fd = ready_fd
+        self._ready_reported = False
+        # Set once, in start()'s init except, when agent init fails. The
+        # ORIGINAL cause — kept distinct from whatever a later invoke
+        # attempt's own set_error() call overwrites error_message with.
+        self._startup_error_reason: str | None = None
 
         # The underlying chat model. Assigned in ``start()`` after
         # ``create_model`` returns. Used by ``_auto_continue_after_restart``
@@ -1458,7 +1479,11 @@ class AgentProcess:
 
                 # Now import AFTER environment is loaded and deepagents is in path
                 from deep_worker_cli.agent import create_cli_agent
-                from deep_worker_cli.config import WebSearchPolicy, create_model
+                from deep_worker_cli.config import (
+                    WebSearchPolicy,
+                    create_model,
+                    preflight_provider_async,
+                )
                 from deep_worker_cli import tools as cli_tools
                 from deep_worker_cli.tools import (
                     http_request,
@@ -1491,6 +1516,17 @@ class AgentProcess:
                         self._token_stats_recorder
                     ),
                 )
+
+                # Verify the provider's EXTERNAL runtime (node adapter / CLI
+                # binary) NOW, while we are still inside the init try/except
+                # that turns a failure into AgentStatus.ERROR + a readiness
+                # "error" report to the launching terminal. Per-provider by
+                # construction: a no-op for every API provider, so an agent
+                # on openai/azure/... starts fine on a host with no node.
+                # Without this the claude-code node>=22 gate only fired at
+                # the first ainvoke — the launcher printed a healthy start
+                # and the agent broke later, on the user's first prompt.
+                await preflight_provider_async(self.config.provider)
 
                 # Set working_dir on model for MCP direct tool execution
                 # (e.g. project_memory needs to know the project root)
@@ -1968,11 +2004,18 @@ class AgentProcess:
                 # Make the error VISIBLE and PERSISTENT in Web UI as ERROR status + error_message.
                 # It must not be hidden in logs only. The error banner will show prominently
                 # for the selected agent.
+                startup_error_reason = f"Agent initialization failed: {e}"
+                # Kept so the readiness channel (reported AFTER _register(),
+                # per docs/DESIGN_FAIL_FAST_AGENT_STARTUP.md — the agent
+                # stays registered/ERROR, only the launcher's terminal
+                # report differs) and any later invoke attempt can surface
+                # this ORIGINAL cause instead of a generic
+                # "not initialised" message once it is overwritten by a
+                # subsequent set_error call.
+                self._startup_error_reason = startup_error_reason
                 if self.session_manager:
                     try:
-                        await self.session_manager.set_error(
-                            f"Agent initialization failed: {e}"
-                        )
+                        await self.session_manager.set_error(startup_error_reason)
                     except Exception:
                         pass  # best effort; don't block start continuation
 
@@ -2081,6 +2124,20 @@ class AgentProcess:
             sys.stdout.flush()
             _logger.info(msg)
 
+            # Report the startup outcome to the launching terminal (if any)
+            # NOW — right after registration, which per the
+            # No-Agent-Error-State policy happens unconditionally whether
+            # or not agent init (step 4) succeeded. docs/DESIGN_FAIL_FAST_AGENT_STARTUP.md:
+            # the process stays alive and registered either way; this only
+            # decides what ``deep-worker <name>``'s terminal prints and
+            # exits with.
+            if self.agent is None:
+                self._report_startup_error(
+                    self._startup_error_reason or "agent initialization failed"
+                )
+            else:
+                self._report_ready()
+
             # 7. Enter event loop
             self.running = True
             print(f"{_ts()} Agent '{self.name}' started (PID {os.getpid()})")
@@ -2145,6 +2202,15 @@ class AgentProcess:
 
         except BaseException as e:
             print(f"{_ts()} Failed to start agent: {e}")
+            # Unlike the init try/except (step 4) above, a failure reaching
+            # THIS level means something went wrong OUTSIDE agent-build —
+            # PID file, RPyC port, registry — and the process is genuinely
+            # about to die (``raise`` below), never registered. The
+            # launching terminal would otherwise block until
+            # daemon.READY_TIMEOUT and report a misleading timeout instead
+            # of the real cause. No-op if step 4's except already reported
+            # (``_ready_reported`` guard in ``_send_ready_event``).
+            self._report_startup_error(str(e))
             await self.shutdown()
             # ``shutdown()`` exits on the ``if not self.running`` guard for
             # any failure BEFORE step 7 — but the pid file is written in
@@ -3367,6 +3433,39 @@ class AgentProcess:
             a2a_url=a2a_url,
         )
         self.registry.register(process_info)
+
+    def _report_ready(self) -> None:
+        """Tell the launching terminal the agent reached its normal
+        running state. One-shot, best-effort: a missing/closed fd (no
+        ``deep-worker <name>`` launcher waiting, already reported, or the
+        launcher gave up and closed its end) must never fail startup —
+        the agent keeps running regardless of whether anyone heard this.
+        """
+        self._send_ready_event({"ready": True})
+
+    def _report_startup_error(self, reason: str) -> None:
+        """Tell the launching terminal WHY initialization failed.
+
+        Called once, from ``start()``'s init ``except`` (after the agent
+        has already been registered — see docs/DESIGN_FAIL_FAST_AGENT_STARTUP.md):
+        the process itself stays alive in ``AgentStatus.ERROR`` per the
+        No-Agent-Error-State policy; this only changes what the launching
+        terminal prints and its exit code.
+        """
+        self._send_ready_event({"error": reason})
+
+    def _send_ready_event(self, event: dict[str, Any]) -> None:
+        if self._ready_reported or self._ready_fd is None:
+            return
+        self._ready_reported = True
+        try:
+            with socket.socket(fileno=self._ready_fd) as sock:
+                sock.sendall(json.dumps(event).encode() + b"\n")
+        except OSError:
+            # Launcher already gone (Ctrl-C on the terminal, closed
+            # pipe, …) — nothing left to report to. The agent is still
+            # alive and registered; only the terminal report is lost.
+            pass
 
     # ================================================================
     # Durable inter-agent inbox

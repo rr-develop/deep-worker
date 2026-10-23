@@ -2531,6 +2531,7 @@ async def run_agent(args: argparse.Namespace) -> int:
             startup_summary_prompt=(
                 startup_query if getattr(args, "summarize", False) else None
             ),
+            ready_fd=getattr(args, "_ready_fd", None),
         )
 
         try:
@@ -2584,11 +2585,28 @@ def _reap_empty_cgroup_leaves() -> None:
     reap()
 
 
-def daemonize(name: str, log_dir: Path | None = None) -> None:
+def daemonize(name: str, log_dir: Path | None = None) -> int | None:
+    """Daemonize, returning the readiness-channel fd for the grandchild.
+
+    The ORIGINAL (launching) process never returns from this call — it
+    blocks inside ``daemon.daemonize()`` until the grandchild reports
+    "ready"/"error"/dies, then ``sys.exit()``s. Only the daemonized
+    grandchild actually returns here, with the fd it must report through
+    (see ``AgentProcess.__init__``'s ``ready_fd`` and ``start()``'s use of
+    it). Returns ``None`` if not daemonizing (not expected on this path,
+    kept for type-safety with the ``int | None`` contract of the
+    underlying ``daemon.daemonize()``).
+    """
     from deep_worker_cli.process.daemon import daemonize as daemonize_process
 
-    daemonize_process(
-        name, log_dir, detach=_detach_from_session_scope, reap=_reap_empty_cgroup_leaves
+    return daemonize_process(
+        name,
+        log_dir,
+        # The agent path is the one that owns this channel; web_daemon has
+        # its own and must not block on ours.
+        await_readiness=True,
+        detach=_detach_from_session_scope,
+        reap=_reap_empty_cgroup_leaves,
     )
 
 
@@ -3625,7 +3643,7 @@ def main() -> int:
         elif "DEEP_WORKER_ORIGINAL_CWD" not in os.environ:
             os.environ["DEEP_WORKER_ORIGINAL_CWD"] = os.getcwd()
 
-        daemonize(args.name)
+        args._ready_fd = daemonize(args.name)
 
         # After daemonize: stop running agent (if any), then launch
         return asyncio.run(restart_agent(args))
@@ -3741,8 +3759,12 @@ def main() -> int:
     _emit_effective_tool_selection_preflight(args)
 
     # Daemonize IMMEDIATELY. Everything below here executes in the
-    # detached grandchild; parent already returned to the shell.
-    daemonize(args.name)
+    # detached grandchild; the ORIGINAL process never returns from this
+    # call — it blocks until the grandchild reports ready/error over the
+    # readiness channel (see daemon.py's ``_wait_for_readiness``), then
+    # exits with the matching code. Only the grandchild gets a return
+    # value here: the fd it must report success/failure through.
+    args._ready_fd = daemonize(args.name)
 
     # --- Post-daemonize (grandchild only) -------------------------------
     # Output goes to ~/.deep_worker/logs/<name>.{out,err}.log from here on.

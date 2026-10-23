@@ -55,8 +55,8 @@ SCANNED_ROOTS = (
 #: belongs in always-shipped code, not behind a capability probe.
 ALLOWED_SITES = frozenset(
     {
-        ("deep_worker_cli/config.py", 2005),
-        ("deep_worker_cli/process/agent_process.py", 2419),
+        ("deep_worker_cli/config.py", 2077),
+        ("deep_worker_cli/process/agent_process.py", 2485),
         ("deep_worker_cli/tools.py", 154),
     }
 )

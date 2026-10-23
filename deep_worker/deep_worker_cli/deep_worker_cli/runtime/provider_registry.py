@@ -37,6 +37,34 @@ for backwards compatibility elsewhere; nothing new goes there.)
       ]
     }
 
+AZURE OPENAI (``compatible_with="azure"``). Azure addresses a *deployment*
+in the URL path and requires an ``api-version`` query parameter, so it needs
+two extra fields:
+
+    {
+      "providers": [
+        {
+          "name": "my-azure",
+          "compatible_with": "azure",
+          "base_url": "https://<resource>.openai.azure.com",
+          "api_key_env": "MY_AZURE_API_KEY",
+          "api_version": "2024-10-21",
+          "default_model": "my-gpt4o-deployment",
+          "auth_header": "api-key"
+        }
+      ]
+    }
+
+* ``api_version`` is REQUIRED for this dialect and rejected-if-missing at
+  load time (Azure answers a request without it with an opaque HTTP error).
+* ``base_url`` is the bare resource endpoint — do NOT append
+  ``/openai/deployments/...``; the client assembles that path itself.
+* The model name IS the Azure **deployment** name from your own resource,
+  not a public model id. It travels in the URL, never in the request body.
+* ``auth_header`` defaults to ``"api-key"`` (what Azure itself expects). Use
+  ``"authorization"`` when a corporate gateway in front of Azure wants
+  ``Authorization: Bearer <key>`` instead.
+
 SECURITY (project API key security policy): this file names the ENV VAR
 that holds the key — it never holds the key. The loader rejects an entry
 carrying an inline ``api_key`` (or an ``api_key_env`` that looks like a
@@ -65,7 +93,15 @@ REGISTRY_FILE_NAME = "providers.json"
 # rejected rather than defaulted: silently running an OpenAI client against
 # a non-OpenAI API produces confusing runtime errors instead of a clear
 # config error at startup.
-SUPPORTED_DIALECTS: frozenset[str] = frozenset({"openai"})
+SUPPORTED_DIALECTS: frozenset[str] = frozenset({"openai", "azure"})
+
+# Accepted values for ``auth_header`` (azure dialect only).
+#
+# Azure OpenAI itself authenticates with an ``api-key`` header, but
+# corporate API gateways fronting it commonly demand
+# ``Authorization: Bearer <key>`` instead. Both reach the same deployment
+# URL, so the choice is a header detail, not a separate dialect.
+SUPPORTED_AUTH_HEADERS: frozenset[str] = frozenset({"api-key", "authorization"})
 
 # Names owned by the built-in providers. A config entry may not reuse one:
 # agents persist ``provider`` by name, so shadowing "openai" would silently
@@ -114,6 +150,11 @@ class ProviderSpec:
     default_model_env: str | None = None
     model_markers: tuple[str, ...] = ()
     account_group: str | None = None
+    # Azure dialect only. ``api_version`` is REQUIRED there (Azure rejects a
+    # request without ``?api-version=``), and validated at load time rather
+    # than on the first request — see _parse_entry.
+    api_version: str | None = None
+    auth_header: str = "api-key"
     extra: dict[str, Any] = field(default_factory=dict)
 
     def api_key(self) -> str | None:
@@ -282,6 +323,44 @@ def _parse_entry(entry: Any, index: int) -> ProviderSpec:
             f"{REGISTRY_FILE_NAME}: provider {name!r} has a non-object 'extra'."
         )
 
+    # --- azure dialect extras -------------------------------------------
+    # Validated HERE, at config load, not at first request: a missing
+    # api-version surfaces from Azure as an opaque HTTP error on the
+    # operator's first turn, long after the misconfiguration was made.
+    raw_api_version = entry.get("api_version")
+    api_version: str | None = None
+    if raw_api_version is not None:
+        if not isinstance(raw_api_version, str) or not raw_api_version.strip():
+            raise ProviderConfigError(
+                f"{REGISTRY_FILE_NAME}: provider {name!r} has a non-string "
+                f"api_version."
+            )
+        api_version = raw_api_version.strip()
+
+    raw_auth_header = entry.get("auth_header")
+    auth_header = "api-key"
+    if raw_auth_header is not None:
+        if not isinstance(raw_auth_header, str):
+            raise ProviderConfigError(
+                f"{REGISTRY_FILE_NAME}: provider {name!r} has a non-string "
+                f"auth_header."
+            )
+        auth_header = raw_auth_header.strip().lower()
+        if auth_header not in SUPPORTED_AUTH_HEADERS:
+            raise ProviderConfigError(
+                f"{REGISTRY_FILE_NAME}: provider {name!r} declares "
+                f"auth_header={auth_header!r}, which is not supported. "
+                f"Supported: {', '.join(sorted(SUPPORTED_AUTH_HEADERS))}."
+            )
+
+    if dialect == "azure" and api_version is None:
+        raise ProviderConfigError(
+            f"{REGISTRY_FILE_NAME}: provider {name!r} declares "
+            f"compatible_with='azure' but no api_version. Azure OpenAI "
+            f"requires an ?api-version= query parameter on every request "
+            f"(e.g. \"api_version\": \"2024-10-21\")."
+        )
+
     return ProviderSpec(
         name=name,
         compatible_with=dialect,
@@ -291,6 +370,8 @@ def _parse_entry(entry: Any, index: int) -> ProviderSpec:
         default_model_env=default_model_env,
         model_markers=markers,
         account_group=account_group.strip() if account_group else None,
+        api_version=api_version,
+        auth_header=auth_header,
         extra=dict(extra),
     )
 

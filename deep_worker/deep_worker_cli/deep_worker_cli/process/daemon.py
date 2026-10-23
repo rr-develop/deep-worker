@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
 import os
+import select
+import socket
 import sys
 from pathlib import Path
 from collections.abc import Callable
@@ -8,6 +11,13 @@ from collections.abc import Callable
 from deep_worker_cli.storage_paths import deep_worker_home
 
 DAEMON_UMASK = 0o022
+
+# How long the launching terminal waits for the daemonized grandchild to
+# report "ready" (agent registered, running) or "error" (init failed, but
+# the process is still alive in AgentStatus.ERROR — see
+# docs/DESIGN_FAIL_FAST_AGENT_STARTUP.md) over the readiness socketpair,
+# before giving up and reporting a timeout. Mirrors ``web_daemon._START_TIMEOUT``.
+READY_TIMEOUT = 90.0
 
 
 def _detach_from_session_scope(agent_name: str | None = None) -> None:
@@ -181,12 +191,55 @@ def _reap_empty_cgroup_leaves() -> None:
             continue
 
 
-def daemonize(name: str, log_dir: Path | None = None, *, detach: Callable[[str], None] | None = None, reap: Callable[[], None] | None = None) -> None:
+def daemonize(
+    name: str,
+    log_dir: Path | None = None,
+    *,
+    await_readiness: bool = False,
+    detach: Callable[[str], None] | None = None,
+    reap: Callable[[], None] | None = None,
+) -> int | None:
     """Daemonize the current process (Unix double-fork + cgroup detach).
 
     Args:
         name: Agent name for log files
         log_dir: Directory for log files (default: the logs directory under the deep_worker home)
+        await_readiness: Opt in to the startup handshake described below.
+
+            MUST stay opt-in. ``web_daemon.main()`` also calls this
+            function, but it owns a SEPARATE readiness channel of its own
+            (``--ready-fd``, written right after ``daemonize()`` returns).
+            Blocking the launching process here for an agent-style report
+            that the web server never sends made ``web_daemon.start()``'s
+            ``child.wait(timeout=30)`` expire — four web_daemon tests plus
+            the installed-distribution test went red. Default False keeps
+            every non-agent caller on the original print-and-exit path.
+
+    Returns:
+        With ``await_readiness=False`` (default): the historical
+        behaviour — the original process prints "starting in background"
+        and ``sys.exit(0)``s immediately after the first fork; the
+        grandchild gets ``None``.
+
+        With ``await_readiness=True``, in the daemonized grandchild: the
+        write end (fd) of a readiness socketpair, inherited across both
+        forks (``os.fork()`` copies the whole fd table — unlike
+        ``subprocess.Popen``, no ``pass_fds`` is needed). The grandchild
+        MUST, exactly once, before exiting:
+
+        * send ``{"ready": true}\\n`` once the agent has reached its
+          normal running state, OR
+        * send ``{"error": "<cause>"}\\n`` if agent initialization failed
+          (the process itself stays alive — AgentStatus.ERROR,
+          docs/DESIGN_FAIL_FAST_AGENT_STARTUP.md — only the terminal
+          report differs),
+
+        then close the fd. The launching terminal (this function's
+        caller, in the ORIGINAL process) blocks on this same channel and
+        exits 0 on ``{"ready": true}``, exits 1 on ``{"error": ...}`` or
+        on EOF (grandchild died before reporting either). ``None`` in
+        the original process — it never reaches this return, since it
+        ``sys.exit()``s once the channel resolves.
     """
     # Set up log directory
     if log_dir is None:
@@ -208,6 +261,20 @@ def daemonize(name: str, log_dir: Path | None = None, *, detach: Callable[[str],
     # Log file paths
     stdout_log = log_dir / f"{name}.out.log"
     stderr_log = log_dir / f"{name}.err.log"
+    err_log = stderr_log
+
+    # Readiness channel, created BEFORE the first fork so both the parent
+    # (which keeps ``reader``) and the grandchild (which inherits ``writer``
+    # across both forks) share it. Mirrors web_daemon.start()'s socketpair,
+    # adapted to a same-binary double-fork instead of subprocess.Popen — a
+    # plain os.fork() needs no pass_fds, every open fd is already shared.
+    # Only created when the caller opted in: a non-agent caller
+    # (web_daemon) has its own channel and must not be made to wait on
+    # this one. See ``await_readiness`` in the docstring.
+    reader: socket.socket | None = None
+    writer: socket.socket | None = None
+    if await_readiness:
+        reader, writer = socket.socketpair()
 
     # CRITICAL: Flush Python's stdio buffers BEFORE forking. Otherwise any
     # text that a caller printed before calling daemonize() still sits in
@@ -220,14 +287,36 @@ def daemonize(name: str, log_dir: Path | None = None, *, detach: Callable[[str],
     try:
         pid = os.fork()
         if pid > 0:
-            # Parent process - print info and exit
-            print(f"Agent '{name}' starting in background (PID will be written to /tmp/deep_worker_{name}.pid)")
-            print(f"Logs: {stdout_log}")
-            sys.stdout.flush()
-            sys.exit(0)
+            if reader is not None and writer is not None:
+                # Parent process: close our copy of the write end (only the
+                # grandchild must hold it — otherwise the kernel never
+                # reports EOF if the grandchild dies without reporting
+                # first, because this process would still be holding a
+                # writable copy open).
+                writer.close()
+                _wait_for_readiness(reader, name, stdout_log, err_log)
+            else:
+                # Legacy path, byte-identical to the pre-handshake
+                # behaviour: report the launch optimistically and leave.
+                print(
+                    f"Agent '{name}' starting in background (PID will be "
+                    f"written to /tmp/deep_worker_{name}.pid)"
+                )
+                print(f"Logs: {stdout_log}")
+                sys.stdout.flush()
+                sys.exit(0)
     except OSError as e:
+        if reader is not None:
+            reader.close()
+        if writer is not None:
+            writer.close()
         print(f"Fork #1 failed: {e}", file=sys.stderr)
         sys.exit(1)
+
+    # In the first child (pre-second-fork) AND the final grandchild: close
+    # the read end, we only ever write to this channel from here on.
+    if reader is not None:
+        reader.close()
 
     # Decouple from parent environment
     os.chdir("/")
@@ -259,7 +348,9 @@ def daemonize(name: str, log_dir: Path | None = None, *, detach: Callable[[str],
     try:
         pid = os.fork()
         if pid > 0:
-            # First child exits
+            # First child exits. Its copy of ``writer`` closes automatically
+            # on process exit — only the surviving grandchild's copy matters
+            # for the EOF/"ready"/"error" contract.
             sys.exit(0)
     except OSError as e:
         print(f"Fork #2 failed: {e}", file=sys.stderr)
@@ -301,3 +392,89 @@ def daemonize(name: str, log_dir: Path | None = None, *, detach: Callable[[str],
     os.close(stdin_fd)
     os.close(stdout_write_fd)
     os.close(stderr_write_fd)
+
+    # ``detach()``, NOT ``fileno()``: returning ``writer.fileno()`` would
+    # leave the socket OBJECT unreferenced the moment this function returns,
+    # and ``socket.__del__`` then closes the underlying fd at the next GC —
+    # at C level, invisibly to any Python-level mock. The grandchild's later
+    # readiness write would land on a closed (or, worse, recycled) descriptor
+    # and the launching terminal would see EOF instead of the real cause.
+    #
+    # Caught by the step-5 end-to-end check from an installed wheel, NOT by the
+    # unit tests: those hold their own reference to the socketpair, which
+    # masks the leak exactly the way production does not.
+    #
+    # ``detach()`` hands the fd over and marks the object closed WITHOUT
+    # closing it, so the descriptor outlives the object. Ownership moves to
+    # AgentProcess._send_ready_event, which wraps it back into a socket and
+    # closes it after the one-shot report.
+    return writer.detach() if writer is not None else None
+
+
+def _wait_for_readiness(
+    reader: socket.socket, name: str, stdout_log: Path, err_log: Path
+) -> None:
+    """Block the ORIGINAL (launching) process until the daemonized
+    grandchild reports its startup outcome, then print and ``sys.exit``.
+
+    Event-driven, no polling: one blocking ``select`` + ``recv`` per
+    message, exactly like ``web_daemon.start()``'s wait loop. Three
+    outcomes, matching the grandchild's contract documented on
+    ``daemonize()``:
+
+    * ``{"ready": true}``  -> agent is up and running.   exit 0.
+    * ``{"error": "..."}`` -> agent init failed; the process is still
+      alive in AgentStatus.ERROR (the registered-but-broken state the
+      No-Agent-Error-State policy requires — see
+      docs/DESIGN_FAIL_FAST_AGENT_STARTUP.md). exit 1, printing the
+      cause VERBATIM plus the log path, so the user never has to go
+      read the log just to learn what broke.
+    * EOF with no message at all -> the grandchild died before it
+      could report either way (crash, SIGKILL, OOM). exit 1.
+
+    Never raises: this function always ends in ``sys.exit()``.
+    """
+    buffer = b""
+    try:
+        while True:
+            if not select.select([reader], [], [], READY_TIMEOUT)[0]:
+                print(
+                    f"Agent '{name}': startup timed out after "
+                    f"{READY_TIMEOUT:.0f}s; see {err_log}",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            data = reader.recv(4096)
+            if not data:
+                print(
+                    f"Agent '{name}': process exited before reporting "
+                    f"startup outcome; see {err_log}",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            buffer += data
+            while b"\n" in buffer:
+                line, buffer = buffer.split(b"\n", 1)
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue  # malformed line — keep waiting for a real one
+                if "error" in event:
+                    print(
+                        f"Agent '{name}' failed to initialize: {event['error']}\n"
+                        f"Log: {err_log}",
+                        file=sys.stderr,
+                    )
+                    sys.exit(1)
+                if event.get("ready"):
+                    print(
+                        f"Agent '{name}' started (PID will be written to "
+                        f"/tmp/deep_worker_{name}.pid)"
+                    )
+                    print(f"Logs: {stdout_log}")
+                    sys.stdout.flush()
+                    sys.exit(0)
+    finally:
+        reader.close()

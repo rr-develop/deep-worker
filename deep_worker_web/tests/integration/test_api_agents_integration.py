@@ -25,9 +25,35 @@ async def _warm_connection(service: AgentService, name: str) -> None:
     via the sanctioned blocking lifecycle path (``connect_to_agent``),
     which is exactly the "warm the connection with one sequential call
     before issuing the batch" rule the service already prescribes.
+
+    MUST be awaited on the SAME loop that then issues the requests — see
+    :func:`_run_with_warm_connection`. An rpyc Connection is bound to the
+    loop it was created on; warming it under its own ``asyncio.run()`` and
+    requesting under the next one hands the handler a connection whose loop
+    is already closed. That used to surface as ``RuntimeError: Event loop is
+    closed`` from deep inside asyncio; the service now detects the dead loop
+    and evicts instead (``AgentService.is_agent_connected``), so the same
+    mistake would now show up as a permanent 503 — still a broken test,
+    just a legible one.
     """
     ok = await service.connect_to_agent(name)
     assert ok is True, f"failed to warm RPyC connection to {name}"
+
+
+def _run_with_warm_connection(service: AgentService, name: str, body) -> None:
+    """Warm the RPyC connection and run ``body()`` on ONE event loop.
+
+    The whole point is that there is a single ``asyncio.run`` here: the
+    connection ``connect_to_agent`` opens stays valid for ``body`` because
+    the loop it is bound to is still the running one. Splitting these into
+    two ``asyncio.run`` calls is the defect this helper exists to prevent.
+    """
+
+    async def _main() -> None:
+        await _warm_connection(service, name)
+        await body()
+
+    asyncio.run(_main())
 
 
 @pytest.fixture
@@ -103,7 +129,6 @@ class TestAgentsAPIWithRealAgent:
             registry = ProcessRegistry()
             service = AgentService(registry=registry)
             asyncio.run(service.initialize())
-            asyncio.run(_warm_connection(service, agent_info.name))
             app.state.agent_service = service
 
             transport = ASGITransport(app=app)
@@ -123,7 +148,7 @@ class TestAgentsAPIWithRealAgent:
                     data = response.json()
                     assert "status" in data or "message" in data
 
-            asyncio.run(run_test())
+            _run_with_warm_connection(service, agent_info.name, run_test)
             asyncio.run(service.shutdown())
 
     def test_get_history_from_real_agent(self, app: FastAPI) -> None:
@@ -139,7 +164,6 @@ class TestAgentsAPIWithRealAgent:
             registry = ProcessRegistry()
             service = AgentService(registry=registry)
             asyncio.run(service.initialize())
-            asyncio.run(_warm_connection(service, agent_info.name))
             app.state.agent_service = service
 
             transport = ASGITransport(app=app)
@@ -160,7 +184,7 @@ class TestAgentsAPIWithRealAgent:
                     assert isinstance(data.get("request_id"), str)
                     assert data["request_id"]
 
-            asyncio.run(run_test())
+            _run_with_warm_connection(service, agent_info.name, run_test)
             asyncio.run(service.shutdown())
 
     def test_stop_task_manager(self, app: FastAPI) -> None:
@@ -169,7 +193,6 @@ class TestAgentsAPIWithRealAgent:
             registry = ProcessRegistry()
             service = AgentService(registry=registry)
             asyncio.run(service.initialize())
-            asyncio.run(_warm_connection(service, agent_info.name))
             app.state.agent_service = service
 
             transport = ASGITransport(app=app)
@@ -189,7 +212,7 @@ class TestAgentsAPIWithRealAgent:
                         data = response.json()
                         assert "status" in data or "message" in data
 
-            asyncio.run(run_test())
+            _run_with_warm_connection(service, agent_info.name, run_test)
             asyncio.run(service.shutdown())
 
     def test_get_agent_status(self, app: FastAPI) -> None:
@@ -204,7 +227,6 @@ class TestAgentsAPIWithRealAgent:
             registry = ProcessRegistry()
             service = AgentService(registry=registry)
             asyncio.run(service.initialize())
-            asyncio.run(_warm_connection(service, agent_info.name))
             app.state.agent_service = service
 
             transport = ASGITransport(app=app)
@@ -225,7 +247,7 @@ class TestAgentsAPIWithRealAgent:
                     assert isinstance(data.get("request_id"), str)
                     assert data["request_id"]
 
-            asyncio.run(run_test())
+            _run_with_warm_connection(service, agent_info.name, run_test)
             asyncio.run(service.shutdown())
 
     def test_agent_not_found_handling(self, app: FastAPI) -> None:
@@ -304,7 +326,6 @@ class TestAgentsAPIWithRealAgent:
             # while the background connect runs; warming via the
             # sanctioned blocking connect path establishes the single
             # connection deterministically before the parallel batch.
-            asyncio.run(_warm_connection(service, agent_info.name))
             app.state.agent_service = service
 
             transport = ASGITransport(app=app)
@@ -350,5 +371,5 @@ class TestAgentsAPIWithRealAgent:
                     # sanity check.
                     assert service._connections[agent_info.name] is not None
 
-            asyncio.run(run_test())
+            _run_with_warm_connection(service, agent_info.name, run_test)
             asyncio.run(service.shutdown())

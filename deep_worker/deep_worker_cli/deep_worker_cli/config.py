@@ -1559,16 +1559,88 @@ def _config_provider_for_model(model_name: str):
     return None
 
 
+def _create_azure_model(spec, model_name: str, user: str | None):
+    """Build an ``AzureChatOpenAI`` for a ``compatible_with="azure"`` provider.
+
+    Azure differs from the OpenAI dialect in WHERE the model name goes: it
+    is the *deployment*, and it travels in the URL path, not the request
+    body. ``AzureChatOpenAI`` assembles
+
+        <azure_endpoint>/openai/deployments/<deployment>/chat/completions
+            ?api-version=<api_version>
+
+    so passing the name as ``model=`` would silently omit the deployment and
+    hit a non-existent URL.
+
+    NOTE on kwarg vs attribute names (langchain_openai 1.1.7): the
+    constructor takes the *aliases* ``azure_deployment`` / ``api_version`` /
+    ``api_key``, while the resulting fields are ``deployment_name`` /
+    ``openai_api_version`` / ``openai_api_key``. Tests assert on the
+    attributes, so the two must not be confused.
+    """
+    from langchain_openai import AzureChatOpenAI
+
+    deployment = (model_name or "").strip()
+    if not deployment:
+        # Azure cannot be called without a deployment, and we refuse to
+        # invent one: no model name is ever hardcoded in Python.
+        raise ValueError(
+            f"provider {spec.name!r} (compatible_with='azure') needs a "
+            f"deployment name and none was given. Pass --model <deployment>, "
+            f"or set 'default_model' / 'default_model_env' for this provider "
+            f"in providers.json. For Azure the model name IS the deployment "
+            f"name from your Azure resource, not a public model id."
+        )
+
+    kwargs: dict[str, Any] = {
+        "azure_endpoint": spec.base_url,
+        "azure_deployment": deployment,
+        "api_version": spec.api_version,
+        # Same rationale as the openai branch: langchain_openai only
+        # auto-enables stream_options={"include_usage": true} for the DEFAULT
+        # base URL, and Azure never is one — without this the
+        # token-statistics subsystem would record ``no_usage``.
+        "stream_usage": True,
+    }
+
+    if spec.auth_header == "authorization":
+        # A gateway in front of Azure wants ``Authorization: Bearer <key>``.
+        # The SDK still requires *some* api_key to construct, so pass a
+        # placeholder and send the real credential in the header we were
+        # told to use. The placeholder is never transmitted: Azure's own
+        # ``api-key`` header is not set in this mode.
+        kwargs["api_key"] = "placeholder-unused-see-default-headers"
+        kwargs["default_headers"] = {
+            "Authorization": f"Bearer {spec.api_key()}"
+        }
+    else:
+        kwargs["api_key"] = spec.api_key()
+
+    if user is not None:
+        kwargs["model_kwargs"] = {"user": user}
+    # Operator escape hatch for vendor-specific knobs. Applied last so
+    # config can override our defaults deliberately.
+    kwargs.update(spec.extra)
+
+    return AzureChatOpenAI(**kwargs)
+
+
 def _create_config_provider_model(spec, model_name: str, user: str | None):
     """Build a chat model for a config-declared provider.
 
-    Only the ``openai`` dialect exists today (``SUPPORTED_DIALECTS`` in the
-    registry rejects anything else at load time), so this maps onto
-    ``ChatOpenAI`` with the operator's ``base_url``/key. ``model_name``
-    reaches the vendor VERBATIM — no local whitelist; an unknown name is
-    rejected by the vendor with a real error
+    Two dialects exist (``SUPPORTED_DIALECTS`` in the registry rejects
+    anything else at load time):
+
+    * ``openai``  → ``ChatOpenAI`` with the operator's ``base_url``/key.
+    * ``azure``   → ``AzureChatOpenAI``; see ``_create_azure_model``.
+
+    ``model_name`` reaches the vendor VERBATIM — no local whitelist; an
+    unknown name is rejected by the vendor with a real error
     (no local model whitelist).
     """
+    if spec.compatible_with == "azure":
+        return _create_azure_model(spec, model_name, user)
+
     from langchain_openai import ChatOpenAI
 
     kwargs: dict[str, Any] = {
@@ -2125,6 +2197,68 @@ def create_model(
         )
 
     return model
+
+
+#: Providers whose runtime lives OUTSIDE this Python process — a CLI binary
+#: and/or a node adapter — and can therefore be absent/unusable on a host
+#: where the Python side imports perfectly well. Only these get a runtime
+#: preflight; see :func:`preflight_provider_async`.
+#:
+#: Everything NOT listed here (openai, anthropic, google, vertexai, deepseek,
+#: and every config-declared providers.json entry incl. compatible_with=
+#: "openai"/"azure") is a pure HTTP/API provider: no subprocess, no node, no
+#: binary. Those MUST NOT be probed — a node-less host running an API provider
+#: is a perfectly valid deployment, and a preflight there would invent a
+#: dependency the provider does not have.
+_RUNTIME_PREFLIGHT_PROVIDERS = frozenset({"claude-code"})
+
+
+async def preflight_provider_async(provider: str | None) -> None:
+    """Verify a provider's EXTERNAL runtime before the agent reports ready.
+
+    Per-provider by construction, not a blanket check: the node >= 22 gate
+    belongs to ``claude-code`` (its ``@agentclientprotocol/claude-agent-acp``
+    adapter's ``engines`` requirement), NOT to deep-worker as a whole. An
+    agent on an API provider must start on a host with no node at all.
+
+    Called from ``AgentProcess.start()`` right after the model is built, so a
+    broken runtime becomes a startup failure with a readable cause — the agent
+    settles into ``AgentStatus.ERROR`` and the launching terminal prints the
+    reason and exits nonzero (see ``daemon._wait_for_readiness`` and
+    ``AgentProcess._report_startup_error``). Before this, the probe only ran
+    lazily at the first ``ainvoke``: ``deep-worker <name>`` reported a healthy
+    start and the agent only failed once the user sent a prompt.
+
+    Raises whatever the provider's own preflight raises (``AcpAdapterError``
+    for claude-code) — the caller's init ``except`` turns it into the agent's
+    persisted error message verbatim.
+    """
+    if provider not in _RUNTIME_PREFLIGHT_PROVIDERS:
+        return
+
+    if provider == "claude-code":
+        # Imported lazily and through the same capability resolution the
+        # model construction uses: in a tree/wheel without the provider this
+        # must stay a clean CapabilityError, never a raw ImportError.
+        from deep_worker_cli.provider_paths import ensure_provider_importable
+
+        resolution = ensure_provider_importable(
+            "deep_worker.providers.claude_code_provider"
+        )
+        if resolution.unavailable:
+            raise CapabilityError(
+                capability="claude-code",
+                remedy=resolution.remedy or resolution.unavailable,
+            )
+
+        from deep_worker.providers.claude_code_provider.profile import (
+            preflight_async,
+        )
+
+        # node >= 22 + adapter present + live ``node <entry> --version`` smoke.
+        # Async on purpose: ``start()`` runs inside the event loop, and a sync
+        # ``subprocess.run`` here would freeze every asyncio task.
+        await preflight_async()
 
 
 def _attach_token_stats(

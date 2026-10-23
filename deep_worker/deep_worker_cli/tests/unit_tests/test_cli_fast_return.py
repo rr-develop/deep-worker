@@ -206,13 +206,24 @@ def test_deep_worker_clean_returns_control_within_budget(agent_name: str) -> Non
     )
 
     # Secondary: exit code must be 0 (daemonize succeeded) and stdout
-    # must carry the "starting in background" line.
+    # must carry the launch notice naming this agent.
     assert proc.returncode == 0, (
         f"deep-worker returned {proc.returncode}; "
         f"stdout={proc.stdout!r}, stderr={proc.stderr!r}"
     )
-    assert "starting in background" in proc.stdout, (
-        f"Expected 'starting in background' notice in stdout; got: "
+    # Two wordings are legitimate, one per daemonize() path. The agent
+    # path opts into the readiness handshake (await_readiness=True) and
+    # therefore reports past tense — "started" — only once the grandchild
+    # has confirmed it reached its running state. Callers that stay on
+    # the print-and-exit path (web_daemon) still report optimistically,
+    # in the present progressive — "starting in background". Asserting
+    # the literal "starting in background" here pinned the legacy
+    # wording and went red on CI the moment the agent path began
+    # waiting for a real report.
+    assert f"Agent '{agent_name}' started" in proc.stdout or (
+        "starting in background" in proc.stdout
+    ), (
+        f"Expected a launch notice for {agent_name!r} in stdout; got: "
         f"{proc.stdout!r}"
     )
 
